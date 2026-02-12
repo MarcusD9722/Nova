@@ -1,0 +1,32 @@
+﻿# Python / venv
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / frontend
+frontend/node_modules/
+node_modules/
+
+# Models / weights
+model/
+models/
+*.gguf
+*.bin
+*.pt
+*.onnx
+
+# Runtime data
+memory_data/
+diskcache/
+vector_store/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# OS/IDE
+.vscode/
+.DS_Store
+Thumbs.db
