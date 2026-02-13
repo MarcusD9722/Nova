@@ -1,72 +1,177 @@
-# Nova (Backend)
+Nova — Local AI Assistant Backend
 
-Python 3.11 async backend for an Electron frontend.
+• Local-first AI assistant backend built in Python 3.11
+• Designed to power the Nova desktop app
+• FastAPI async API for Electron frontend
+• Local GGUF model inference via llama-cpp with GPU offload
+• Persistent multi-layer memory
+• Plugin system and voice pipeline support
+• README reflects current Nova boot and setup behavior
 
-## Setup (Windows, PowerShell)
+---
 
-### 1) Create venv
+Requirements
 
-```powershell
+• Windows (primary supported platform)
+• Python 3.11
+• NVIDIA GPU with CUDA
+• PowerShell
+• FFmpeg recommended for voice features
+• Node.js only if running the frontend
+
+---
+
+Expected Repo Layout (do not restructure)
+
+• backend/
+• core/
+• memory/
+• plugins/
+• voice/
+• model/
+• memory_data/
+• projects/
+• start_nova.ps1
+• requirements.txt
+• .env
+
+Folder roles:
+
+• backend/ → FastAPI entry package
+• core/ → brain and orchestration
+• memory/ → memory engines and unifier
+• plugins/ → all tools and integrations
+• voice/ → TTS / STT pipeline
+• model/ → GGUF model files
+• memory_data/ → runtime memory storage (gitignored)
+• projects/ → boot tests and utility runners
+
+---
+
+Setup (Windows / PowerShell)
+
+• Create virtual environment
 py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
+..venv\Scripts\Activate.ps1
 
-### 2) Install dependencies
-
-```powershell
+• Install dependencies
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-> Notes
-> - `llama-cpp-python==0.3.4` must be a CUDA-enabled build to enforce RTX 3080 GPU offload.
-> - `TTS==0.22.0` (Coqui) is required for XTTS. On Windows you may also need FFmpeg.
+Critical packages:
 
-### 3) Configure `.env`
+• llama-cpp-python==0.3.4 (CUDA-enabled build required)
+• TTS==0.22.0 (Coqui XTTS)
 
-Create a `.env` in the repo root.
+---
 
-Required keys (as needed by features):
+.env configuration (repo root)
 
-- `NOVA_LOG_LEVEL=INFO`
-- `OPENWEATHER_API_KEY=...` (Weather plugin)
-- `GOOGLE_MAPS_API_KEY=...` (Google Maps plugin)
-- `DISCORD_BOT_TOKEN=...` and `DISCORD_CHANNEL_ID=...` (Discord plugin)
+Core settings:
 
-Optional:
+• NOVA_LOG_LEVEL=INFO
+• NOVA_HOST=127.0.0.1
+• NOVA_PORT=8000
+• NOVA_CONTEXT_TOKENS=8192
+• NOVA_MEMORY_DIR=memory_data
 
-- `NOVA_HOST=127.0.0.1`
-- `NOVA_PORT=8008`
-- `NOVA_MODEL_PATH=` (leave empty to auto-pick any `model/*.gguf`)
-- `NOVA_CONTEXT_TOKENS=8192`
-- `NOVA_MEMORY_DIR=memory_data`
+Optional plugin keys (only if those plugins are used):
 
-### 4) Place a GGUF model
+• OPENWEATHER_API_KEY=
+• GOOGLE_MAPS_API_KEY=
+• DISCORD_BOT_TOKEN=
+• DISCORD_CHANNEL_ID=
 
-Put a `.gguf` file under `model/`.
+---
 
-Nova will auto-detect it. If no model exists, `/chat` will still work but will return a clear "model missing" response and tests will skip inference.
+Model setup
 
-### 5) Start Nova (backend + frontend)
+• Place at least one GGUF file inside model/
+• Example: model/llama-3.1-8b-instruct-q6_k.gguf
+• If no model exists, server still boots
+• /chat returns a model-missing response
 
-```powershell
+---
+
+Boot Nova
+
+Recommended:
+
+• Run start script
 .\start_nova.ps1
-```
 
-If a frontend exists, the script will attempt to run its npm start script.
+Script behavior:
 
-### 6) Run tests
+• Activates virtual environment
+• Starts backend server
+• Loads model
+• Initializes memory layers
+• Registers plugins
+• Starts frontend if present
 
-```powershell
-python -m pytest
-python scripts\boot_test.py
-```
+Manual backend boot:
 
-## GPU enforcement (llama-cpp)
+• python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 
-When a model is present, Nova loads it with `n_gpu_layers=-1` and `main_gpu=0` and captures llama.cpp initialization logs.
+---
 
-- If CUDA offload is confirmed: startup succeeds and `/health` reports GPU enforcement as active.
-- If CUDA offload cannot be confirmed: startup fails fast with a clear error explaining how to install a CUDA-enabled `llama-cpp-python==0.3.4` build on Windows.
+Successful startup indicators
 
-This prevents silent CPU fallback for inference.
+• Model loaded: llama-3.1-8b-instruct-q6_k.gguf (ctx=8192)
+• Startup complete: gpu_offload_confirmed
+
+---
+
+GPU enforcement (llama-cpp)
+
+• Model loads with full GPU layer offload
+• n_gpu_layers = -1
+• main_gpu = 0
+• If CUDA offload is not confirmed, startup errors
+
+---
+
+Plugins
+
+• All tools must live in plugins/
+• Plugins auto-register at startup
+• Missing API keys disable only that plugin, not Nova
+
+---
+
+Voice system
+
+• Voice modules live in voice/
+• Uses Coqui TTS
+• FFmpeg required for audio processing
+
+---
+
+Memory system
+
+• Runtime memory stored in memory_data/
+• Do not commit this folder
+
+---
+
+Tests
+
+• python -m pytest
+• python projects\boot_test.py
+
+---
+
+Gitignore these
+
+• .env
+• memory_data/
+• **pycache**/
+• *.gguf
+
+---
+
+Troubleshooting GPU
+
+• Reinstall llama-cpp with CUDA build
+pip uninstall llama-cpp-python
+pip install llama-cpp-python==0.3.4 --force-reinstall --no-cache-dir
