@@ -4,12 +4,15 @@ import asyncio
 
 import aiosqlite
 import json
+import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from core.dates import parse_month_day
+from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from memory.backends.chroma_backend import ChromaMemoryBackend
 from memory.backends.diskcache_backend import DiskCacheBackend
@@ -22,21 +25,103 @@ logger = get_logger(__name__)
 
 IGNORE_TURN_KINDS = {"turn", "turn_user", "turn_assistant"}
 
+# Behavioral "lessons" — durable guidance Nova learns from Marcus's corrections
+# and preferences — are stored as facts under this entity and applied to future
+# replies. Kept separate from ordinary facts so they can be listed/injected as a
+# group. See core/runtime.py (capture + injection) and the reflection pass.
+LESSON_ENTITY = "lesson"
+
+
+def _lesson_topic_slug(topic: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (topic or "").strip().lower()).strip("-")
+    return s[:48] or "general"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 class MemoryUnifier:
-    def __init__(self, memory_dir: Path):
+    # Attributes that hold exactly ONE current value: a new write supersedes
+    # (deletes) older rows instead of accumulating contradictory facts that
+    # search would then surface side by side ("mother = Tara" AND "= Sara").
+    _SINGLETON_USER_ATTRS = {"name", "location", "spouse", "mother", "father", "children_type"}
+    _SINGLETON_PROJECT_ATTRS = {"status", "summary", "brief", "next_steps", "last_worked"}
+
+    def __init__(self, memory_dir: Path, *, enable_chroma: bool = True):
         self._dir = memory_dir
         self._sqlite = SQLiteMemoryBackend(memory_dir / "sqlite" / "nova.sqlite3")
         self._diskcache = DiskCacheBackend(memory_dir / "diskcache")
-        self._chroma = ChromaMemoryBackend(memory_dir / "chroma")
+        self._chroma = ChromaMemoryBackend(memory_dir / "chroma") if enable_chroma else None
         self._json = JsonAuditBackend(memory_dir / "json")
         self._write_lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._initialized = False
+        self._chroma_degraded_logged = False
+        # Bumped on every long-term write/delete; part of the search cache key
+        # so fresh facts are recallable immediately instead of after the TTL.
+        self._search_gen = 0
+
+    def _is_singleton_fact(self, entity: str, attribute: str) -> bool:
+        ent = (entity or "").strip().lower()
+        attr = (attribute or "").strip().lower()
+        if ent == "user":
+            return attr in self._SINGLETON_USER_ATTRS
+        if ent == "projects":
+            return attr == "last_active"
+        if ent.startswith("project:"):
+            return attr in self._SINGLETON_PROJECT_ATTRS
+        if ent.startswith("conversation:"):
+            # ":digest" facts are keyed by day (attribute=date-slug): one digest
+            # per day, latest wins, but different days ACCUMULATE (so history
+            # isn't destroyed). The plain rolling "summary" stays singleton.
+            if ent.endswith(":digest"):
+                return True
+            if ent.endswith(":story"):
+                return attr == "state"  # one running story bible, latest wins
+            return attr == "summary"
+        if ent == "mood":
+            return True  # one mood reading per day (attribute=date), days accumulate
+        if ent == "wellbeing":
+            return True  # one wellbeing reading per day (attribute=date), days accumulate
+        if ent == "interest_focus":
+            return True  # one focus snapshot per week (attribute=week-slug), weeks accumulate
+        if ent == "session":
+            return True  # bookkeeping facts (last_active, *_nudged_at, habit_suggested:*) — one current value each
+        return False
+
+    async def _fact_ids_for(self, entity: str, attribute: str, value: str | None = None) -> list[str]:
+        sql = "SELECT id FROM facts WHERE entity = ? AND attribute = ?"
+        params: list[Any] = [entity, attribute]
+        if value is not None:
+            sql += " AND value = ?"
+            params.append(value)
+        async with aiosqlite.connect(self._sqlite._db_path) as db:  # type: ignore[attr-defined]
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, tuple(params)) as cur:
+                rows = await cur.fetchall()
+        return [str(r["id"]) for r in rows]
+
+    async def _chroma_upsert_safe(self, *, doc_id: str, text: str, metadata: dict[str, Any]) -> None:
+        """Best-effort semantic index write.
+
+        SQLite is the source of truth; a Chroma failure (e.g. a store written
+        by an incompatible chromadb version) must never break memory ingest.
+        """
+        if self._chroma is None:
+            return
+        try:
+            await self._chroma.upsert_text(doc_id=doc_id, text=text, metadata=metadata)
+        except Exception as e:  # noqa: BLE001
+            if not self._chroma_degraded_logged:
+                self._chroma_degraded_logged = True
+                logger.warning("chroma_unavailable_semantic_index_degraded", error=str(e)[:300])
+                BUS.publish(
+                    "system.warning",
+                    {"component": "memory.semantic_index", "error": clip(e, 200), "impact": "semantic recall degraded; facts still saved"},
+                )
+            else:
+                logger.debug("chroma_upsert_failed", error=str(e)[:200])
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -60,6 +145,8 @@ class MemoryUnifier:
 
         SQLite is the source-of-truth. If Chroma is empty (e.g., deleted), rebuild it.
         """
+        if self._chroma is None:
+            return
         sqlite_counts = await self._sqlite.count_records()
         try:
             chroma_count = await self._chroma.count()
@@ -77,6 +164,8 @@ class MemoryUnifier:
 
     async def rebuild_semantic_index(self) -> dict[str, int]:
         """Rebuild Chroma documents from SQLite facts/people/events."""
+        if self._chroma is None:
+            return {"facts": 0, "people": 0, "events": 0}
         await self._sqlite.initialize()
         await self._json.initialize()
 
@@ -129,8 +218,16 @@ class MemoryUnifier:
         turn_id = uuid4()
         created_at = _now().isoformat()
 
+        # Index substantive turns semantically so anything said is recallable
+        # later (not just what got distilled into a structured fact). Skip short
+        # greetings/acks to keep the index signal-rich. Best-effort; never blocks.
+        index_turn = (
+            os.getenv("NOVA_INDEX_TURNS", "1").strip().lower() not in {"0", "false", "no", "off"}
+            and len((content or "").strip()) >= 25
+        )
+
         async with self._write_lock:
-            await asyncio.gather(
+            writes = [
                 self._sqlite.add_turn(
                     turn_id=turn_id,
                     conversation_id=conversation_id,
@@ -148,13 +245,22 @@ class MemoryUnifier:
                         "created_at": created_at,
                     }
                 ),
-                self._diskcache.set(
-                    f"turn:{turn_id}",
-                    {"conversation_id": str(conversation_id), "role": role, "content": content, "created_at": created_at},
-                    ttl_s=86400,
-                ),
-            )
+            ]
+            if index_turn and self._chroma is not None:
+                speaker = "Marcus" if role == "user" else "Nova"
+                writes.append(
+                    self._chroma_upsert_safe(
+                        doc_id=f"turn:{turn_id}",
+                        text=f"{speaker} said: {content}",
+                        metadata={"kind": "turn", "role": role, "created_at": created_at,
+                                  "conversation_id": str(conversation_id)},
+                    )
+                )
+            await asyncio.gather(*writes)
 
+        if index_turn:
+            self._search_gen += 1
+        BUS.publish("memory.write", {"kind": "turn", "role": role, "source": "conversation"})
         return turn_id
 
     async def add_fact(self, entity: str, attribute: str, value: str, confidence: float = 0.7) -> UUID:
@@ -188,7 +294,26 @@ class MemoryUnifier:
         created_at = _now().isoformat()
 
         async with self._write_lock:
-            await asyncio.gather(
+            # Supersede stale values for single-valued attributes; skip exact
+            # duplicates for list-valued ones (child, friend, note, ...).
+            stale_ids: list[str] = []
+            if self._is_singleton_fact(entity, attribute):
+                try:
+                    stale_ids = await self._fact_ids_for(entity, attribute)
+                    if stale_ids:
+                        await self._sqlite.delete_facts_by_ids(stale_ids)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("fact_supersede_failed", entity=entity, attribute=attribute, error=str(e)[:200])
+                    stale_ids = []
+            else:
+                try:
+                    dupes = await self._fact_ids_for(entity, attribute, str(value))
+                    if dupes:
+                        return UUID(dupes[0])  # already stored; nothing to write
+                except Exception:
+                    pass
+
+            tasks = [
                 self._sqlite.add_fact(fact_id, entity=entity, attribute=attribute, value=value, confidence=confidence),
                 self._json.append_audit(
                     {
@@ -201,28 +326,58 @@ class MemoryUnifier:
                         "created_at": created_at,
                     }
                 ),
-                self._chroma.upsert_text(
-                    doc_id=str(fact_id),
-                    text=f"FACT {entity} {attribute} = {value}",
-                    metadata={"kind": "fact", "entity": entity, "attribute": attribute, "created_at": created_at},
-                ),
                 self._diskcache.set(
                     f"fact:{fact_id}",
                     {"entity": entity, "attribute": attribute, "value": value, "confidence": confidence, "created_at": created_at},
                     ttl_s=86400,
                 ),
-            )
+            ]
+            if self._chroma is not None:
+                tasks.append(
+                    self._chroma_upsert_safe(
+                        doc_id=str(fact_id),
+                        text=f"FACT {entity} {attribute} = {value}",
+                        metadata={"kind": "fact", "entity": entity, "attribute": attribute, "created_at": created_at},
+                    )
+                )
+            await asyncio.gather(*tasks)
 
+        self._search_gen += 1
+        if stale_ids and self._chroma is not None:
+            try:
+                await self._chroma.delete_ids(stale_ids)
+            except Exception:
+                pass
+
+        BUS.publish(
+            "memory.write",
+            {"kind": "fact", "entity": entity, "attribute": attribute, "value": clip(value, 120), "source": "long_term",
+             "superseded": len(stale_ids)},
+        )
         return fact_id
 
     async def upsert_person(self, name: str, attributes: dict[str, str]) -> UUID:
         await self.initialize()
         person_id = uuid4()
         created_at = _now().isoformat()
-        attributes_json = json.dumps(attributes, ensure_ascii=False, sort_keys=True)
+
+        # Merge with whatever's already known about this person — a SQL upsert
+        # replaces the whole attributes_json blob, so writing just {"birthday":
+        # ...} later would otherwise silently erase an earlier {"relation":
+        # "son"} write for the same name.
+        existing = await self._sqlite.get_person_by_name(name)
+        merged = dict(attributes)
+        if existing:
+            try:
+                prior = json.loads(existing.get("attributes_json") or "{}")
+                if isinstance(prior, dict):
+                    merged = {**prior, **attributes}
+            except Exception:
+                pass
+        attributes_json = json.dumps(merged, ensure_ascii=False, sort_keys=True)
 
         async with self._write_lock:
-            await asyncio.gather(
+            tasks = [
                 self._sqlite.upsert_person(person_id, name=name, attributes_json=attributes_json),
                 self._json.append_audit(
                     {
@@ -233,15 +388,122 @@ class MemoryUnifier:
                         "created_at": created_at,
                     }
                 ),
-                self._chroma.upsert_text(
-                    doc_id=str(person_id),
-                    text=f"PERSON {name} {attributes_json}",
-                    metadata={"kind": "person", "name": name, "created_at": created_at},
-                ),
-                self._diskcache.set(f"person:{name.lower()}", attributes, ttl_s=86400),
-            )
+                self._diskcache.set(f"person:{name.lower()}", merged, ttl_s=86400),
+            ]
+            if self._chroma is not None:
+                tasks.append(
+                    self._chroma_upsert_safe(
+                        doc_id=str(person_id),
+                        text=f"PERSON {name} {attributes_json}",
+                        metadata={"kind": "person", "name": name, "created_at": created_at},
+                    )
+                )
+            await asyncio.gather(*tasks)
 
+        self._search_gen += 1
+        BUS.publish("memory.write", {"kind": "person", "name": clip(name, 80), "source": "long_term"})
         return person_id
+
+    # Attribute keys treated as an important recurring date (birthdays,
+    # anniversaries, ...) when found in a person's attributes_json.
+    _IMPORTANT_DATE_KEYS = ("birthday", "anniversary", "bday")
+
+    @staticmethod
+    def _important_dates_for(attributes: dict[str, Any]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for key, value in attributes.items():
+            key_l = str(key).lower()
+            is_date_key = key_l in MemoryUnifier._IMPORTANT_DATE_KEYS or key_l.endswith("_date")
+            if not is_date_key:
+                continue
+            md = parse_month_day(str(value))
+            if md is None:
+                continue
+            out.append({"label": key_l, "month": md[0], "day": md[1], "raw": str(value)})
+        return out
+
+    async def recall_person(self, name: str) -> dict[str, Any] | None:
+        """Everything known about a person: attributes, when they were last
+        mentioned in conversation, and any upcoming important dates."""
+        await self.initialize()
+        row = await self._sqlite.get_person_by_name(name)
+        if not row:
+            return None
+        try:
+            attributes = json.loads(row.get("attributes_json") or "{}")
+            if not isinstance(attributes, dict):
+                attributes = {}
+        except Exception:
+            attributes = {}
+
+        last_mentioned: str | None = None
+        try:
+            turns = await self._sqlite.search_turns(term=name, limit=1)
+            if turns:
+                last_mentioned = str(turns[0]["created_at"])
+        except Exception:
+            pass
+
+        return {
+            "name": row["name"],
+            "attributes": attributes,
+            "last_mentioned": last_mentioned,
+            "important_dates": self._important_dates_for(attributes),
+        }
+
+    async def list_people_with_upcoming_dates(self, within_days: int = 7) -> list[dict[str, Any]]:
+        """People with a birthday/anniversary landing within the next N days
+        (today inclusive), soonest first. Used to surface a gentle reminder —
+        never guesses a date that wasn't actually stored."""
+        await self.initialize()
+        today = _now().date()
+        out: list[dict[str, Any]] = []
+        for row in await self._sqlite.all_people(limit=None):
+            try:
+                attributes = json.loads(row.get("attributes_json") or "{}")
+                if not isinstance(attributes, dict):
+                    continue
+            except Exception:
+                continue
+            for d in self._important_dates_for(attributes):
+                # Compare month/day only — the stored year (if any) isn't the
+                # occurrence year; a birthday recurs every year.
+                try:
+                    this_year = today.replace(month=d["month"], day=d["day"], year=today.year)
+                    occurrence = this_year if this_year >= today else this_year.replace(year=today.year + 1)
+                except ValueError:
+                    continue  # e.g. Feb 29 landing on a non-leap year — skip rather than guess
+                days_until = (occurrence - today).days
+                if 0 <= days_until <= within_days:
+                    out.append({
+                        "name": row["name"], "label": d["label"], "month": d["month"], "day": d["day"],
+                        "occurrence": occurrence.isoformat(), "days_until": days_until,
+                    })
+        out.sort(key=lambda x: x["days_until"])
+        return out
+
+    # --- Long-horizon interest drift (MR1) ------------------------------------
+
+    async def record_interest_focus(self, topic: str, week: str | None = None) -> None:
+        """One interest-focus snapshot per ISO week (singleton per week; weeks
+        accumulate so drift over months can be read back later)."""
+        topic = (topic or "").strip()
+        if not topic:
+            return
+        week = week or _now().strftime("%G-W%V")
+        await self.add_fact(entity="interest_focus", attribute=week, value=topic[:200], confidence=0.5)
+
+    async def recent_interest_drift(self, weeks: int = 6) -> str:
+        """A short natural-language line noting how focus has shifted over the
+        last few weeks, or '' if there's not enough history yet."""
+        rows = await self.get_facts(entity="interest_focus", limit=weeks, newest_first=True)
+        topics = [r.value for r in rows if r.value]
+        if len(topics) < 2:
+            return ""
+        newest, oldest = topics[0], topics[-1]
+        if newest.strip().lower() == oldest.strip().lower():
+            return ""
+        return f"A few weeks ago Marcus was focused on {oldest}; more recently it's been {newest}."
 
     async def add_event(self, date: str, note: str) -> UUID:
         await self.initialize()
@@ -249,7 +511,7 @@ class MemoryUnifier:
         created_at = _now().isoformat()
 
         async with self._write_lock:
-            await asyncio.gather(
+            tasks = [
                 self._sqlite.add_event(event_id, date=date, note=note),
                 self._json.append_audit(
                     {
@@ -260,18 +522,24 @@ class MemoryUnifier:
                         "created_at": created_at,
                     }
                 ),
-                self._chroma.upsert_text(
-                    doc_id=str(event_id),
-                    text=f"EVENT {date}: {note}",
-                    metadata={"kind": "event", "date": date, "created_at": created_at},
-                ),
                 self._diskcache.set(
                     f"event:{event_id}",
                     {"date": date, "note": note, "created_at": created_at},
                     ttl_s=86400,
                 ),
-            )
+            ]
+            if self._chroma is not None:
+                tasks.append(
+                    self._chroma_upsert_safe(
+                        doc_id=str(event_id),
+                        text=f"EVENT {date}: {note}",
+                        metadata={"kind": "event", "date": date, "created_at": created_at},
+                    )
+                )
+            await asyncio.gather(*tasks)
 
+        self._search_gen += 1
+        BUS.publish("memory.write", {"kind": "event", "date": clip(date, 40), "note": clip(note, 120), "source": "long_term"})
         return event_id
 
     def _fact_from_row(self, row: dict[str, Any]) -> FactRecord:
@@ -331,6 +599,421 @@ class MemoryUnifier:
         hits = await self.get_facts(entity=entity, attribute=attribute, limit=1, newest_first=True)
         return hits[0] if hits else None
 
+    # ── Behavioral lessons (self-learning) ───────────────────────────────────
+
+    async def add_lesson(self, lesson: str, topic: str = "general", confidence: float = 0.9) -> UUID:
+        """Store a durable behavioral lesson (a correction or preference).
+
+        Lessons are facts under LESSON_ENTITY; exact duplicates are skipped by
+        add_fact's list-attribute dedup, so repeating the same instruction won't
+        pile up.
+        """
+        text = (lesson or "").strip()
+        if not text:
+            return uuid4()
+        return await self.add_fact(
+            entity=LESSON_ENTITY, attribute=_lesson_topic_slug(topic), value=text[:400], confidence=confidence
+        )
+
+    async def get_lessons(self, limit: int = 12, newest_first: bool = True) -> list[str]:
+        """Return recent lesson texts (deduped, order preserved)."""
+        rows = await self.get_facts(entity=LESSON_ENTITY, limit=max(1, int(limit) * 2), newest_first=newest_first)
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in rows:
+            v = (r.value or "").strip()
+            k = v.lower()
+            if v and k not in seen:
+                seen.add(k)
+                out.append(v)
+            if len(out) >= limit:
+                break
+        return out
+
+    async def lesson_records(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Lessons for the UI panel (id/topic/text/created_at)."""
+        rows = await self.get_facts(entity=LESSON_ENTITY, limit=limit, newest_first=True)
+        return [
+            {"id": str(r.id), "topic": r.attribute, "text": r.value, "created_at": r.created_at.isoformat()}
+            for r in rows
+        ]
+
+    # --- Mood tracking (M1: emotional presence) ------------------------------
+
+    async def record_mood(self, label: str, day: str | None = None) -> None:
+        """One mood reading per calendar day (singleton per day; days
+        accumulate so a trend can be read back later)."""
+        day = day or _now().strftime("%Y-%m-%d")
+        await self.add_fact(entity="mood", attribute=day, value=label, confidence=0.6)
+
+    async def recent_mood_trend(self, days: int = 3) -> str:
+        """A short natural-language line summarizing the last few days'
+        detected mood, or '' if there's nothing recent to say. Never guesses —
+        only reflects what was actually detected."""
+        rows = await self.get_facts(entity="mood", limit=days, newest_first=True)
+        if not rows:
+            return ""
+        labels = [r.value for r in rows if r.value]
+        if not labels:
+            return ""
+        if len(labels) == 1:
+            return f"Marcus seemed {labels[0]} recently."
+        if len(set(labels)) == 1:
+            return f"Marcus has seemed {labels[0]} the last {len(labels)} days."
+        return f"Marcus's mood recently: {', '.join(labels)} (most recent first)."
+
+    # --- Wellbeing awareness (WB1) --------------------------------------------
+
+    async def record_wellbeing_signal(self, label: str, day: str | None = None) -> None:
+        """One wellbeing reading per calendar day (singleton per day; days
+        accumulate). Only meaningful signals get written — an ordinary day
+        records nothing, same discipline as record_mood."""
+        day = day or _now().strftime("%Y-%m-%d")
+        await self.add_fact(entity="wellbeing", attribute=day, value=label, confidence=0.5)
+
+    async def recent_wellbeing_trend(self, days: int = 5) -> str:
+        """A short, gentle natural-language line if a wellbeing pattern shows
+        up across recent days — e.g. several late nights in a row. Returns ''
+        when there's nothing worth a mention (including: already mentioned
+        recently, see should_nudge_wellbeing)."""
+        rows = await self.get_facts(entity="wellbeing", limit=days, newest_first=True)
+        labels = [r.value for r in rows if r.value]
+        if len(labels) < 2:
+            return ""
+        if labels[0] == "late_night" and labels.count("late_night") >= 2:
+            return f"Marcus has been up late {labels.count('late_night')} of the last {len(labels)} days he talked to you."
+        return ""
+
+    async def should_nudge_wellbeing(self, *, min_gap_days: int = 3) -> bool:
+        """Guard so a wellbeing observation surfaces once, gently — not every
+        turn. True if she hasn't nudged about it in the last `min_gap_days`."""
+        last = await self.get_latest_fact(entity="session", attribute="wellbeing_nudged_at")
+        if not last or not last.value:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last.value)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return True
+        return (_now() - last_dt).days >= min_gap_days
+
+    async def mark_wellbeing_nudged(self) -> None:
+        await self.add_fact(entity="session", attribute="wellbeing_nudged_at", value=_now().isoformat(), confidence=1.0)
+
+    # --- Habit & pattern learning (HP1) ----------------------------------------
+
+    async def log_tool_usage(self, tool_name: str) -> None:
+        await self.initialize()
+        await self._sqlite.log_tool_usage(tool_name)
+
+    async def distinct_logged_tools(self, window_days: int = 14) -> list[str]:
+        await self.initialize()
+        since = (_now() - timedelta(days=window_days)).isoformat()
+        return await self._sqlite.distinct_logged_tools(since)
+
+    async def detect_habit(
+        self, tool_name: str, *, window_days: int = 14, min_distinct_days: int = 4, hour_window: int = 2
+    ) -> dict[str, Any] | None:
+        """A tool called in roughly the same hour-of-day window on several
+        distinct recent days — e.g. weather.current most mornings. Returns
+        None unless there's a genuine repeated pattern (never guesses from a
+        handful of calls)."""
+        since = (_now() - timedelta(days=window_days)).isoformat()
+        timestamps = await self._sqlite.tool_usage_since(tool_name, since)
+        if len(timestamps) < min_distinct_days:
+            return None
+
+        by_hour: dict[int, set[str]] = {}
+        for ts in timestamps:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            by_hour.setdefault(dt.hour, set()).add(dt.date().isoformat())
+
+        best_hour, best_days = None, set()
+        for hour, days in by_hour.items():
+            # Merge this hour with its neighbors within hour_window so "7am"
+            # and "8am" count as the same loose morning window.
+            combined: set[str] = set(days)
+            for h2, days2 in by_hour.items():
+                if h2 != hour and abs(h2 - hour) <= hour_window:
+                    combined |= days2
+            if len(combined) > len(best_days):
+                best_hour, best_days = hour, combined
+
+        if best_hour is None or len(best_days) < min_distinct_days:
+            return None
+        return {"tool": tool_name, "hour": best_hour, "distinct_days": len(best_days)}
+
+    async def should_suggest_habit(self, tool_name: str) -> bool:
+        existing = await self.get_latest_fact(entity="session", attribute=f"habit_suggested:{tool_name}")
+        return existing is None
+
+    async def mark_habit_suggested(self, tool_name: str) -> None:
+        await self.add_fact(
+            entity="session", attribute=f"habit_suggested:{tool_name}", value=_now().isoformat(), confidence=1.0
+        )
+
+    # --- Continuity across gaps (CG1) ------------------------------------------
+
+    async def check_and_mark_session_gap(self) -> "timedelta | None":
+        """Gap since the last recorded activity across any conversation
+        (measured from BEFORE this call updates it), or None on the very
+        first-ever session. Always advances last_active to now — call this
+        once per turn so the next gap stays accurate."""
+        await self.initialize()
+        prior = await self.get_latest_fact(entity="session", attribute="last_active")
+        gap: timedelta | None = None
+        if prior and prior.value:
+            try:
+                prior_dt = datetime.fromisoformat(prior.value)
+                if prior_dt.tzinfo is None:
+                    prior_dt = prior_dt.replace(tzinfo=timezone.utc)
+                gap = _now() - prior_dt
+            except Exception:
+                gap = None
+        await self.add_fact(entity="session", attribute="last_active", value=_now().isoformat(), confidence=1.0)
+        return gap
+
+    async def build_catchup_summary(self, since_iso: str) -> str:
+        """What changed since `since_iso` — newly indexed documents, fired
+        reminders, goal progress, mood/wellbeing trend. Sections are omitted
+        honestly when there's nothing to report; never invented."""
+        parts: list[str] = []
+
+        try:
+            docs = await self.list_indexed_documents(limit=200)
+            new_docs = [d for d in docs if str(d.get("indexed_at") or "") >= since_iso]
+            if new_docs:
+                parts.append(f"I indexed {len(new_docs)} new file(s)")
+        except Exception:
+            pass
+
+        try:
+            rems = await self.list_reminders(status="fired", limit=100)
+            fired = [
+                r for r in rems
+                if str(r.get("updated_at") or "") >= since_iso and not str(r.get("title") or "").startswith("__nova_")
+            ]
+            if fired:
+                parts.append(f"{len(fired)} reminder(s) fired")
+        except Exception:
+            pass
+
+        try:
+            goals = await self.list_goals(limit=50)
+            updated = [g for g in goals if str(g.get("updated_at") or "") >= since_iso]
+            if updated:
+                titles = ", ".join(str(g.get("title") or "") for g in updated[:3])
+                parts.append(f"progress on: {titles}")
+        except Exception:
+            pass
+
+        for trend_fn in (self.recent_mood_trend, self.recent_wellbeing_trend):
+            try:
+                trend = await trend_fn()
+                if trend:
+                    parts.append(trend.rstrip("."))
+            except Exception:
+                pass
+
+        if not parts:
+            return ""
+        return "Since you last talked, " + "; ".join(parts) + "."
+
+    async def recall_conversation(
+        self,
+        *,
+        term: str | None = None,
+        since_iso: str | None = None,
+        until_iso: str | None = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Keyword/date-range recall over the full turn history (any age)."""
+        await self.initialize()
+        rows = await self._sqlite.search_turns(
+            term=(term or None), since_iso=since_iso, until_iso=until_iso, limit=int(limit)
+        )
+        return [
+            {
+                "role": str(r.get("role")),
+                "speaker": "Marcus" if str(r.get("role")) == "user" else "Nova",
+                "content": str(r.get("content") or ""),
+                "created_at": str(r.get("created_at") or ""),
+            }
+            for r in rows
+        ]
+
+    # --- Reminders / scheduling ---------------------------------------------
+
+    async def create_reminder(
+        self, *, title: str, details: str = "", due_at_iso: str, recurrence: str = "none"
+    ) -> UUID:
+        await self.initialize()
+        rid = uuid4()
+        async with self._write_lock:
+            await self._sqlite.create_reminder(
+                reminder_id=rid, title=title, details=details or title,
+                due_at_iso=due_at_iso, recurrence=recurrence,
+            )
+        BUS.publish("reminder.created", {"reminder_id": str(rid), "title": clip(title, 120), "due_at": due_at_iso})
+        return rid
+
+    async def list_reminders(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_reminders(status=status, limit=limit)
+
+    async def due_reminders(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.due_reminders(now_iso=_now().isoformat(), limit=limit)
+
+    async def reschedule_reminder(self, *, reminder_id: str, next_due_at_iso: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.reschedule_reminder(reminder_id=reminder_id, next_due_at_iso=next_due_at_iso)
+
+    async def complete_reminder(self, *, reminder_id: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="fired")
+
+    async def cancel_reminder(self, *, reminder_id: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="cancelled")
+        BUS.publish("reminder.cancelled", {"reminder_id": reminder_id})
+
+    # --- Local file / photo recall (indexed documents) ----------------------
+
+    async def document_needs_indexing(self, path: str, mtime: float) -> bool:
+        """True if this file was never indexed, or has changed since (mtime
+        differs) — used to skip re-indexing unchanged files on repeat scans."""
+        await self.initialize()
+        existing = await self._sqlite.get_document_mtime(path)
+        return existing is None or abs(existing - mtime) > 1e-6
+
+    @staticmethod
+    def _chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> list[str]:
+        """Split into overlapping chunks so a semantic query can retrieve just
+        the relevant passage(s) of a long file instead of only its first
+        ~1500 chars. Overlap avoids splitting a relevant sentence across two
+        chunks that neither fully contains."""
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text) <= chunk_size:
+            return [text]
+        chunks: list[str] = []
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            chunks.append(text[start:end])
+            if end >= len(text):
+                break
+            start = end - overlap
+        return chunks
+
+    async def index_document(self, *, path: str, excerpt: str, mtime: float) -> None:
+        await self.initialize()
+        chunks = self._chunk_text(excerpt)
+        async with self._write_lock:
+            await self._sqlite.upsert_document(path=path, excerpt=excerpt, mtime=mtime)
+
+            # Drop any stale chunk-ids left over from a previous, longer
+            # version of this file before writing the fresh set — Chroma
+            # upserts by id, so a shrinking file would otherwise leave orphan
+            # entries behind.
+            prior_count = await self._sqlite.document_chunk_count(path)
+            if self._chroma is not None and prior_count > len(chunks):
+                stale_ids = [f"doc:{path}#{i}" for i in range(len(chunks), prior_count)]
+                try:
+                    await self._chroma.delete_ids(stale_ids)
+                except Exception:
+                    pass
+
+            await self._sqlite.replace_document_chunks(path, chunks)
+
+            if self._chroma is not None:
+                name = Path(path).name
+                for i, chunk in enumerate(chunks):
+                    await self._chroma_upsert_safe(
+                        doc_id=f"doc:{path}#{i}",
+                        text=f"FILE {name} (part {i + 1}/{len(chunks)}): {chunk}",
+                        metadata={"kind": "document", "path": path, "chunk_index": i, "created_at": _now().isoformat()},
+                    )
+        self._search_gen += 1
+        BUS.publish("memory.write", {"kind": "document", "path": clip(path, 200), "source": "file_index"})
+
+    async def list_indexed_documents(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_documents(limit=limit)
+
+    async def search_document_chunks_broad(self, topic: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Broader multi-chunk retrieval across indexed documents for
+        memory.synthesize — deliberately NOT capped to one chunk per file
+        (that cap is for the general-purpose search() used by memory.recall,
+        which needs to stay uncluttered by a single long document)."""
+        await self.initialize()
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        if self._chroma is not None:
+            try:
+                chroma_hits = await self._chroma.query(topic, limit=limit * 3)
+            except Exception:
+                chroma_hits = []
+            for ch in chroma_hits:
+                meta = ch.get("metadata") or {}
+                if str(meta.get("kind", "")).lower() != "document":
+                    continue
+                doc_id = str(ch.get("id"))
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                dist = float(ch.get("distance", 1.0))
+                results.append({
+                    "path": str(meta.get("path", "")),
+                    "chunk_index": meta.get("chunk_index"),
+                    "text": str(ch.get("text", "")),
+                    "score": max(0.0, 1.0 - dist),
+                })
+
+        if len(results) < limit:
+            # Keyword fallback so this still works if chroma is degraded — a
+            # single LIKE '%whole phrase%' rarely matches natural text, so
+            # split into terms and search each individually (same approach
+            # as the main search() method's SQLite fallback).
+            terms = [t for t in re.findall(r"[a-z0-9']+", topic.lower()) if len(t) >= 3]
+            for term in terms[:8] or [topic]:
+                rows = await self._sqlite.search_document_chunks(term, limit=limit)
+                for row in rows:
+                    key = f"{row['path']}#{row['chunk_index']}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append({
+                        "path": row["path"], "chunk_index": row["chunk_index"], "text": row["text"], "score": 0.5,
+                    })
+
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results[:limit]
+
+    async def recent_turns_text(self, limit: int = 30) -> str:
+        """Recent conversation turns (across conversations) as a transcript —
+        used by the reflection pass to distill behavioral lessons."""
+        await self.initialize()
+        rows = await self._sqlite.recent_turns(conversation_id=None, limit=int(limit))
+        rows = list(reversed(rows))  # chronological
+        lines: list[str] = []
+        for r in rows:
+            role = "Marcus" if str(r.get("role")) == "user" else "Nova"
+            content = str(r.get("content") or "").strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines).strip()
+
     async def purge_facts(
         self,
         entity: str,
@@ -338,6 +1021,7 @@ class MemoryUnifier:
         value_in: list[str] | None = None,
         value_ilike: str | None = None,
         dry_run: bool = True,
+        limit: int = 5000,
     ) -> dict[str, Any]:
         """Delete facts matching simple filters (SQLite only)."""
         await self.initialize()
@@ -360,20 +1044,29 @@ class MemoryUnifier:
             params.append(vilike.replace("*", "%"))
 
         where_sql = " AND ".join(where)
-        select_sql = f"SELECT id FROM facts WHERE {where_sql}"
-        delete_sql = f"DELETE FROM facts WHERE {where_sql}"
+        select_sql = f"SELECT id FROM facts WHERE {where_sql} LIMIT ?"
 
         async with aiosqlite.connect(self._sqlite._db_path) as db:  # type: ignore[attr-defined]
             db.row_factory = aiosqlite.Row
-            async with db.execute(select_sql, tuple(params)) as cur:
+            async with db.execute(select_sql, tuple(params) + (int(limit),)) as cur:
                 id_rows = await cur.fetchall()
             ids = [str(r["id"]) for r in id_rows]
             matched = len(ids)
             deleted = 0
             if not dry_run and matched:
-                await db.execute(delete_sql, tuple(params))
+                id_placeholders = ",".join(["?"] * len(ids))
+                await db.execute(f"DELETE FROM facts WHERE id IN ({id_placeholders})", tuple(ids))
                 await db.commit()
                 deleted = matched
+
+        # Purged facts must vanish from semantic recall too, not just SQLite.
+        if deleted:
+            self._search_gen += 1
+            if self._chroma is not None:
+                try:
+                    await self._chroma.delete_ids(ids)
+                except Exception:
+                    pass
 
         return {
             "entity": ent,
@@ -393,20 +1086,50 @@ class MemoryUnifier:
             return []
 
         # Normalize query into searchable terms (helps simple LIKE-based backends).
-        q_norm = q.lower()
-        terms = [t for t in re.findall(r"[a-z0-9']+", q_norm) if len(t) >= 3]
+        q_norm = q.lower().replace("’", "'")
+        raw_terms = [t for t in re.findall(r"[a-z0-9']+", q_norm) if len(t) >= 3]
 
-        # Keep a few high-signal short terms.
-        if "ai" in q_norm:
+        # Strip possessive suffixes (e.g. "mom's" -> "mom")
+        terms: list[str] = []
+        for t in raw_terms:
+            if t.endswith("'s") and len(t) > 2:
+                t = t[:-2]
+            terms.append(t)
+
+        # Keep a few high-signal short terms — WHOLE WORD only. A plain
+        # substring check (`"ai" in q_norm`) false-positives on "hawaii",
+        # "chairs", "explain", "again", etc., silently adding "ai" as an extra
+        # broad search term that LIKE-matches huge numbers of unrelated facts
+        # (any row containing "ai" anywhere) at a fixed high score, drowning
+        # out genuinely relevant results. Same failure mode for "id" (avoid,
+        # said, provide, decide, ...) — even more common as a substring.
+        if re.search(r"\bai\b", q_norm):
             terms.append("ai")
-        if "id" in q_norm:
+        if re.search(r"\bid\b", q_norm):
             terms.append("id")
 
         # De-duplicate while preserving order.
         seen: set[str] = set()
         terms = [t for t in terms if not (t in seen or seen.add(t))]
 
-        cache_key = f"search:{conversation_id}:{'|'.join(terms) or q_norm}:{limit}"
+        # Lightweight synonym expansion for common relationship queries.
+        synonyms = {
+            "mom": ["mother"],
+            "mother": ["mom"],
+            "dad": ["father"],
+            "father": ["dad"],
+        }
+        expanded: list[str] = []
+        for t in terms:
+            expanded.append(t)
+            expanded.extend(synonyms.get(t, []))
+
+        seen2: set[str] = set()
+        terms = [t for t in expanded if not (t in seen2 or seen2.add(t))]
+
+        BUS.publish("memory.search", {"query": clip(q, 120)})
+
+        cache_key = f"search:{self._search_gen}:{conversation_id}:{'|'.join(terms) or q_norm}:{limit}"
         cached = await self._diskcache.get(cache_key)
         if isinstance(cached, list) and cached:
             return [MemoryHit.model_validate(x) for x in cached]
@@ -417,23 +1140,29 @@ class MemoryUnifier:
         fact_rows: list[dict[str, Any]] = []
         people_rows: list[dict[str, Any]] = []
         event_rows: list[dict[str, Any]] = []
+        document_rows: list[dict[str, Any]] = []
 
         if terms:
             for t in terms[:8]:
                 fact_rows.extend(await self._sqlite.search_facts(t, limit=12))
                 people_rows.extend(await self._sqlite.search_people(t, limit=8))
                 event_rows.extend(await self._sqlite.search_events(t, limit=8))
+                document_rows.extend(await self._sqlite.search_documents(t, limit=8))
         else:
             fact_rows = await self._sqlite.search_facts(q, limit=12)
             people_rows = await self._sqlite.search_people(q, limit=8)
             event_rows = await self._sqlite.search_events(q, limit=8)
+            document_rows = await self._sqlite.search_documents(q, limit=8)
 
         # Semantic recall is optional; do not fail the request.
-        try:
-            chroma_hits = await self._chroma.query(q, limit=limit)
-        except Exception as e:
-            logger.debug("chroma_query_failed", error=str(e))
+        if self._chroma is None:
             chroma_hits = []
+        else:
+            try:
+                chroma_hits = await self._chroma.query(q, limit=limit)
+            except Exception as e:
+                logger.debug("chroma_query_failed", error=str(e))
+                chroma_hits = []
 
         hits: list[MemoryHit] = []
 
@@ -450,7 +1179,14 @@ class MemoryUnifier:
                 if not any(t in content_l for t in recent_terms):
                     continue
 
-                created_at = datetime.fromisoformat(row["created_at"])
+                try:
+                    created_at = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                # Tolerate legacy naive timestamps (assume UTC) so mixing them
+                # with timezone-aware ones never crashes the search.
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
                 age_s = max(1.0, (now - created_at).total_seconds())
 
                 # Hard cap: ignore turns older than 2 hours.
@@ -507,26 +1243,52 @@ class MemoryUnifier:
                 )
             )
 
-        # Chroma: distance is cosine distance; convert to similarity-ish
-        for ch in chroma_hits:
-            meta = ch.get("metadata") or {}
-            # Never treat raw turns as long-term semantic memory.
-            k = str(meta.get("kind", "")).lower()
-            r = str(meta.get("role", "")).lower()
-            if k == "turn" or k.startswith("turn") or r == "assistant":
-                continue
-            kind = str(meta.get("kind", "chroma"))
-            dist = float(ch.get("distance", 1.0))
-            sim = max(0.0, 1.0 - dist)
+        # Indexed local files/photos (memory.index_folder) — keyword fallback so
+        # they're recallable even when Chroma is unavailable/degraded.
+        for row in document_rows:
+            name = Path(str(row["path"])).name
+            text = f"FILE {name}: {row['excerpt']}"
             hits.append(
                 MemoryHit(
-                    id=str(ch.get("id")),
-                    kind=kind,
-                    text=str(ch.get("text", "")),
-                    score=0.85 * sim,
-                    provenance={"backend": "chroma", **{k: str(v) for k, v in meta.items()}},
+                    id=f"doc:{row['path']}",
+                    kind="document",
+                    text=text,
+                    score=0.80,
+                    provenance={"backend": "sqlite", "table": "documents", "path": str(row["path"])},
                 )
             )
+
+        # Chroma: distance is cosine distance; convert to similarity-ish. Turns
+        # ARE now indexed and searchable (that's how "recall anything we talked
+        # about" works) — but they sit in a lower score bucket so a structured
+        # fact still outranks a passing remark on the same topic.
+        # Documents are now chunked (DS1) — a long file can contribute several
+        # chroma entries. For this general-purpose search (used by
+        # memory.recall), keep only the best-scoring chunk per file so one
+        # long document can't crowd out everything else; memory.synthesize
+        # queries chroma directly and isn't subject to this cap.
+        best_doc_chunk: dict[str, MemoryHit] = {}
+        for ch in chroma_hits:
+            meta = ch.get("metadata") or {}
+            kind = str(meta.get("kind", "chroma")).lower()
+            dist = float(ch.get("distance", 1.0))
+            sim = max(0.0, 1.0 - dist)
+            weight = 0.55 if kind.startswith("turn") else 0.85
+            hit = MemoryHit(
+                id=str(ch.get("id")),
+                kind=kind or "chroma",
+                text=str(ch.get("text", "")),
+                score=weight * sim,
+                provenance={"backend": "chroma", **{mk: str(mv) for mk, mv in meta.items()}},
+            )
+            if kind == "document" and meta.get("path"):
+                doc_path = str(meta["path"])
+                prev = best_doc_chunk.get(doc_path)
+                if prev is None or hit.score > prev.score:
+                    best_doc_chunk[doc_path] = hit
+            else:
+                hits.append(hit)
+        hits.extend(best_doc_chunk.values())
 
         # Merge by id taking max score
         merged: dict[str, MemoryHit] = {}
@@ -538,8 +1300,235 @@ class MemoryUnifier:
         ranked = sorted(merged.values(), key=lambda x: x.score, reverse=True)[: int(limit)]
 
         await self._diskcache.set(cache_key, [r.model_dump() for r in ranked], ttl_s=120)
-        await self._json.append_snapshot(
-            {"kind": "search", "q": q, "conversation_id": str(conversation_id) if conversation_id else None, "results": [r.model_dump() for r in ranked]}
-        )
+        # NOTE: previously every search() appended its full result set to
+        # snapshots.jsonl — the fastest-growing file in the system, with no code
+        # ever reading it back. Dropped: search runs on every chat turn.
 
         return ranked
+
+
+    # ---------------- ChatGPT-like autonomy task queue (new contract) ----------------
+
+    async def enqueue_task(
+        self,
+        *,
+        title: str,
+        details: str,
+        priority: int = 3,
+        project_name: str = "temp",
+        initiated_by_user: bool = True,
+        conversation_id: UUID | None = None,
+        run_after_iso: str | None = None,
+    ) -> UUID:
+        """Enqueue a background autonomy task.
+
+        Contract required by the runtime's Autonomy Supervisor:
+        - title/details/priority are user-facing task descriptors
+        - claim_next_task() will return these fields
+        """
+        await self.initialize()
+        tid = uuid4()
+        async with self._write_lock:
+            await self._sqlite.enqueue_autonomy_task(
+                task_id=tid,
+                conversation_id=str(conversation_id) if conversation_id else None,
+                project_name=project_name,
+                title=title,
+                details=details,
+                priority=int(priority),
+                initiated_by_user=bool(initiated_by_user),
+                run_after_iso=run_after_iso,
+            )
+        BUS.publish("task.created", {"task_id": str(tid), "title": clip(title, 120), "project": project_name})
+        return tid
+
+    async def claim_next_task(self) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.claim_next_autonomy_task()
+
+    async def list_tasks(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """List background autonomy tasks (newest first) for the Tasks UI panel."""
+        await self.initialize()
+        return await self._sqlite.list_autonomy_tasks(status=status, limit=limit)
+
+    async def recent_memory(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Recent long-term memory records (facts/people/events) for the Memory UI panel."""
+        await self.initialize()
+        # all_* order ascending; fetch everything (stable records only, stays small)
+        # and slice the newest after sorting.
+        facts = await self._sqlite.all_facts(limit=None)
+        people = await self._sqlite.all_people(limit=None)
+        events = await self._sqlite.all_events(limit=None)
+
+        items: list[dict[str, Any]] = []
+        for row in facts:
+            items.append(
+                {
+                    "id": str(row.get("id")),
+                    "kind": "fact",
+                    "source": "long_term",
+                    "text": f"{row.get('entity')} · {row.get('attribute')} = {row.get('value')}",
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
+        for row in people:
+            items.append(
+                {
+                    "id": str(row.get("id")),
+                    "kind": "person",
+                    "source": "long_term",
+                    "text": str(row.get("name") or ""),
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
+        for row in events:
+            items.append(
+                {
+                    "id": str(row.get("id")),
+                    "kind": "event",
+                    "source": "long_term",
+                    "text": f"{row.get('date')}: {row.get('note')}",
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
+
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        return items[:limit]
+
+    async def mark_task_done(self, *, task_id: str, result: dict[str, Any] | None = None) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.complete_autonomy_task(task_id=task_id, status="done", result=result or {}, error="")
+        BUS.publish("task.completed", {"task_id": str(task_id), "status": "done"})
+
+    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error)
+        BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
+
+    async def bump_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.bump_autonomy_task_attempt(task_id=task_id, attempts=int(attempts), run_after_iso=run_after_iso, error=error)
+
+    async def cancel_pending_background_work(self) -> dict[str, int]:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.cancel_pending_background_work()
+
+
+    # ---------------- Agentic goal/task/proposal wrappers ----------------
+
+    async def create_goal(
+        self,
+        *,
+        project_name: str,
+        title: str,
+        objective: str,
+        success_criteria: str = "",
+        status: str = "active",
+        priority: int = 50,
+    ) -> UUID:
+        await self.initialize()
+        gid = uuid4()
+        async with self._write_lock:
+            await self._sqlite.create_goal(
+                goal_id=gid,
+                project_name=project_name,
+                title=title,
+                objective=objective,
+                success_criteria=success_criteria or "",
+                status=status,
+                priority=priority,
+            )
+        return gid
+
+    async def update_goal_status(self, *, goal_id: UUID, status: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.update_goal_status(goal_id=goal_id, status=status)
+
+    async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_goals(project_name=project_name, limit=limit)
+
+    async def enqueue_goal_task(
+        self,
+        *,
+        goal_id: UUID,
+        project_name: str,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        run_after_iso: str | None = None,
+    ) -> UUID:
+        await self.initialize()
+        tid = uuid4()
+        async with self._write_lock:
+            await self._sqlite.enqueue_task(
+                task_id=tid,
+                goal_id=goal_id,
+                project_name=project_name,
+                tool_name=tool_name,
+                args=args or {},
+                run_after_iso=run_after_iso,
+            )
+        return tid
+
+    async def claim_next_goal_task(self) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.claim_next_task()
+
+    async def complete_goal_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.complete_task(task_id=task_id, status=status, result=result, error=error)
+
+    async def bump_goal_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.bump_task_attempt(task_id=task_id, attempts=attempts, run_after_iso=run_after_iso, error=error)
+
+    async def list_goal_tasks(self, *, goal_id: str | None = None, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_tasks(goal_id=goal_id, project_name=project_name, limit=limit)
+
+    async def create_proposal(
+        self,
+        *,
+        goal_id: UUID,
+        project_name: str,
+        suggestion: str,
+        rationale: str = "",
+        status: str = "pending",
+    ) -> UUID:
+        await self.initialize()
+        pid = uuid4()
+        async with self._write_lock:
+            await self._sqlite.create_proposal(
+                proposal_id=pid,
+                goal_id=goal_id,
+                project_name=project_name,
+                suggestion=suggestion,
+                rationale=rationale or "",
+                status=status,
+            )
+        return pid
+
+    async def latest_pending_proposal(self, *, project_name: str) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.latest_pending_proposal(project_name=project_name)
+
+    async def set_proposal_status(self, *, proposal_id: str, status: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.set_proposal_status(proposal_id=proposal_id, status=status)
+
+    async def add_progress_event(self, *, goal_id: UUID, project_name: str, kind: str, message: str) -> None:
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.add_progress_event(event_id=uuid4(), goal_id=goal_id, project_name=project_name, kind=kind, message=message)
+
+    async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.fetch_unacked_progress(project_name=project_name, limit=limit)

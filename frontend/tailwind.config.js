@@ -8,9 +8,16 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        'nova-purple': '#7C3AED',
-        'nova-gold': '#FFD700',
-        'glass': 'rgba(32,32,64,0.60)'
+        'nova-purple': '#8B5CF6',
+        'nova-gold': '#F5C542',
+        // Purple-tinted glass (no opacity on container; text stays 100% opaque)
+        'glass': 'rgba(18,12,40,0.62)',
+        'nova-bg': '#060217'
+      },
+      fontFamily: {
+        orbitron: ['Orbitron', 'sans-serif'],
+        rajdhani: ['Rajdhani', 'sans-serif'],
+        space: ['Space Grotesk', 'sans-serif'],
       },
     },
   },

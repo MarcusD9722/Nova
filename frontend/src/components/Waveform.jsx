@@ -138,12 +138,15 @@ export default function Waveform({
 
       ctx2d.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Background gradient (subtle)
-      const g = ctx2d.createLinearGradient(0, 0, canvas.width, canvas.height);
-      g.addColorStop(0, "rgba(12,16,56,0.12)");
-      g.addColorStop(1, "rgba(41,235,255,0.10)");
-      ctx2d.fillStyle = g;
-      ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+      // Transparent holographic baseline; the chamber supplies the glass surface.
+      const baseline = ctx2d.createLinearGradient(0, 0, canvas.width, 0);
+      baseline.addColorStop(0, "rgba(139,92,246,0)");
+      baseline.addColorStop(0.28, "rgba(139,92,246,0.18)");
+      baseline.addColorStop(0.5, "rgba(245,197,66,0.3)");
+      baseline.addColorStop(0.72, "rgba(139,92,246,0.18)");
+      baseline.addColorStop(1, "rgba(139,92,246,0)");
+      ctx2d.fillStyle = baseline;
+      ctx2d.fillRect(0, canvas.height * 0.495, canvas.width, Math.max(1, canvas.height * 0.01));
 
       // No analyser yet? show idle pulse
       if (!analyser || !data) { idlePulse(ctx2d, canvas); return; }
@@ -170,15 +173,15 @@ export default function Waveform({
   }, [mediaStream, audioEl, _fftSize, smoothing, mode, height, theme.primary, theme.secondary, theme.glow, mirror]);
 
   return (
-    <div className="w-full">
+    <div className="nova-waveform-canvas-wrap">
       <canvas
         ref={canvasRef}
+        className="nova-waveform-canvas"
         style={{
           display: "block",
-          margin: "8px auto",
+          margin: "0 auto",
           width: "100%",
           height: `${height}px`,
-          filter: "drop-shadow(0 0 18px rgba(124,58,237,0.35))",
         }}
       />
     </div>

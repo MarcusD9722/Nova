@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
+import { GlassButton, GlassInput, GlassPanel, GlowCard, NeonDivider, StatusBadge } from "../ui";
 
 // API base resolution:
 // - Dev (Vite): keep relative URLs so Vite proxy works
@@ -43,7 +44,7 @@ export default function ChatPanel({
   const textAreaRef = useRef(null);
 
   const [input, setInput] = useState("");
-  const [attached, setAttached] = useState([]); // pending File[]
+  const [attached, setAttached] = useState([]); // pending uploaded attachments
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
 
@@ -60,9 +61,7 @@ export default function ChatPanel({
   const _onFileUpload =
     onFileUpload ||
     (async (files) => {
-      const uploaded = await uploadToServer(files);
-      setAttached((prev) => [...prev, ...uploaded]);
-      return uploaded;
+      return uploadToServer(files);
     });
 
   // Focus on mount
@@ -201,7 +200,7 @@ export default function ChatPanel({
       parts.push(
         <span
           key="caret"
-          className="inline-block w-2 h-4 align-bottom animate-pulse bg-cyan-300/80 ml-1 rounded-[2px]"
+          className="inline-block w-2 h-4 align-bottom animate-pulse bg-nova-gold ml-1 rounded-[2px]"
         />
       );
     }
@@ -212,15 +211,49 @@ export default function ChatPanel({
     isAssistantThinking ||
     (!!messages.length && messages[messages.length - 1]?.streaming);
 
+  const modelMissing = useMemo(() => {
+    try {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (!m || m.sender !== "nova") continue;
+        const t = String(m.text || "");
+        if (t.includes("No GGUF model found") || t.includes("*.gguf") || t.includes("NOVA_MODEL_PATH")) return true;
+        // only consider the most recent nova message
+        break;
+      }
+    } catch {}
+    return false;
+  }, [messages]);
+
+  const canOpenModelFolder = useMemo(() => {
+    try {
+      return typeof window !== "undefined" && typeof window.novaDesktop?.openModelFolder === "function";
+    } catch {}
+    return false;
+  }, []);
+
+  const formatTimestamp = useCallback((msg) => {
+    if (msg?.timestamp) {
+      const d = new Date(msg.timestamp);
+      if (!Number.isNaN(d.getTime())) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    if (typeof msg?.id === "string") {
+      const m = msg.id.match(/-(\d{10,})$/);
+      if (m) {
+        const d = new Date(Number(m[1]));
+        if (!Number.isNaN(d.getTime())) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+    }
+    return "";
+  }, []);
+
   return (
-    <form
-      className="relative flex flex-col w-full h-full min-w-0 min-h-0
-      bg-gradient-to-br from-[#13142a]/80 via-[#262b41]/70 to-[#181928]/90
-      backdrop-blur-2xl border border-cyan-500/30 rounded-3xl
-      shadow-[0_8px_32px_0_rgba(12,16,56,0.36)]
-      before:absolute before:inset-0 before:rounded-3xl before:opacity-60 before:pointer-events-none
-      before:bg-gradient-to-br before:from-cyan-400/20 before:to-fuchsia-500/10
-      after:absolute after:inset-0 after:rounded-3xl after:pointer-events-none after:ring-2 after:ring-cyan-400/20"
+    <GlassPanel
+      as="form"
+      variant="strong"
+      neon
+      glow="purple"
+      className="nova-chat-panel"
       style={{ boxSizing: "border-box" }}
       onSubmit={(e) => {
         e.preventDefault();
@@ -235,45 +268,104 @@ export default function ChatPanel({
     >
       {/* Drag overlay */}
       {isDraggingOver && (
-        <div className="absolute inset-0 z-20 rounded-3xl bg-cyan-400/10 ring-2 ring-cyan-300/40 grid place-items-center pointer-events-none">
-          <div className="text-cyan-100 font-medium">Drop files to attach</div>
+        <div className="nova-chat-drop-zone">
+          <div>Drop files to attach</div>
         </div>
       )}
 
-      {/* Neon top glow */}
-      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4/5 h-1.5 bg-gradient-to-r from-cyan-400/40 via-fuchsia-400/20 to-cyan-400/40 blur-lg opacity-80 rounded-b-3xl pointer-events-none" />
+      <span className="nova-chat-edge-accent" aria-hidden="true" />
+
+      <div className="nova-chat-header">
+        <div className="nova-chat-identity">
+          <span className="nova-chat-signal" aria-hidden="true">
+            <i /><i /><i /><i /><i />
+          </span>
+          <div>
+            <div className="nova-chat-eyebrow">Holographic channel</div>
+            <div className="nova-chat-title">Nova Conversation</div>
+          </div>
+        </div>
+        <StatusBadge
+          status={isAssistantThinking || isStreaming ? "warning" : "online"}
+          pulse={isAssistantThinking || isStreaming}
+          label={isAssistantThinking ? "Thinking" : isStreaming ? "Streaming" : "Online"}
+          className="nova-chat-status"
+        />
+      </div>
+
+      <NeonDivider tone="mixed" className="nova-chat-divider" />
+
+      {modelMissing && (
+        <GlowCard as="div" tone="gold" className="nova-chat-model-warning">
+          <div className="nova-chat-model-warning-content">
+            <div className="nova-chat-model-warning-copy">
+              <div className="nova-chat-model-warning-title">Model not found</div>
+              <div className="nova-chat-model-warning-detail">
+                Drop a <span className="font-mono">*.gguf</span> into <span className="font-mono">%APPDATA%\\Nova\\model</span>
+              </div>
+            </div>
+            {canOpenModelFolder && (
+              <GlassButton
+                type="button"
+                variant="gold"
+                className="nova-chat-model-button"
+                onClick={() => {
+                  try {
+                    window.novaDesktop.openModelFolder();
+                  } catch {}
+                }}
+                title="Open model folder"
+              >
+                Open folder
+              </GlassButton>
+            )}
+          </div>
+        </GlowCard>
+      )}
 
       {/* Messages list */}
       <div
         ref={listRef}
-        className="flex-1 overflow-y-auto mb-2 min-h-0 pt-1 px-1"
+        className="nova-chat-messages"
         onScroll={handleScroll}
       >
+        {messages.length === 0 && (
+          <div className="nova-chat-empty" aria-hidden="true">
+            <span className="nova-chat-empty-orbit" />
+            <div className="nova-chat-empty-wordmark">NOVA</div>
+            <div className="nova-chat-empty-copy">Conversation channel ready</div>
+          </div>
+        )}
+
         {messages.map((msg, i) => {
           const isSystem = msg.sender === "system";
           const isUser = msg.sender === "user";
           if (isSystem) {
             return (
-              <div key={msg.id ?? i} className="my-2 text-center">
-                <span className="inline-block text-[11px] px-2 py-1 rounded-full bg-white/5 border border-white/10 text-white/60">
+              <div key={msg.id ?? i} className="nova-chat-system-row">
+                <span className="nova-chat-system-message">
                   {msg.text}
                 </span>
               </div>
             );
           }
           return (
-            <div key={msg.id ?? i} className={`mb-1 ${isUser ? "text-right" : "text-left"}`}>
+            <div key={msg.id ?? i} className={`nova-chat-message-row ${isUser ? "nova-chat-message-row--user" : "nova-chat-message-row--nova"}`}>
               <Bubble isUser={isUser} streaming={!!msg.streaming}>
-                <div className="whitespace-pre-wrap break-words leading-relaxed">
+                <div className="nova-chat-message-body">
                   {renderMessageText(msg.text || "", msg.streaming)}
                 </div>
 
+                <div className="nova-chat-message-meta">
+                  {isUser ? "You" : "Nova"} {formatTimestamp(msg)}
+                </div>
+
                 {!!msg.files?.length && (
-                  <div className="mt-2 flex flex-wrap gap-2">
+                  <div className="nova-chat-file-list">
                     {msg.files.map((f, idx) => (
                       <span
                         key={idx}
-                        className="text-xs px-2 py-1 rounded-lg border border-white/10 bg-black/20 hover:bg-black/30"
+                        className="nova-chat-file-chip"
                         title={f.name}
                       >
                         📎 {truncate(f.name, 28)}
@@ -282,7 +374,7 @@ export default function ChatPanel({
                             href={API_BASE ? `${API_BASE}${f.url}` : f.url}
                             target="_blank"
                             rel="noreferrer"
-                            className="underline ml-1"
+                            className="nova-chat-link"
                           >
                             open
                           </a>
@@ -292,8 +384,28 @@ export default function ChatPanel({
                   </div>
                 )}
 
+                {!!msg.images?.length && (
+                  <div className="nova-chat-image-list">
+                    {msg.images.map((img, idx) => (
+                      <a
+                        key={idx}
+                        href={img.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={img.prompt || "Generated image"}
+                      >
+                        <img
+                          src={img.url}
+                          alt={img.prompt || "Generated image"}
+                          className="nova-chat-generated-image"
+                        />
+                      </a>
+                    ))}
+                  </div>
+                )}
+
                 {msg.error && (
-                  <div className="mt-1 text-[11px] text-red-300/80">⚠ {msg.error}</div>
+                  <div className="nova-chat-message-error">⚠ {msg.error}</div>
                 )}
               </Bubble>
             </div>
@@ -301,10 +413,10 @@ export default function ChatPanel({
         })}
 
         {isAssistantThinking && (
-          <div className="mb-1 text-left">
-            <span className="inline-flex items-center gap-1 rounded-2xl px-3 py-1.5 bg-white/10 border border-cyan-200/10 text-cyan-200">
+          <div className="nova-chat-thinking-row">
+            <span className="nova-chat-thinking">
               <TypingDots />
-              <span className="text-xs opacity-80">thinking…</span>
+              <span>thinking…</span>
             </span>
           </div>
         )}
@@ -313,25 +425,26 @@ export default function ChatPanel({
       </div>
 
       {!autoScroll && (
-        <button
+        <GlassButton
           type="button"
+          variant="ghost"
           onClick={() => {
             setAutoScroll(true);
             scrollToEnd("smooth");
           }}
-          className="absolute bottom-24 right-4 z-10 text-xs px-2 py-1 rounded-md bg-black/40 border border-white/10 text-white/80 hover:text-white hover:bg-black/60"
+          className="nova-chat-jump"
           aria-label="Jump to latest messages"
         >
           Jump to latest ↓
-        </button>
+        </GlassButton>
       )}
 
       {!!attached.length && (
-        <div className="mx-1 mb-1 flex flex-wrap gap-2">
+        <div className="nova-chat-attachment-tray">
           {attached.map((f, i) => (
             <span
               key={i}
-              className="text-xs px-2 py-1 rounded-lg border border-white/10 bg-black/30 text-white/80 flex items-center gap-1"
+              className="nova-chat-file-chip"
             >
               📎 {truncate(f.name, 28)}
               {f.url ? (
@@ -339,14 +452,14 @@ export default function ChatPanel({
                   href={API_BASE ? `${API_BASE}${f.url}` : f.url}
                   target="_blank"
                   rel="noreferrer"
-                  className="underline ml-1"
+                  className="nova-chat-link"
                 >
                   open
                 </a>
               ) : null}
               <button
                 type="button"
-                className="ml-1 text-white/50 hover:text-white"
+                className="nova-chat-file-remove"
                 onClick={() =>
                   setAttached((prev) => prev.filter((_, idx) => idx !== i))
                 }
@@ -360,15 +473,14 @@ export default function ChatPanel({
         </div>
       )}
 
-      <div className="flex gap-2 mt-auto p-1">
-        <textarea
+      <GlassPanel variant="subtle" className="nova-chat-composer">
+        <GlassInput
+          as="textarea"
           ref={(el) => {
             inputRef.current = el;
             textAreaRef.current = el;
           }}
-          className="flex-1 rounded-xl px-4 py-2 bg-black/30 border border-cyan-600/30 outline-none text-cyan-100
-          placeholder:text-cyan-200/60 font-mono shadow focus:ring-2 focus:ring-cyan-500/40 transition
-          max-h-[220px] resize-none"
+          className="nova-chat-input"
           placeholder="Type a message…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -376,9 +488,10 @@ export default function ChatPanel({
           aria-label="Message input"
         />
 
-        <label
-          className="cursor-pointer bg-gradient-to-br from-cyan-500 to-fuchsia-500 text-white rounded-xl px-3 py-2 shadow-lg
-          hover:scale-105 transition-all duration-100 flex items-center"
+        <GlassButton
+          as="label"
+          variant="ghost"
+          className="nova-chat-file-button"
           title="Upload files"
         >
           <input
@@ -399,52 +512,49 @@ export default function ChatPanel({
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
           </svg>
           <span className="hidden sm:inline">File</span>
-        </label>
+        </GlassButton>
 
         {isStreaming && (
-          <button
+          <GlassButton
             type="button"
+            variant="ghost"
             onClick={() => onStop?.()}
-            className="rounded-xl px-3 py-2 bg-black/40 border border-white/10 text-white/80 hover:text-white"
+            className="nova-chat-stop-button"
             title="Stop generating"
           >
             Stop
-          </button>
+          </GlassButton>
         )}
 
-        <button
+        <GlassButton
           type="submit"
-          className="rounded-xl px-4 py-2 bg-gradient-to-br from-cyan-500 to-fuchsia-500 text-white shadow-lg
-          hover:scale-105 hover:bg-cyan-600/90 transition-all duration-100"
+          variant="gold"
+          className="nova-chat-send-button"
           title="Send (Enter)"
         >
           Send
-        </button>
-      </div>
-    </form>
+        </GlassButton>
+      </GlassPanel>
+    </GlassPanel>
   );
 }
 
 /* ---------- Bubble (futuristic skin) ---------- */
 
 function Bubble({ isUser, streaming, children }) {
-  const side = isUser ? "items-end" : "items-start";
-  const tail = isUser ? "bubble-tail-right" : "bubble-tail-left";
-  const roleSkin = isUser ? "bubble-user glow-breathe-user" : "bubble-assistant glow-breathe-assistant";
-  const streamBoost = streaming ? "glow-stream" : "";
-
   return (
-    <div className={`inline-block max-w-[85%] ${side}`}>
-      <div
+    <div className="nova-chat-bubble-wrap">
+      <GlowCard
+        as="div"
+        tone={isUser ? "gold" : "purple"}
         className={[
-          "bubble-base nova-glass nova-border nova-scan nova-sheen nova-float",
-          roleSkin,
-          tail,
-          streamBoost,
-        ].join(" ")}
+          "nova-chat-bubble",
+          isUser ? "nova-chat-bubble--user" : "nova-chat-bubble--nova",
+          streaming && "nova-chat-bubble--streaming",
+        ].filter(Boolean).join(" ")}
       >
         {children}
-      </div>
+      </GlowCard>
     </div>
   );
 }
@@ -457,10 +567,10 @@ function truncate(s, n) {
 
 function TypingDots() {
   return (
-    <span aria-hidden className="inline-flex gap-1 px-1">
-      <span className="w-1.5 h-1.5 bg-cyan-300/80 rounded-full animate-bounce [animation-delay:-0.2s]" />
-      <span className="w-1.5 h-1.5 bg-cyan-300/80 rounded-full animate-bounce" />
-      <span className="w-1.5 h-1.5 bg-cyan-300/80 rounded-full animate-bounce [animation-delay:0.2s]" />
+    <span aria-hidden className="nova-chat-typing-dots">
+      <span />
+      <span />
+      <span />
     </span>
   );
 }
@@ -475,19 +585,20 @@ function CodeBlock({ code, lang }) {
     } catch {}
   };
   return (
-    <div className="group relative my-2">
-      <pre className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 overflow-auto text-[12.5px] leading-6">
-        <div className="text-[11px] opacity-60 mb-1">{lang || "code"}</div>
+    <div className="nova-chat-code group">
+      <pre>
+        <div className="nova-chat-code-language">{lang || "code"}</div>
         <code className="whitespace-pre">{code}</code>
       </pre>
-      <button
+      <GlassButton
         type="button"
+        variant="ghost"
         onClick={doCopy}
-        className="absolute top-2 right-2 text-xs px-2 py-1 rounded-md bg-black/40 border border-white/10 text-white/70 hover:text-white opacity-0 group-hover:opacity-100 transition"
+        className="nova-chat-code-copy"
         title="Copy"
       >
         {copied ? "Copied" : "Copy"}
-      </button>
+      </GlassButton>
     </div>
   );
 }
@@ -508,7 +619,7 @@ function linkify(chunk) {
         href={href}
         target="_blank"
         rel="noreferrer"
-        className="underline decoration-cyan-400/60 hover:decoration-cyan-300"
+        className="nova-chat-link"
       >
         {m[0]}
       </a>

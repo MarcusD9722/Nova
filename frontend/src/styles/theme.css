@@ -1,0 +1,2713 @@
+:root {
+  color-scheme: dark;
+
+  /* Nova UI v2: foundations */
+  --nova-bg-void: #020107;
+  --nova-bg-deep: #05020f;
+  --nova-bg-base: #090419;
+  --nova-bg-raised: #100725;
+  --nova-bg-elevated: #170b33;
+
+  --nova-purple-50: #eee9ff;
+  --nova-purple-100: #d8ccff;
+  --nova-purple-200: #b9a2ff;
+  --nova-purple-300: #9b72ff;
+  --nova-purple-400: #834cff;
+  --nova-purple-500: #6828e8;
+  --nova-purple-rgb: 139, 92, 246;
+
+  --nova-gold-50: #fff8dc;
+  --nova-gold-100: #ffeaa3;
+  --nova-gold-200: #ffd96b;
+  --nova-gold-300: #f5c542;
+  --nova-gold-400: #d99b20;
+  --nova-gold-rgb: 245, 197, 66;
+
+  --nova-success: #69f0a2;
+  --nova-success-rgb: 105, 240, 162;
+  --nova-warning: var(--nova-gold-200);
+  --nova-danger: #ff6f91;
+  --nova-danger-rgb: 255, 111, 145;
+
+  --nova-text-primary: #f8f5ff;
+  --nova-text-secondary: rgba(239, 232, 255, 0.76);
+  --nova-text-muted: rgba(221, 209, 255, 0.52);
+  --nova-text-disabled: rgba(221, 209, 255, 0.34);
+
+  --nova-glass-subtle: rgba(10, 5, 25, 0.38);
+  --nova-glass-default: rgba(14, 7, 34, 0.58);
+  --nova-glass-strong: rgba(18, 9, 44, 0.78);
+  --nova-glass-highlight: rgba(255, 255, 255, 0.1);
+  --nova-glass-border: rgba(185, 162, 255, 0.3);
+  --nova-glass-border-soft: rgba(185, 162, 255, 0.17);
+  --nova-glass-border-strong: rgba(155, 114, 255, 0.56);
+  --nova-glass-blur: 18px;
+  --nova-glass-saturation: 145%;
+
+  --nova-border-purple: rgba(var(--nova-purple-rgb), 0.52);
+  --nova-border-gold: rgba(var(--nova-gold-rgb), 0.56);
+  --nova-border-mixed: color-mix(in srgb, var(--nova-purple-300) 68%, var(--nova-gold-200));
+
+  --nova-glow-purple-soft: 0 0 18px rgba(var(--nova-purple-rgb), 0.22);
+  --nova-glow-purple: 0 0 28px rgba(var(--nova-purple-rgb), 0.42);
+  --nova-glow-gold-soft: 0 0 16px rgba(var(--nova-gold-rgb), 0.2);
+  --nova-glow-gold: 0 0 26px rgba(var(--nova-gold-rgb), 0.38);
+  --nova-shadow-panel: 0 22px 64px rgba(0, 0, 0, 0.58);
+  --nova-shadow-control: 0 10px 28px rgba(0, 0, 0, 0.42);
+  --nova-shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+
+  --nova-radius-xs: 0.375rem;
+  --nova-radius-sm: 0.625rem;
+  --nova-radius-md: 0.875rem;
+  --nova-radius-lg: 1.125rem;
+  --nova-radius-xl: 1.5rem;
+  --nova-radius-pill: 999px;
+
+  --nova-duration-fast: 140ms;
+  --nova-duration-normal: 220ms;
+  --nova-duration-slow: 420ms;
+  --nova-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --nova-ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --nova-focus-ring: 0 0 0 2px rgba(var(--nova-purple-rgb), 0.34), 0 0 22px rgba(var(--nova-purple-rgb), 0.48);
+
+  /* Compatibility aliases for the current application and early primitives. */
+  --bg-0: var(--nova-bg-deep);
+  --bg-1: var(--nova-bg-base);
+  --bg-2: var(--nova-bg-raised);
+  --purple-100: var(--nova-purple-100);
+  --purple-200: var(--nova-purple-200);
+  --purple-300: var(--nova-purple-300);
+  --purple-glow: rgba(var(--nova-purple-rgb), 0.5);
+  --gold-100: var(--nova-gold-100);
+  --gold-200: var(--nova-gold-300);
+  --gold-glow: rgba(var(--nova-gold-rgb), 0.46);
+  --text-primary: var(--nova-text-primary);
+  --text-secondary: var(--nova-text-secondary);
+  --glass-bg: var(--nova-glass-default);
+  --glass-border: var(--nova-glass-border);
+  --glass-shadow: var(--nova-shadow-panel);
+  --glass-blur: var(--nova-glass-blur);
+  --radius-sm: var(--nova-radius-sm);
+  --radius-md: var(--nova-radius-md);
+  --radius-lg: var(--nova-radius-lg);
+  --radius-xl: var(--nova-radius-xl);
+}
+
+/* Shared glass surfaces */
+.nova-glass-surface,
+.glass,
+.glass-heavy {
+  position: relative;
+  isolation: isolate;
+  border: 1px solid var(--nova-glass-border);
+  color: var(--nova-text-primary);
+  backdrop-filter: blur(var(--nova-glass-blur)) saturate(var(--nova-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--nova-glass-blur)) saturate(var(--nova-glass-saturation));
+  box-shadow: var(--nova-shadow-panel), var(--nova-shadow-inset);
+}
+
+.nova-glass-surface,
+.glass {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.06), transparent 36%),
+    var(--nova-glass-default);
+  border-radius: var(--nova-radius-lg);
+}
+
+.nova-glass-surface--subtle {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.045), transparent 38%),
+    var(--nova-glass-subtle);
+}
+
+.nova-glass-surface--strong,
+.glass-heavy {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.075), transparent 34%),
+    var(--nova-glass-strong);
+  border-color: var(--nova-glass-border-strong);
+  border-radius: var(--nova-radius-xl);
+  backdrop-filter: blur(calc(var(--nova-glass-blur) + 8px)) saturate(160%);
+  -webkit-backdrop-filter: blur(calc(var(--nova-glass-blur) + 8px)) saturate(160%);
+}
+
+/* Reusable borders and glows */
+.nova-neon-border,
+.nova-border-purple,
+.nova-border-gold,
+.neon-border {
+  border-style: solid;
+  border-width: 1px;
+}
+
+.nova-neon-border,
+.neon-border {
+  border-color: var(--nova-border-mixed);
+}
+
+.nova-border-purple {
+  border-color: var(--nova-border-purple);
+}
+
+.nova-border-gold {
+  border-color: var(--nova-border-gold);
+}
+
+.nova-glow-purple,
+.glow-purple {
+  box-shadow: var(--nova-shadow-control), var(--nova-glow-purple);
+}
+
+.nova-glow-gold,
+.glow-gold {
+  box-shadow: var(--nova-shadow-control), var(--nova-glow-gold);
+}
+
+.nova-glow-mixed,
+.panel-shadow {
+  box-shadow: var(--nova-shadow-panel), var(--nova-glow-purple-soft), var(--nova-glow-gold-soft);
+}
+
+.nova-text-glow,
+.text-glow {
+  color: var(--nova-text-primary);
+  text-shadow: 0 0 10px rgba(var(--nova-purple-rgb), 0.58), 0 0 16px rgba(var(--nova-gold-rgb), 0.24);
+}
+
+/* Premium surface sheen shared by panel-like primitives. */
+.ui-glass-panel,
+.ui-glass-button,
+.ui-glow-card,
+.ui-floating-container {
+  position: relative;
+  isolation: isolate;
+}
+
+.ui-glass-panel::after,
+.ui-glass-button::after,
+.ui-glow-card::after,
+.ui-floating-container::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(155deg, var(--nova-glass-highlight), transparent 34%, transparent 72%, rgba(var(--nova-purple-rgb), 0.06));
+  opacity: 0.72;
+}
+
+.ui-glass-panel {
+  transition:
+    border-color var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease,
+    background-color var(--nova-duration-normal) ease,
+    transform var(--nova-duration-normal) var(--nova-ease-out);
+}
+
+.ui-glass-panel--interactive:hover {
+  transform: translateY(-2px);
+  border-color: var(--nova-glass-border-strong);
+  box-shadow: var(--nova-shadow-panel), var(--nova-glow-purple-soft), var(--nova-shadow-inset);
+}
+
+.ui-tone-purple {
+  --ui-accent: var(--nova-purple-300);
+  --ui-accent-rgb: var(--nova-purple-rgb);
+  --ui-accent-border: var(--nova-border-purple);
+}
+
+.ui-tone-gold {
+  --ui-accent: var(--nova-gold-200);
+  --ui-accent-rgb: var(--nova-gold-rgb);
+  --ui-accent-border: var(--nova-border-gold);
+}
+
+.ui-tone-mixed,
+.ui-tone-neutral {
+  --ui-accent: var(--nova-border-mixed);
+  --ui-accent-rgb: var(--nova-purple-rgb);
+  --ui-accent-border: var(--nova-glass-border);
+}
+
+/* Buttons */
+.ui-glass-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  padding: 0.625rem 1rem;
+  overflow: hidden;
+  border: 1px solid var(--ui-accent-border, var(--nova-glass-border));
+  border-radius: var(--nova-radius-md);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 48%),
+    var(--nova-glass-default);
+  color: var(--nova-text-primary);
+  font: inherit;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  backdrop-filter: blur(calc(var(--nova-glass-blur) - 5px)) saturate(145%);
+  -webkit-backdrop-filter: blur(calc(var(--nova-glass-blur) - 5px)) saturate(145%);
+  box-shadow: var(--nova-shadow-control), 0 0 14px rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.2), var(--nova-shadow-inset);
+  transition:
+    color var(--nova-duration-fast) ease,
+    border-color var(--nova-duration-normal) ease,
+    background var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease,
+    transform var(--nova-duration-fast) var(--nova-ease-spring);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ui-glass-button--purple {
+  --ui-accent: var(--nova-purple-300);
+  --ui-accent-rgb: var(--nova-purple-rgb);
+  --ui-accent-border: var(--nova-border-purple);
+}
+
+.ui-glass-button--gold {
+  --ui-accent: var(--nova-gold-200);
+  --ui-accent-rgb: var(--nova-gold-rgb);
+  --ui-accent-border: var(--nova-border-gold);
+  color: var(--nova-gold-50);
+}
+
+.ui-glass-button--ghost {
+  --ui-accent-rgb: var(--nova-purple-rgb);
+  --ui-accent-border: var(--nova-glass-border-soft);
+  background: var(--nova-glass-subtle);
+  color: var(--nova-text-secondary);
+}
+
+.ui-glass-button:hover:not(:disabled):not([aria-disabled="true"]) {
+  transform: translateY(-2px);
+  color: var(--nova-text-primary);
+  border-color: var(--ui-accent, var(--nova-purple-300));
+  box-shadow: var(--nova-shadow-control), 0 0 22px rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.44), var(--nova-shadow-inset);
+}
+
+.ui-glass-button:active:not(:disabled):not([aria-disabled="true"]) {
+  transform: translateY(0) scale(0.985);
+}
+
+.ui-glass-button:focus-visible,
+.ui-glass-input:focus-visible {
+  outline: none;
+  border-color: var(--ui-accent, var(--nova-purple-300));
+  box-shadow: var(--nova-focus-ring), var(--nova-shadow-inset);
+}
+
+.ui-glass-button:disabled,
+.ui-glass-button[aria-disabled="true"] {
+  color: var(--nova-text-disabled);
+  cursor: not-allowed;
+  filter: saturate(0.45);
+  opacity: 0.62;
+}
+
+/* Inputs */
+.ui-glass-input {
+  width: 100%;
+  min-height: 2.625rem;
+  padding: 0.68rem 0.85rem;
+  border: 1px solid var(--nova-glass-border);
+  border-radius: var(--nova-radius-md);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent),
+    var(--nova-glass-default);
+  color: var(--nova-text-primary);
+  caret-color: var(--nova-gold-200);
+  font: inherit;
+  line-height: 1.4;
+  backdrop-filter: blur(calc(var(--nova-glass-blur) - 6px)) saturate(135%);
+  -webkit-backdrop-filter: blur(calc(var(--nova-glass-blur) - 6px)) saturate(135%);
+  box-shadow: inset 0 1px 8px rgba(0, 0, 0, 0.28), var(--nova-shadow-inset);
+  transition:
+    border-color var(--nova-duration-normal) ease,
+    background var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease;
+}
+
+.ui-glass-input:hover:not(:disabled) {
+  border-color: var(--nova-glass-border-strong);
+}
+
+.ui-glass-input::placeholder {
+  color: var(--nova-text-muted);
+  opacity: 1;
+}
+
+.ui-glass-input:disabled {
+  color: var(--nova-text-disabled);
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.ui-glass-input[aria-invalid="true"] {
+  border-color: rgba(var(--nova-danger-rgb), 0.72);
+  box-shadow: 0 0 0 1px rgba(var(--nova-danger-rgb), 0.18), 0 0 18px rgba(var(--nova-danger-rgb), 0.22);
+}
+
+textarea.ui-glass-input {
+  resize: vertical;
+}
+
+/* Cards */
+.ui-glow-card {
+  overflow: hidden;
+  padding: 1rem;
+  border: 1px solid var(--ui-accent-border, var(--nova-glass-border));
+  border-radius: var(--nova-radius-lg);
+  background:
+    radial-gradient(circle at 15% 0%, rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.13), transparent 42%),
+    var(--nova-glass-default);
+  color: var(--nova-text-primary);
+  backdrop-filter: blur(var(--nova-glass-blur)) saturate(var(--nova-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--nova-glass-blur)) saturate(var(--nova-glass-saturation));
+  box-shadow: var(--nova-shadow-panel), 0 0 20px rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.22), var(--nova-shadow-inset);
+  transition:
+    border-color var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease,
+    transform var(--nova-duration-normal) var(--nova-ease-out);
+}
+
+.ui-glow-card--interactive:hover {
+  transform: translateY(-3px);
+  border-color: var(--ui-accent, var(--nova-purple-300));
+  box-shadow: var(--nova-shadow-panel), 0 0 30px rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.38), var(--nova-shadow-inset);
+}
+
+/* Status badges */
+.ui-status-badge {
+  --ui-status-rgb: var(--nova-purple-rgb);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.48rem;
+  min-height: 1.65rem;
+  padding: 0.28rem 0.68rem;
+  border: 1px solid rgba(var(--ui-status-rgb), 0.34);
+  border-radius: var(--nova-radius-pill);
+  background: linear-gradient(180deg, rgba(var(--ui-status-rgb), 0.12), rgba(var(--ui-status-rgb), 0.045));
+  color: var(--nova-text-secondary);
+  font-size: 0.72rem;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 0 14px rgba(var(--ui-status-rgb), 0.12);
+}
+
+.ui-status-dot {
+  width: 0.46rem;
+  height: 0.46rem;
+  flex: 0 0 auto;
+  border-radius: var(--nova-radius-pill);
+  background: rgb(var(--ui-status-rgb));
+  box-shadow: 0 0 10px rgba(var(--ui-status-rgb), 0.82);
+}
+
+.ui-status-online {
+  --ui-status-rgb: var(--nova-success-rgb);
+  color: var(--nova-text-primary);
+}
+
+.ui-status-warning {
+  --ui-status-rgb: var(--nova-gold-rgb);
+  color: var(--nova-gold-50);
+}
+
+.ui-status-error {
+  --ui-status-rgb: var(--nova-danger-rgb);
+  color: var(--nova-text-primary);
+}
+
+.ui-status-offline {
+  --ui-status-rgb: 135, 124, 158;
+  color: var(--nova-text-muted);
+}
+
+.ui-status-badge--pulse .ui-status-dot {
+  animation: nova-status-pulse 1.9s ease-in-out infinite;
+}
+
+/* Dividers */
+.ui-neon-divider {
+  --ui-divider-rgb: var(--nova-purple-rgb);
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 1px;
+  margin: 0;
+  border: 0;
+  color: var(--nova-text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.ui-neon-divider::before,
+.ui-neon-divider::after {
+  content: "";
+  height: 1px;
+  flex: 1 1 auto;
+  background: linear-gradient(90deg, transparent, rgba(var(--ui-divider-rgb), 0.86), transparent);
+  box-shadow: 0 0 10px rgba(var(--ui-divider-rgb), 0.52);
+}
+
+.ui-neon-divider__label {
+  flex: 0 0 auto;
+  padding: 0 0.65rem;
+}
+
+.ui-neon-divider--gold {
+  --ui-divider-rgb: var(--nova-gold-rgb);
+}
+
+.ui-neon-divider--mixed {
+  --ui-divider-rgb: 176, 122, 210;
+}
+
+.ui-neon-divider--vertical {
+  width: 1px;
+  height: 100%;
+  min-height: 1.5rem;
+  flex-direction: column;
+}
+
+.ui-neon-divider--vertical::before,
+.ui-neon-divider--vertical::after {
+  width: 1px;
+  height: auto;
+  background: linear-gradient(180deg, transparent, rgba(var(--ui-divider-rgb), 0.86), transparent);
+}
+
+.ui-neon-divider--vertical .ui-neon-divider__label {
+  padding: 0.65rem 0;
+  writing-mode: vertical-rl;
+}
+
+/* Floating surfaces */
+.ui-floating-container {
+  border: 1px solid var(--ui-accent-border, var(--nova-glass-border));
+  border-radius: var(--nova-radius-xl);
+  background:
+    radial-gradient(circle at 50% -20%, rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.16), transparent 48%),
+    var(--nova-glass-strong);
+  color: var(--nova-text-primary);
+  backdrop-filter: blur(calc(var(--nova-glass-blur) + 2px)) saturate(155%);
+  -webkit-backdrop-filter: blur(calc(var(--nova-glass-blur) + 2px)) saturate(155%);
+  box-shadow: var(--nova-shadow-panel), 0 0 24px rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.25), var(--nova-shadow-inset);
+  transition:
+    border-color var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease,
+    transform var(--nova-duration-normal) var(--nova-ease-out);
+}
+
+.ui-floating-container--hoverable:hover {
+  border-color: var(--ui-accent, var(--nova-purple-300));
+  box-shadow: var(--nova-shadow-panel), 0 0 34px rgba(var(--ui-accent-rgb, var(--nova-purple-rgb)), 0.38), var(--nova-shadow-inset);
+}
+
+.ui-floating-container--float {
+  animation: nova-ui-float 5s var(--nova-ease-out) infinite;
+}
+
+@keyframes nova-ui-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+@keyframes nova-status-pulse {
+  0%, 100% { opacity: 0.78; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.12); }
+}
+
+/* Nova v2 title bar. Its 2px rail + 48px shell preserve the existing layout footprint. */
+.nova-titlebar {
+  height: 50px;
+  color: var(--nova-text-primary);
+}
+
+.nova-titlebar-rail {
+  position: relative;
+  z-index: 2;
+  height: 2px;
+  overflow: hidden;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(var(--nova-purple-rgb), 0.7) 12%,
+    var(--nova-purple-300) 50%,
+    rgba(var(--nova-purple-rgb), 0.7) 88%,
+    transparent 100%
+  );
+  box-shadow: 0 0 16px rgba(var(--nova-purple-rgb), 0.88), 0 0 30px rgba(var(--nova-purple-rgb), 0.34);
+}
+
+.nova-titlebar-rail::before,
+.nova-titlebar-rail::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: 5rem;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--nova-gold-200), transparent);
+  box-shadow: var(--nova-glow-gold-soft);
+}
+
+.nova-titlebar-rail::before { left: 9%; }
+.nova-titlebar-rail::after { right: 9%; }
+
+.nova-titlebar-shell {
+  height: 48px;
+  display: grid;
+  grid-template-columns: minmax(15rem, 1fr) auto minmax(22rem, 1fr);
+  align-items: center;
+  gap: 1rem;
+  padding: 0 0.75rem 0 1rem;
+  overflow: hidden;
+  border-width: 0 0 1px;
+  border-color: var(--nova-glass-border-soft);
+  border-radius: 0;
+  background:
+    radial-gradient(circle at 50% 120%, rgba(var(--nova-purple-rgb), 0.14), transparent 42%),
+    linear-gradient(180deg, rgba(18, 9, 44, 0.9), rgba(5, 2, 15, 0.76));
+  box-shadow:
+    0 10px 36px rgba(0, 0, 0, 0.4),
+    0 1px 0 rgba(var(--nova-purple-rgb), 0.22),
+    inset 0 -1px 0 rgba(var(--nova-gold-rgb), 0.045);
+}
+
+.nova-titlebar-shell::before {
+  content: "";
+  position: absolute;
+  inset: auto 27% -1px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(var(--nova-gold-rgb), 0.58), transparent);
+  box-shadow: var(--nova-glow-gold-soft);
+  pointer-events: none;
+}
+
+.nova-titlebar-scanline {
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 28%;
+  pointer-events: none;
+  opacity: 0.42;
+  background: linear-gradient(100deg, transparent 0%, rgba(var(--nova-purple-rgb), 0.04) 38%, rgba(255, 255, 255, 0.11) 50%, rgba(var(--nova-gold-rgb), 0.045) 58%, transparent 100%);
+  filter: blur(0.25px);
+  transform: translateX(-140%);
+  animation: nova-titlebar-scan 7s linear infinite;
+}
+
+.nova-titlebar-brand,
+.nova-titlebar-mode,
+.nova-titlebar-actions {
+  position: relative;
+  z-index: 1;
+}
+
+.nova-titlebar-brand {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.nova-titlebar-sigil {
+  position: relative;
+  width: 1.8rem;
+  height: 1.8rem;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--nova-border-gold);
+  border-radius: var(--nova-radius-pill);
+  color: var(--nova-gold-100);
+  background: radial-gradient(circle, rgba(var(--nova-gold-rgb), 0.1), transparent 68%);
+  box-shadow: inset 0 0 10px rgba(var(--nova-gold-rgb), 0.08), var(--nova-glow-gold-soft);
+  font-family: "Orbitron", sans-serif;
+  font-size: 0.68rem;
+  text-shadow: 0 0 8px rgba(var(--nova-gold-rgb), 0.7);
+}
+
+.nova-titlebar-sigil::after {
+  content: "";
+  position: absolute;
+  inset: 0.2rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.24);
+  border-radius: inherit;
+}
+
+.nova-titlebar-brand-copy {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  white-space: nowrap;
+}
+
+.nova-titlebar-wordmark {
+  color: var(--nova-text-primary);
+  font-family: "Orbitron", sans-serif;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.38em;
+  text-shadow: 0 0 11px rgba(var(--nova-purple-rgb), 0.62);
+}
+
+.nova-titlebar-subtitle {
+  color: var(--nova-gold-200);
+  font-size: 0.58rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  opacity: 0.82;
+}
+
+.nova-titlebar-version {
+  flex: 0 0 auto;
+  padding: 0.18rem 0.4rem;
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.22);
+  border-radius: var(--nova-radius-xs);
+  color: var(--nova-gold-100);
+  background: rgba(var(--nova-gold-rgb), 0.035);
+  font-size: 0.55rem;
+  line-height: 1;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.68;
+}
+
+.nova-titlebar-mode {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.65rem;
+  min-width: 13.5rem;
+  padding: 0.28rem 0.7rem;
+  border: 1px solid var(--nova-glass-border-soft);
+  border-radius: var(--nova-radius-pill);
+  background: var(--nova-glass-subtle);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045), var(--nova-glow-purple-soft);
+}
+
+.nova-titlebar-meter {
+  height: 0.9rem;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.nova-titlebar-meter > span {
+  width: 2px;
+  border-radius: var(--nova-radius-pill);
+  background: linear-gradient(180deg, var(--nova-gold-200), var(--nova-purple-300));
+  box-shadow: 0 0 5px rgba(var(--nova-purple-rgb), 0.55);
+  transition: height 100ms linear, opacity 100ms linear;
+}
+
+.nova-titlebar-mode-badge {
+  min-height: 1.35rem;
+  padding: 0.2rem 0.5rem;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  font-size: 0.58rem;
+  letter-spacing: 0.14em;
+}
+
+.nova-titlebar-actions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.65rem;
+}
+
+.nova-titlebar-system {
+  min-height: 1.45rem;
+  padding: 0.22rem 0.55rem;
+  border-color: rgba(var(--nova-success-rgb), 0.18);
+  background: rgba(var(--nova-success-rgb), 0.035);
+  font-size: 0.56rem;
+  letter-spacing: 0.14em;
+}
+
+.nova-titlebar-time {
+  min-width: 3.4rem;
+  color: var(--nova-text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+
+.nova-titlebar-window-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding-left: 0.65rem;
+  border-left: 1px solid var(--nova-glass-border-soft);
+}
+
+.nova-titlebar-control.ui-glass-button {
+  width: 1.85rem;
+  height: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0;
+  border-color: transparent;
+  border-radius: var(--nova-radius-sm);
+  color: var(--nova-text-muted);
+  background: transparent;
+  box-shadow: none;
+}
+
+.nova-titlebar-control.ui-glass-button:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--nova-gold-100);
+  border-color: rgba(var(--nova-purple-rgb), 0.42);
+  background: rgba(var(--nova-purple-rgb), 0.13);
+  box-shadow: 0 0 16px rgba(var(--nova-purple-rgb), 0.34), inset 0 0 10px rgba(var(--nova-purple-rgb), 0.08);
+  transform: translateY(-1px);
+}
+
+.nova-titlebar-control--danger.ui-glass-button:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--nova-danger);
+  border-color: rgba(var(--nova-danger-rgb), 0.5);
+  background: rgba(var(--nova-danger-rgb), 0.12);
+  box-shadow: 0 0 17px rgba(var(--nova-danger-rgb), 0.38), inset 0 0 10px rgba(var(--nova-danger-rgb), 0.08);
+}
+
+@keyframes nova-titlebar-scan {
+  0% { transform: translateX(-140%); }
+  72%, 100% { transform: translateX(470%); }
+}
+
+@media (max-width: 960px) {
+  .nova-titlebar-shell {
+    grid-template-columns: minmax(12rem, 1fr) auto;
+  }
+
+  .nova-titlebar-mode {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .nova-titlebar-shell {
+    grid-template-columns: minmax(8rem, 1fr) auto;
+    gap: 0.5rem;
+    padding-left: 0.65rem;
+  }
+
+  .nova-titlebar-subtitle,
+  .nova-titlebar-version,
+  .nova-titlebar-system,
+  .nova-titlebar-time {
+    display: none;
+  }
+}
+
+/* Nova v2 floating command dock */
+.nova-dock-layer {
+  position: fixed;
+  z-index: 40;
+  right: 0;
+  bottom: 0.85rem;
+  left: 0;
+  display: flex;
+  justify-content: center;
+  padding: 0 0.75rem;
+  pointer-events: none;
+}
+
+.nova-dock-capsule.ui-floating-container {
+  width: min(43rem, calc(100vw - 1.5rem));
+  min-width: 0;
+  padding: 0.45rem 0.9rem 0.3rem;
+  overflow: visible;
+  pointer-events: auto;
+  border-color: rgba(var(--nova-purple-rgb), 0.48);
+  border-radius: var(--nova-radius-pill);
+  background:
+    radial-gradient(circle at 50% -45%, rgba(var(--nova-purple-rgb), 0.3), transparent 50%),
+    linear-gradient(180deg, rgba(28, 15, 61, 0.72), rgba(7, 3, 19, 0.76));
+  box-shadow:
+    0 20px 36px rgba(0, 0, 0, 0.68),
+    0 8px 14px rgba(0, 0, 0, 0.46),
+    0 0 34px rgba(var(--nova-purple-rgb), 0.34),
+    0 0 0 1px rgba(var(--nova-gold-rgb), 0.055),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -1px 0 rgba(var(--nova-purple-rgb), 0.22);
+}
+
+.nova-dock-capsule.ui-floating-container::after {
+  z-index: 0;
+  inset: 1px;
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.11), transparent 30%, transparent 72%, rgba(var(--nova-purple-rgb), 0.08));
+  opacity: 0.78;
+}
+
+.nova-dock-reflection {
+  position: absolute;
+  z-index: 0;
+  top: 0.16rem;
+  right: 8%;
+  left: 8%;
+  height: 42%;
+  border-radius: var(--nova-radius-pill);
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.014) 48%, transparent);
+  filter: blur(0.2px);
+  opacity: 0.72;
+}
+
+.nova-dock-edge {
+  position: absolute;
+  z-index: 3;
+  top: -1px;
+  width: 4.2rem;
+  height: 2px;
+  border-radius: var(--nova-radius-pill);
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, var(--nova-gold-200), transparent);
+  box-shadow: 0 0 12px rgba(var(--nova-gold-rgb), 0.56);
+  opacity: 0.82;
+}
+
+.nova-dock-edge--left { left: 8%; }
+.nova-dock-edge--right { right: 8%; }
+
+.nova-dock-actions {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.62rem;
+  min-width: 0;
+}
+
+.nova-dock-orb.ui-glass-button {
+  width: 2.65rem;
+  height: 2.65rem;
+  min-height: 2.65rem;
+  flex: 0 0 2.65rem;
+  padding: 0;
+  border-color: rgba(var(--nova-purple-rgb), 0.4);
+  border-radius: var(--nova-radius-pill);
+  color: var(--nova-purple-100);
+  background:
+    radial-gradient(circle at 38% 24%, rgba(255, 255, 255, 0.13), transparent 22%),
+    linear-gradient(155deg, rgba(var(--nova-purple-rgb), 0.18), var(--nova-glass-default));
+  box-shadow:
+    0 8px 18px rgba(0, 0, 0, 0.38),
+    0 0 15px rgba(var(--nova-purple-rgb), 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -6px 12px rgba(0, 0, 0, 0.2);
+  transition:
+    color var(--nova-duration-fast) ease,
+    border-color var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease,
+    transform var(--nova-duration-fast) var(--nova-ease-spring);
+}
+
+.nova-dock-orb.ui-glass-button:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--nova-gold-100);
+  border-color: rgba(var(--nova-gold-rgb), 0.48);
+  background:
+    radial-gradient(circle at 38% 24%, rgba(255, 255, 255, 0.18), transparent 23%),
+    linear-gradient(155deg, rgba(var(--nova-purple-rgb), 0.3), var(--nova-glass-strong));
+  box-shadow:
+    0 12px 22px rgba(0, 0, 0, 0.48),
+    0 0 23px rgba(var(--nova-purple-rgb), 0.5),
+    0 0 10px rgba(var(--nova-gold-rgb), 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  transform: translateY(-4px) scale(1.07);
+}
+
+.nova-dock-orb--active.ui-glass-button {
+  color: var(--nova-gold-100);
+  border-color: rgba(var(--nova-gold-rgb), 0.58);
+  background:
+    radial-gradient(circle at 50% 12%, rgba(var(--nova-gold-rgb), 0.16), transparent 42%),
+    linear-gradient(155deg, rgba(var(--nova-purple-rgb), 0.36), var(--nova-glass-strong));
+  box-shadow:
+    0 9px 20px rgba(0, 0, 0, 0.44),
+    0 0 22px rgba(var(--nova-purple-rgb), 0.48),
+    0 0 12px rgba(var(--nova-gold-rgb), 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.nova-dock-voice.ui-glass-button {
+  position: relative;
+  width: 3.9rem;
+  height: 3.9rem;
+  min-height: 3.9rem;
+  flex: 0 0 3.9rem;
+  padding: 0;
+  overflow: visible;
+  border-width: 1px;
+  border-color: rgba(var(--nova-purple-rgb), 0.62);
+  border-radius: var(--nova-radius-pill);
+  color: var(--nova-gold-100);
+  background:
+    radial-gradient(circle at 42% 27%, rgba(255, 255, 255, 0.18), transparent 20%),
+    radial-gradient(circle, rgba(var(--nova-purple-rgb), 0.46), rgba(7, 3, 19, 0.86) 72%);
+  box-shadow:
+    0 12px 25px rgba(0, 0, 0, 0.54),
+    0 0 24px rgba(var(--nova-purple-rgb), 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -9px 17px rgba(0, 0, 0, 0.3);
+}
+
+.nova-dock-voice.ui-glass-button::before {
+  content: "";
+  position: absolute;
+  inset: -0.28rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.38);
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: 0 0 18px rgba(var(--nova-purple-rgb), 0.3);
+}
+
+.nova-dock-voice-ring {
+  position: absolute;
+  inset: 0.34rem;
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.3);
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 0 12px rgba(var(--nova-purple-rgb), 0.2);
+}
+
+.nova-dock-voice.ui-glass-button > svg {
+  position: relative;
+  z-index: 2;
+  filter: drop-shadow(0 0 7px rgba(var(--nova-purple-rgb), 0.7));
+}
+
+.nova-dock-voice.ui-glass-button:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--nova-gold-50);
+  border-color: rgba(var(--nova-gold-rgb), 0.7);
+  box-shadow:
+    0 15px 28px rgba(0, 0, 0, 0.58),
+    0 0 30px rgba(var(--nova-purple-rgb), 0.66),
+    0 0 18px rgba(var(--nova-gold-rgb), 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  transform: translateY(-4px) scale(1.07);
+}
+
+.nova-dock-voice--enabled.ui-glass-button {
+  border-color: rgba(var(--nova-gold-rgb), 0.66);
+}
+
+.nova-dock-voice--listening.ui-glass-button {
+  animation: nova-dock-listening 1.45s ease-in-out infinite;
+}
+
+.nova-dock-voice--listening.ui-glass-button::before {
+  animation: nova-dock-ring-purple 1.45s ease-out infinite;
+}
+
+.nova-dock-voice--speaking.ui-glass-button {
+  border-color: rgba(var(--nova-gold-rgb), 0.84);
+  animation: nova-dock-speaking 0.88s ease-in-out infinite;
+}
+
+.nova-dock-voice--speaking.ui-glass-button::before {
+  border-color: rgba(var(--nova-gold-rgb), 0.54);
+  animation: nova-dock-ring-gold 0.88s ease-out infinite;
+}
+
+.nova-dock-status-row {
+  position: relative;
+  z-index: 2;
+  min-height: 1.05rem;
+  margin-top: 0.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.9rem;
+  color: var(--nova-text-muted);
+  font-size: 0.54rem;
+  letter-spacing: 0.16em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.nova-dock-status-row > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  transition: color var(--nova-duration-normal) ease, text-shadow var(--nova-duration-normal) ease;
+}
+
+.nova-dock-status-row > span.is-active {
+  color: var(--nova-gold-100);
+  text-shadow: 0 0 8px rgba(var(--nova-gold-rgb), 0.4);
+}
+
+.nova-dock-voice-status.ui-status-badge {
+  min-height: 1.05rem;
+  padding: 0.12rem 0.38rem;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  font-size: 0.52rem;
+  letter-spacing: 0.14em;
+}
+
+@keyframes nova-dock-listening {
+  0%, 100% { box-shadow: 0 12px 25px rgba(0, 0, 0, 0.54), 0 0 22px rgba(var(--nova-purple-rgb), 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.18); }
+  50% { box-shadow: 0 14px 28px rgba(0, 0, 0, 0.56), 0 0 38px rgba(var(--nova-purple-rgb), 0.9), 0 0 16px rgba(var(--nova-gold-rgb), 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.2); }
+}
+
+@keyframes nova-dock-speaking {
+  0%, 100% { box-shadow: 0 12px 25px rgba(0, 0, 0, 0.54), 0 0 22px rgba(var(--nova-gold-rgb), 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.18); }
+  50% { box-shadow: 0 14px 28px rgba(0, 0, 0, 0.56), 0 0 38px rgba(var(--nova-gold-rgb), 0.88), 0 0 17px rgba(var(--nova-purple-rgb), 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.22); }
+}
+
+@keyframes nova-dock-ring-purple {
+  0% { opacity: 0.76; transform: scale(0.92); }
+  80%, 100% { opacity: 0; transform: scale(1.24); }
+}
+
+@keyframes nova-dock-ring-gold {
+  0% { opacity: 0.8; transform: scale(0.94); }
+  80%, 100% { opacity: 0; transform: scale(1.2); }
+}
+
+@media (max-width: 720px) {
+  .nova-dock-layer {
+    bottom: 0.7rem;
+    padding: 0 0.45rem;
+  }
+
+  .nova-dock-capsule.ui-floating-container {
+    width: min(37rem, calc(100vw - 0.9rem));
+    padding-right: 0.55rem;
+    padding-left: 0.55rem;
+  }
+
+  .nova-dock-actions { gap: 0.42rem; }
+
+  .nova-dock-orb.ui-glass-button {
+    width: 2.35rem;
+    height: 2.35rem;
+    min-height: 2.35rem;
+    flex-basis: 2.35rem;
+  }
+
+  .nova-dock-voice.ui-glass-button {
+    width: 3.45rem;
+    height: 3.45rem;
+    min-height: 3.45rem;
+    flex-basis: 3.45rem;
+  }
+}
+
+@media (max-width: 440px) {
+  .nova-dock-capsule.ui-floating-container {
+    padding-right: 0.38rem;
+    padding-left: 0.38rem;
+  }
+
+  .nova-dock-actions { gap: 0.24rem; }
+
+  .nova-dock-orb.ui-glass-button {
+    width: 2.1rem;
+    height: 2.1rem;
+    min-height: 2.1rem;
+    flex-basis: 2.1rem;
+  }
+
+  .nova-dock-voice.ui-glass-button {
+    width: 3.1rem;
+    height: 3.1rem;
+    min-height: 3.1rem;
+    flex-basis: 3.1rem;
+  }
+
+  .nova-dock-status-row { gap: 0.5rem; }
+}
+
+/* Nova v2 left navigation and telemetry module */
+.nova-sidebar {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  color: var(--nova-text-primary);
+}
+
+.nova-sidebar-panel.ui-glass-panel {
+  position: relative;
+  overflow: hidden;
+  padding: 0.78rem;
+  border-color: rgba(var(--nova-purple-rgb), 0.42);
+  border-radius: var(--nova-radius-xl);
+  background:
+    radial-gradient(circle at 0% 0%, rgba(var(--nova-purple-rgb), 0.16), transparent 38%),
+    linear-gradient(165deg, rgba(18, 9, 44, 0.74), rgba(5, 2, 15, 0.72));
+  box-shadow:
+    0 18px 42px rgba(0, 0, 0, 0.48),
+    0 0 24px rgba(var(--nova-purple-rgb), 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.095),
+    inset 0 -1px 0 rgba(var(--nova-purple-rgb), 0.16);
+}
+
+.nova-sidebar-navigation {
+  flex: 0 0 auto;
+}
+
+.nova-sidebar-core {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nova-sidebar-edge-accent {
+  position: absolute;
+  z-index: 2;
+  top: -1px;
+  left: 1.15rem;
+  width: 4.5rem;
+  height: 2px;
+  border-radius: var(--nova-radius-pill);
+  background: linear-gradient(90deg, transparent, var(--nova-purple-200), transparent);
+  box-shadow: 0 0 13px rgba(var(--nova-purple-rgb), 0.7);
+  pointer-events: none;
+}
+
+.nova-sidebar-edge-accent--gold {
+  right: 1.15rem;
+  left: auto;
+  background: linear-gradient(90deg, transparent, var(--nova-gold-200), transparent);
+  box-shadow: 0 0 13px rgba(var(--nova-gold-rgb), 0.58);
+}
+
+.nova-sidebar-header,
+.nova-sidebar-core-header {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.nova-sidebar-core-header {
+  justify-content: space-between;
+}
+
+.nova-sidebar-emblem {
+  position: relative;
+  width: 2.15rem;
+  height: 2.15rem;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--nova-border-gold);
+  border-radius: var(--nova-radius-md);
+  color: var(--nova-gold-100);
+  background:
+    radial-gradient(circle, rgba(var(--nova-gold-rgb), 0.12), transparent 65%),
+    var(--nova-glass-subtle);
+  box-shadow: var(--nova-glow-gold-soft), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.nova-sidebar-emblem::after {
+  content: "";
+  position: absolute;
+  inset: 0.28rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.24);
+  border-radius: var(--nova-radius-sm);
+  transform: rotate(45deg);
+}
+
+.nova-sidebar-heading {
+  min-width: 0;
+}
+
+.nova-sidebar-eyebrow {
+  overflow: hidden;
+  color: var(--nova-text-muted);
+  font-size: 0.58rem;
+  line-height: 1.2;
+  letter-spacing: 0.19em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.nova-sidebar-title {
+  margin-top: 0.15rem;
+  overflow: hidden;
+  color: var(--nova-text-primary);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-overflow: ellipsis;
+  text-shadow: 0 0 9px rgba(var(--nova-purple-rgb), 0.42);
+  white-space: nowrap;
+}
+
+.nova-sidebar-divider {
+  margin: 0.58rem 0 0.48rem;
+  opacity: 0.66;
+}
+
+.nova-sidebar-nav {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 0.28rem;
+}
+
+.nova-sidebar-nav-item.ui-glass-button {
+  width: 100%;
+  min-height: 2.18rem;
+  justify-content: flex-start;
+  padding: 0.42rem 0.58rem;
+  overflow: hidden;
+  border-color: transparent;
+  border-radius: var(--nova-radius-md);
+  color: var(--nova-text-secondary);
+  background: transparent;
+  box-shadow: none;
+  font-size: 0.76rem;
+  letter-spacing: 0.055em;
+  text-align: left;
+}
+
+.nova-sidebar-nav-icon {
+  width: 1.55rem;
+  height: 1.55rem;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.2);
+  border-radius: var(--nova-radius-sm);
+  color: var(--nova-purple-100);
+  background: rgba(var(--nova-purple-rgb), 0.055);
+  transition:
+    color var(--nova-duration-normal) ease,
+    border-color var(--nova-duration-normal) ease,
+    box-shadow var(--nova-duration-normal) ease;
+}
+
+.nova-sidebar-nav-trace {
+  width: 1.65rem;
+  height: 1px;
+  margin-left: auto;
+  background: linear-gradient(90deg, transparent, rgba(var(--nova-purple-rgb), 0.34));
+  opacity: 0;
+  transform: translateX(0.35rem);
+  transition: opacity var(--nova-duration-normal) ease, transform var(--nova-duration-normal) var(--nova-ease-out);
+}
+
+.nova-sidebar-nav-item.ui-glass-button:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--nova-text-primary);
+  border-color: rgba(var(--nova-purple-rgb), 0.32);
+  background: linear-gradient(90deg, rgba(var(--nova-purple-rgb), 0.14), rgba(var(--nova-purple-rgb), 0.025));
+  box-shadow: 0 7px 18px rgba(0, 0, 0, 0.26), 0 0 15px rgba(var(--nova-purple-rgb), 0.18);
+  transform: translateY(-1px) translateX(2px);
+}
+
+.nova-sidebar-nav-item:hover .nova-sidebar-nav-icon,
+.nova-sidebar-nav-item--active .nova-sidebar-nav-icon {
+  color: var(--nova-gold-100);
+  border-color: rgba(var(--nova-gold-rgb), 0.46);
+  box-shadow: 0 0 12px rgba(var(--nova-purple-rgb), 0.4), inset 0 0 8px rgba(var(--nova-gold-rgb), 0.08);
+}
+
+.nova-sidebar-nav-item:hover .nova-sidebar-nav-trace,
+.nova-sidebar-nav-item--active .nova-sidebar-nav-trace {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.nova-sidebar-nav-item--active.ui-glass-button {
+  color: var(--nova-gold-50);
+  border-color: rgba(var(--nova-gold-rgb), 0.5);
+  background:
+    radial-gradient(circle at 15% 50%, rgba(var(--nova-purple-rgb), 0.28), transparent 48%),
+    linear-gradient(90deg, rgba(var(--nova-purple-rgb), 0.24), rgba(var(--nova-gold-rgb), 0.035));
+  box-shadow:
+    0 8px 20px rgba(0, 0, 0, 0.3),
+    0 0 20px rgba(var(--nova-purple-rgb), 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  text-shadow: 0 0 9px rgba(var(--nova-purple-rgb), 0.5);
+}
+
+.nova-sidebar-core-status.ui-status-badge {
+  min-height: 1.35rem;
+  max-width: 7.5rem;
+  padding: 0.2rem 0.46rem;
+  font-size: 0.52rem;
+  letter-spacing: 0.11em;
+}
+
+.nova-sidebar-metrics {
+  min-height: 0;
+  display: grid;
+  gap: 0.36rem;
+  overflow-y: auto;
+  padding: 0.04rem 0.1rem 0.1rem;
+}
+
+.nova-sidebar-metric.ui-glow-card {
+  min-height: 2.36rem;
+  display: grid;
+  grid-template-columns: minmax(4.8rem, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem 0.58rem;
+  border-color: rgba(var(--ui-accent-rgb), 0.18);
+  border-radius: var(--nova-radius-md);
+  background:
+    linear-gradient(115deg, rgba(var(--ui-accent-rgb), 0.075), transparent 45%),
+    var(--nova-glass-subtle);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055), 0 6px 15px rgba(0, 0, 0, 0.2);
+}
+
+.nova-sidebar-metric-label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--nova-text-muted);
+  font-size: 0.52rem;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.nova-sidebar-metric-label svg {
+  color: var(--ui-accent);
+  filter: drop-shadow(0 0 5px rgba(var(--ui-accent-rgb), 0.4));
+}
+
+.nova-sidebar-metric-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--nova-text-secondary);
+  font-size: 0.67rem;
+  letter-spacing: 0.025em;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Nova v2 holographic conversation panel */
+.nova-chat-panel.ui-glass-panel {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-color: rgba(var(--nova-purple-rgb), 0.5);
+  border-radius: var(--nova-radius-xl);
+  color: var(--nova-text-primary);
+  background:
+    linear-gradient(rgba(var(--nova-purple-rgb), 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(var(--nova-purple-rgb), 0.018) 1px, transparent 1px),
+    radial-gradient(circle at 100% 0%, rgba(var(--nova-purple-rgb), 0.15), transparent 35%),
+    linear-gradient(165deg, rgba(16, 8, 39, 0.76), rgba(4, 2, 12, 0.76));
+  background-size: 22px 22px, 22px 22px, auto, auto;
+  box-shadow:
+    0 22px 52px rgba(0, 0, 0, 0.54),
+    0 0 30px rgba(var(--nova-purple-rgb), 0.3),
+    0 0 0 1px rgba(var(--nova-gold-rgb), 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(var(--nova-purple-rgb), 0.18);
+}
+
+.nova-chat-edge-accent {
+  position: absolute;
+  z-index: 3;
+  top: -1px;
+  right: 1.25rem;
+  width: 4.75rem;
+  height: 2px;
+  border-radius: var(--nova-radius-pill);
+  background: linear-gradient(90deg, transparent, var(--nova-gold-200), transparent);
+  box-shadow: 0 0 13px rgba(var(--nova-gold-rgb), 0.56);
+  pointer-events: none;
+}
+
+.nova-chat-header {
+  position: relative;
+  z-index: 2;
+  min-height: 3.1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.8rem 0.52rem;
+  background: linear-gradient(180deg, rgba(var(--nova-purple-rgb), 0.085), transparent);
+}
+
+.nova-chat-identity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.58rem;
+}
+
+.nova-chat-signal {
+  width: 1.75rem;
+  height: 1.75rem;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.36);
+  border-radius: var(--nova-radius-sm);
+  background: rgba(var(--nova-purple-rgb), 0.075);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), var(--nova-glow-purple-soft);
+}
+
+.nova-chat-signal i {
+  width: 2px;
+  height: 0.35rem;
+  border-radius: var(--nova-radius-pill);
+  background: linear-gradient(180deg, var(--nova-gold-200), var(--nova-purple-300));
+  box-shadow: 0 0 5px rgba(var(--nova-purple-rgb), 0.58);
+  animation: nova-chat-signal 1.6s ease-in-out infinite;
+}
+
+.nova-chat-signal i:nth-child(2),
+.nova-chat-signal i:nth-child(4) { height: 0.75rem; animation-delay: -0.45s; }
+.nova-chat-signal i:nth-child(3) { height: 1rem; animation-delay: -0.8s; }
+
+.nova-chat-eyebrow {
+  overflow: hidden;
+  color: var(--nova-text-muted);
+  font-size: 0.52rem;
+  letter-spacing: 0.18em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.nova-chat-title {
+  margin-top: 0.14rem;
+  overflow: hidden;
+  color: var(--nova-purple-100);
+  font-family: "Orbitron", sans-serif;
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-overflow: ellipsis;
+  text-shadow: 0 0 9px rgba(var(--nova-purple-rgb), 0.55);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.nova-chat-status.ui-status-badge {
+  min-height: 1.35rem;
+  padding: 0.2rem 0.45rem;
+  font-size: 0.5rem;
+  letter-spacing: 0.12em;
+}
+
+.nova-chat-divider {
+  position: relative;
+  z-index: 2;
+  opacity: 0.72;
+}
+
+.nova-chat-drop-zone {
+  position: absolute;
+  z-index: 30;
+  inset: 0.4rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.64);
+  border-radius: calc(var(--nova-radius-xl) - 0.2rem);
+  color: var(--nova-gold-50);
+  background: rgba(8, 3, 24, 0.78);
+  box-shadow: inset 0 0 38px rgba(var(--nova-purple-rgb), 0.2), 0 0 24px rgba(var(--nova-gold-rgb), 0.18);
+  backdrop-filter: blur(calc(var(--nova-glass-blur) + 4px));
+  pointer-events: none;
+}
+
+.nova-chat-drop-zone > div {
+  padding: 0.62rem 0.9rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.4);
+  border-radius: var(--nova-radius-pill);
+  background: var(--nova-glass-default);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.nova-chat-model-warning.ui-glow-card {
+  margin: 0.5rem 0.55rem 0.1rem;
+  padding: 0.58rem 0.66rem;
+  border-radius: var(--nova-radius-md);
+}
+
+.nova-chat-model-warning-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.nova-chat-model-warning-copy { min-width: 0; }
+.nova-chat-model-warning-title { color: var(--nova-gold-50); font-size: 0.68rem; font-weight: 600; }
+.nova-chat-model-warning-detail { margin-top: 0.12rem; overflow: hidden; color: var(--nova-text-muted); font-size: 0.58rem; text-overflow: ellipsis; white-space: nowrap; }
+.nova-chat-model-button.ui-glass-button { min-height: 1.85rem; flex: 0 0 auto; padding: 0.35rem 0.55rem; font-size: 0.58rem; }
+
+.nova-chat-messages {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.68rem 0.62rem 0.45rem;
+  scroll-behavior: smooth;
+}
+
+.nova-chat-empty {
+  min-height: 100%;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  color: var(--nova-text-muted);
+  pointer-events: none;
+}
+
+.nova-chat-empty-orbit {
+  position: relative;
+  width: 3.6rem;
+  height: 3.6rem;
+  margin-bottom: 0.7rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.38);
+  border-radius: var(--nova-radius-pill);
+  box-shadow: 0 0 24px rgba(var(--nova-purple-rgb), 0.22), inset 0 0 18px rgba(var(--nova-purple-rgb), 0.1);
+  animation: nova-chat-orbit 9s linear infinite;
+}
+
+.nova-chat-empty-orbit::before,
+.nova-chat-empty-orbit::after {
+  content: "";
+  position: absolute;
+  border-radius: inherit;
+}
+
+.nova-chat-empty-orbit::before {
+  inset: 0.45rem;
+  border: 1px dashed rgba(var(--nova-gold-rgb), 0.36);
+}
+
+.nova-chat-empty-orbit::after {
+  inset: 1.25rem;
+  background: var(--nova-purple-300);
+  box-shadow: 0 0 15px rgba(var(--nova-purple-rgb), 0.75);
+}
+
+.nova-chat-empty-wordmark {
+  color: var(--nova-purple-100);
+  font-family: "Orbitron", sans-serif;
+  font-size: 0.7rem;
+  letter-spacing: 0.45em;
+  text-shadow: 0 0 10px rgba(var(--nova-purple-rgb), 0.5);
+}
+
+.nova-chat-empty-copy {
+  margin-top: 0.36rem;
+  font-size: 0.55rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.nova-chat-system-row {
+  margin: 0.45rem 0;
+  text-align: center;
+}
+
+.nova-chat-system-message {
+  display: inline-block;
+  max-width: 90%;
+  padding: 0.28rem 0.55rem;
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.16);
+  border-radius: var(--nova-radius-pill);
+  color: var(--nova-text-muted);
+  background: rgba(var(--nova-gold-rgb), 0.035);
+  font-size: 0.54rem;
+  letter-spacing: 0.04em;
+}
+
+.nova-chat-message-row {
+  display: flex;
+  margin-bottom: 0.68rem;
+}
+
+.nova-chat-message-row--user { justify-content: flex-end; }
+.nova-chat-message-row--nova { justify-content: flex-start; }
+.nova-chat-bubble-wrap { max-width: 86%; min-width: 0; }
+
+.nova-chat-bubble.ui-glow-card {
+  padding: 0.62rem 0.72rem 0.52rem;
+  overflow: hidden;
+  border-radius: var(--nova-radius-lg);
+  color: var(--nova-text-primary);
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.32),
+    0 0 17px rgba(var(--ui-accent-rgb), 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.nova-chat-bubble--nova.ui-glow-card {
+  border-color: rgba(var(--nova-purple-rgb), 0.32);
+  border-bottom-left-radius: var(--nova-radius-xs);
+  background:
+    linear-gradient(145deg, rgba(var(--nova-purple-rgb), 0.14), transparent 45%),
+    rgba(10, 5, 27, 0.64);
+}
+
+.nova-chat-bubble--user.ui-glow-card {
+  border-color: rgba(var(--nova-gold-rgb), 0.32);
+  border-bottom-right-radius: var(--nova-radius-xs);
+  background:
+    linear-gradient(215deg, rgba(var(--nova-gold-rgb), 0.11), transparent 46%),
+    rgba(12, 7, 25, 0.68);
+}
+
+.nova-chat-bubble--streaming.ui-glow-card {
+  animation: nova-chat-stream 2.2s ease-in-out infinite;
+}
+
+.nova-chat-message-body {
+  overflow-wrap: anywhere;
+  color: var(--nova-text-secondary);
+  font-size: 0.72rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.nova-chat-bubble--user .nova-chat-message-body { color: var(--nova-gold-50); }
+
+.nova-chat-message-meta {
+  margin-top: 0.38rem;
+  color: var(--nova-text-muted);
+  font-size: 0.48rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.nova-chat-bubble--user .nova-chat-message-meta { text-align: right; }
+.nova-chat-message-error { margin-top: 0.28rem; color: var(--nova-danger); font-size: 0.58rem; }
+
+.nova-chat-file-list,
+.nova-chat-attachment-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.nova-chat-file-list { margin-top: 0.42rem; }
+
+.nova-chat-attachment-tray {
+  position: relative;
+  z-index: 2;
+  padding: 0.35rem 0.58rem 0;
+}
+
+.nova-chat-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 100%;
+  padding: 0.25rem 0.42rem;
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.18);
+  border-radius: var(--nova-radius-sm);
+  color: var(--nova-text-secondary);
+  background: var(--nova-glass-subtle);
+  font-size: 0.56rem;
+}
+
+.nova-chat-link {
+  color: var(--nova-gold-100);
+  text-decoration-color: rgba(var(--nova-gold-rgb), 0.48);
+  text-decoration-line: underline;
+  text-underline-offset: 0.15em;
+  transition: color var(--nova-duration-fast) ease, text-shadow var(--nova-duration-fast) ease;
+}
+
+.nova-chat-link:hover {
+  color: var(--nova-gold-50);
+  text-shadow: 0 0 8px rgba(var(--nova-gold-rgb), 0.42);
+}
+
+.nova-chat-file-remove {
+  margin-left: 0.1rem;
+  border: 0;
+  color: var(--nova-text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.nova-chat-file-remove:hover { color: var(--nova-danger); }
+
+.nova-chat-image-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.nova-chat-generated-image {
+  max-width: 260px;
+  max-height: 260px;
+  width: 100%;
+  height: auto;
+  border-radius: var(--nova-radius-sm);
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.18);
+  display: block;
+  object-fit: cover;
+  transition: transform var(--nova-duration-fast) ease, box-shadow var(--nova-duration-fast) ease;
+}
+
+.nova-chat-generated-image:hover {
+  transform: scale(1.02);
+  box-shadow: 0 0 18px rgba(var(--nova-gold-rgb), 0.28);
+}
+
+.nova-chat-thinking-row { margin: 0.2rem 0; }
+
+.nova-chat-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.34rem 0.58rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.2);
+  border-radius: var(--nova-radius-pill);
+  color: var(--nova-text-muted);
+  background: var(--nova-glass-subtle);
+  font-size: 0.58rem;
+}
+
+.nova-chat-typing-dots {
+  display: inline-flex;
+  gap: 0.18rem;
+}
+
+.nova-chat-typing-dots > span {
+  width: 0.28rem;
+  height: 0.28rem;
+  border-radius: var(--nova-radius-pill);
+  background: var(--nova-purple-200);
+  box-shadow: 0 0 6px rgba(var(--nova-purple-rgb), 0.6);
+  animation: nova-chat-dot 1s ease-in-out infinite;
+}
+
+.nova-chat-typing-dots > span:nth-child(2) { animation-delay: 0.14s; }
+.nova-chat-typing-dots > span:nth-child(3) { animation-delay: 0.28s; }
+
+.nova-chat-jump.ui-glass-button {
+  position: absolute;
+  z-index: 8;
+  right: 0.75rem;
+  bottom: 5.6rem;
+  min-height: 1.65rem;
+  padding: 0.28rem 0.48rem;
+  font-size: 0.54rem;
+}
+
+.nova-chat-composer.ui-glass-panel {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: end;
+  gap: 0.4rem;
+  margin: 0.42rem;
+  padding: 0.42rem;
+  overflow: visible;
+  border-color: rgba(var(--nova-purple-rgb), 0.3);
+  border-radius: var(--nova-radius-lg);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), transparent),
+    rgba(7, 3, 19, 0.68);
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.36),
+    0 0 18px rgba(var(--nova-purple-rgb), 0.15),
+    inset 0 1px 0 rgba(255, 255, 255, 0.075);
+}
+
+.nova-chat-input.ui-glass-input {
+  min-width: 0;
+  min-height: 2.32rem;
+  max-height: 220px;
+  padding: 0.55rem 0.68rem;
+  resize: none;
+  border-color: rgba(var(--nova-purple-rgb), 0.28);
+  border-radius: var(--nova-radius-md);
+  background: rgba(5, 2, 15, 0.5);
+  color: var(--nova-text-primary);
+  font-size: 0.7rem;
+}
+
+.nova-chat-file-button.ui-glass-button,
+.nova-chat-stop-button.ui-glass-button,
+.nova-chat-send-button.ui-glass-button {
+  min-height: 2.32rem;
+  padding: 0.48rem 0.62rem;
+  font-size: 0.62rem;
+}
+
+.nova-chat-file-button.ui-glass-button {
+  cursor: pointer;
+}
+
+.nova-chat-send-button.ui-glass-button {
+  min-width: 3.5rem;
+  color: var(--nova-gold-50);
+  background:
+    linear-gradient(180deg, rgba(var(--nova-gold-rgb), 0.12), transparent),
+    rgba(var(--nova-purple-rgb), 0.17);
+}
+
+.nova-chat-code {
+  position: relative;
+  margin: 0.5rem 0;
+}
+
+.nova-chat-code pre {
+  overflow: auto;
+  margin: 0;
+  padding: 0.62rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.2);
+  border-radius: var(--nova-radius-md);
+  color: var(--nova-purple-50);
+  background: rgba(2, 1, 7, 0.72);
+  box-shadow: inset 0 1px 10px rgba(0, 0, 0, 0.34);
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.nova-chat-code-language {
+  margin-bottom: 0.28rem;
+  color: var(--nova-gold-200);
+  font-size: 0.5rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.72;
+}
+
+.nova-chat-code-copy.ui-glass-button {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.35rem;
+  min-height: 1.45rem;
+  padding: 0.22rem 0.38rem;
+  font-size: 0.5rem;
+  opacity: 0;
+}
+
+.nova-chat-code:hover .nova-chat-code-copy,
+.nova-chat-code-copy:focus-visible { opacity: 1; }
+
+@keyframes nova-chat-signal {
+  0%, 100% { transform: scaleY(0.55); opacity: 0.6; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
+
+@keyframes nova-chat-orbit {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes nova-chat-stream {
+  0%, 100% { box-shadow: 0 10px 24px rgba(0, 0, 0, 0.32), 0 0 15px rgba(var(--nova-purple-rgb), 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.08); }
+  50% { box-shadow: 0 11px 25px rgba(0, 0, 0, 0.34), 0 0 26px rgba(var(--nova-purple-rgb), 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.1); }
+}
+
+@keyframes nova-chat-dot {
+  0%, 100% { transform: translateY(0); opacity: 0.45; }
+  50% { transform: translateY(-0.18rem); opacity: 1; }
+}
+
+@media (max-width: 1180px) {
+  .nova-chat-composer.ui-glass-panel {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+
+  .nova-chat-input.ui-glass-input {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-height: 760px) {
+  .nova-sidebar-panel.ui-glass-panel { padding: 0.62rem; }
+  .nova-sidebar-nav { gap: 0.2rem; }
+  .nova-sidebar-nav-item.ui-glass-button { min-height: 1.95rem; padding-top: 0.32rem; padding-bottom: 0.32rem; }
+  .nova-sidebar-metric.ui-glow-card { min-height: 2.08rem; padding-top: 0.34rem; padding-bottom: 0.34rem; }
+  .nova-sidebar-divider { margin-top: 0.42rem; margin-bottom: 0.36rem; }
+}
+
+/* Nova v2 cinematic ambient background */
+.nova-ambient-background {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  isolation: isolate;
+  contain: strict;
+  pointer-events: none;
+  background: var(--nova-bg-void);
+  transform: translateZ(0);
+}
+
+.nova-ambient-background > * {
+  position: absolute;
+  pointer-events: none;
+}
+
+.nova-ambient-base {
+  z-index: 0;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 72% 58% at 50% 42%, rgba(var(--nova-purple-rgb), 0.115), transparent 66%),
+    radial-gradient(ellipse 48% 42% at 13% 72%, rgba(var(--nova-purple-rgb), 0.055), transparent 72%),
+    radial-gradient(ellipse 42% 38% at 88% 68%, rgba(var(--nova-gold-rgb), 0.035), transparent 72%),
+    linear-gradient(180deg, var(--nova-bg-void) 0%, var(--nova-bg-deep) 48%, #030109 100%);
+}
+
+.nova-ambient-nebula {
+  z-index: 1;
+  width: 62vw;
+  height: 62vw;
+  min-width: 34rem;
+  min-height: 34rem;
+  border-radius: 50%;
+  filter: blur(76px);
+  will-change: transform, opacity;
+}
+
+.nova-ambient-nebula--purple {
+  top: -34vw;
+  left: 18vw;
+  background:
+    radial-gradient(circle at 46% 48%, rgba(var(--nova-purple-rgb), 0.18), rgba(var(--nova-purple-rgb), 0.065) 34%, transparent 68%);
+  opacity: 0.72;
+  animation: nova-ambient-nebula-purple 28s var(--nova-ease-out) infinite alternate;
+}
+
+.nova-ambient-nebula--gold {
+  right: -26vw;
+  bottom: -42vw;
+  background:
+    radial-gradient(circle at 48% 45%, rgba(var(--nova-gold-rgb), 0.095), rgba(var(--nova-purple-rgb), 0.035) 38%, transparent 69%);
+  opacity: 0.58;
+  animation: nova-ambient-nebula-gold 36s var(--nova-ease-out) infinite alternate;
+}
+
+.nova-ambient-stars {
+  z-index: 2;
+  inset: -8%;
+  background-repeat: repeat;
+  will-change: background-position, opacity;
+}
+
+.nova-ambient-stars--far {
+  opacity: 0.28;
+  background-image:
+    radial-gradient(circle, rgba(238, 233, 255, 0.72) 0 0.65px, transparent 0.9px),
+    radial-gradient(circle, rgba(var(--nova-purple-rgb), 0.68) 0 0.75px, transparent 1px),
+    radial-gradient(circle, rgba(var(--nova-gold-rgb), 0.48) 0 0.55px, transparent 0.85px);
+  background-size: 83px 97px, 127px 149px, 191px 173px;
+  background-position: 13px 21px, 47px 83px, 101px 29px;
+  animation: nova-ambient-stars-far 110s linear infinite;
+}
+
+.nova-ambient-stars--near {
+  opacity: 0.24;
+  filter: drop-shadow(0 0 3px rgba(var(--nova-purple-rgb), 0.34));
+  background-image:
+    radial-gradient(circle, rgba(var(--nova-purple-rgb), 0.88) 0 0.8px, transparent 1.15px),
+    radial-gradient(circle, rgba(255, 248, 220, 0.7) 0 0.65px, transparent 1px);
+  background-size: 211px 179px, 263px 229px;
+  background-position: 31px 61px, 151px 19px;
+  animation: nova-ambient-stars-near 78s linear infinite, nova-ambient-stars-twinkle 7s ease-in-out infinite alternate;
+}
+
+.nova-ambient-beam {
+  z-index: 3;
+  top: -28%;
+  width: 18vw;
+  height: 156%;
+  min-width: 11rem;
+  opacity: 0.13;
+  filter: blur(18px);
+  mix-blend-mode: screen;
+  transform-origin: 50% 0;
+  will-change: transform, opacity;
+}
+
+.nova-ambient-beam--left {
+  left: 11%;
+  background: linear-gradient(90deg, transparent, rgba(var(--nova-purple-rgb), 0.2), rgba(var(--nova-purple-rgb), 0.055), transparent);
+  transform: rotate(16deg) translateX(-10vw);
+  animation: nova-ambient-beam-left 24s ease-in-out infinite alternate;
+}
+
+.nova-ambient-beam--right {
+  right: 8%;
+  background: linear-gradient(90deg, transparent, rgba(var(--nova-gold-rgb), 0.13), rgba(var(--nova-purple-rgb), 0.055), transparent);
+  transform: rotate(-17deg) translateX(8vw);
+  animation: nova-ambient-beam-right 31s ease-in-out infinite alternate;
+}
+
+.nova-ambient-avatar-halo {
+  z-index: 3;
+  top: 12%;
+  left: 50%;
+  width: min(58vw, 56rem);
+  height: min(72vh, 48rem);
+  border-radius: 50%;
+  background:
+    radial-gradient(ellipse at center, rgba(var(--nova-purple-rgb), 0.12) 0%, rgba(var(--nova-purple-rgb), 0.045) 38%, transparent 70%);
+  filter: blur(8px);
+  opacity: 0.72;
+  transform: translateX(-50%);
+  animation: nova-ambient-halo 12s ease-in-out infinite alternate;
+}
+
+.nova-ambient-horizon {
+  z-index: 4;
+  right: 8%;
+  bottom: 8%;
+  left: 8%;
+  height: 24%;
+  opacity: 0.56;
+  background:
+    radial-gradient(ellipse 42% 48% at 50% 100%, rgba(var(--nova-purple-rgb), 0.19), transparent 70%),
+    radial-gradient(ellipse 24% 36% at 70% 100%, rgba(var(--nova-gold-rgb), 0.075), transparent 74%);
+  filter: blur(14px);
+}
+
+.nova-ambient-grid {
+  z-index: 5;
+  right: -14%;
+  bottom: -21%;
+  left: -14%;
+  height: 58%;
+  opacity: 0.14;
+  background-image:
+    linear-gradient(rgba(var(--nova-purple-rgb), 0.3) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(var(--nova-purple-rgb), 0.24) 1px, transparent 1px);
+  background-size: 52px 38px;
+  mask-image: linear-gradient(to bottom, transparent 0%, rgba(0, 0, 0, 0.7) 42%, #000 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, rgba(0, 0, 0, 0.7) 42%, #000 100%);
+  transform: perspective(520px) rotateX(61deg) scale(1.2);
+  transform-origin: center bottom;
+  animation: nova-ambient-grid-drift 28s linear infinite;
+}
+
+.nova-ambient-haze {
+  z-index: 6;
+  inset: 0;
+  opacity: 0.22;
+  background:
+    repeating-linear-gradient(180deg, transparent 0 4px, rgba(var(--nova-purple-rgb), 0.018) 5px, transparent 6px),
+    linear-gradient(105deg, transparent 18%, rgba(var(--nova-purple-rgb), 0.025) 46%, transparent 72%);
+  animation: nova-ambient-haze 18s ease-in-out infinite alternate;
+}
+
+.nova-ambient-vignette {
+  z-index: 8;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at center, transparent 38%, rgba(2, 1, 7, 0.22) 68%, rgba(2, 1, 7, 0.72) 100%),
+    linear-gradient(180deg, rgba(2, 1, 7, 0.12), transparent 18%, transparent 78%, rgba(2, 1, 7, 0.45));
+}
+
+.nova-ambient-grain {
+  z-index: 9;
+  inset: -20%;
+  opacity: 0.035;
+  background-image:
+    repeating-radial-gradient(circle at 17% 23%, rgba(255, 255, 255, 0.7) 0 0.35px, transparent 0.6px 3px);
+  background-size: 5px 5px;
+  transform: rotate(0.001deg);
+}
+
+@keyframes nova-ambient-nebula-purple {
+  0% { transform: translate3d(-3%, -2%, 0) scale(0.96); opacity: 0.56; }
+  100% { transform: translate3d(8%, 6%, 0) scale(1.08); opacity: 0.78; }
+}
+
+@keyframes nova-ambient-nebula-gold {
+  0% { transform: translate3d(3%, 4%, 0) scale(1); opacity: 0.42; }
+  100% { transform: translate3d(-9%, -5%, 0) scale(1.12); opacity: 0.64; }
+}
+
+@keyframes nova-ambient-stars-far {
+  to { background-position: 13px 991px, 47px 617px, 101px 401px; }
+}
+
+@keyframes nova-ambient-stars-near {
+  to { background-position: -391px 601px, 677px 471px; }
+}
+
+@keyframes nova-ambient-stars-twinkle {
+  0% { opacity: 0.16; }
+  100% { opacity: 0.3; }
+}
+
+@keyframes nova-ambient-beam-left {
+  0% { transform: rotate(13deg) translateX(-12vw); opacity: 0.07; }
+  100% { transform: rotate(19deg) translateX(18vw); opacity: 0.16; }
+}
+
+@keyframes nova-ambient-beam-right {
+  0% { transform: rotate(-20deg) translateX(13vw); opacity: 0.06; }
+  100% { transform: rotate(-13deg) translateX(-17vw); opacity: 0.14; }
+}
+
+@keyframes nova-ambient-halo {
+  0% { opacity: 0.5; transform: translateX(-50%) scale(0.97); }
+  100% { opacity: 0.78; transform: translateX(-50%) scale(1.04); }
+}
+
+@keyframes nova-ambient-grid-drift {
+  to { background-position: 0 152px, 156px 0; }
+}
+
+@keyframes nova-ambient-haze {
+  0% { opacity: 0.14; transform: translateX(-1.5%); }
+  100% { opacity: 0.25; transform: translateX(1.5%); }
+}
+
+@media (max-width: 900px) {
+  .nova-ambient-nebula { filter: blur(58px); }
+  .nova-ambient-beam { opacity: 0.08; }
+  .nova-ambient-grid { opacity: 0.1; background-size: 42px 32px; }
+  .nova-ambient-stars--near { opacity: 0.18; }
+}
+
+/* Nova v2 center hologram chamber */
+.nova-center-stage-panel {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.26);
+  border-radius: var(--nova-radius-xl);
+  background:
+    radial-gradient(ellipse 76% 62% at 50% 43%, rgba(var(--nova-purple-rgb), 0.075), transparent 72%),
+    linear-gradient(180deg, rgba(9, 4, 25, 0.28), rgba(2, 1, 7, 0.2));
+  box-shadow:
+    0 20px 50px rgba(0, 0, 0, 0.42),
+    0 0 28px rgba(var(--nova-purple-rgb), 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    inset 0 -1px 0 rgba(var(--nova-gold-rgb), 0.045);
+}
+
+.nova-center-stage-panel::before,
+.nova-center-stage-panel::after {
+  content: "";
+  position: absolute;
+  z-index: 3;
+  width: 5.5rem;
+  height: 1px;
+  pointer-events: none;
+}
+
+.nova-center-stage-panel::before {
+  top: -1px;
+  left: 10%;
+  background: linear-gradient(90deg, transparent, var(--nova-purple-200), transparent);
+  box-shadow: 0 0 12px rgba(var(--nova-purple-rgb), 0.68);
+}
+
+.nova-center-stage-panel::after {
+  right: 10%;
+  bottom: -1px;
+  background: linear-gradient(90deg, transparent, var(--nova-gold-200), transparent);
+  box-shadow: 0 0 12px rgba(var(--nova-gold-rgb), 0.48);
+}
+
+.nova-hologram-stage {
+  --stage-diameter: min(96%, calc(100vh - 13.5rem), 32rem);
+  --stage-halo-size: min(70%, calc(100vh - 17rem), 23rem);
+  --stage-segment-size: min(88%, calc(100vh - 15rem), 29rem);
+  --stage-tick-size: min(79%, calc(100vh - 16rem), 26rem);
+  --stage-inner-size: min(64%, calc(100vh - 18rem), 21rem);
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 1.85rem minmax(0, 1fr) 4.9rem;
+  gap: 0.2rem;
+  padding: 0.48rem 0.62rem 0.42rem;
+  isolation: isolate;
+}
+
+.nova-hologram-header {
+  position: relative;
+  z-index: 10;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  min-width: 0;
+  padding: 0 0.35rem;
+}
+
+.nova-hologram-header-trace {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(var(--nova-purple-rgb), 0.42));
+  box-shadow: 0 0 8px rgba(var(--nova-purple-rgb), 0.28);
+}
+
+.nova-hologram-wordmark {
+  padding: 0 0.75rem;
+  color: var(--nova-gold-100);
+  font-family: "Orbitron", sans-serif;
+  font-size: 0.64rem;
+  letter-spacing: 0.42em;
+  text-shadow: 0 0 10px rgba(var(--nova-purple-rgb), 0.62), 0 0 7px rgba(var(--nova-gold-rgb), 0.24);
+  white-space: nowrap;
+}
+
+.nova-hologram-state {
+  justify-self: end;
+  color: var(--nova-text-muted);
+  font-size: 0.5rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.nova-hologram-chamber {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.nova-hologram-depth {
+  position: absolute;
+  z-index: 0;
+  top: 50%;
+  left: 50%;
+  width: var(--stage-diameter);
+  height: var(--stage-diameter);
+  border-radius: var(--nova-radius-pill);
+  background:
+    radial-gradient(circle at center, rgba(var(--nova-purple-rgb), 0.13), rgba(var(--nova-purple-rgb), 0.042) 48%, transparent 71%),
+    repeating-radial-gradient(circle at center, transparent 0 11%, rgba(var(--nova-purple-rgb), 0.035) 11.2% 11.45%, transparent 11.7% 18%);
+  filter: blur(0.2px);
+  transform: translate(-50%, -50%);
+}
+
+.nova-hologram-halo {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  width: var(--stage-halo-size);
+  height: var(--stage-halo-size);
+  border-radius: var(--nova-radius-pill);
+  background: radial-gradient(circle, rgba(var(--nova-purple-rgb), 0.19), rgba(var(--nova-purple-rgb), 0.055) 43%, transparent 72%);
+  filter: blur(16px);
+  opacity: 0.76;
+  transform: translate(-50%, -50%);
+  animation: nova-hologram-halo 5.8s ease-in-out infinite alternate;
+}
+
+.nova-hologram-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--stage-diameter);
+  height: var(--stage-diameter);
+  border-radius: var(--nova-radius-pill);
+  pointer-events: none;
+  will-change: transform;
+  /* Base centering — the rotate keyframes must also carry this translate,
+     otherwise the ring slides off-center during each animation cycle. */
+  transform: translate(-50%, -50%);
+}
+
+.nova-hologram-ring--outer {
+  z-index: 2;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.48);
+  box-shadow:
+    0 0 20px rgba(var(--nova-purple-rgb), 0.22),
+    inset 0 0 20px rgba(var(--nova-purple-rgb), 0.08);
+  animation: nova-hologram-rotate 42s linear infinite;
+}
+
+.nova-hologram-ring--outer::before,
+.nova-hologram-ring--outer::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 0.42rem;
+  height: 0.42rem;
+  border: 1px solid rgba(var(--nova-gold-rgb), 0.62);
+  background: var(--nova-bg-deep);
+  box-shadow: 0 0 9px rgba(var(--nova-gold-rgb), 0.48);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.nova-hologram-ring--outer::before { left: -0.22rem; }
+.nova-hologram-ring--outer::after { right: -0.22rem; }
+
+.nova-hologram-ring--segments {
+  z-index: 2;
+  width: var(--stage-segment-size);
+  height: var(--stage-segment-size);
+  background: repeating-conic-gradient(
+    from 8deg,
+    rgba(var(--nova-purple-rgb), 0.7) 0deg 4deg,
+    transparent 4deg 13deg,
+    rgba(var(--nova-gold-rgb), 0.42) 13deg 14deg,
+    transparent 14deg 24deg
+  );
+  mask: radial-gradient(circle, transparent 0 47.7%, #000 48% 49%, transparent 49.3%);
+  -webkit-mask: radial-gradient(circle, transparent 0 47.7%, #000 48% 49%, transparent 49.3%);
+  opacity: 0.72;
+  animation: nova-hologram-rotate-reverse 31s linear infinite;
+}
+
+.nova-hologram-ring--ticks {
+  z-index: 3;
+  width: var(--stage-tick-size);
+  height: var(--stage-tick-size);
+  background: repeating-conic-gradient(
+    rgba(var(--nova-purple-rgb), 0.5) 0deg 0.7deg,
+    transparent 0.7deg 5deg
+  );
+  mask: radial-gradient(circle, transparent 0 46.7%, #000 47% 49%, transparent 49.3%);
+  -webkit-mask: radial-gradient(circle, transparent 0 46.7%, #000 47% 49%, transparent 49.3%);
+  opacity: 0.48;
+  animation: nova-hologram-rotate 52s linear infinite;
+}
+
+.nova-hologram-ring--inner {
+  z-index: 3;
+  width: var(--stage-inner-size);
+  height: var(--stage-inner-size);
+  border: 1px dashed rgba(var(--nova-purple-rgb), 0.32);
+  box-shadow: inset 0 0 17px rgba(var(--nova-purple-rgb), 0.07);
+  animation: nova-hologram-rotate-reverse 24s linear infinite;
+}
+
+.nova-hologram-arc {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  left: 50%;
+  width: min(86%, 28rem);
+  aspect-ratio: 1;
+  border-radius: var(--nova-radius-pill);
+  pointer-events: none;
+}
+
+.nova-hologram-arc--one {
+  border-top: 2px solid rgba(var(--nova-gold-rgb), 0.68);
+  border-right: 1px solid rgba(var(--nova-gold-rgb), 0.12);
+  filter: drop-shadow(0 0 6px rgba(var(--nova-gold-rgb), 0.42));
+  transform: translate(-50%, -50%) rotate(28deg);
+  clip-path: polygon(0 0, 100% 0, 100% 38%, 50% 12%, 0 38%);
+  animation: nova-hologram-arc-one 18s ease-in-out infinite alternate;
+}
+
+.nova-hologram-arc--two {
+  width: min(72%, 23rem);
+  border-bottom: 1px solid rgba(var(--nova-gold-rgb), 0.46);
+  border-left: 1px solid rgba(var(--nova-purple-rgb), 0.2);
+  filter: drop-shadow(0 0 5px rgba(var(--nova-gold-rgb), 0.28));
+  transform: translate(-50%, -50%) rotate(-41deg);
+  clip-path: polygon(0 62%, 50% 88%, 100% 62%, 100% 100%, 0 100%);
+  animation: nova-hologram-arc-two 22s ease-in-out infinite alternate;
+}
+
+.nova-hologram-crosshair {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  width: min(94%, 31rem);
+  height: min(94%, 31rem);
+  border-radius: var(--nova-radius-pill);
+  transform: translate(-50%, -50%);
+  opacity: 0.34;
+}
+
+.nova-hologram-crosshair::before,
+.nova-hologram-crosshair::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  background: linear-gradient(90deg, transparent, rgba(var(--nova-purple-rgb), 0.36), transparent);
+  transform: translate(-50%, -50%);
+}
+
+.nova-hologram-crosshair::before { width: 100%; height: 1px; }
+.nova-hologram-crosshair::after { width: 1px; height: 100%; background: linear-gradient(180deg, transparent, rgba(var(--nova-purple-rgb), 0.3), transparent); }
+
+.nova-hologram-particles {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  left: 50%;
+  width: var(--stage-diameter);
+  height: var(--stage-diameter);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.nova-hologram-particles > span {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  border-radius: var(--nova-radius-pill);
+  background: var(--nova-purple-100);
+  box-shadow: 0 0 7px rgba(var(--nova-purple-rgb), 0.78);
+  opacity: 0.3;
+  animation: nova-hologram-particle var(--particle-duration) ease-in-out var(--particle-delay) infinite alternate;
+}
+
+.nova-hologram-particles > span:nth-child(5n) {
+  background: var(--nova-gold-100);
+  box-shadow: 0 0 7px rgba(var(--nova-gold-rgb), 0.64);
+}
+
+.nova-hologram-avatar-slot {
+  position: relative;
+  z-index: 6;
+  display: grid;
+  place-items: center;
+  max-width: 100%;
+  max-height: 100%;
+  filter: drop-shadow(0 16px 22px rgba(0, 0, 0, 0.34));
+}
+
+.nova-hologram-loading {
+  color: var(--nova-text-muted);
+  font-size: 0.64rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.nova-hologram-scanline {
+  position: absolute;
+  z-index: 8;
+  top: 7%;
+  right: 4%;
+  left: 4%;
+  height: 8%;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent, rgba(var(--nova-purple-rgb), 0.07), rgba(255, 255, 255, 0.035), transparent);
+  filter: blur(0.3px);
+  opacity: 0.48;
+  animation: nova-hologram-scan 8.5s linear infinite;
+}
+
+.nova-hologram-spectrum {
+  position: relative;
+  z-index: 10;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0.82rem 0.7rem 0.08rem;
+  border: 1px solid rgba(var(--nova-purple-rgb), 0.24);
+  border-radius: 0.9rem 0.9rem var(--nova-radius-lg) var(--nova-radius-lg);
+  background:
+    linear-gradient(180deg, rgba(var(--nova-purple-rgb), 0.075), transparent 45%),
+    rgba(5, 2, 15, 0.48);
+  box-shadow:
+    0 10px 22px rgba(0, 0, 0, 0.28),
+    0 0 17px rgba(var(--nova-purple-rgb), 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  clip-path: polygon(2% 0, 98% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+}
+
+.nova-hologram-spectrum-header {
+  position: absolute;
+  z-index: 2;
+  top: 0.28rem;
+  right: 0.78rem;
+  left: 0.78rem;
+  display: flex;
+  justify-content: space-between;
+  color: var(--nova-text-muted);
+  font-size: 0.43rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.nova-hologram-spectrum-header span:last-child {
+  color: var(--nova-gold-100);
+  text-shadow: 0 0 6px rgba(var(--nova-gold-rgb), 0.36);
+}
+
+.nova-hologram-waveform {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+}
+
+.nova-hologram-spectrum-accent {
+  position: absolute;
+  z-index: 3;
+  top: -1px;
+  left: 50%;
+  width: 5rem;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--nova-gold-200), transparent);
+  box-shadow: 0 0 10px rgba(var(--nova-gold-rgb), 0.45);
+  transform: translateX(-50%);
+}
+
+.nova-waveform-canvas-wrap {
+  width: 100%;
+  overflow: hidden;
+}
+
+.nova-waveform-canvas {
+  opacity: 0.86;
+  filter: drop-shadow(0 0 12px rgba(var(--nova-purple-rgb), 0.38)) drop-shadow(0 0 5px rgba(var(--nova-gold-rgb), 0.14));
+}
+
+.nova-hologram-stage[data-stage-state="listening"] .nova-hologram-halo {
+  opacity: 0.94;
+  animation-duration: 2.4s;
+}
+
+.nova-hologram-stage[data-stage-state="thinking"] .nova-hologram-ring--segments {
+  animation-duration: 12s;
+}
+
+.nova-hologram-stage[data-stage-state="speaking"] .nova-hologram-halo {
+  background: radial-gradient(circle, rgba(var(--nova-gold-rgb), 0.14), rgba(var(--nova-purple-rgb), 0.075) 46%, transparent 72%);
+}
+
+.nova-hologram-stage[data-stage-state="working"] .nova-hologram-ring--segments,
+.nova-hologram-stage[data-stage-state="searching"] .nova-hologram-ring--segments {
+  animation-duration: 6s;
+}
+
+.nova-hologram-stage[data-stage-state="working"] .nova-hologram-halo,
+.nova-hologram-stage[data-stage-state="searching"] .nova-hologram-halo {
+  background: radial-gradient(circle, rgba(var(--nova-gold-rgb), 0.18), rgba(var(--nova-purple-rgb), 0.06) 46%, transparent 72%);
+  opacity: 0.9;
+}
+
+.nova-hologram-stage[data-stage-state="memory"] .nova-hologram-ring--inner {
+  animation-duration: 5s;
+}
+
+.nova-hologram-stage[data-stage-state="memory"] .nova-hologram-halo {
+  background: radial-gradient(circle, rgba(var(--nova-purple-rgb), 0.2), rgba(var(--nova-gold-rgb), 0.05) 50%, transparent 74%);
+}
+
+.nova-hologram-stage[data-stage-state="vision"] .nova-hologram-crosshair {
+  opacity: 0.95;
+}
+
+.nova-hologram-stage[data-stage-state="vision"] .nova-hologram-halo {
+  opacity: 0.96;
+  animation-duration: 1.9s;
+}
+
+@keyframes nova-hologram-rotate {
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+@keyframes nova-hologram-rotate-reverse {
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to { transform: translate(-50%, -50%) rotate(-360deg); }
+}
+
+@keyframes nova-hologram-halo {
+  0% { opacity: 0.55; transform: translate(-50%, -50%) scale(0.94); }
+  100% { opacity: 0.84; transform: translate(-50%, -50%) scale(1.06); }
+}
+
+@keyframes nova-hologram-arc-one {
+  0% { opacity: 0.42; transform: translate(-50%, -50%) rotate(24deg); }
+  100% { opacity: 0.78; transform: translate(-50%, -50%) rotate(38deg); }
+}
+
+@keyframes nova-hologram-arc-two {
+  0% { opacity: 0.32; transform: translate(-50%, -50%) rotate(-47deg); }
+  100% { opacity: 0.64; transform: translate(-50%, -50%) rotate(-34deg); }
+}
+
+@keyframes nova-hologram-particle {
+  0% { opacity: 0.18; transform: translate3d(0, 7px, 0) scale(var(--particle-scale)); }
+  100% { opacity: 0.76; transform: translate3d(4px, -10px, 0) scale(var(--particle-scale)); }
+}
+
+@keyframes nova-hologram-scan {
+  0% { top: 4%; opacity: 0; }
+  12% { opacity: 0.42; }
+  78% { opacity: 0.32; }
+  100% { top: 90%; opacity: 0; }
+}
+
+@media (max-height: 760px) {
+  .nova-hologram-stage {
+    --stage-diameter: min(94%, calc(100vh - 12.5rem), 29rem);
+    grid-template-rows: 1.55rem minmax(0, 1fr) 4.5rem;
+    padding-top: 0.35rem;
+  }
+
+  .nova-hologram-wordmark { font-size: 0.56rem; }
+  .nova-hologram-spectrum { padding-top: 0.66rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-glass-panel,
+  .ui-glass-button,
+  .ui-glass-input,
+  .ui-glow-card,
+  .ui-floating-container {
+    transition-duration: 1ms;
+  }
+
+  .ui-floating-container--float,
+  .ui-status-badge--pulse .ui-status-dot,
+  .nova-titlebar-scanline,
+  .nova-dock-voice--listening.ui-glass-button,
+  .nova-dock-voice--listening.ui-glass-button::before,
+  .nova-dock-voice--speaking.ui-glass-button,
+  .nova-dock-voice--speaking.ui-glass-button::before,
+  .nova-chat-signal i,
+  .nova-chat-empty-orbit,
+  .nova-chat-bubble--streaming.ui-glow-card,
+  .nova-chat-typing-dots > span,
+  .nova-ambient-nebula,
+  .nova-ambient-stars,
+  .nova-ambient-beam,
+  .nova-ambient-avatar-halo,
+  .nova-ambient-grid,
+  .nova-ambient-haze,
+  .nova-hologram-halo,
+  .nova-hologram-ring,
+  .nova-hologram-arc,
+  .nova-hologram-particles > span,
+  .nova-hologram-scanline {
+    animation: none;
+  }
+}

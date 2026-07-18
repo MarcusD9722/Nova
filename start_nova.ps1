@@ -69,6 +69,14 @@ $env:NOVA_AUTONOMY_MAX_STEPS = "12"
 $env:NOVA_ALLOW_SHELL = "1"
 $env:NOVA_ALLOW_NETWORK_TOOLS = "1"
 $env:NOVA_MEMORY_SAVE_MODE = "all"
+$env:NOVA_VOICE_DIR = (Join-Path $repoRoot "voices")
+$env:NOVA_DEFAULT_VOICE = "nova.wav"
+$env:NOVA_TTS_DEVICE = "cuda"
+$env:NOVA_TTS_PREWARM = "1"
+# XTTS v2 download requires accepting the Coqui CPML license (non-commercial):
+# https://coqui.ai/cpml
+$env:COQUI_TOS_AGREED = "1"
+$env:NOVA_TTS_WARMUP_TEXT = "Hello there. I am ready to help."
 
 if ($Test) {
   Write-Host "Test mode enabled: not starting processes." -ForegroundColor Yellow
@@ -105,7 +113,7 @@ Write-Host "Starting Electron..." -ForegroundColor Cyan
 Start-Process powershell -WindowStyle Normal -ArgumentList @(
   "-NoExit",
   "-Command",
-  "cd `"$frontendDir`"; `$env:ELECTRON_RENDERER_URL=`"$rendererUrl`"; npx electron .\electron\main.js; Write-Host 'Electron exited. Press Enter to close.'; Read-Host | Out-Null"
+  "cd `"$frontendDir`"; `$env:ELECTRON_RENDERER_URL='$rendererUrl'; npx electron .\electron\main.js; Write-Host 'Electron exited. Press Enter to close.'; Read-Host | Out-Null"
 )
 
 Write-Host ""

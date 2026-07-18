@@ -10,7 +10,12 @@
     "electron": "electron .",
     "electron:dev": "concurrently -k -n VITE,ELECTRON -c cyan,magenta \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "electron:build": "vite build",
-    "electron:start": "electron ."
+    "electron:start": "electron .",
+    "backend:build": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\build_backend.ps1",
+    "dist:win:dir": "npm run backend:build && npm run build && electron-builder --win dir",
+    "dist:win:setup": "npm run backend:build && npm run build && electron-builder --win nsis",
+    "dist:win:portable": "npm run backend:build && npm run build && electron-builder --win portable",
+    "dist:win:all": "npm run backend:build && npm run build && electron-builder --win nsis portable"
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",
@@ -20,8 +25,12 @@
     "@react-three/postprocessing": "^3.0.4",
     "axios": "^1.6.7",
     "clsx": "^2.1.0",
+    "diff": "^8.0.4",
     "drei": "^2.2.21",
     "framer-motion": "^12.23.0",
+    "gsap": "^3.15.0",
+    "lucide-react": "^1.22.0",
+    "qrcode": "^1.5.4",
     "re-resizable": "^6.11.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -35,9 +44,49 @@
     "autoprefixer": "^10.4.2",
     "concurrently": "^9.2.1",
     "electron": "^37.10.3",
+    "electron-builder": "^24.13.3",
     "postcss": "^8.4.6",
     "tailwindcss": "^3.3.2",
     "vite": "^7.0.3",
     "wait-on": "^8.0.5"
+  },
+  "build": {
+    "appId": "com.nova.desktop",
+    "productName": "Nova",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-backend/nova-backend",
+        "to": "backend"
+      },
+      {
+        "from": "../voices",
+        "to": "voices"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
   }
 }

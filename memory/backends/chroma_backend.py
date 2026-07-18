@@ -67,15 +67,54 @@ class _HashEmbeddingFunction:
         return self.embed_documents(input)
 
 
-class ChromaMemoryBackend:
-    """Persistent Chroma-backed store for semantic-ish recall.
+class _SemanticEmbeddingFunction:
+    """Real sentence embeddings (bge-small on GPU) with hash fallback.
 
-    Uses a deterministic hash embedding function by default to avoid external
-    model dependencies. This satisfies Chroma's embedding interface and prevents
-    runtime errors during query().
+    Falls back to the hash embedder per-call if the model is unavailable so
+    memory keeps working offline — with degraded semantic quality, not errors.
+    Both produce 384-dim vectors, so they share a collection safely enough
+    for graceful degradation.
     """
 
-    def __init__(self, persist_dir: Path, collection_name: str = "nova_memory") -> None:
+    def __init__(self, dim: int = 384) -> None:
+        self._dim = int(dim)
+        self._fallback = _HashEmbeddingFunction(dim=dim)
+
+    def name(self) -> str:
+        return "nova-semantic-v1"
+
+    def get_config(self) -> dict[str, int]:
+        return {"dim": self._dim}
+
+    def _encode(self, texts: list[str]) -> list[list[float]]:
+        from memory import embeddings as emb_mod
+
+        if emb_mod.embedding_available():
+            return emb_mod.embed_texts(texts)
+        return self._fallback.embed_documents(texts)
+
+    def embed_query(self, input: Any) -> list[float]:
+        text = " ".join(str(x) for x in input) if isinstance(input, list) else str(input or "")
+        return self._encode([text])[0]
+
+    def embed_documents(self, input: list[str]) -> list[list[float]]:
+        return self._encode([str(t) for t in (input or [])])
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        return self.embed_documents(input)
+
+
+class ChromaMemoryBackend:
+    """Persistent Chroma-backed store for semantic recall.
+
+    Uses a real embedding model (see memory/embeddings.py) with a
+    deterministic hash fallback so query()/upsert() never hard-fail.
+    """
+
+    # v2: semantic embeddings replaced the hash embedder. A new collection
+    # name makes the unifier's startup check see an empty index and rebuild
+    # it from SQLite with the new vectors.
+    def __init__(self, persist_dir: Path, collection_name: str = "nova_memory_v2") -> None:
         self._persist_dir = Path(persist_dir)
         self._collection_name = collection_name
         self._lock = asyncio.Lock()
@@ -96,7 +135,7 @@ class ChromaMemoryBackend:
         # PersistentClient handles persistence via the directory.
         self._client = chromadb.PersistentClient(path=str(self._persist_dir), settings=settings)
 
-        emb = _HashEmbeddingFunction(dim=384)
+        emb = _SemanticEmbeddingFunction(dim=384)
         self._emb = emb
         self._collection = self._client.get_or_create_collection(
             name=self._collection_name,
