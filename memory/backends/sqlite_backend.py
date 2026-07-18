@@ -307,8 +307,59 @@ class SQLiteMemoryBackend:
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_proposals_pending ON proposals(status, created_at);")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_progress_ack ON progress_events(project_name, acknowledged, created_at);")
 
+                await self._apply_migrations(db)
+
                 await db.commit()
             self._initialized = True
+
+    # ---------------- Schema versioning (Phase 0.5 of docs/ROADMAP.md) ----------------
+    #
+    # The CREATE TABLE IF NOT EXISTS block above always builds the CURRENT full
+    # schema, so a fresh database needs no migrations and is stamped at the
+    # latest version. An existing database runs every migration newer than its
+    # stamp, in order, each inside the surrounding transaction. Rules from here
+    # on: any schema change = a new (version, description, [sql]) entry BELOW
+    # plus the matching change in the create block above. Never edit or remove
+    # a shipped migration.
+
+    _MIGRATIONS: list[tuple[int, str, list[str]]] = [
+        (1, "baseline: full schema as of Phase 0 (2026-07-18)", []),
+    ]
+
+    async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);"
+        )
+        async with db.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version") as cur:
+            row = await cur.fetchone()
+        current = int(row[0]) if row else 0
+
+        latest = max(v for v, _, _ in self._MIGRATIONS)
+        if current == 0:
+            # Fresh DB (or a pre-versioning DB, which by definition matches
+            # today's create block): stamp latest without replaying history.
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, description, applied_at) VALUES(?, ?, ?)",
+                (latest, "stamped current (create block builds latest schema)", self._now_iso()),
+            )
+            return
+
+        for version, description, statements in sorted(self._MIGRATIONS, key=lambda m: m[0]):
+            if version <= current:
+                continue
+            for sql in statements:
+                await db.execute(sql)
+            await db.execute(
+                "INSERT INTO schema_version(version, description, applied_at) VALUES(?, ?, ?)",
+                (version, description, self._now_iso()),
+            )
+
+    async def schema_version(self) -> int:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version") as cur:
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
     # ---------------- Autonomy task queue (new contract) ----------------
 
