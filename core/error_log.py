@@ -30,6 +30,11 @@ def _now_iso() -> str:
 
 def is_error_event(event_type: str, data: dict[str, Any] | None = None) -> bool:
     t = (event_type or "").lower()
+    # "Not configured" is a state, not a defect — never a self-correction
+    # candidate (it carries an `error` field, so exclude it before the
+    # generic checks below).
+    if t == "tool.not_configured":
+        return False
     if t == "system.warning":
         return True
     if t.endswith(".error"):

@@ -93,17 +93,41 @@ there is no silent CPU fallback. XTTS likewise requires CUDA (`NOVA_TTS_DEVICE=c
 | `GET /tasks` | Background autonomy tasks |
 | `GET /dev/status`, `/dev/inspect`, `/dev/propose`, `/dev/proposals`, `/dev/apply` | Developer mode (guarded) |
 
-## Developer Mode (self-inspection)
+## Developer Mode (guarded self-editing)
 
 Disabled by default. Set `NOVA_DEV_MODE=1` in `.env` to enable.
 
-- Read-only inspection of the repo (never `.env`, `.git`, `memory_data`, `model`, `venv`, `node_modules`)
-- Changes flow through **propose → review diff → apply with `confirm=true`**; proposing never writes
-- See `core/dev_mode.py` for the full safety model and open TODOs
-  (proposal persistence, auto-test after apply, UI diff viewer)
+- Read-only inspection of the repo (never `.env`, `.git`, `credentials`, `memory_data`, `model`, `venv`, `node_modules`)
+- Changes flow through **propose → review real diff in the Improve panel → approve**;
+  applies are backed up, boot-tested in a subprocess, and auto-rolled-back on failure
+- Registered external projects get the same propose/approve/backup/rollback guard
+  (syntax-checked but not boot-tested — surfaced honestly as `skipped_external_project`)
+- Proposals and backups persist under `.nova_dev/`; see `core/dev_mode.py`
 
-## Packaging (not yet implemented)
+## Security
+
+Set `NOVA_API_TOKEN` in `.env` to require `Authorization: Bearer <token>` on every
+endpoint (the UI picks it up automatically; `/health` stays open). Unset = localhost-only
+use, with a boot warning. See `.env.example`.
+
+## Tests
+
+```powershell
+.\run_tests.ps1            # all suites in tests/
+.\run_tests.ps1 memory     # filtered
+```
+
+## Architecture & roadmap
+
+Nova is mid-transformation into a local-first AI operating layer. The audit, target
+architecture, invariants, and the phased plan live in:
+
+- `docs/ARCHITECTURE.md` — current state (measured), debt register, target design
+- `docs/ROADMAP.md` — Phases 0–6, dependencies, open decisions
+- `docs/CONTRIBUTING.md` — the one-writer rule and the verification ritual
+
+## Packaging (not yet implemented — Phase 3.4)
 
 `package.json` contains `dist:win:*` scripts that expect a PyInstaller build script
-(`build_backend.ps1`) which **does not exist yet** — building a standalone .exe is a TODO.
-Run Nova from source with `start_nova.ps1` for now.
+(`build_backend.ps1`) which **does not exist yet**. Run Nova from source with
+`start_nova.ps1` for now; a standalone build ships with Phase 3 (always-on).

@@ -64,5 +64,14 @@ class ToolRouter:
                 logger.warning("tool_failed", tool=call.name, attempt=attempt, error=str(e))
                 await asyncio.sleep(0.2 * (attempt + 1))
 
-        BUS.publish("tool.error", {"tool": call.name, "error": clip(last_err, 200) if last_err else "tool_failed"})
+        # A "not configured" state (missing API key, OAuth never run) is not a
+        # code defect: publish it as tool.not_configured so the self-improve
+        # loop never files a bogus code-fix proposal for it (observed live:
+        # an auto-"fix" proposed for google_oauth_setup.py because the honest
+        # "account not connected" error recurred). Matched by class name to
+        # keep core/ free of a plugins/ import.
+        if type(last_err).__name__ == "PluginConfigError":
+            BUS.publish("tool.not_configured", {"tool": call.name, "error": clip(last_err, 200)})
+        else:
+            BUS.publish("tool.error", {"tool": call.name, "error": clip(last_err, 200) if last_err else "tool_failed"})
         return ToolResult(name=call.name, ok=False, result=None, error=str(last_err) if last_err else "tool_failed")
