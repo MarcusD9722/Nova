@@ -343,6 +343,41 @@ async def _bind_request_id(request, call_next):  # noqa: ANN001
     return resp
 
 
+# ── API authentication (Phase 0.3 of docs/ROADMAP.md) ───────────────────────
+# Enforced only when NOVA_API_TOKEN is set: every HTTP request must present
+# Authorization: Bearer <token> (or ?token= for clients that can't set
+# headers, e.g. the WebSocket). Unset = current localhost-only behavior, with
+# a boot warning so the gap is never silent. /health stays open so process
+# supervisors can probe liveness without credentials.
+_AUTH_EXEMPT_PATHS = {"/health"}
+
+
+def _api_token() -> str:
+    return os.getenv("NOVA_API_TOKEN", "").strip()
+
+
+def _request_token_ok(supplied: str | None) -> bool:
+    import hmac
+
+    expected = _api_token()
+    if not expected:
+        return True
+    return bool(supplied) and hmac.compare_digest(supplied.strip(), expected)
+
+
+@app.middleware("http")
+async def _require_api_token(request, call_next):  # noqa: ANN001
+    if not _api_token() or request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+    auth = request.headers.get("authorization", "")
+    supplied = auth[7:] if auth.lower().startswith("bearer ") else request.query_params.get("token")
+    if not _request_token_ok(supplied):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token."})
+    return await call_next(request)
+
+
 def _parse_allowed_origins() -> list[str]:
     raw = os.getenv("NOVA_ALLOWED_ORIGINS", "").strip()
     if not raw:
@@ -1147,6 +1182,13 @@ async def _startup() -> None:
         STATE.tts_prewarm_task = asyncio.create_task(_prewarm_tts())
         _bullet("XTTS prewarm scheduled")
 
+    if not _api_token():
+        logger.warning(
+            "api_auth_disabled",
+            note="NOVA_API_TOKEN is not set — every endpoint is open to anything that can reach this port. "
+                 "Fine for localhost-only use; set a token before any 24/7 or remote exposure.",
+        )
+
     BUS.publish(
         "nova.startup.complete",
         {
@@ -1258,6 +1300,11 @@ async def status() -> dict:
 @app.websocket("/ws/events")
 async def ws_events(ws: WebSocket) -> None:
     """Structured event stream powering the UI's live activity states."""
+    # HTTP middleware doesn't cover WebSockets — enforce the API token here
+    # via query param (browsers can't set WS headers). 4401 = auth failure.
+    if not _request_token_ok(ws.query_params.get("token")):
+        await ws.close(code=4401)
+        return
     await ws.accept()
     queue = BUS.subscribe()
     try:

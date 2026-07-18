@@ -82,3 +82,11 @@ try {
   const base = process.env.NOVA_API_BASE ? String(process.env.NOVA_API_BASE) : "";
   if (base) contextBridge.exposeInMainWorld("__NOVA_API_BASE", base.replace(/\/$/, ""));
 } catch {}
+
+// API auth token (Phase 0.3): flows from the NOVA_API_TOKEN env var into the
+// renderer so the fetch wrapper in src/lib/apiToken.js can attach it. Only
+// ever sent to Nova's own API base, never third-party hosts.
+try {
+  const token = process.env.NOVA_API_TOKEN ? String(process.env.NOVA_API_TOKEN) : "";
+  if (token) contextBridge.exposeInMainWorld("__NOVA_API_TOKEN", token);
+} catch {}

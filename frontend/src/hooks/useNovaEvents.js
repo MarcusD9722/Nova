@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import { novaApiToken, novaApiBase } from "../lib/apiToken";
 
 // Live connection to the backend event bus (/ws/events).
 // Drives the UI's real activity states: thinking, tool use, memory access,
@@ -6,11 +7,11 @@ import { useEffect, useRef, useState, useCallback } from "react";
 // UI shows offline) — never fakes activity.
 
 function wsUrl() {
-  let base = "http://localhost:8008";
-  try {
-    if (window.__NOVA_API_BASE) base = String(window.__NOVA_API_BASE);
-  } catch {}
-  return base.replace(/^http/, "ws").replace(/\/$/, "") + "/ws/events";
+  const base = novaApiBase().replace(/^http/, "ws");
+  // Browsers can't set WS headers, so the API token rides as a query param
+  // (the backend checks it before accepting the socket).
+  const token = novaApiToken();
+  return base + "/ws/events" + (token ? `?token=${encodeURIComponent(token)}` : "");
 }
 
 const MAX_EVENTS = 100;
