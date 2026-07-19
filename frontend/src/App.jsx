@@ -26,6 +26,7 @@ import TasksSheet from "./overlays/TasksSheet";
 import SystemSheet from "./overlays/SystemSheet";
 import ImprovementsSheet from "./overlays/ImprovementsSheet";
 import ScreenVisionSheet from "./overlays/ScreenVisionSheet";
+import GraphSheet from "./overlays/GraphSheet";
 
 const AnimatedBackground = lazy(() => import("./components/AnimatedBackground"));
 const NovaHologramAvatar = lazy(() => import("./components/NovaHologramAvatar"));
@@ -1518,6 +1519,10 @@ export default function App() {
       setActiveOverlay("memory");
       return;
     }
+    if (key === "graph") {
+      setActiveOverlay("graph");
+      return;
+    }
     if (key === "system") {
       setActiveOverlay("system");
       return;
@@ -1987,6 +1992,14 @@ export default function App() {
         onClose={() => setActiveOverlay(null)}
       >
         <ScreenVisionSheet />
+      </OverlayHost>
+
+      <OverlayHost
+        open={activeOverlay === "graph"}
+        title="Knowledge Graph"
+        onClose={() => setActiveOverlay(null)}
+      >
+        <GraphSheet />
       </OverlayHost>
     </div>
   );

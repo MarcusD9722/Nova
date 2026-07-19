@@ -12,6 +12,7 @@ import {
   MemoryStick,
   Flame,
   Wand2,
+  Share2,
 } from "lucide-react";
 import { GlassButton, GlassPanel, GlowCard, NeonDivider, StatusBadge } from "../ui";
 
@@ -19,6 +20,7 @@ const NAV_ITEMS = [
   { key: "home", label: "Home", icon: House },
   { key: "chat", label: "Chat", icon: MessageSquare },
   { key: "memory", label: "Memory", icon: Brain },
+  { key: "graph", label: "Graph", icon: Share2 },
   { key: "tasks", label: "Tasks", icon: ListTodo },
   { key: "improvements", label: "Improve", icon: Wand2 },
   { key: "system", label: "System", icon: Cpu },
