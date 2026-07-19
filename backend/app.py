@@ -1182,6 +1182,16 @@ async def _startup() -> None:
         STATE.tts_prewarm_task = asyncio.create_task(_prewarm_tts())
         _bullet("XTTS prewarm scheduled")
 
+    # Phase 0.4: surface config typos/parse errors once, at boot, where
+    # they're actually visible — a misspelled NOVA_* var is otherwise
+    # silently ignored forever.
+    try:
+        from core.settings import log_environment_validation
+
+        log_environment_validation()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("config_validation_failed", error=str(e)[:200])
+
     if not _api_token():
         logger.warning(
             "api_auth_disabled",
