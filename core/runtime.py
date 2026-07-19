@@ -35,6 +35,9 @@ from core.project_builder import (
     RESUME_WORDS_RE,
     STATUS_WORDS_RE,
 )
+from core.orchestrator.agent import Agent, ToolLoopExecutor
+from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
+from core.orchestrator.model_router import ModelRouter, parse_role_map
 from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
@@ -327,6 +330,20 @@ class RuntimeManager:
 
         self._llm_sem = asyncio.Semaphore(1)
 
+        # ModelRouter (Phase 2.4): today every role resolves to this one 9B on
+        # its one GPU semaphore. NOVA_MODEL_ROLES can remap roles once a second
+        # model handle is registered — the call sites already go through here.
+        self._models = ModelRouter.single(
+            self._llm, self._llm_sem, role_map=parse_role_map(os.getenv("NOVA_MODEL_ROLES", "")),
+        )
+        # Orchestrator (Phase 2.1): the reason→act→observe loop runs here. The
+        # default chat agent reproduces the previous inline loop exactly.
+        self._tool_loop = ToolLoopExecutor(models=self._models, tool_router=router)
+        self._chat_agent = Agent(name="chat", step_budget=self._TOOL_LOOP_MAX)
+        # Deep mode (Phase 2.3): Planner + Critic bookends around the loop,
+        # opt-in only (is_deep_request), so normal chat stays one-pass fast.
+        self._deep = DeepPipeline(self._models)
+
         recent_turns = int(os.getenv("NOVA_RECENT_CHAT_TURNS", "20").strip() or "20")
         followup_window = int(os.getenv("NOVA_FOLLOWUP_WINDOW", "10").strip() or "10")
 
@@ -527,6 +544,10 @@ class RuntimeManager:
         return self._router
 
     @property
+    def models(self) -> ModelRouter:
+        return self._models
+
+    @property
     def error_log(self) -> ErrorLog:
         return self._error_log
 
@@ -712,90 +733,10 @@ class RuntimeManager:
 
     # ── Streaming chat with native function calling ─────────────────────────
 
-    # Max reason→act→observe rounds per chat turn (env-tunable).
+    # Max reason→act→observe rounds per chat turn (env-tunable). The loop
+    # itself lives in core/orchestrator/agent.py (Phase 2.1); this is the
+    # default chat agent's step budget.
     _TOOL_LOOP_MAX = int(os.getenv("NOVA_AGENT_MAX_STEPS", "6").strip() or "6")
-
-    def _tool_catalog(self) -> str:
-        # code.write stays gated behind the project builder (writes are
-        # sandboxed to projects/); the rest — including guarded shell — is
-        # available to the agent loop.
-        skip = {"code.write", "memory.rebuild_index", "project.scaffold"}
-        lines = [
-            f"- {name}: {desc}" for name, desc in self._router.describe_tools().items()
-            if name not in skip and desc
-        ]
-        return "\n".join(lines)
-
-    async def _decide_tool(self, *, user_text: str, grounding: str, tool_results: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """One reason→act decision: returns {"tool","args"} or None to respond.
-
-        Runs with native thinking enabled — the model reasons in the background
-        about what it has learned so far and what step comes next; only the
-        final JSON decision comes out (think blocks are stripped in the LLM
-        runtime).
-        """
-        results_text = ""
-        if tool_results:
-            results_text = "Observations from tools you already called this turn (in order):\n" + "\n".join(
-                f"- {r['tool']}: {'OK ' + str(r['result'])[:700] if r['ok'] else 'FAILED ' + str(r['error'])[:200]}"
-                for r in tool_results
-            )
-        prompt = (
-            "You are the agent brain for Nova, a local AI assistant. Work the user's "
-            "request step by step: decide whether you need ONE more tool call, or "
-            "whether you have enough to answer.\n\n"
-            f"Available tools:\n{self._tool_catalog()}\n\n"
-            f"Context: {grounding}\n{results_text}\n"
-            f"User message: {user_text}\n\n"
-            'Reply ONLY with JSON. Next tool call: {"action": "tool", "tool": "<name>", "args": {...}}. '
-            'Ready to answer: {"action": "respond"}.\n'
-            "Rules:\n"
-            "- Chain tools when the task needs it: e.g. web.search first, then web.fetch on the most "
-            "relevant result URL; or read a file, then act on its contents.\n"
-            "- Call tools ONLY for live/current/external data or real actions (weather, places, web, "
-            "Discord, files, shell, projects, memory). Never for general knowledge, math, opinions, or chat.\n"
-            "- project.start_build creates a brand-new project — only call it when the user clearly asks to "
-            "start/create/build something new. Questions or discussion about an existing project (even ones "
-            "asking for improvement ideas) are NOT a reason to call it; respond in chat instead, or use "
-            "project.improve only if they clearly asked you to make a change.\n"
-            "- When the user asks you to remember something, save it with memory.remember. When they ask "
-            "what you remember about a topic, check memory.recall first.\n"
-            "- To inspect or improve your OWN code, use self.read_code / self.list_code, and self.propose_change "
-            "to suggest an edit. Proposals are NOT applied automatically — Marcus reviews and approves them.\n"
-            "- Each observation above is real; trust it. Don't repeat a call that already succeeded.\n"
-            "- If a tool failed twice, stop and respond — explain what failed.\n"
-            "- When the observations already answer the user, respond."
-        )
-        async with self._llm_sem:
-            raw = await self._llm.chat(
-                [{"role": "user", "content": prompt}],
-                max_tokens=900,  # room for background reasoning + the JSON decision
-                temperature=0.1,
-                thinking=True,
-            )
-        obj = extract_first_json_object(raw or "")
-        logger.debug("tool_decision", raw=(raw or "")[:200], parsed=bool(obj))
-        if not obj:
-            return None
-
-        # Lenient parse: small models put the tool name in "action" or skip
-        # the wrapper entirely ({"tool": "web.search", ...}).
-        known = set(self._router.list_tools())
-        action = str(obj.get("action") or "").strip()
-        tool = str(obj.get("tool") or "").strip()
-        if action == "respond":
-            return None
-        if action == "tool" and tool in known:
-            pass
-        elif action in known:
-            tool = action
-        elif tool in known:
-            pass
-        else:
-            return None
-
-        args = obj.get("args") if isinstance(obj.get("args"), dict) else {}
-        return {"tool": tool, "args": args}
 
     async def chat_turn_stream(
         self,
@@ -950,28 +891,31 @@ class RuntimeManager:
             pass
         recent_chat = await self._state_store.recent_chat_text(conversation_id)
 
-        # ── Agent loop: reason → act → observe, up to NOVA_AGENT_MAX_STEPS ──
-        tool_results: list[dict[str, Any]] = []
-        failure_counts: dict[str, int] = {}
-        for _ in range(self._TOOL_LOOP_MAX):
+        # ── Deep mode (Phase 2.3): opt-in Planner → Executor → Critic ──
+        # Explicit-request only; normal chat skips all of this and stays fast.
+        deep_mode = is_deep_request(clean_user)
+        deep_plan = ""
+        loop_agent = self._chat_agent
+        if deep_mode:
+            BUS.publish("agent.stage", {"stage": "planner"})
             try:
-                decision = await self._decide_tool(user_text=clean_user, grounding=grounding, tool_results=tool_results)
+                deep_plan = await self._deep.plan(
+                    user_text=clean_user, grounding=grounding,
+                    tool_catalog=self._tool_loop.tool_catalog(self._chat_agent),
+                )
             except Exception as e:  # noqa: BLE001
-                logger.debug("tool_decider_failed", error=str(e))
-                decision = None
-            if decision is None:
-                break
+                logger.debug("deep_plan_failed", error=str(e)[:160])
+            if deep_plan:
+                loop_agent = Agent(
+                    name="chat-deep", step_budget=self._chat_agent.step_budget,
+                    extra_instructions=f"A planner drafted this plan for the task — follow it:\n{deep_plan}",
+                )
+            BUS.publish("agent.stage", {"stage": "executor"})
 
-            # Hard guard mirroring the prompt rule: a tool that failed twice is
-            # dead for this turn — force the loop to wrap up and answer.
-            if failure_counts.get(decision["tool"], 0) >= 2:
-                break
-
-            call = ToolCall(name=decision["tool"], args=decision["args"])
-            res = await self._router.execute(call, timeout_s=25.0, retries=0)
-            tool_results.append({"tool": call.name, "ok": res.ok, "result": res.result, "error": res.error})
-            if not res.ok:
-                failure_counts[call.name] = failure_counts.get(call.name, 0) + 1
+        # ── Agent loop: reason → act → observe (core/orchestrator/agent.py) ──
+        tool_results = await self._tool_loop.run(
+            agent=loop_agent, user_text=clean_user, grounding=grounding
+        )
 
         # ── Streamed final response ─────────────────────────────────────────
         tools_context = ""
@@ -1030,6 +974,47 @@ class RuntimeManager:
             {"role": "user", "content": clean_user},
         ]
 
+        # ── Deep mode reply: draft → Critic → one optional revision ──────────
+        # Not streamed (the draft may be revised); the final lands as one chunk.
+        if deep_mode:
+            reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
+            chat_model = self._models.for_role("chat")
+            async with chat_model.semaphore:
+                draft = await chat_model.runtime.chat(
+                    messages, max_tokens=reply_budget, temperature=0.4, thinking=True
+                )
+            draft = (draft or "").strip()
+            BUS.publish("agent.stage", {"stage": "critic"})
+            verdict, notes = "approve", ""
+            try:
+                verdict, notes = await self._deep.critique(
+                    user_text=clean_user, plan=deep_plan, draft=draft, tool_results=tool_results
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("deep_critique_failed", error=str(e)[:160])
+            reply = draft
+            if verdict == "revise" and notes:
+                BUS.publish("agent.stage", {"stage": "revise", "notes": notes[:160]})
+                revise_msgs = messages + [
+                    {"role": "assistant", "content": draft},
+                    {"role": "user", "content": (
+                        f"Before sending, a reviewer flagged: {notes}. Fix those issues while keeping your "
+                        "natural voice and staying honest about anything uncertain or that failed. Reply with "
+                        "ONLY the corrected message.")},
+                ]
+                async with chat_model.semaphore:
+                    revised = await chat_model.runtime.chat(
+                        revise_msgs, max_tokens=reply_budget, temperature=0.4, thinking=True
+                    )
+                if (revised or "").strip():
+                    reply = revised.strip()
+            if not reply:
+                reply = "Sorry — I came up empty on that one."
+            yield {"type": "token", "text": reply}
+            await _finish(reply, tool_results, mode="deep")
+            yield {"type": "done", "full_text": reply, "tool_calls": tool_results}
+            return
+
         # This reasoning model ignores the '/no_think' switch and reasons anyway;
         # forcing it there produces a long unclosed <think> that overflows the
         # token budget and gets stripped to nothing ("came up empty"). Instead we
@@ -1037,9 +1022,10 @@ class RuntimeManager:
         # instruction above to keep the hidden reasoning to a line or two. Proven
         # far more reliable in practice.
         reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
+        chat_model = self._models.for_role("chat")
         full: list[str] = []
-        async with self._llm_sem:
-            async for token in self._llm.chat_stream(
+        async with chat_model.semaphore:
+            async for token in chat_model.runtime.chat_stream(
                 messages, max_tokens=reply_budget, temperature=0.4, thinking=True
             ):
                 full.append(token)

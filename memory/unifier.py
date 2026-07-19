@@ -118,6 +118,8 @@ class MemoryUnifier:
             return True  # one wellbeing reading per day (attribute=date), days accumulate
         if ent == "interest_focus":
             return True  # one focus snapshot per week (attribute=week-slug), weeks accumulate
+        if ent == "self_eval":
+            return True  # one self-eval snapshot per day (attribute=date), days accumulate
         if ent == "session":
             return True  # bookkeeping facts (last_active, *_nudged_at, habit_suggested:*) — one current value each
         return False

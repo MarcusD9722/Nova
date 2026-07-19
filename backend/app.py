@@ -1263,6 +1263,7 @@ async def status() -> dict:
         },
         "integrations": _plugin_config_status(),
         "tools": tools,
+        "models": (STATE.runtime.models.describe() if STATE.runtime is not None else {}),
         "dev_mode": (os.getenv("NOVA_DEV_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}),
     }
 

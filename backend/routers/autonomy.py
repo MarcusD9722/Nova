@@ -59,6 +59,16 @@ async def autonomy_errors(limit: int = Query(50)) -> dict:
     return {"recent": recent, "recurring": recurring}
 
 
+@router.get("/autonomy/metrics")
+async def autonomy_metrics() -> dict:
+    """Live self-evaluation metrics (Phase 2.5): reply latency, tool failure
+    rate, empty replies, vision errors — today so far. Snapshotted daily into
+    a self_eval fact by the self-improve worker."""
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return STATE.runtime.self_improve.metrics()
+
+
 # ── Goals (multi-session objectives, advanced by AgentSupervisor) ────────────
 
 class GoalCreateRequest(BaseModel):

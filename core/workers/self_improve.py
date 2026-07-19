@@ -20,6 +20,7 @@ Safety (do not weaken):
 """
 
 import asyncio
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from core.error_log import ErrorLog, error_message, is_error_event
 from core.event_bus import BUS, clip
 from core.llm_runtime import LLMRuntime
 from core.logging_setup import get_logger
+from core.orchestrator.metrics import MetricsCollector
 from core.policy._json_extract import extract_first_json_object
 from memory.unifier import MemoryUnifier
 
@@ -72,6 +74,8 @@ class SelfImproveWorker:
         self._bus_q = None
         self._handled_sigs: set[str] = set()
         self._last_reflect_turn = 0
+        self._metrics = MetricsCollector()  # Phase 2.5: fed in the capture loop
+        self._last_eval_day = ""
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -109,6 +113,10 @@ class SelfImproveWorker:
             "dev_mode": dev_mode_enabled(),
         }
 
+    def metrics(self) -> dict:
+        """Live self-eval snapshot for /autonomy/metrics (Phase 2.5)."""
+        return self._metrics.snapshot()
+
     # ── capture loop ─────────────────────────────────────────────────────────
 
     async def _capture_loop(self) -> None:
@@ -125,6 +133,9 @@ class SelfImproveWorker:
             try:
                 etype = getattr(event, "type", "")
                 data = getattr(event, "data", {}) or {}
+                # Phase 2.5: feed self-eval metrics (latency, tool failures,
+                # empty replies) — observes chat.*/tool.*/vision.* only.
+                self._metrics.observe(etype, getattr(event, "ts", ""), data)
                 # Don't log our own autonomy chatter as errors.
                 if etype.startswith("autonomy.") or etype.startswith("dev."):
                     continue
@@ -183,6 +194,22 @@ class SelfImproveWorker:
             await self._memory.consolidate_lessons()
         except Exception as e:  # noqa: BLE001
             logger.debug("lesson_consolidation_failed", error=str(e)[:160])
+
+        # 4) Self-eval (Phase 2.5) — once per UTC day, snapshot the metrics
+        # into a durable fact and announce it on the bus.
+        try:
+            snap = self._metrics.snapshot()
+            if snap["day"] != self._last_eval_day and snap["turns"] > 0:
+                self._last_eval_day = snap["day"]
+                await self._memory.add_fact(
+                    entity="self_eval", attribute=snap["day"], value=json.dumps(snap), confidence=1.0
+                )
+                BUS.publish("autonomy.self_eval", {"day": snap["day"], "turns": snap["turns"],
+                            "tool_failure_rate": snap["tool_failure_rate"],
+                            "avg_latency_s": snap["reply_latency_s"]["avg"]})
+                logger.info("self_eval_recorded", day=snap["day"], turns=snap["turns"])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("self_eval_failed", error=str(e)[:160])
 
     # ── self-correction (error -> diagnose -> propose) ───────────────────────
 

@@ -68,6 +68,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_MODEL_DIR", "path", "", "Model directory override (default: model/)."),
         _s("NOVA_MMPROJ_PATH", "path", "", "Explicit mmproj GGUF for vision (empty = auto-detect)."),
         _s("NOVA_CHAT_FORMAT", "str", "", "llama-cpp chat format override."),
+        _s("NOVA_MODEL_ROLES", "str", "", "Role→model remap once a second model handle exists, e.g. 'coder=secondary'. Empty = every role on the primary model."),
         _s("NOVA_CONTEXT_TOKENS", "int", "8192", "Model context window."),
         _s("NOVA_MAX_TOKENS", "int", "1536", "Default reply token budget."),
         _s("NOVA_MAIN_GPU", "int", "0", "CUDA device index for the LLM."),
