@@ -96,6 +96,31 @@ async def memory_lessons(limit: int = Query(50)) -> dict:
     return {"lessons": await STATE.memory.lesson_records(limit=int(limit))}
 
 
+# ── Knowledge graph (Phase 1.1) ──────────────────────────────────────────────
+
+@router.get("/memory/graph")
+async def memory_graph(key: str = Query(min_length=1), limit: int = Query(20, ge=1, le=100)) -> dict:
+    """Graph neighbors for one key — powers memory.related and the future
+    graph UI panel."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return await STATE.memory.related(key, limit=int(limit))
+
+
+@router.get("/memory/graph/stats")
+async def memory_graph_stats() -> dict:
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return await STATE.memory.graph.stats()
+
+
+@router.get("/memory/timeline")
+async def memory_timeline(about: str | None = Query(None), days: int = Query(14, ge=1, le=120)) -> dict:
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return {"entries": await STATE.memory.timeline(about=about, days=days)}
+
+
 # ── Reminders / scheduling (real "remind me at 5pm", proactive check-ins) ────
 
 class ReminderCreateRequest(BaseModel):
