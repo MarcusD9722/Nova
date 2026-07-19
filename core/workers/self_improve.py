@@ -177,6 +177,13 @@ class SelfImproveWorker:
         # 2) Reflection — distill lessons from recent conversation.
         await self._reflect()
 
+        # 3) Consolidation (Phase 1.4) — merge near-duplicate lessons the
+        # reflection pass keeps re-learning. Deterministic, no LLM call.
+        try:
+            await self._memory.consolidate_lessons()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lesson_consolidation_failed", error=str(e)[:160])
+
     # ── self-correction (error -> diagnose -> propose) ───────────────────────
 
     async def _self_correct(self, err: dict) -> bool:

@@ -55,7 +55,8 @@ class SQLiteMemoryBackend:
                         attribute TEXT NOT NULL,
                         value TEXT NOT NULL,
                         confidence REAL NOT NULL,
-                        created_at TEXT NOT NULL
+                        created_at TEXT NOT NULL,
+                        last_reinforced_at TEXT
                     );
                     """
                 )
@@ -125,6 +126,32 @@ class SQLiteMemoryBackend:
                     );
                     '''
                 )
+
+                # --- Knowledge graph (Phase 1.1): typed edges between the things
+                # Nova already stores (people, projects, facts, events, documents).
+                # Re-observing the same edge reinforces it (weight/confidence up)
+                # instead of duplicating. ---
+                await db.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS edges (
+                        id TEXT PRIMARY KEY,
+                        src_kind TEXT NOT NULL,
+                        src_key TEXT NOT NULL,
+                        predicate TEXT NOT NULL,
+                        dst_kind TEXT NOT NULL,
+                        dst_key TEXT NOT NULL,
+                        weight REAL NOT NULL DEFAULT 1.0,
+                        confidence REAL NOT NULL DEFAULT 0.6,
+                        created_at TEXT NOT NULL,
+                        last_reinforced_at TEXT NOT NULL
+                    );
+                    '''
+                )
+                await db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_edges_triple ON edges(src_kind, src_key, predicate, dst_kind, dst_key);"
+                )
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_kind, src_key);")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_kind, dst_key);")
 
                 # --- Habit & pattern learning (HP1): lightweight tool-call history ---
                 await db.execute(
@@ -324,6 +351,28 @@ class SQLiteMemoryBackend:
 
     _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         (1, "baseline: full schema as of Phase 0 (2026-07-18)", []),
+        (
+            2,
+            "Phase 1.1/1.3: knowledge-graph edges table + facts.last_reinforced_at",
+            [
+                """CREATE TABLE IF NOT EXISTS edges (
+                    id TEXT PRIMARY KEY,
+                    src_kind TEXT NOT NULL,
+                    src_key TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    dst_kind TEXT NOT NULL,
+                    dst_key TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    confidence REAL NOT NULL DEFAULT 0.6,
+                    created_at TEXT NOT NULL,
+                    last_reinforced_at TEXT NOT NULL
+                );""",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_edges_triple ON edges(src_kind, src_key, predicate, dst_kind, dst_key);",
+                "CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_kind, src_key);",
+                "CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_kind, dst_key);",
+                "ALTER TABLE facts ADD COLUMN last_reinforced_at TEXT;",
+            ],
+        ),
     ]
 
     async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
@@ -693,11 +742,23 @@ class SQLiteMemoryBackend:
         async with aiosqlite.connect(self._db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT id, entity, attribute, value, confidence, created_at FROM facts WHERE entity LIKE ? OR attribute LIKE ? OR value LIKE ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT id, entity, attribute, value, confidence, created_at, last_reinforced_at FROM facts "
+                "WHERE entity LIKE ? OR attribute LIKE ? OR value LIKE ? ORDER BY created_at DESC LIMIT ?",
                 (like, like, like, int(limit)),
             ) as cur:
                 rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def reinforce_fact(self, fact_id: str) -> None:
+        """Re-mention of an existing fact: touch last_reinforced_at and nudge
+        confidence toward (but never past) 0.95 — Phase 1.3."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "UPDATE facts SET last_reinforced_at=?, confidence=MIN(0.95, confidence + 0.05) WHERE id=?",
+                (self._now_iso(), fact_id),
+            )
+            await db.commit()
 
     async def get_person_by_name(self, name: str) -> dict[str, Any] | None:
         await self.initialize()

@@ -18,6 +18,7 @@ from memory.backends.chroma_backend import ChromaMemoryBackend
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.backends.json_backend import JsonAuditBackend
 from memory.backends.sqlite_backend import SQLiteMemoryBackend
+from memory.graph import GraphStore, build_timeline, extract_turn_edges, fact_edge, person_relation_edge
 from memory.schemas import FactRecord, MemoryHit
 
 
@@ -41,6 +42,30 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _staleness_factor(created_at: Any, last_reinforced_at: Any, half_life_days: float = 90.0) -> float:
+    """Recency multiplier in [0.85, 1.0] (Phase 1.3). Uses the NEWER of
+    created/reinforced timestamps, so a re-mentioned memory stays fresh.
+    Deliberately gentle: decay re-ranks, it never buries or deletes."""
+    import math
+
+    newest = None
+    for raw in (last_reinforced_at, created_at):
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if newest is None or dt > newest:
+            newest = dt
+    if newest is None:
+        return 1.0
+    age_days = max(0.0, (_now() - newest).total_seconds() / 86400.0)
+    return 0.85 + 0.15 * math.exp(-age_days / half_life_days)
+
+
 class MemoryUnifier:
     # Attributes that hold exactly ONE current value: a new write supersedes
     # (deletes) older rows instead of accumulating contradictory facts that
@@ -61,6 +86,13 @@ class MemoryUnifier:
         # Bumped on every long-term write/delete; part of the search cache key
         # so fresh facts are recallable immediately instead of after the TTL.
         self._search_gen = 0
+        # Knowledge graph (Phase 1.1) — same SQLite file, own table.
+        self._graph = GraphStore(memory_dir / "sqlite" / "nova.sqlite3")
+        self._known_names_cache: tuple[float, list[str]] | None = None
+
+    @property
+    def graph(self) -> GraphStore:
+        return self._graph
 
     def _is_singleton_fact(self, entity: str, attribute: str) -> bool:
         ent = (entity or "").strip().lower()
@@ -261,7 +293,65 @@ class MemoryUnifier:
         if index_turn:
             self._search_gen += 1
         BUS.publish("memory.write", {"kind": "turn", "role": role, "source": "conversation"})
+
+        # Phase 1.1: observe co-mentions in this turn as graph edges (people
+        # mentioned together; people tied to the active project). Cheap and
+        # deterministic; failures never block ingest.
+        try:
+            known = await self.known_person_names()
+            active_project = None
+            try:
+                lp = await self.get_latest_fact(entity="projects", attribute="last_active")
+                active_project = lp.value.strip() if lp and lp.value else None
+            except Exception:
+                pass
+            for edge in extract_turn_edges(content, known, active_project):
+                await self._graph.upsert_edge(edge)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("graph_turn_extract_failed", error=str(e)[:160])
+
         return turn_id
+
+    async def known_person_names(self) -> list[str]:
+        """Names Nova knows as people: the people table plus family/friend
+        fact values. Cached briefly — called on every ingested turn."""
+        import time as _time
+
+        cached = self._known_names_cache
+        if cached and (_time.monotonic() - cached[0]) < 60:
+            return cached[1]
+        names: set[str] = set()
+        try:
+            for row in await self._sqlite.all_people(limit=None):
+                n = str(row.get("name") or "").strip()
+                if n:
+                    names.add(n)
+        except Exception:
+            pass
+        try:
+            for attr in ("child", "spouse", "mother", "father", "sibling", "cousin", "friend", "pet"):
+                for rec in await self.get_facts(entity="user", attribute=attr, limit=30, newest_first=False):
+                    n = (rec.value or "").split("|", 1)[0].strip()
+                    # Guard against junk values (past extraction bugs stored
+                    # sentences as child names); real names are short.
+                    if n and len(n) <= 32 and len(n.split()) <= 3:
+                        names.add(n)
+        except Exception:
+            pass
+        result = sorted(names)
+        self._known_names_cache = (_time.monotonic(), result)
+        return result
+
+    async def related(self, key: str, *, limit: int = 20) -> dict[str, Any]:
+        """Graph neighbors (1- and 2-hop) for a person/project/topic key."""
+        await self.initialize()
+        return await self._graph.related(key, limit=limit)
+
+    async def timeline(self, *, about: str | None = None, days: int = 14, limit: int = 40) -> list[dict[str, Any]]:
+        """Time-ordered view of what happened (events, digests, reminders,
+        new facts), optionally filtered to one person/project/topic."""
+        await self.initialize()
+        return await build_timeline(self._sqlite, about=about, days=days, limit=limit)
 
     async def add_fact(self, entity: str, attribute: str, value: str, confidence: float = 0.7) -> UUID:
 
@@ -309,6 +399,14 @@ class MemoryUnifier:
                 try:
                     dupes = await self._fact_ids_for(entity, attribute, str(value))
                     if dupes:
+                        # Phase 1.3: a re-mention is signal, not noise — touch
+                        # last_reinforced_at and nudge confidence so this fact
+                        # resists decay, instead of silently dropping the write.
+                        try:
+                            await self._sqlite.reinforce_fact(dupes[0])
+                            self._search_gen += 1
+                        except Exception:
+                            pass
                         return UUID(dupes[0])  # already stored; nothing to write
                 except Exception:
                     pass
@@ -354,6 +452,16 @@ class MemoryUnifier:
             {"kind": "fact", "entity": entity, "attribute": attribute, "value": clip(value, 120), "source": "long_term",
              "superseded": len(stale_ids)},
         )
+
+        # Phase 1.1: a relationship-shaped fact also becomes a graph edge
+        # (user.child=Liam -> Liam child_of user). Best-effort, never blocks.
+        try:
+            edge = fact_edge(entity, attribute, str(value))
+            if edge is not None:
+                await self._graph.upsert_edge(edge, confidence=min(0.9, confidence))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("graph_fact_edge_failed", error=str(e)[:160])
+
         return fact_id
 
     async def upsert_person(self, name: str, attributes: dict[str, str]) -> UUID:
@@ -402,6 +510,15 @@ class MemoryUnifier:
 
         self._search_gen += 1
         BUS.publish("memory.write", {"kind": "person", "name": clip(name, 80), "source": "long_term"})
+
+        # Phase 1.1: a stored relation ("son", "coworker") becomes a graph edge.
+        try:
+            edge = person_relation_edge(name, merged)
+            if edge is not None:
+                await self._graph.upsert_edge(edge, confidence=0.8)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("graph_person_edge_failed", error=str(e)[:160])
+
         return person_id
 
     # Attribute keys treated as an important recurring date (birthdays,
@@ -637,6 +754,59 @@ class MemoryUnifier:
             {"id": str(r.id), "topic": r.attribute, "text": r.value, "created_at": r.created_at.isoformat()}
             for r in rows
         ]
+
+    async def consolidate_lessons(self, *, similarity: float = 0.87) -> int:
+        """Merge near-duplicate lessons (Phase 1.4). The reflection loop keeps
+        re-learning variations of the same instruction ("don't start new
+        projects when debugging" × 8); collapse each cluster to its newest
+        phrasing, deterministically — no LLM call. Returns lessons removed."""
+        import difflib
+
+        rows = await self.get_facts(entity=LESSON_ENTITY, limit=300, newest_first=True)
+        kept: list[tuple[str, str]] = []  # (normalized full text, lead clause), newest first
+        to_delete: list[str] = []         # exact values to purge
+
+        def _norm(s: str) -> str:
+            # Lowercase, strip punctuation, and crudely singularize so
+            # "projects/ones" vs "project/one" phrasings compare equal.
+            s = re.sub(r"[^a-z0-9 ]+", "", (s or "").lower()).strip()
+            return " ".join(w.rstrip("s") if len(w) > 3 else w for w in s.split())
+
+        def _lead(n: str) -> str:
+            # The reflection loop's duplicates share an opening clause and
+            # differ in tacked-on tails ("...; fix the current issue"), which
+            # sinks whole-string similarity — compare the lead too. Thresholds
+            # tuned against the real duplicate corpus: within-cluster lead
+            # ratios run 0.75-1.0, distinct lessons max at ~0.51.
+            return " ".join(n.split()[:8])
+
+        for rec in rows:  # newest first, so the first of each cluster survives
+            text = (rec.value or "").strip()
+            if not text:
+                continue
+            n = _norm(text)
+            lead = _lead(n)
+            dup = any(
+                difflib.SequenceMatcher(None, n, k_full).ratio() >= similarity
+                or difflib.SequenceMatcher(None, lead, k_lead).ratio() >= 0.72
+                for k_full, k_lead in kept
+            )
+            if dup:
+                to_delete.append(text)
+            else:
+                kept.append((n, lead))
+
+        if not to_delete:
+            return 0
+        result = await self.purge_facts(
+            entity=LESSON_ENTITY, attribute=None, value_in=to_delete, value_ilike=None,
+            dry_run=False, limit=len(to_delete) + 10,
+        )
+        removed = int(result.get("deleted") or 0)
+        if removed:
+            logger.info("lessons_consolidated", removed=removed, kept=len(kept))
+            BUS.publish("memory.lessons_consolidated", {"removed": removed, "kept": len(kept)})
+        return removed
 
     # --- Mood tracking (M1: emotional presence) ------------------------------
 
@@ -1204,15 +1374,23 @@ class MemoryUnifier:
                     )
                 )
 
-        # Facts (highest priority for identity and stable attributes)
+        # Facts (highest priority for identity and stable attributes).
+        # Phase 1.3: free-form notes decay gently with staleness (floor 0.85×,
+        # never deleted); a re-mention refreshes them via last_reinforced_at.
+        # Identity facts (user.*), lessons, and project state stay undecayed —
+        # being old doesn't make your name less true, and sinking them would
+        # falsely trip the low-confidence hedge (CH1).
         for row in fact_rows:
             text = f"FACT {row['entity']} {row['attribute']} = {row['value']}"
+            base = 0.95
+            if str(row.get("entity") or "").strip().lower() == "note":
+                base *= _staleness_factor(row.get("created_at"), row.get("last_reinforced_at"))
             hits.append(
                 MemoryHit(
                     id=row["id"],
                     kind="fact",
                     text=text,
-                    score=0.95,
+                    score=base,
                     provenance={"backend": "sqlite", "table": "facts"},
                 )
             )
@@ -1230,7 +1408,8 @@ class MemoryUnifier:
                 )
             )
 
-        # Events
+        # Events (decay with age like notes — an event from months ago is
+        # still recallable, just outranked by fresher context)
         for row in event_rows:
             text = f"EVENT {row['date']}: {row['note']}"
             hits.append(
@@ -1238,7 +1417,7 @@ class MemoryUnifier:
                     id=row["id"],
                     kind="event",
                     text=text,
-                    score=0.60,
+                    score=0.60 * _staleness_factor(row.get("created_at"), None),
                     provenance={"backend": "sqlite", "table": "events"},
                 )
             )

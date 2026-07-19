@@ -143,6 +143,27 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": False, "error": "not_found", "name": name}
         return {"ok": True, **person}
 
+    async def _memory_related(args: dict[str, Any]) -> dict[str, Any]:
+        key = str(args.get("name") or args.get("key") or args.get("topic") or "").strip()
+        if not key:
+            return {"ok": False, "error": "missing_name"}
+        result = await memory.related(key)
+        if not result["neighbors"] and not result["two_hop"]:
+            return {"ok": False, "error": "no_connections_recorded", "key": key,
+                    "note": "Nothing linked to this in the knowledge graph yet — connections build up as things get mentioned together."}
+        return {"ok": True, **result}
+
+    async def _memory_timeline(args: dict[str, Any]) -> dict[str, Any]:
+        about = str(args.get("about") or args.get("topic") or "").strip() or None
+        try:
+            days = max(1, min(int(args.get("days") or 14), 120))
+        except (TypeError, ValueError):
+            days = 14
+        entries = await memory.timeline(about=about, days=days)
+        if not entries:
+            return {"ok": True, "entries": [], "note": f"Nothing recorded in the last {days} day(s)" + (f" about '{about}'" if about else "") + "."}
+        return {"ok": True, "days": days, "about": about, "entries": entries}
+
     _INDEX_SKIP_DIR_NAMES = {
         "__pycache__", "node_modules", ".git", ".venv", "venv",
         "$recycle.bin", "system volume information",
@@ -449,6 +470,8 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.remember_person": _memory_remember_person,
         "memory.remember_event": _memory_remember_event,
         "memory.recall_person": _memory_recall_person,
+        "memory.related": _memory_related,
+        "memory.timeline": _memory_timeline,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
         "memory.index_folder": _memory_index_folder,
@@ -478,6 +501,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.recall_person": ("Look up everything remembered about a specific person by name — attributes, "
                                   "when they were last mentioned, and any upcoming birthdays/anniversaries. "
                                   "args: {name}"),
+        "memory.related": ("How a person/project/topic connects to everything else Nova knows (knowledge-graph "
+                            "neighbors, direct and one step out). Use for 'how is X connected to Y' or 'what do "
+                            "you associate with X'. args: {name}"),
+        "memory.timeline": ("Time-ordered view of what actually happened — events, conversation digests, fired "
+                             "reminders, new facts — optionally about one person/project/topic. Use for 'what "
+                             "happened this week' / 'catch me up on X'. args: {about?, days?}"),
         "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
                                  "('where's that PDF about the mortgage', 'photos from the beach trip'). "
                                  "args: {path, max_files?}. Skips files already indexed and unchanged."),
