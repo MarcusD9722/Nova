@@ -160,9 +160,58 @@ async def _async_checks():
           "allowlist filters the tool catalog")
 
 
+# ── Self-eval metrics (2.5) ───────────────────────────────────────────────────
+
+def _metrics_checks():
+    from core.orchestrator.metrics import MetricsCollector
+
+    m = MetricsCollector()
+    # a normal turn with a success + a failure, then an empty-reply turn
+    m.observe("chat.thinking_start", "2026-07-19T10:00:00+00:00", {})
+    m.observe("tool.result", "2026-07-19T10:00:02+00:00", {"tool": "weather.current", "ok": True})
+    m.observe("tool.error", "2026-07-19T10:00:03+00:00", {"tool": "x", "error": "boom"})
+    m.observe("chat.assistant_done", "2026-07-19T10:00:05+00:00", {"chars": 120, "tools_used": 2})
+    m.observe("chat.thinking_start", "2026-07-19T10:01:00+00:00", {})
+    m.observe("chat.assistant_done", "2026-07-19T10:01:01+00:00", {"chars": 0, "tools_used": 0})
+    s = m.snapshot()
+    check(s["turns"] == 2, "counts turns")
+    check(s["empty_replies"] == 1, "counts empty replies")
+    check(s["reply_latency_s"]["count"] == 2 and s["reply_latency_s"]["avg"] == 3.0, "computes reply latency")
+    check(s["tool_calls"] == 2 and s["tool_failures"] == 1 and s["tool_failure_rate"] == 0.5, "tool failure rate")
+    check(s["avg_tools_per_turn"] == 1.0, "avg tools per turn")
+
+    # tool.result ok=False also counts as a failure
+    m2 = MetricsCollector()
+    m2.observe("tool.result", "2026-07-19T10:00:00+00:00", {"tool": "y", "ok": False})
+    check(m2.snapshot()["tool_failures"] == 1, "tool.result ok=False counts as failure")
+
+    # vision errors
+    m2.observe("vision.error", "2026-07-19T10:00:00+00:00", {"error": "x"})
+    check(m2.snapshot()["vision_errors"] == 1, "counts vision errors")
+
+    # UTC-day rollover resets the day's counters
+    m3 = MetricsCollector()
+    m3.observe("chat.thinking_start", "2026-07-19T23:59:00+00:00", {})
+    m3.observe("chat.assistant_done", "2026-07-19T23:59:01+00:00", {"chars": 5})
+    m3.observe("chat.assistant_done", "2026-07-20T00:01:00+00:00", {"chars": 5})
+    s3 = m3.snapshot()
+    check(s3["day"] == "2026-07-20" and s3["turns"] == 1, "day rollover resets counters")
+
+    # p95 sanity: 100 fast + 1 slow -> p95 stays low-ish, max catches the spike
+    m4 = MetricsCollector()
+    for i in range(100):
+        m4.observe("chat.thinking_start", "2026-07-19T10:00:00+00:00", {})
+        m4.observe("chat.assistant_done", "2026-07-19T10:00:01+00:00", {"chars": 5})
+    m4.observe("chat.thinking_start", "2026-07-19T10:00:00+00:00", {})
+    m4.observe("chat.assistant_done", "2026-07-19T10:00:30+00:00", {"chars": 5})
+    s4 = m4.snapshot()
+    check(s4["reply_latency_s"]["p95"] <= 5 and s4["reply_latency_s"]["max"] == 30.0, "p95 robust to one spike; max catches it")
+
+
 def main():
     _router_checks()
     asyncio.run(_async_checks())
+    _metrics_checks()
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)
 
