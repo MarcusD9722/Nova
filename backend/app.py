@@ -45,7 +45,7 @@ from core.runtime import RuntimeManager
 from core.tooling import build_tool_router
 from memory.unifier import MemoryUnifier
 from core.brain import Brain
-from plugins.registry import PluginConfigError, REGISTRY
+from plugins.registry import PluginConfigError
 
 try:
     from dotenv import load_dotenv as _load_dotenv
@@ -134,24 +134,6 @@ def _compose_chat_message(cfg: "RuntimeConfig", message: str | None, attachments
     return f"{clean_message}\n\nAttached file context:\n{attachment_context}"
 
 
-
-class MemoryPurgeRequest(BaseModel):
-    entity: str = Field(..., description="Fact entity (e.g. 'user').")
-    attribute: str | None = Field(None, description="Optional attribute filter (e.g. 'child').")
-    value_in: list[str] | None = Field(None, description="Delete values whose LOWER(value) is in this list.")
-    value_ilike: str | None = Field(None, description="Delete values whose LOWER(value) matches LIKE '%value_ilike%'.")
-    dry_run: bool = Field(True, description="If true, return matches without deleting.")
-    limit: int = Field(5000, ge=1, le=20000, description="Max facts to match/delete in one call.")
-
-class MemoryPurgeResponse(BaseModel):
-    entity: str
-    attribute: str | None
-    value_in: list[str] | None
-    value_ilike: str | None
-    dry_run: bool
-    matched: int
-    deleted: int
-    ids: list[str]
 
 
 def _repo_root_from_this_file() -> Path:
@@ -292,10 +274,6 @@ class ChatRequest(BaseModel):
     attachments: list[UploadedAttachment] = Field(default_factory=list)
 
 
-class PluginExecuteRequest(BaseModel):
-    name: str
-    args: dict[str, Any] = Field(default_factory=dict)
-
 
 class TtsRequest(BaseModel):
     text: str = Field(min_length=1)
@@ -395,30 +373,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Routers (Phase 0.6): domain endpoints live in backend/routers/ ───────────
+from backend.routers import autonomy as _r_autonomy  # noqa: E402
+from backend.routers import dev as _r_dev  # noqa: E402
+from backend.routers import memory_api as _r_memory  # noqa: E402
+from backend.routers import web_maps as _r_web_maps  # noqa: E402
 
-class _State:
-    config: RuntimeConfig | None = None
-    memory: MemoryUnifier | None = None
-    llm: LLMRuntime | None = None
-    brain: Brain | None = None
-    runtime: RuntimeManager | None = None
-    tts = None
-    stt = None
-    tts_cache: dict[str, bytes] = {}  # bounded to _TTS_CACHE_MAX most-recent clips
-    tts_device: str | None = None
-    tts_load_task: asyncio.Task | None = None
-    tts_prewarm_task: asyncio.Task | None = None
-    tts_voice_cache: dict[str, str] = {}
-    tts_voice_tasks: dict[str, asyncio.Task[str]] = {}
-    tts_voice_cache_dir: Path | None = None
-    tts_phrase_cache: dict[str, bytes] = {}
-    dev_mode = None  # lazily created DevMode instance (see core/dev_mode.py)
+app.include_router(_r_dev.router)
+app.include_router(_r_autonomy.router)
+app.include_router(_r_memory.router)
+app.include_router(_r_web_maps.router)
 
 
-# Max number of recent TTS clips to retain in memory (see tts_worker eviction).
-_TTS_CACHE_MAX = int(os.getenv("NOVA_TTS_CACHE_MAX", "64").strip() or "64")
-
-STATE = _State()
+from backend.state import STATE, _TTS_CACHE_MAX  # Phase 0.6: shared state lives in backend/state.py
 
 
 def _xtts_gpu_required_message() -> str:
@@ -443,13 +410,6 @@ def _require_model_present() -> None:
             ),
         )
 
-
-def _require_admin_token(token: str | None) -> None:
-    expected = os.getenv("NOVA_ADMIN_TOKEN", "").strip()
-    if not expected:
-        return
-    if (token or "").strip() != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def _ffmpeg_executable() -> str:
@@ -1330,23 +1290,6 @@ async def ws_events(ws: WebSocket) -> None:
         BUS.unsubscribe(queue)
 
 
-@app.get("/tasks")
-async def tasks_list(status_filter: str | None = Query(None, alias="status"), limit: int = Query(50, ge=1, le=200)) -> dict:
-    """List background autonomy tasks for the Tasks panel."""
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    items = await STATE.memory.list_tasks(status=status_filter, limit=limit)
-    return {"tasks": items}
-
-
-@app.get("/memory/recent")
-async def memory_recent(limit: int = Query(50, ge=1, le=200)) -> dict:
-    """Recent long-term memory records for the Memory panel."""
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    items = await STATE.memory.recent_memory(limit=limit)
-    return {"items": items}
-
 
 @app.post("/chat")
 async def chat(req: ChatRequest) -> dict:
@@ -1610,127 +1553,6 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@app.get("/memory/search")
-async def memory_search(q: str = Query(min_length=1)) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    hits = await STATE.memory.search(q=q, conversation_id=None, limit=12)
-    return {"q": q, "results": [h.model_dump() for h in hits]}
-
-
-
-@app.post("/memory/purge", response_model=MemoryPurgeResponse)
-async def memory_purge(req: MemoryPurgeRequest, admin_token: str | None = Query(None, alias="admin_token")) -> MemoryPurgeResponse:
-    """Maintenance endpoint to purge bad/legacy facts from memory stores.
-
-    If env NOVA_ADMIN_TOKEN is set, caller must provide ?admin_token=... .
-    """
-    _require_admin_token(admin_token)
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Memory not initialized")
-    result = await STATE.memory.purge_facts(
-        entity=req.entity,
-        attribute=req.attribute,
-        value_in=req.value_in,
-        value_ilike=req.value_ilike,
-        dry_run=req.dry_run,
-        limit=req.limit,
-    )
-    return MemoryPurgeResponse(**result)
-
-
-
-@app.post("/plugins/execute")
-async def plugins_execute(req: PluginExecuteRequest) -> dict:
-    tools = REGISTRY.get_tools()
-    if req.name not in tools:
-        raise HTTPException(status_code=404, detail=f"Unknown tool: {req.name}")
-    try:
-        result = await tools[req.name].fn(req.args)
-        return {"name": req.name, "ok": True, "result": result}
-    except PluginConfigError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:  # noqa: BLE001
-        logger.error("plugin_execute_failed", tool=req.name, error=str(e))
-        raise HTTPException(status_code=500, detail="plugin_execute_failed") from e
-
-
-# ── Web search / fetch endpoints ─────────────────────────────────────────────
-
-@app.get("/api/web/search")
-async def api_web_search(q: str, max_results: int = 8) -> dict:
-    """Proxy DuckDuckGo search for the frontend WebSheet widget."""
-    from plugins.web_search import web_search as _web_search  # noqa: WPS433
-    try:
-        BUS.publish("web.search_start", {"query": _event_clip(q, 120)})
-        result = await _web_search({"query": q, "max_results": max_results})
-        BUS.publish("web.search_done", {"results": len(result.get("results", []) or [])})
-        return result
-    except Exception as e:  # noqa: BLE001
-        BUS.publish("web.search_error", {"error": _event_clip(e, 200)})
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/web/fetch")
-async def api_web_fetch(url: str, max_chars: int = 8000) -> dict:
-    """Fetch and strip a web page for the frontend WebSheet widget."""
-    from plugins.web_search import web_fetch as _web_fetch  # noqa: WPS433
-    try:
-        BUS.publish("web.fetch_start", {"url": _event_clip(url, 200)})
-        result = await _web_fetch({"url": url, "max_chars": max_chars})
-        BUS.publish("web.fetch_done", {})
-        return result
-    except Exception as e:  # noqa: BLE001
-        BUS.publish("web.fetch_error", {"error": _event_clip(e, 200)})
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-# ── Maps endpoints ───────────────────────────────────────────────────────────
-
-@app.get("/api/maps/directions")
-async def api_maps_directions(origin: str, destination: str, mode: str = "driving") -> dict:
-    """Get directions + embed_url for the frontend MapsSheet widget."""
-    from plugins.google_maps import directions as _directions  # noqa: WPS433
-    try:
-        return await _directions({"origin": origin, "destination": destination, "mode": mode})
-    except PluginConfigError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/maps/geocode")
-async def api_maps_geocode(address: str) -> dict:
-    """Resolve a typed location/address into coordinates for the frontend MapsSheet widget."""
-    from plugins.google_maps import geocode as _geocode  # noqa: WPS433
-    try:
-        return await _geocode({"address": address})
-    except PluginConfigError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/maps/nearby")
-async def api_maps_nearby(query: str, lat: float, lng: float, limit: int = 6) -> dict:
-    """Find nearby places around the user's current location for the frontend MapsSheet widget."""
-    from plugins.google_maps import places_nearby as _places_nearby  # noqa: WPS433
-    try:
-        return await _places_nearby({"query": query, "lat": lat, "lng": lng, "limit": limit})
-    except PluginConfigError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/maps/key")
-async def api_maps_key() -> dict:
-    """Return the Google Maps API key so the frontend can render the embed."""
-    key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
-    if not key:
-        raise HTTPException(status_code=400, detail="GOOGLE_MAPS_API_KEY not set")
-    return {"key": key}
-
 
 
 async def tts(req: TtsRequest) -> Response:
@@ -1811,313 +1633,3 @@ async def upload_get(stored_name: str) -> FileResponse:
     if path is None:
         raise HTTPException(status_code=404, detail="Upload not found")
     return FileResponse(path)
-
-
-# ── Developer mode (guarded self-inspection; see core/dev_mode.py) ───────────
-
-class DevInspectRequest(BaseModel):
-    path: str
-    project: str = ""  # registered external project name; "" = Nova's own code
-
-
-class DevProposeRequest(BaseModel):
-    path: str
-    new_content: str
-    reason: str = ""
-    project: str = ""  # registered external project name; "" = Nova's own code
-
-
-class DevApplyRequest(BaseModel):
-    proposal_id: str
-    confirm: bool = False
-
-
-class DevRollbackRequest(BaseModel):
-    proposal_id: str
-
-
-def _dev_mode() -> "DevMode":
-    from core.dev_mode import DevMode, dev_mode_enabled
-
-    cfg = STATE.config
-    if cfg is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    if not dev_mode_enabled():
-        raise HTTPException(status_code=403, detail="Developer mode is disabled (set NOVA_DEV_MODE=1 in .env).")
-    # Prefer the shared instance the tool router built, so proposals Nova files
-    # via self.propose_change and proposals managed through these endpoints are
-    # the same store. Fall back to a lazily-created instance if unavailable.
-    shared = getattr(getattr(STATE.runtime, "router", None), "dev_mode", None) if STATE.runtime is not None else None
-    if shared is not None:
-        STATE.dev_mode = shared
-        return shared
-    if getattr(STATE, "dev_mode", None) is None:
-        STATE.dev_mode = DevMode(repo_root=cfg.repo_root, projects_dir=cfg.projects_dir)
-    return STATE.dev_mode
-
-
-@app.get("/dev/status")
-async def dev_status() -> dict:
-    from core.dev_mode import dev_mode_enabled
-
-    enabled = dev_mode_enabled()
-    pending = 0
-    if enabled and getattr(STATE, "dev_mode", None) is not None:
-        pending = sum(1 for p in STATE.dev_mode.list_proposals() if p.get("status") == "pending")
-    return {"enabled": enabled, "pending_proposals": pending}
-
-
-@app.post("/dev/inspect")
-async def dev_inspect(req: DevInspectRequest) -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return dev.read_file(req.path, project=req.project)
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.post("/dev/propose")
-async def dev_propose(req: DevProposeRequest) -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        proposal = dev.propose_change(req.path, req.new_content, reason=req.reason, project=req.project)
-        return {"proposal_id": proposal.id, "path": proposal.path, "diff": proposal.diff, "status": proposal.status}
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.get("/dev/proposals")
-async def dev_proposals() -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return {"proposals": dev.list_proposals()}
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.get("/dev/proposals/{proposal_id}")
-async def dev_proposal_detail(proposal_id: str) -> dict:
-    """Full detail (old_content + new_content) for the diff viewer — the list
-    endpoint stays lightweight."""
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return dev.get_proposal(proposal_id)
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.get("/dev/projects")
-async def dev_projects() -> dict:
-    """Registered external project roots (guarded editing beyond Nova's repo)."""
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return {"projects": dev.list_external_roots()}
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.post("/dev/apply")
-async def dev_apply(req: DevApplyRequest) -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return dev.apply_proposal(req.proposal_id, confirm=req.confirm)
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.post("/dev/reject")
-async def dev_reject(req: DevRollbackRequest) -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        dev.reject_proposal(req.proposal_id)
-        return {"proposal_id": req.proposal_id, "status": "rejected"}
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.post("/dev/rollback")
-async def dev_rollback(req: DevRollbackRequest) -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return dev.rollback_proposal(req.proposal_id)
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.get("/dev/backups")
-async def dev_backups() -> dict:
-    from core.dev_mode import DevModeError
-
-    dev = _dev_mode()
-    try:
-        return {"backups": dev.list_backups()}
-    except DevModeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-# ── Autonomy / self-improvement (bounded, killable) ──────────────────────────
-
-@app.get("/autonomy/status")
-async def autonomy_status() -> dict:
-    if STATE.runtime is None:
-        return {"available": False}
-    try:
-        return {"available": True, **STATE.runtime.self_improve.status()}
-    except Exception as e:  # noqa: BLE001
-        return {"available": False, "error": str(e)}
-
-
-@app.post("/autonomy/stop")
-async def autonomy_stop() -> dict:
-    """Kill switch: pause the proactive self-improvement loop and cancel any
-    queued background work. Error capture keeps running (harmless)."""
-    if STATE.runtime is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    STATE.runtime.self_improve.set_enabled(False)
-    try:
-        if STATE.memory is not None:
-            await STATE.memory.cancel_pending_background_work()
-    except Exception:
-        pass
-    return {"enabled": False}
-
-
-@app.post("/autonomy/start")
-async def autonomy_start() -> dict:
-    if STATE.runtime is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    STATE.runtime.self_improve.set_enabled(True)
-    return {"enabled": True}
-
-
-@app.get("/autonomy/errors")
-async def autonomy_errors(limit: int = Query(50)) -> dict:
-    if STATE.runtime is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    recent = await STATE.runtime.error_log.recent(limit=int(limit))
-    recurring = await STATE.runtime.error_log.recurring(min_count=2)
-    return {"recent": recent, "recurring": recurring}
-
-
-@app.get("/memory/lessons")
-async def memory_lessons(limit: int = Query(50)) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    return {"lessons": await STATE.memory.lesson_records(limit=int(limit))}
-
-
-# ── Goals (multi-session objectives, advanced by AgentSupervisor) ────────────
-
-class GoalCreateRequest(BaseModel):
-    objective: str
-    title: str | None = None
-    success_criteria: str | None = None
-    project: str = "general"
-
-
-@app.post("/goals")
-async def goals_create(req: GoalCreateRequest) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    objective = (req.objective or "").strip()
-    if not objective:
-        raise HTTPException(status_code=422, detail="objective is required")
-    gid = await STATE.memory.create_goal(
-        project_name=(req.project or "general"),
-        title=(req.title or objective[:60]),
-        objective=objective,
-        success_criteria=(req.success_criteria or ""),
-    )
-    await STATE.memory.enqueue_goal_task(
-        goal_id=gid, project_name=(req.project or "general"), tool_name="__decide__", args={}
-    )
-    return {"goal_id": str(gid), "title": req.title or objective[:60], "project": req.project or "general"}
-
-
-@app.get("/goals")
-async def goals_list(project: str | None = Query(None), limit: int = Query(50)) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    return {"goals": await STATE.memory.list_goals(project_name=project, limit=int(limit))}
-
-
-@app.get("/goals/{goal_id}/tasks")
-async def goals_tasks(goal_id: str, limit: int = Query(50)) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    return {"goal_id": goal_id, "tasks": await STATE.memory.list_goal_tasks(goal_id=goal_id, limit=int(limit))}
-
-
-@app.post("/goals/{goal_id}/cancel")
-async def goals_cancel(goal_id: str) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    await STATE.memory.update_goal_status(goal_id=UUID(goal_id), status="cancelled")
-    return {"goal_id": goal_id, "status": "cancelled"}
-
-
-@app.post("/goals/{goal_id}/resume")
-async def goals_resume(goal_id: str, project: str = Query("general")) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    await STATE.memory.update_goal_status(goal_id=UUID(goal_id), status="active")
-    await STATE.memory.enqueue_goal_task(goal_id=UUID(goal_id), project_name=project, tool_name="__decide__", args={})
-    return {"goal_id": goal_id, "status": "active"}
-
-
-# ── Reminders / scheduling (real "remind me at 5pm", proactive check-ins) ────
-
-class ReminderCreateRequest(BaseModel):
-    title: str
-    when: str  # "5pm", "in 20 minutes", "tomorrow at 9am", "every morning at 8", ...
-    details: str | None = None
-
-
-@app.post("/reminders")
-async def reminders_create(req: ReminderCreateRequest) -> dict:
-    from core.dates import parse_reminder_time
-
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    title = (req.title or "").strip()
-    if not title:
-        raise HTTPException(status_code=422, detail="title is required")
-    parsed = parse_reminder_time(req.when or "")
-    if parsed is None:
-        raise HTTPException(status_code=422, detail=f"Could not understand the time '{req.when}'.")
-    due_at, recurrence = parsed
-    rid = await STATE.memory.create_reminder(
-        title=title, details=(req.details or title), due_at_iso=due_at.isoformat(), recurrence=recurrence,
-    )
-    return {"reminder_id": str(rid), "title": title, "due_at": due_at.isoformat(), "recurrence": recurrence}
-
-
-@app.get("/reminders")
-async def reminders_list(status: str | None = Query(None), limit: int = Query(50)) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    return {"reminders": await STATE.memory.list_reminders(status=status, limit=int(limit))}
-
-
-@app.delete("/reminders/{reminder_id}")
-async def reminders_cancel(reminder_id: str) -> dict:
-    if STATE.memory is None:
-        raise HTTPException(status_code=503, detail="Not ready")
-    await STATE.memory.cancel_reminder(reminder_id=reminder_id)
-    return {"reminder_id": reminder_id, "status": "cancelled"}

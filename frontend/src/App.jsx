@@ -12,6 +12,7 @@ import useCamera from "./hooks/useCamera";
 import useHandTracking from "./hooks/useHandTracking";
 import useNovaEvents from "./hooks/useNovaEvents";
 import useFocusSession from "./hooks/useFocusSession";
+import useNovaBusEffects from "./hooks/useNovaBusEffects";
 
 import { useWakeNova } from "./voice/useWakeNova";
 import { acquireMicStreamHandle, playAudioUrl, prefetchAudioBlob, recordVoiceActivityFromStreamToBlob, recordVoiceActivityToBlob, stopActiveAudio, transcribeBlob, unlockAudioContext } from "./voice/recorder";
@@ -1625,105 +1626,15 @@ export default function App() {
     } catch {}
   };
 
-  const lastProjectEventSeqRef = useRef(null);
-  useEffect(() => {
-    if (!novaEvents.length) return;
-    // First batch is a replay of past events — skip it so old completions
-    // don't re-post into chat on every app start.
-    if (lastProjectEventSeqRef.current === null) {
-      lastProjectEventSeqRef.current = Math.max(...novaEvents.map((e) => e.seq || 0));
-      return;
-    }
+  // Bus-event side effects (project reports, reminders, screen-look
+  // requests) live in hooks/useNovaBusEffects.js — extracted in Phase 0.6.
+  useNovaBusEffects({
+    novaEvents,
+    appendNovaMessage: (id, text) => setMessages((prev) => [...prev, { id, sender: "nova", text }]),
+    speakNotice,
+    onScreenLookRequest: setScreenLookRequest,
+  });
 
-    const fresh = novaEvents.filter(
-      (ev) =>
-        (ev.seq || 0) > lastProjectEventSeqRef.current &&
-        (ev.type === "project.completed" || ev.type === "project.error")
-    );
-    if (!fresh.length) {
-      const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
-      if (maxSeq > lastProjectEventSeqRef.current) lastProjectEventSeqRef.current = maxSeq;
-      return;
-    }
-
-    lastProjectEventSeqRef.current = Math.max(
-      ...fresh.map((e) => e.seq || 0),
-      lastProjectEventSeqRef.current
-    );
-
-    fresh.forEach((ev) => {
-      const d = ev.data || {};
-      if (ev.type === "project.completed") {
-        const files = Array.isArray(d.files) && d.files.length ? d.files.join(", ") : "";
-        const suggestions =
-          Array.isArray(d.suggestions) && d.suggestions.length
-            ? `\n\nSuggested improvements:\n${d.suggestions.map((s) => `• ${s}`).join("\n")}\n\nSay "implement those improvements" and I'll do it.`
-            : "";
-        // Be honest about how sure we are. The build/run check only confirms it
-        // launches — it can't verify a visual/interactive feature actually works.
-        const status = d.status || "complete";
-        const isImprove = d.mode === "improve";
-        const note = d.test_note && !/passed/i.test(d.test_note) ? d.test_note : (d.run_note && !/passed/i.test(d.run_note) ? d.run_note : "");
-        let head;
-        if (status === "needs attention") {
-          head = `⚠️ I worked on "${d.project}" but it didn't fully check out${note ? ` — ${note}` : ""}.`;
-        } else if (status === "needs review") {
-          head = `🛠️ I updated "${d.project}"${note ? ` (${note})` : ""}. It runs, but please double-check it does what you wanted.`;
-        } else if (isImprove) {
-          head = `🛠️ Done updating "${d.project}". ${d.summary || ""}\nIt launches cleanly — give it a try and tell me if it works how you wanted (I can't fully test the interactive parts myself).`;
-        } else {
-          head = `✅ Project "${d.project}" is built. ${d.summary || ""}\nGive it a try and let me know how it looks.`;
-        }
-        const text =
-          head +
-          (files ? `\nFiles: ${files}` : "") +
-          (d.run ? `\nRun it with: ${d.run}` : "") +
-          suggestions;
-        setMessages((prev) => [...prev, { id: `nova-project-${ev.seq}`, sender: "nova", text }]);
-        speakNotice(`I finished working on ${String(d.project || "").replace(/-/g, " ")}. Give it a try.`);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `nova-project-${ev.seq}`,
-            sender: "nova",
-            text: `⚠️ Project "${d.project}" hit a problem: ${d.error || "unknown error"}. Ask me to try again and I'll take another pass.`,
-          },
-        ]);
-      }
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [novaEvents]);
-
-  const lastReminderEventSeqRef = useRef(null);
-  useEffect(() => {
-    if (!novaEvents.length) return;
-    // Same "skip the initial replay batch" pattern as project events, so old
-    // reminders don't re-fire into chat every time the app starts.
-    if (lastReminderEventSeqRef.current === null) {
-      lastReminderEventSeqRef.current = Math.max(...novaEvents.map((e) => e.seq || 0));
-      return;
-    }
-
-    const fresh = novaEvents.filter(
-      (ev) => (ev.seq || 0) > lastReminderEventSeqRef.current && ev.type === "reminder.due"
-    );
-    if (!fresh.length) {
-      const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
-      if (maxSeq > lastReminderEventSeqRef.current) lastReminderEventSeqRef.current = maxSeq;
-      return;
-    }
-    lastReminderEventSeqRef.current = Math.max(...fresh.map((e) => e.seq || 0), lastReminderEventSeqRef.current);
-
-    fresh.forEach((ev) => {
-      const d = ev.data || {};
-      const message = String(d.message || d.title || "Reminder!").trim();
-      const text = d.briefing ? message : `⏰ ${d.title || "Reminder"}: ${message}`;
-      setMessages((prev) => [...prev, { id: `nova-reminder-${ev.seq}`, sender: "nova", text }]);
-      speakNotice(message);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [novaEvents]);
 
   // PI1: opt-in periodic screen glances. Best-effort — a failed/empty glance
   // just waits for the next interval, never surfaces an error to the user.
@@ -1736,28 +1647,6 @@ export default function App() {
     },
   });
 
-  // PI1: the agent asked to look at the screen mid-conversation
-  // (vision.look_at_screen) — surface a confirm prompt; nothing captures
-  // without this explicit click, even though a periodic focus session
-  // might already be running.
-  const lastScreenReqSeqRef = useRef(null);
-  useEffect(() => {
-    if (!novaEvents.length) return;
-    if (lastScreenReqSeqRef.current === null) {
-      lastScreenReqSeqRef.current = Math.max(...novaEvents.map((e) => e.seq || 0));
-      return;
-    }
-    const fresh = novaEvents.filter(
-      (ev) => (ev.seq || 0) > lastScreenReqSeqRef.current && ev.type === "screen.capture_requested"
-    );
-    const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
-    if (maxSeq > lastScreenReqSeqRef.current) lastScreenReqSeqRef.current = maxSeq;
-    if (!fresh.length) return;
-    const latest = fresh[fresh.length - 1];
-    const d = latest.data || {};
-    setScreenLookRequest({ requestId: String(d.request_id || ""), question: String(d.question || "") });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [novaEvents]);
 
   async function respondToScreenLookRequest(approved) {
     const req = screenLookRequest;
