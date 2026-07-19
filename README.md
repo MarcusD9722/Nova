@@ -3,11 +3,28 @@
 Local, GPU-only AI assistant: FastAPI backend + React/Vite/Electron desktop UI.
 
 - Local LLM chat (llama-cpp-python, CUDA offload enforced — no CPU fallback)
-- Vision (Qwen2-VL + mmproj), XTTS voice, Whisper STT, "Hey Nova" wake word
-- Unified memory (SQLite + Chroma + diskcache + JSON audit)
-- Tools: weather, Google Maps, Discord, web search, project scaffolding
+- Vision (camera, screen, focus sessions), XTTS voice, Whisper STT, "Hey Nova" wake word
+- Unified memory (SQLite + Chroma + diskcache + JSON audit) with people, events, habits, mood
+- Tools: weather, Google Maps/navigation, Discord, Calendar/Gmail (OAuth), web search, projects
 - Live event stream (`/ws/events`) driving the UI's activity states
-- Guarded Developer Mode (off by default) for self-inspection with diff approval
+- Guarded Developer Mode (off by default) for self-editing with diff approval
+
+## Repo layout
+
+| Folder | Role |
+| --- | --- |
+| `backend/` | FastAPI entry package (API, SSE chat, voice endpoints) |
+| `core/` | Brain: runtime, tool loop, workers, dev mode, policies |
+| `memory/` | Memory engines + unifier (SQLite is source of truth) |
+| `plugins/` | Tool integrations (auto-register at startup) |
+| `frontend/` | React/Vite/Electron desktop UI |
+| `voices/`, `wakewords/` | TTS reference voice, wake-word model |
+| `model/` | GGUF model files (gitignored) |
+| `memory_data/` | Runtime memory storage (gitignored) |
+| `projects/` | Projects Nova builds autonomously |
+| `tools/` | Isolated services (imagegen), avatar pipeline, setup scripts |
+| `docs/` | Architecture, roadmap, contributing |
+| `tests/` + `run_tests.ps1` | Offline test suites + runner |
 
 ## Setup (Windows, PowerShell)
 
@@ -39,7 +56,8 @@ Copy-Item .env.example .env
 ```
 
 Then fill in what you use (all optional — features show "not configured" if missing):
-`OPENWEATHER_API_KEY`, `GOOGLE_MAPS_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`.
+`OPENWEATHER_API_KEY`, `GOOGLE_MAPS_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`,
+`GOOGLE_OAUTH_CLIENT_ID`/`GOOGLE_OAUTH_CLIENT_SECRET` (see `tools/README_google_oauth.md`).
 Never commit `.env`.
 
 ### 4) Model
@@ -65,12 +83,12 @@ Or individually:
 cd frontend; npm run electron:dev
 ```
 
-## Checks & tests
+Successful startup indicators:
 
-```powershell
-.\venv\Scripts\python.exe scripts\boot_test.py   # import/config/plugin sanity
-.\venv\Scripts\python.exe -m pytest tests\ -q    # smoke tests (no GPU needed)
-cd frontend; npm run build                       # frontend build check
+```
+• Model loaded: <your-model>.gguf (ctx=8192)
+• Vision model loaded: mmproj-*.gguf
+• Startup complete: gpu_offload_confirmed
 ```
 
 ## GPU enforcement
@@ -79,19 +97,26 @@ Nova loads the model with `n_gpu_layers=-1` and parses llama.cpp logs to confirm
 CUDA offload. If offload is not confirmed, startup **fails** with install guidance —
 there is no silent CPU fallback. XTTS likewise requires CUDA (`NOVA_TTS_DEVICE=cuda`).
 
+Troubleshooting: if offload fails, reinstall the CUDA build —
+
+```powershell
+pip uninstall llama-cpp-python
+pip install -r requirements.txt --force-reinstall --no-cache-dir
+```
+
 ## Key endpoints
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /health` | Liveness + GPU enforcement state |
+| `GET /health` | Liveness + GPU enforcement state (open even with auth on) |
 | `GET /status` | Full status: model, real GPU telemetry (nvidia-smi), subsystems, integrations |
 | `WS /ws/events` | Structured live events (thinking, tools, memory, vision, web, TTS/STT) |
 | `POST /chat`, `POST /chat/stream` | Chat (JSON / SSE stream with optional TTS) |
 | `POST /stt`, `POST /speak` | Whisper transcription / XTTS synthesis |
 | `POST /vision/analyze` | Image analysis via mmproj vision model |
 | `GET /memory/recent`, `GET /memory/search` | Memory panel data |
-| `GET /tasks` | Background autonomy tasks |
-| `GET /dev/status`, `/dev/inspect`, `/dev/propose`, `/dev/proposals`, `/dev/apply` | Developer mode (guarded) |
+| `GET /reminders`, `GET /goals`, `GET /tasks` | Scheduling + autonomy |
+| `GET /dev/status`, `/dev/proposals`, `/dev/proposals/{id}`, `/dev/apply` | Developer mode (guarded) |
 
 ## Developer Mode (guarded self-editing)
 
@@ -115,6 +140,7 @@ use, with a boot warning. See `.env.example`.
 ```powershell
 .\run_tests.ps1            # all suites in tests/
 .\run_tests.ps1 memory     # filtered
+cd frontend; npm run build # frontend build check
 ```
 
 ## Architecture & roadmap
