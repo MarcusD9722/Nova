@@ -36,6 +36,7 @@ from core.project_builder import (
     STATUS_WORDS_RE,
 )
 from core.orchestrator.agent import Agent, ToolLoopExecutor
+from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
 from core.orchestrator.model_router import ModelRouter, parse_role_map
 from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
@@ -339,6 +340,9 @@ class RuntimeManager:
         # default chat agent reproduces the previous inline loop exactly.
         self._tool_loop = ToolLoopExecutor(models=self._models, tool_router=router)
         self._chat_agent = Agent(name="chat", step_budget=self._TOOL_LOOP_MAX)
+        # Deep mode (Phase 2.3): Planner + Critic bookends around the loop,
+        # opt-in only (is_deep_request), so normal chat stays one-pass fast.
+        self._deep = DeepPipeline(self._models)
 
         recent_turns = int(os.getenv("NOVA_RECENT_CHAT_TURNS", "20").strip() or "20")
         followup_window = int(os.getenv("NOVA_FOLLOWUP_WINDOW", "10").strip() or "10")
@@ -887,9 +891,30 @@ class RuntimeManager:
             pass
         recent_chat = await self._state_store.recent_chat_text(conversation_id)
 
+        # ── Deep mode (Phase 2.3): opt-in Planner → Executor → Critic ──
+        # Explicit-request only; normal chat skips all of this and stays fast.
+        deep_mode = is_deep_request(clean_user)
+        deep_plan = ""
+        loop_agent = self._chat_agent
+        if deep_mode:
+            BUS.publish("agent.stage", {"stage": "planner"})
+            try:
+                deep_plan = await self._deep.plan(
+                    user_text=clean_user, grounding=grounding,
+                    tool_catalog=self._tool_loop.tool_catalog(self._chat_agent),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("deep_plan_failed", error=str(e)[:160])
+            if deep_plan:
+                loop_agent = Agent(
+                    name="chat-deep", step_budget=self._chat_agent.step_budget,
+                    extra_instructions=f"A planner drafted this plan for the task — follow it:\n{deep_plan}",
+                )
+            BUS.publish("agent.stage", {"stage": "executor"})
+
         # ── Agent loop: reason → act → observe (core/orchestrator/agent.py) ──
         tool_results = await self._tool_loop.run(
-            agent=self._chat_agent, user_text=clean_user, grounding=grounding
+            agent=loop_agent, user_text=clean_user, grounding=grounding
         )
 
         # ── Streamed final response ─────────────────────────────────────────
@@ -948,6 +973,47 @@ class RuntimeManager:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": clean_user},
         ]
+
+        # ── Deep mode reply: draft → Critic → one optional revision ──────────
+        # Not streamed (the draft may be revised); the final lands as one chunk.
+        if deep_mode:
+            reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
+            chat_model = self._models.for_role("chat")
+            async with chat_model.semaphore:
+                draft = await chat_model.runtime.chat(
+                    messages, max_tokens=reply_budget, temperature=0.4, thinking=True
+                )
+            draft = (draft or "").strip()
+            BUS.publish("agent.stage", {"stage": "critic"})
+            verdict, notes = "approve", ""
+            try:
+                verdict, notes = await self._deep.critique(
+                    user_text=clean_user, plan=deep_plan, draft=draft, tool_results=tool_results
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("deep_critique_failed", error=str(e)[:160])
+            reply = draft
+            if verdict == "revise" and notes:
+                BUS.publish("agent.stage", {"stage": "revise", "notes": notes[:160]})
+                revise_msgs = messages + [
+                    {"role": "assistant", "content": draft},
+                    {"role": "user", "content": (
+                        f"Before sending, a reviewer flagged: {notes}. Fix those issues while keeping your "
+                        "natural voice and staying honest about anything uncertain or that failed. Reply with "
+                        "ONLY the corrected message.")},
+                ]
+                async with chat_model.semaphore:
+                    revised = await chat_model.runtime.chat(
+                        revise_msgs, max_tokens=reply_budget, temperature=0.4, thinking=True
+                    )
+                if (revised or "").strip():
+                    reply = revised.strip()
+            if not reply:
+                reply = "Sorry — I came up empty on that one."
+            yield {"type": "token", "text": reply}
+            await _finish(reply, tool_results, mode="deep")
+            yield {"type": "done", "full_text": reply, "tool_calls": tool_results}
+            return
 
         # This reasoning model ignores the '/no_think' switch and reasons anyway;
         # forcing it there produces a long unclosed <think> that overflows the

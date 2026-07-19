@@ -47,6 +47,10 @@ class ToolLoopExecutor:
         self._models = models
         self._router = tool_router
 
+    def tool_catalog(self, agent: Agent) -> str:
+        """Public: the tool list an agent would see (for the Planner)."""
+        return self._tool_catalog(agent)
+
     def _tool_catalog(self, agent: Agent) -> str:
         lines = []
         for name, desc in self._router.describe_tools().items():

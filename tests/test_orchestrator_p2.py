@@ -159,6 +159,30 @@ async def _async_checks():
     check("- weather.current: live weather" in p2 and "- web.fetch: fetch a url" not in p2,
           "allowlist filters the tool catalog")
 
+    # ── deep mode (2.3) ──
+    from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
+
+    check(is_deep_request("think carefully and check your work"), "deep trigger: phrase")
+    check(is_deep_request("plan this out for me"), "deep trigger: 'plan this out'")
+    check(not is_deep_request("what's the weather in Denver"), "no deep trigger on ordinary chat")
+    check(is_deep_request("anything at all", flag=True), "deep trigger: explicit flag")
+
+    def pipeline(replies):
+        return DeepPipeline(ModelRouter.single(_ScriptedLLM(replies), asyncio.Semaphore(1)))
+
+    plan = await pipeline(["1. Check X\n2. Do Y"]).plan(user_text="do a thing", grounding="{}", tool_catalog="- t: x")
+    check(plan == "1. Check X\n2. Do Y", "planner returns a plan")
+    plan2 = await pipeline(["DIRECT"]).plan(user_text="hi", grounding="{}", tool_catalog="")
+    check(plan2 == "", "planner returns '' for a trivial (DIRECT) request")
+
+    v, notes = await pipeline(['{"verdict": "approve"}']).critique(user_text="q", plan="", draft="a", tool_results=[])
+    check(v == "approve" and notes == "", "critic approves a good draft")
+    v, notes = await pipeline(['{"verdict": "revise", "notes": "claims weather worked but it 404d"}']).critique(
+        user_text="q", plan="", draft="It's sunny", tool_results=[{"tool": "weather.current", "ok": False, "error": "404"}])
+    check(v == "revise" and "404" in notes, "critic requests revision with notes")
+    v, notes = await pipeline(["not json at all"]).critique(user_text="q", plan="", draft="a", tool_results=[])
+    check(v == "approve", "unparseable critic response never blocks the reply (defaults approve)")
+
 
 # ── Self-eval metrics (2.5) ───────────────────────────────────────────────────
 
