@@ -35,6 +35,7 @@ from core.project_builder import (
     RESUME_WORDS_RE,
     STATUS_WORDS_RE,
 )
+from core.orchestrator.model_router import ModelRouter, parse_role_map
 from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
@@ -327,6 +328,13 @@ class RuntimeManager:
 
         self._llm_sem = asyncio.Semaphore(1)
 
+        # ModelRouter (Phase 2.4): today every role resolves to this one 9B on
+        # its one GPU semaphore. NOVA_MODEL_ROLES can remap roles once a second
+        # model handle is registered — the call sites already go through here.
+        self._models = ModelRouter.single(
+            self._llm, self._llm_sem, role_map=parse_role_map(os.getenv("NOVA_MODEL_ROLES", "")),
+        )
+
         recent_turns = int(os.getenv("NOVA_RECENT_CHAT_TURNS", "20").strip() or "20")
         followup_window = int(os.getenv("NOVA_FOLLOWUP_WINDOW", "10").strip() or "10")
 
@@ -525,6 +533,10 @@ class RuntimeManager:
     @property
     def router(self) -> ToolRouter:
         return self._router
+
+    @property
+    def models(self) -> ModelRouter:
+        return self._models
 
     @property
     def error_log(self) -> ErrorLog:
@@ -766,8 +778,9 @@ class RuntimeManager:
             "- If a tool failed twice, stop and respond — explain what failed.\n"
             "- When the observations already answer the user, respond."
         )
-        async with self._llm_sem:
-            raw = await self._llm.chat(
+        decider = self._models.for_role("decider")
+        async with decider.semaphore:
+            raw = await decider.runtime.chat(
                 [{"role": "user", "content": prompt}],
                 max_tokens=900,  # room for background reasoning + the JSON decision
                 temperature=0.1,
@@ -1037,9 +1050,10 @@ class RuntimeManager:
         # instruction above to keep the hidden reasoning to a line or two. Proven
         # far more reliable in practice.
         reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
+        chat_model = self._models.for_role("chat")
         full: list[str] = []
-        async with self._llm_sem:
-            async for token in self._llm.chat_stream(
+        async with chat_model.semaphore:
+            async for token in chat_model.runtime.chat_stream(
                 messages, max_tokens=reply_budget, temperature=0.4, thinking=True
             ):
                 full.append(token)
