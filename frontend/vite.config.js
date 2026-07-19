@@ -7,6 +7,23 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   base: "./",
   plugins: [react()],
+  // Pre-bundle the three.js stack at server start. IMPORTANT: import drei via
+  // SUBPATHS only (e.g. "@react-three/drei/core/Gltf") — bundling all of drei
+  // produces a 3.7 MB dev chunk, and Norton's network filter on this machine
+  // resets localhost HTTP responses larger than ~2 MB (symptom:
+  // ERR_CONNECTION_RESET on the chunk and a blank app).
+  optimizeDeps: {
+    include: [
+      "three",
+      "@react-three/fiber",
+      "@react-three/postprocessing",
+      "three/examples/jsm/utils/SkeletonUtils.js",
+      "three/examples/jsm/loaders/KTX2Loader.js",
+      "@react-three/drei/core/Gltf",
+      "@react-three/drei/core/AdaptiveDpr",
+      "@react-three/drei/core/PerspectiveCamera",
+    ],
+  },
   server: {
     port: 5173,
     proxy: {
@@ -23,10 +40,24 @@ export default defineConfig({
       // Plugins / tools
       '/plugins': 'http://localhost:8008',
 
+      // API sub-routes (web search, maps)
+      '/api': 'http://localhost:8008',
+
+      // Vision
+      '/vision': 'http://localhost:8008',
+
       // Model + memory + uploads
       '/model': 'http://localhost:8008',
       '/memory': 'http://localhost:8008',
       '/file-upload': 'http://localhost:8008',
+      '/uploads': 'http://localhost:8008',
+
+      // Status + health + tasks + developer mode
+      // (without these, the Nova Core card shows offline in dev)
+      '/status': 'http://localhost:8008',
+      '/health': 'http://localhost:8008',
+      '/tasks': 'http://localhost:8008',
+      '/dev': 'http://localhost:8008',
 
       // WebSocket (FastAPI)
       '/ws': {

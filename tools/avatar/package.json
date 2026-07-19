@@ -1,0 +1,19 @@
+{
+  "name": "avatar",
+  "version": "1.0.0",
+  "description": "`frontend/src/assets/avatar/nova.glb` (a.k.a. **Nova_Hologram_Avatar.glb**) is generated procedurally by Blender Python around a realistic scanned face (three.js \"facecap\", 52 ARKit shape keys).",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@gltf-transform/core": "^4.4.1",
+    "@gltf-transform/extensions": "^4.4.1",
+    "@gltf-transform/functions": "^4.4.1",
+    "meshoptimizer": "^1.2.0"
+  }
+}

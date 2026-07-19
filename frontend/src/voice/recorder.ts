@@ -23,17 +23,198 @@ function vlog(debugTag: string | undefined, ...args: any[]) {
   console.log(prefix, ...args);
 }
 
-export async function playAudioUrl(url: string, opts: { debugTag?: string } = {}): Promise<void> {
-  const debugTag = opts.debugTag || "tts";
+// Keep a reference to the most recent Audio element while it plays.
+// In some Chromium/Electron cases, losing all references can cause
+// playback to stop unexpectedly.
+let _activeAudio: HTMLAudioElement | null = null;
+
+export function stopActiveAudio(): void {
+  const audio = _activeAudio;
+  if (!audio) return;
+  try { audio.pause(); } catch {}
+  try { audio.currentTime = 0; } catch {}
+  _activeAudio = null;
+}
+
+// ── TTS output analyser (drives avatar lip sync) ────────────────────────────
+// Nova's playback is routed through a WebAudio AnalyserNode so the avatar's
+// mouth can follow the real speech waveform. Blob object-URLs are same-origin,
+// so routing never taints/mutes the audio.
+let _outCtx: AudioContext | null = null;
+let _outAnalyser: AnalyserNode | null = null;
+let _outData: Uint8Array | null = null;
+
+function ensureOutputAnalyser(): { ctx: AudioContext; analyser: AnalyserNode } | null {
+  try {
+    if (!_outCtx) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      _outCtx = new Ctx();
+    }
+    if (!_outAnalyser) {
+      _outAnalyser = _outCtx.createAnalyser();
+      _outAnalyser.fftSize = 512;
+      _outAnalyser.smoothingTimeConstant = 0.5;
+      _outAnalyser.connect(_outCtx.destination);
+      _outData = new Uint8Array(_outAnalyser.fftSize);
+    }
+    if (_outCtx.state === "suspended") _outCtx.resume().catch(() => {});
+    return { ctx: _outCtx, analyser: _outAnalyser };
+  } catch {
+    return null;
+  }
+}
+
+function routeThroughAnalyser(audio: HTMLAudioElement): void {
+  const nodes = ensureOutputAnalyser();
+  if (!nodes) return;
+  try {
+    const source = nodes.ctx.createMediaElementSource(audio);
+    source.connect(nodes.analyser);
+  } catch {
+    // Element still plays through the default output if routing fails.
+  }
+}
+
+/** Current RMS level (0..1) of Nova's speech output. 0 when not speaking. */
+export function getTtsOutputLevel(): number {
+  try {
+    if (!_outAnalyser || !_outData || !_activeAudio || _activeAudio.paused) return 0;
+    _outAnalyser.getByteTimeDomainData(_outData);
+    let sum = 0;
+    for (let i = 0; i < _outData.length; i += 1) {
+      const v = (_outData[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / _outData.length);
+    return Math.min(1, rms * 3.4);
+  } catch {
+    return 0;
+  }
+}
+
+/** True while a TTS/voice clip is actually playing (not just "queued"). */
+export function isTtsPlaying(): boolean {
+  return !!(_activeAudio && !_activeAudio.paused);
+}
+
+async function playBlobAsAudio(blob: Blob, opts: { debugTag?: string; onEnded?: () => void } = {}) {
+  const url = URL.createObjectURL(blob);
+  stopActiveAudio();
   const audio = new Audio(url);
+  routeThroughAnalyser(audio);
+  _activeAudio = audio;
+
+  audio.onended = () => {
+    try { opts.onEnded?.(); } catch {}
+    try { URL.revokeObjectURL(url); } catch {}
+    if (_activeAudio === audio) _activeAudio = null;
+  };
+  audio.onerror = () => {
+    try { URL.revokeObjectURL(url); } catch {}
+    if (_activeAudio === audio) _activeAudio = null;
+  };
+
+  const p = audio.play();
+  if (p && typeof (p as any).then === "function") await p;
+  vlog(opts.debugTag, "playing audio blob", { bytes: blob.size, type: blob.type });
+}
+
+export async function playAudioUrl(
+  url: string,
+  opts: {
+    debugTag?: string;
+    onEnded?: () => void;
+    onError?: (e: any) => void;
+    /**
+     * Optional in-flight (or already resolved) fetch+decode kicked off when
+     * this clip was enqueued, so it's ready by the time playback advances to
+     * it — removes the audible dead-air between sentences.
+     */
+    preloadedBlob?: Blob | Promise<Blob | null> | null;
+  } = {}
+): Promise<void> {
+  const debugTag = opts.debugTag || "tts";
+
+  if (opts.preloadedBlob) {
+    try {
+      const blob = await opts.preloadedBlob;
+      if (blob) {
+        await playBlobAsAudio(blob, { debugTag, onEnded: opts.onEnded });
+        return;
+      }
+    } catch (e: any) {
+      vlog(debugTag, "preloaded blob playback failed; falling back to fetch", { url, message: e?.message || String(e) });
+    }
+  }
+
+  // Preferred path: fetch bytes and play as a same-origin blob. This lets the
+  // output route through the lip-sync analyser without CORS-tainting (a
+  // tainted media source plays SILENCE through WebAudio), and blob playback
+  // is immune to MIME/proxy quirks. Backend is localhost, so the fetch is fast.
+  if (!url.startsWith("blob:")) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      await playBlobAsAudio(blob, { debugTag, onEnded: opts.onEnded });
+      return;
+    } catch (e: any) {
+      vlog(debugTag, "fetch+blob playback failed; trying direct url", { url, message: e?.message || String(e) });
+    }
+  } else {
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      await playBlobAsAudio(blob, { debugTag, onEnded: opts.onEnded });
+      return;
+    } catch {}
+  }
+
+  // Fallback: direct element playback (no lip-sync analysis).
+  stopActiveAudio();
+  const audio = new Audio(url);
+  _activeAudio = audio;
+  if (typeof opts.onEnded === "function") {
+    audio.onended = () => {
+      try { opts.onEnded?.(); } catch {}
+      if (_activeAudio === audio) _activeAudio = null;
+    };
+  } else {
+    audio.onended = () => {
+      if (_activeAudio === audio) _activeAudio = null;
+    };
+  }
+  audio.onerror = () => {
+    if (_activeAudio === audio) _activeAudio = null;
+  };
   try {
     const p = audio.play();
     if (p && typeof (p as any).then === "function") await p;
-    vlog(debugTag, "playing audio url", { url });
+    vlog(debugTag, "playing audio url (direct)", { url });
   } catch (e: any) {
     vlog(debugTag, "audio url play failed", { url, name: e?.name, message: e?.message || String(e) });
+    try { opts.onError?.(e); } catch {}
     throw e;
   }
+}
+
+/**
+ * Kick off a fetch+decode of a TTS clip's audio immediately, without playing
+ * it. Call this as soon as a clip is enqueued so it's already resolved by
+ * the time playback advances to it. Resolves to null (never rejects) on
+ * failure or for blob: URLs that don't need prefetching.
+ */
+export function prefetchAudioBlob(url: string): Promise<Blob | null> {
+  if (!url || url.startsWith("blob:")) return Promise.resolve(null);
+  return fetch(url)
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.blob();
+    })
+    .catch((e: any) => {
+      vlog("tts", "prefetch failed", { url, message: e?.message || String(e) });
+      return null;
+    });
 }
 
 function apiBase(): string {
@@ -61,6 +242,26 @@ function apiBase(): string {
 function apiUrl(path: string) {
   const base = apiBase();
   return (base ? base : "") + path;
+}
+
+export async function unlockAudioContext(): Promise<void> {
+  // Some Chromium/Electron configurations keep AudioContext suspended
+  // until it is first resumed during a user gesture. Call this from a
+  // click/tap handler (e.g., mic unmute) to ensure meters + playback work.
+  try {
+    const AudioCtx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    try {
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+    } finally {
+      try { await ctx.close(); } catch {}
+    }
+  } catch {
+    // best-effort only
+  }
 }
 
 // ===== Shared microphone stream (wake loop + mic meter + capture) =====
@@ -128,6 +329,160 @@ function bestSupportedMime(): string {
     if (window.MediaRecorder && MediaRecorder.isTypeSupported?.(c)) return c;
   }
   return "";
+}
+
+
+export type VADRecordOptions = {
+  maxMs?: number;
+  minSpeechMs?: number;
+  trailingSilenceMs?: number;
+  speechThreshold?: number;
+  startTimeoutMs?: number;
+  timesliceMs?: number;
+  debugTag?: string;
+};
+
+function rmsFromAnalyser(analyser: AnalyserNode, data: Uint8Array): number {
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    const centered = (data[i] - 128) / 128;
+    sum += centered * centered;
+  }
+  return Math.sqrt(sum / data.length);
+}
+
+export async function recordVoiceActivityFromStreamToBlob(
+  stream: MediaStream,
+  {
+    maxMs = 8000,
+    minSpeechMs = 250,
+    trailingSilenceMs = 700,
+    speechThreshold = 0.025,
+    startTimeoutMs = 3500,
+    timesliceMs = 250,
+    debugTag,
+  }: VADRecordOptions = {}
+): Promise<Blob> {
+  if (!window.MediaRecorder) {
+    throw new Error("MediaRecorder not supported in this runtime.");
+  }
+
+  const AudioCtx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+  if (!AudioCtx) {
+    return recordFromStreamToBlob(stream, { maxMs, timesliceMs, debugTag });
+  }
+
+  const audioCtx = new AudioCtx();
+  const source = audioCtx.createMediaStreamSource(stream);
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.82;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+
+  const mimeType = bestSupportedMime();
+  const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  const chunks: BlobPart[] = [];
+
+  return await new Promise<Blob>((resolve, reject) => {
+    let done = false;
+    let heardSpeechAt = 0;
+    let speechStartedAt = 0;
+    const startedAt = performance.now();
+
+    const cleanup = async () => {
+      try { source.disconnect(); } catch {}
+      try { analyser.disconnect(); } catch {}
+      try { await audioCtx.close(); } catch {}
+    };
+
+    const finish = async () => {
+      if (done) return;
+      done = true;
+      const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+      const durMs = Math.round(performance.now() - startedAt);
+      vlog(debugTag, "vad recorded blob", {
+        size: blob.size,
+        type: blob.type,
+        durMs,
+        speechStartedAt,
+        heardSpeechAt,
+      });
+      await cleanup();
+      resolve(blob);
+    };
+
+    const fail = async (error: any) => {
+      if (done) return;
+      done = true;
+      await cleanup();
+      reject(error);
+    };
+
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    rec.onerror = (e) => {
+      fail(new Error(`MediaRecorder error: ${String((e as any)?.error?.name || "unknown")}`));
+    };
+    rec.onstop = () => { void finish(); };
+
+    try {
+      rec.start(timesliceMs);
+    } catch (e) {
+      void fail(e);
+      return;
+    }
+
+    const tick = () => {
+      if (done) return;
+      const elapsed = performance.now() - startedAt;
+      const level = rmsFromAnalyser(analyser, data);
+      const isSpeech = level >= speechThreshold;
+      const now = performance.now();
+
+      if (isSpeech) {
+        heardSpeechAt = now;
+        if (!speechStartedAt) {
+          speechStartedAt = now;
+          vlog(debugTag, "vad speech start", { elapsed: Math.round(elapsed), level });
+        }
+      }
+
+      if (!speechStartedAt && elapsed >= startTimeoutMs) {
+        try { rec.stop(); } catch {}
+        return;
+      }
+
+      if (speechStartedAt) {
+        const spokenFor = heardSpeechAt - speechStartedAt;
+        const silentFor = heardSpeechAt ? now - heardSpeechAt : 0;
+        if (spokenFor >= minSpeechMs && silentFor >= trailingSilenceMs) {
+          try { rec.stop(); } catch {}
+          return;
+        }
+      }
+
+      if (elapsed >= maxMs) {
+        try { rec.stop(); } catch {}
+        return;
+      }
+
+      window.setTimeout(tick, 40);
+    };
+
+    tick();
+  });
+}
+
+export async function recordVoiceActivityToBlob(opts: VADRecordOptions = {}): Promise<Blob> {
+  const handle = await acquireMicStreamHandle({ debugTag: opts.debugTag });
+  try {
+    return await recordVoiceActivityFromStreamToBlob(handle.stream, opts);
+  } finally {
+    handle.release();
+  }
 }
 
 export async function recordFromStreamToBlob(
@@ -224,10 +579,10 @@ export async function recordOnceToBlob(
   }
 }
 
-export async function transcribeBlob(
+export async function transcribeBlobDetailed(
   blob: Blob,
   urlOrOpts?: string | { url?: string; path?: string; debugTag?: string }
-): Promise<string> {
+): Promise<{ text: string; durationMs?: number; sampleRate?: number; empty?: boolean }> {
   const fd = new FormData();
   const ext = blob.type.includes("wav") ? "wav" : blob.type.includes("ogg") ? "ogg" : "webm";
   fd.append("file", blob, `recording.${ext}`);
@@ -249,17 +604,35 @@ export async function transcribeBlob(
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
   const text = String(data?.text || data?.transcript || "");
-  vlog(debugTag, "STT response", { dtMs, text });
-  return text;
+  const result = {
+    text,
+    durationMs: Number.isFinite(Number(data?.duration_ms)) ? Number(data.duration_ms) : undefined,
+    sampleRate: Number.isFinite(Number(data?.sample_rate)) ? Number(data.sample_rate) : undefined,
+    empty: Boolean(data?.empty),
+  };
+  vlog(debugTag, "STT response", { dtMs, ...result });
+  return result;
+}
+
+export async function transcribeBlob(
+  blob: Blob,
+  urlOrOpts?: string | { url?: string; path?: string; debugTag?: string }
+): Promise<string> {
+  const result = await transcribeBlobDetailed(blob, urlOrOpts);
+  return result.text;
 }
 
 export async function speak(
   text: string,
-  opts: { voice_id?: string; voice_name?: string } = {}
+  opts: { voice?: string; voice_id?: string; voice_name?: string } = {}
 ): Promise<void> {
   const payload: any = { text };
-  if (opts.voice_id) payload.voice_id = opts.voice_id;
-  if (opts.voice_name) payload.voice_name = opts.voice_name;
+
+  // Backend expects `voice` (a filename under the voices directory).
+  if (opts.voice) payload.voice = opts.voice;
+  // Back-compat: map prior option names onto `voice`.
+  else if (opts.voice_name) payload.voice = opts.voice_name;
+  else if (opts.voice_id) payload.voice = opts.voice_id;
 
   const res = await fetch(apiUrl("/speak"), {
     method: "POST",
@@ -270,6 +643,7 @@ export async function speak(
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
 
+  stopActiveAudio();
   const audio = new Audio(url);
   try {
     const p = audio.play();

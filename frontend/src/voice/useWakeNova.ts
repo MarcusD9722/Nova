@@ -1,6 +1,6 @@
 // src/voice/useWakeNova.ts
 import { useCallback, useEffect, useRef } from "react";
-import { acquireMicStreamHandle, recordFromStreamToBlob, transcribeBlob } from "./recorder";
+import { acquireMicStreamHandle, recordVoiceActivityFromStreamToBlob, transcribeBlobDetailed } from "./recorder";
 
 export type WakeState = "idle" | "listening_wake" | "listening_fallback";
 
@@ -75,14 +75,43 @@ function isIgnorableTranscript(raw: string): boolean {
   return false;
 }
 
-function matchesWake(text: string, _primaryPhrase: string): boolean {
-  // Strict wake phrases only.
+function matchesWake(text: string, primaryPhrase: string): boolean {
   const t = normalizeText(text);
-  if (!t) return false;
-  if (/\bhey\s+nova\b/.test(t)) return true;
-  if (/\bok\s+nova\b/.test(t)) return true;
-  if (/\bokay\s+nova\b/.test(t)) return true;
-  return false;
+  const p = normalizeText(primaryPhrase);
+  if (!t || !p) return false;
+
+  const variants = new Set([p, "hey nova", "hi nova", "okay nova", "ok nova"]);
+  for (const phrase of variants) {
+    const words = phrase.split(" ").filter(Boolean);
+    if (!words.length) continue;
+    const escaped = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const re = new RegExp(`\\b${escaped.join("\\s+")}\\b`);
+    if (re.test(t)) return true;
+  }
+
+  return /\bnova\b/.test(t) && /\b(hey|hi|okay|ok)\b/.test(t);
+}
+
+function formatWakeError(error: any): string {
+  const raw = String(error?.message || error || "").trim();
+  if (!raw) return "Wake error: STT request failed";
+
+  const normalized = raw.replace(/\s+/g, " ").trim();
+
+  try {
+    const parsed = JSON.parse(normalized);
+    const detail = parsed?.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return `Wake error: ${detail.trim().slice(0, 180)}`;
+    }
+  } catch {}
+
+  const detailMatch = normalized.match(/"detail"\s*:\s*"([^"]+)"/i);
+  if (detailMatch?.[1]) {
+    return `Wake error: ${detailMatch[1].trim().slice(0, 180)}`;
+  }
+
+  return `Wake error: ${normalized.slice(0, 180)}`;
 }
 
 /**
@@ -91,14 +120,21 @@ function matchesWake(text: string, _primaryPhrase: string): boolean {
  * Primary path: Web Speech API SpeechRecognition (if available).
  * Fallback path (Electron/offline): short-chunk local STT loop via backend /transcribe.
  */
-export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
+export function useWakeNova(
+  onWake: () => void,
+  phrase: string = "hey nova",
+  opts: { onStatus?: (msg: string) => void } = {}
+) {
   const recRef = useRef<any>(null);
   const runningRef = useRef<boolean>(false);
   const lastWakeAtRef = useRef<number>(0);
   const cooldownUntilRef = useRef<number>(0);
   const onWakeRef = useRef(onWake);
   onWakeRef.current = onWake;
+  const onStatusRef = useRef<(msg: string) => void>(() => {});
+  onStatusRef.current = typeof opts?.onStatus === "function" ? opts.onStatus : () => {};
   const micHandleRef = useRef<any>(null);
+  const lastUiNoteAtRef = useRef<number>(0);
 
   const stopWake = useCallback(() => {
     runningRef.current = false;
@@ -112,6 +148,10 @@ export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
     const r = recRef.current;
     recRef.current = null;
     if (!r) return;
+
+    try {
+      onStatusRef.current?.("Wake stopped");
+    } catch {}
 
     // SpeechRecognition path
     try { r.onend = null; } catch {}
@@ -127,6 +167,10 @@ export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
 
     const tag = "wake";
     const electron = isElectronRuntime();
+
+    try {
+      onStatusRef.current?.("Wake listening… (say: Hey Nova)");
+    } catch {}
 
     const SR: any =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -186,15 +230,14 @@ export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
     vlog(tag, "starting backend-STT wake loop", {
       phrase,
       electron,
-      cooldownMs: 7000,
-      chunkMs: 1000,
+      cooldownMs: 5000,
+      mode: "vad_fallback",
     });
     wakeLog("wake loop start", { phrase, electron });
 
     (async () => {
-      const chunkMs = 1400;
-      const betweenChunksMs = 260;
-      const cooldownMs = 8000;
+      const betweenChunksMs = 160;
+      const cooldownMs = 5000;
 
       // Acquire and hold mic stream for the whole wake session.
       try {
@@ -203,6 +246,9 @@ export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
       } catch (e: any) {
         vlog(tag, "failed to acquire mic stream", { name: e?.name, message: e?.message });
         wakeLog("mic acquire failed", { name: e?.name, message: e?.message });
+        try {
+          onStatusRef.current?.("Wake error: mic permission denied/unavailable");
+        } catch {}
         runningRef.current = false;
         return;
       }
@@ -226,23 +272,44 @@ export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
           }
 
           // Record short chunk (keeps CPU reasonable).
-          const blob = await recordFromStreamToBlob(handle.stream, {
-            maxMs: chunkMs,
-            timesliceMs: 250,
+          const blob = await recordVoiceActivityFromStreamToBlob(handle.stream, {
+            maxMs: 2200,
+            minSpeechMs: 180,
+            trailingSilenceMs: 380,
+            speechThreshold: 0.02,
+            startTimeoutMs: 1800,
+            timesliceMs: 200,
             debugTag: tag,
           });
           if (!runningRef.current) break;
 
           // Transcribe via backend
-          const txtRaw = await transcribeBlob(blob, { path: "/stt", debugTag: tag });
+          const stt = await transcribeBlobDetailed(blob, { path: "/stt", debugTag: tag });
+          const txtRaw = String(stt?.text || "").trim();
 
-          if (isIgnorableTranscript(txtRaw)) {
+          if (!txtRaw || stt?.empty || isIgnorableTranscript(txtRaw)) {
             await sleep(betweenChunksMs);
             continue;
           }
 
           const txtNorm = normalizeText(txtRaw);
-          if (txtNorm) wakeLog("chunk transcript", txtNorm);
+          if (txtNorm) {
+            wakeLog("chunk transcript", {
+              text: txtNorm,
+              durationMs: stt?.durationMs,
+              sampleRate: stt?.sampleRate,
+            });
+          }
+
+          // UI hinting (throttled): surface what we heard so users can debug wake reliability.
+          try {
+            const nowUi = Date.now();
+            const shouldNote = txtNorm && (!lastUiNoteAtRef.current || nowUi - lastUiNoteAtRef.current > 6000);
+            if (shouldNote) {
+              lastUiNoteAtRef.current = nowUi;
+              onStatusRef.current?.(`Heard: "${txtRaw.slice(0, 80)}"`);
+            }
+          } catch {}
 
           if (matchesWake(txtNorm, phrase)) {
             const tnow = Date.now();
@@ -271,10 +338,18 @@ export function useWakeNova(onWake: () => void, phrase: string = "hey nova") {
             // Light pacing between chunks
             await sleep(betweenChunksMs);
           }
-        } catch (e) {
+        } catch (e: any) {
           // Backoff on errors (permissions, backend down, etc.)
-          vlog(tag, "wake loop error", { name: e?.name, message: e?.message || String(e) });
-          wakeLog("wake loop error", { name: e?.name, message: e?.message || String(e) });
+          const message = formatWakeError(e);
+          vlog(tag, "wake loop error", { name: e?.name, message: e?.message || String(e), display: message });
+          wakeLog("wake loop error", { name: e?.name, message: e?.message || String(e), display: message });
+          try {
+            const nowUi = Date.now();
+            if (!lastUiNoteAtRef.current || nowUi - lastUiNoteAtRef.current > 6000) {
+              lastUiNoteAtRef.current = nowUi;
+              onStatusRef.current?.(message);
+            }
+          } catch {}
           await sleep(900);
         }
       }

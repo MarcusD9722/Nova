@@ -14,7 +14,7 @@ def _require(key: str) -> str:
     return val
 
 
-@tool(name="discord.send", description="Send a message to a Discord channel using a bot token.")
+@tool(name="discord.send", description="Send a message to the Discord channel. args: {content, channel_id?}")
 async def send_message(args: dict) -> dict:
     token = _require("DISCORD_BOT_TOKEN")
     default_channel = os.getenv("DISCORD_CHANNEL_ID", "").strip()
@@ -38,3 +38,37 @@ async def send_message(args: dict) -> dict:
         data = r.json()
 
     return {"id": data.get("id"), "channel_id": channel_id, "content": data.get("content")}
+
+
+@tool(name="discord.read", description="Read recent messages from the Discord channel. args: {limit?, channel_id?}")
+async def read_messages(args: dict) -> dict:
+    token = _require("DISCORD_BOT_TOKEN")
+    default_channel = os.getenv("DISCORD_CHANNEL_ID", "").strip()
+
+    channel_id = str(args.get("channel_id") or default_channel).strip()
+    if not channel_id:
+        raise PluginConfigError("Missing DISCORD_CHANNEL_ID (or pass channel_id in args)")
+
+    limit = max(1, min(int(args.get("limit") or 10), 50))
+
+    headers = {"Authorization": f"Bot {token}"}
+    timeout = httpx.Timeout(10.0)
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        r = await client.get(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            params={"limit": limit},
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    messages = [
+        {
+            "id": m.get("id"),
+            "author": ((m.get("author") or {}).get("global_name") or (m.get("author") or {}).get("username")),
+            "content": m.get("content"),
+            "timestamp": m.get("timestamp"),
+        }
+        for m in (data if isinstance(data, list) else [])
+    ]
+    return {"channel_id": channel_id, "count": len(messages), "messages": messages}

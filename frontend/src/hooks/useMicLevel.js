@@ -6,8 +6,9 @@ import { acquireMicStreamHandle } from "../voice/recorder";
  * Lightweight mic RMS meter for "always listening" UI.
  * - enabled: when false, shuts down mic stream + audio context
  * - muted: when true, meter returns 0 (and can optionally stop processing)
+ * - stream: optional MediaStream to meter (preferred if you already have one)
  */
-export default function useMicLevel({ enabled = true, muted = false } = {}) {
+export default function useMicLevel({ enabled = true, muted = false, stream = null } = {}) {
   const [level, setLevel] = useState(0);
   const rafRef = useRef(0);
   const ctxRef = useRef(null);
@@ -22,13 +23,20 @@ export default function useMicLevel({ enabled = true, muted = false } = {}) {
     async function start() {
       if (!enabled) return;
       try {
-        const h = await acquireMicStreamHandle({ debugTag: "meter" });
-        const stream = h.stream;
+        let localHandle = null;
+        let activeStream = stream;
+
+        if (!activeStream) {
+          localHandle = await acquireMicStreamHandle({ debugTag: "meter" });
+          activeStream = localHandle.stream;
+        }
+
         if (cancelled) {
-          try { h.release(); } catch {}
+          try { localHandle?.release?.(); } catch {}
           return;
         }
-        micHandleRef.current = h;
+
+        micHandleRef.current = localHandle;
 
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         const ctx = new AudioCtx();
@@ -47,7 +55,7 @@ export default function useMicLevel({ enabled = true, muted = false } = {}) {
         window.addEventListener("pointerdown", onGesture, { once: true });
         window.addEventListener("keydown", onGesture, { once: true });
 
-        const src = ctx.createMediaStreamSource(stream);
+        const src = ctx.createMediaStreamSource(activeStream);
         srcRef.current = src;
 
         const analyser = ctx.createAnalyser();
@@ -112,7 +120,7 @@ export default function useMicLevel({ enabled = true, muted = false } = {}) {
       cancelled = true;
       stop();
     };
-  }, [enabled, muted]);
+  }, [enabled, muted, stream]);
 
   return level;
 }

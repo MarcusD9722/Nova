@@ -1,12 +1,68 @@
+@import url("https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700&family=Rajdhani:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --nova-bg-0: #05020f;
+  --nova-bg-1: #0a041b;
+  --nova-purple: #8b5cf6;
+  --nova-violet: #a78bfa;
+  --nova-gold: #f5c542;
+  --nova-panel: rgba(10, 8, 24, 0.52);
+}
+
 body {
-  font-family: 'Orbitron', 'Exo', sans-serif;
-  background: #060217;
+  font-family: "Space Grotesk", "Rajdhani", sans-serif;
+  color: #f8e9be;
+  background:
+    radial-gradient(1000px 520px at 50% 26%, rgba(139, 92, 246, 0.2), transparent 60%),
+    radial-gradient(900px 500px at 83% 76%, rgba(245, 197, 66, 0.11), transparent 58%),
+    linear-gradient(180deg, var(--nova-bg-1) 0%, var(--nova-bg-0) 100%);
   min-height: 100vh;
   overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+}
+
+.no-select {
+  user-select: none;
+}
+
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.hud-panel {
+  position: relative;
+  border-radius: 1.45rem;
+  border: 1px solid rgba(139, 92, 246, 0.46);
+  background: linear-gradient(180deg, rgba(14, 11, 31, 0.66), rgba(8, 6, 18, 0.52));
+  backdrop-filter: blur(18px) saturate(145%);
+  box-shadow:
+    inset 0 0 0 1px rgba(245, 197, 66, 0.1),
+    0 0 34px rgba(139, 92, 246, 0.26),
+    0 16px 55px rgba(0, 0, 0, 0.58);
+}
+
+.hud-panel::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(128deg, rgba(139, 92, 246, 0.5), rgba(245, 197, 66, 0.18) 42%, transparent 70%);
+  -webkit-mask: linear-gradient(#000 0 0) padding-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
 }
 
 /* Glassmorphism utility for ultra-glassy panels */
@@ -18,6 +74,13 @@ body {
   border-radius: 1.6rem;
   transition: box-shadow 0.18s;
 }
+.glassy-chat {
+  background: rgba(32,24,64,0);
+  box-shadow: 0 2px 22px rgba(124,58,237,0.45), 0 1px 22px rgba(255,215,0,0.20), 0 2px 14px rgba(255,255,255,0.04) inset;
+}
+.glassy-chat:active, .glassy-chat:focus-within {
+  box-shadow: 0 2px 26px rgba(255,215,0,0.45), 0 1px 20px rgba(124,58,237,0.22);
+}
 .glassy:active, .glassy:focus-within {
   box-shadow: 0 2px 52px #FFD700cc, 0 1px 40px #7C3AED77;
 }
@@ -26,10 +89,17 @@ body {
 .bubble-base {
   position: relative;
   border-radius: 1rem;
-  padding: 0.375rem 0.75rem; /* ~px-3 py-1.5 */
-  border: 1px solid rgba(255,255,255,0.10);
+  padding: 0.58rem 0.92rem;
+  border: 1px solid rgba(255,215,0,0.28);
   transition: transform .18s ease, box-shadow .2s ease, filter .2s ease;
   will-change: transform, box-shadow, filter;
+}
+
+/* When the chat panel is fully see-through, keep bubbles see-through too
+   while preserving the gold trim/outline. */
+.bubble-base.nova-glass {
+  background: transparent;
+  background-image: none;
 }
 
 /* Shared chrome */
@@ -44,7 +114,7 @@ body {
   position: absolute; inset: -1px;
   border-radius: inherit;
   pointer-events: none;
-  background: linear-gradient(135deg, rgba(56,189,248,.55), rgba(244,114,182,.35)) border-box;
+  background: linear-gradient(135deg, rgba(124,58,237,.55), rgba(255,215,0,.35)) border-box;
   -webkit-mask: linear-gradient(#000 0 0) padding-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor; mask-composite: exclude;
   opacity: .65;
@@ -80,14 +150,14 @@ body {
 
 /* Role skins */
 .bubble-user {
-  color: #d7f9ff;
-  background-image: linear-gradient(135deg, rgba(56,189,248,0.18), rgba(244,114,182,0.14));
-  box-shadow: 0 6px 28px rgba(41,235,255,0.16);
+  color: #FFD700;
+  background-image: none;
+  box-shadow: 0 6px 24px rgba(245,197,66,0.12);
 }
 .bubble-assistant {
-  color: #bfe9ff;
-  background-image: linear-gradient(135deg, rgba(168,85,247,0.16), rgba(20,184,166,0.14));
-  box-shadow: 0 6px 32px rgba(147,197,253,0.18);
+  color: #FFD700;
+  background-image: none;
+  box-shadow: 0 6px 28px rgba(139,92,246,0.2);
 }
 
 /* Breathing glow loop (subtle) */
@@ -127,10 +197,27 @@ body {
 
 /* Scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  background: rgba(48,26,97,0.12);
+  width: 7px;
+  background: rgba(27, 17, 58, 0.25);
 }
 ::-webkit-scrollbar-thumb {
-  background: #7C3AED;
+  background: linear-gradient(180deg, #f5c542, #8b5cf6);
   border-radius: 8px;
+}
+
+.scanline-overlay {
+  background-image: linear-gradient(to bottom, transparent 0%, rgba(255,255,255,0.05) 50%, transparent 100%);
+  background-size: 100% 3px;
+  animation: scanline-shift 6s linear infinite;
+}
+
+@keyframes scanline-shift {
+  from { background-position-y: 0; }
+  to { background-position-y: 100px; }
+}
+
+@media (max-width: 1024px) {
+  body {
+    font-size: 14px;
+  }
 }

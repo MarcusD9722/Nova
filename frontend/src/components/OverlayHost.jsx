@@ -18,7 +18,7 @@ export default function OverlayHost({ open, title, onClose, children }) {
         ].join(" ")}
         aria-hidden={!open}
         onMouseDown={() => onClose?.()}
-        style={{ background: "rgba(0,0,0,0.55)" }}
+        style={{ background: "rgba(6,2,23,0.72)" }}
       />
       <div
         className={[
@@ -31,21 +31,21 @@ export default function OverlayHost({ open, title, onClose, children }) {
         aria-label={title || "Overlay"}
       >
         <div
-          className="mx-auto w-[min(980px,94vw)] rounded-t-3xl border border-white/10 bg-black/55 backdrop-blur-2xl shadow-[0_-10px_40px_rgba(0,0,0,0.6)]"
+          className="mx-auto w-[min(980px,94vw)] rounded-t-3xl border border-nova-gold/20 bg-glass backdrop-blur-2xl shadow-[0_-10px_40px_rgba(0,0,0,0.65)]"
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
-            <div className="text-xs tracking-widest uppercase text-cyan-200/80">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-nova-gold/15">
+            <div className="text-xs tracking-widest uppercase text-nova-gold/80">
               {title}
             </div>
             <button
-              className="text-white/70 hover:text-white text-sm px-3 py-1 rounded-lg bg-white/5 border border-white/10"
+              className="text-nova-gold/80 hover:text-nova-gold text-sm px-3 py-1 rounded-lg bg-black/25 border border-nova-gold/15"
               onClick={() => onClose?.()}
             >
               Close
             </button>
           </div>
-          <div className="p-4 max-h-[52vh] overflow-auto">
+          <div className="p-4 max-h-[72vh] overflow-auto">
             {children}
           </div>
         </div>

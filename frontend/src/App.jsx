@@ -3,23 +3,31 @@ import React, { useEffect, useMemo, useRef, useState, lazy, Suspense } from "rea
 import TopBar from "./components/TopBar";
 import BottomDock from "./components/BottomDock";
 import OverlayHost from "./components/OverlayHost";
+import LeftSidebar from "./components/LeftSidebar";
+import Waveform from "./components/Waveform";
+import HologramStage from "./components/HologramStage";
 
 import useMicLevel from "./hooks/useMicLevel";
 import useCamera from "./hooks/useCamera";
 import useHandTracking from "./hooks/useHandTracking";
+import useNovaEvents from "./hooks/useNovaEvents";
+import useFocusSession from "./hooks/useFocusSession";
 
 import { useWakeNova } from "./voice/useWakeNova";
-import { acquireMicStreamHandle, playAudioUrl, recordFromStreamToBlob, recordOnceToBlob, transcribeBlob } from "./voice/recorder";
+import { acquireMicStreamHandle, playAudioUrl, prefetchAudioBlob, recordVoiceActivityFromStreamToBlob, recordVoiceActivityToBlob, stopActiveAudio, transcribeBlob, unlockAudioContext } from "./voice/recorder";
 
 import SettingsSheet from "./overlays/SettingsSheet";
 import CameraSheet from "./overlays/CameraSheet";
-import GesturesSheet from "./overlays/GesturesSheet";
-import SmartHomeSheet from "./overlays/SmartHomeSheet";
-import PrinterSheet from "./overlays/PrinterSheet";
+import MapsSheet from "./overlays/SmartHomeSheet";
 import WebSheet from "./overlays/WebSheet";
+import MemorySheet from "./overlays/MemorySheet";
+import TasksSheet from "./overlays/TasksSheet";
+import SystemSheet from "./overlays/SystemSheet";
+import ImprovementsSheet from "./overlays/ImprovementsSheet";
+import ScreenVisionSheet from "./overlays/ScreenVisionSheet";
 
 const AnimatedBackground = lazy(() => import("./components/AnimatedBackground"));
-const NovaOrb3D = lazy(() => import("./components/NovaOrb3D"));
+const NovaHologramAvatar = lazy(() => import("./components/NovaHologramAvatar"));
 const ChatPanel = lazy(() => import("./components/ChatPanel"));
 
 function apiBase() {
@@ -44,6 +52,131 @@ function apiUrl(path) {
   return `${b}${path}`;
 }
 
+const HAND_CALIBRATION_KEY = "nova.handCalibration.v1";
+const LOCATION_REQUIRED_MESSAGE_RE = /\b(?:from\s+here|from\s+my\s+location|near\s+me|around\s+me|nearest\b|closest\b|directions?\s+to\b|how\s+do\s+i\s+get\s+to\b|how\s+long\s+will\s+it\s+take(?:\s+to\s+get)?\s+to\b|(?:get|go|drive|walk|navigate|head)\s+to\b)\s/i;
+const HAND_CALIBRATION_STEPS = [
+  {
+    key: "center",
+    title: "Center",
+    detail: "Hold your index finger where you want the cursor to feel centered, then stay still and capture.",
+  },
+  {
+    key: "left",
+    title: "Left Edge",
+    detail: "Reach to the furthest comfortable left position you want to use for cursor control.",
+  },
+  {
+    key: "right",
+    title: "Right Edge",
+    detail: "Reach to the furthest comfortable right position you want to use for cursor control.",
+  },
+  {
+    key: "top",
+    title: "Top Edge",
+    detail: "Lift your hand to the highest comfortable cursor position.",
+  },
+  {
+    key: "bottom",
+    title: "Bottom Edge",
+    detail: "Lower your hand to the lowest comfortable cursor position.",
+  },
+  {
+    key: "open",
+    title: "Open Pinch",
+    detail: "Relax your thumb and index finger fully open, then capture that resting gap.",
+  },
+  {
+    key: "closed",
+    title: "Closed Pinch",
+    detail: "Pinch firmly the way you want clicks and drags to engage, then capture.",
+  },
+];
+
+function loadSavedHandCalibration() {
+  try {
+    const raw = window.localStorage.getItem(HAND_CALIBRATION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function averageCalibrationSamples(samples) {
+  const list = Array.isArray(samples) ? samples.filter(Boolean) : [];
+  if (!list.length) return null;
+
+  const sum = list.reduce(
+    (acc, item) => ({
+      rawX: acc.rawX + Number(item.rawX || 0),
+      rawY: acc.rawY + Number(item.rawY || 0),
+      pinchRatio: acc.pinchRatio + Number(item.pinchRatio || 0),
+    }),
+    { rawX: 0, rawY: 0, pinchRatio: 0 }
+  );
+
+  return {
+    rawX: sum.rawX / list.length,
+    rawY: sum.rawY / list.length,
+    pinchRatio: sum.pinchRatio / list.length,
+    sampleCount: list.length,
+  };
+}
+
+function buildHandCalibration(samples) {
+  const center = samples?.center;
+  const left = samples?.left;
+  const right = samples?.right;
+  const top = samples?.top;
+  const bottom = samples?.bottom;
+  const open = samples?.open;
+  const closed = samples?.closed;
+
+  if (!center || !left || !right || !top || !bottom || !open || !closed) {
+    return null;
+  }
+
+  const mirrorX = left.rawX > right.rawX;
+  const leftSampleX = mirrorX ? right.rawX : left.rawX;
+  const rightSampleX = mirrorX ? left.rawX : right.rawX;
+
+  const leftBound = Math.max(0, Math.min(leftSampleX, center.rawX - 0.02));
+  const rightBound = Math.min(1, Math.max(rightSampleX, center.rawX + 0.02));
+  const topBound = Math.max(0, Math.min(top.rawY, center.rawY - 0.02));
+  const bottomBound = Math.min(1, Math.max(bottom.rawY, center.rawY + 0.02));
+
+  const xRange = Math.max(0.08, rightBound - leftBound);
+  const yRange = Math.max(0.08, bottomBound - topBound);
+  const xPad = Math.min(0.06, xRange * 0.08);
+  const yPad = Math.min(0.06, yRange * 0.08);
+
+  const openRatio = Math.max(open.pinchRatio, closed.pinchRatio + 0.08);
+  const closedRatio = Math.min(closed.pinchRatio, openRatio - 0.08);
+  const pinchSpan = Math.max(0.08, openRatio - closedRatio);
+
+  return {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    mirrorX,
+    cursorBounds: {
+      left: Math.max(0, leftBound - xPad),
+      right: Math.min(1, rightBound + xPad),
+      top: Math.max(0, topBound - yPad),
+      bottom: Math.min(1, bottomBound + yPad),
+      centerX: center.rawX,
+      centerY: center.rawY,
+    },
+    pinch: {
+      open: openRatio,
+      closed: closedRatio,
+      pressThreshold: closedRatio + pinchSpan * 0.34,
+      releaseThreshold: closedRatio + pinchSpan * 0.62,
+    },
+    samples,
+  };
+}
+
 export default function App() {
   // ===== Chat state =====
   const [messages, setMessages] = useState([]);
@@ -65,18 +198,66 @@ export default function App() {
     } catch {}
   }, [conversationId]);
   const [thinking, setThinking] = useState(false);
+  const thinkingRef = useRef(false);
+  useEffect(() => {
+    thinkingRef.current = thinking;
+  }, [thinking]);
 
   // ===== Layout state =====
-  const [activeOverlay, setActiveOverlay] = useState(null); // "settings"|"camera"|"gestures"|"smarthome"|"printer"|"web"|null
+  const [chatOpen, setChatOpen] = useState(true);
+  const [activeSection, setActiveSection] = useState("home");
+  const [activeOverlay, setActiveOverlay] = useState(null); // "settings"|"camera"|"maps"|"web"|null
+  const [mapsRoutePreload, setMapsRoutePreload] = useState(null);
+  const [currentLocation, setCurrentLocation] = useState(null);
+  const [locationStatus, setLocationStatus] = useState("idle"); // idle | locating | ready | denied | unavailable | manual
+  const [locationNote, setLocationNote] = useState("");
 
   // ===== Subsystem state =====
   const [micMuted, setMicMuted] = useState(true);
   const [gesturesOn, setGesturesOn] = useState(false);
+  // PI1: opt-in periodic screen glances — off by default; toggling this ON
+  // IS the explicit action that permits periodic capture (see useFocusSession).
+  const [focusSessionOn, setFocusSessionOn] = useState(false);
+  // PI1: pending agent-requested screen look, waiting on the user's confirm click.
+  const [screenLookRequest, setScreenLookRequest] = useState(null); // {requestId, question} | null
+  const [desktopControlAvailable, setDesktopControlAvailable] = useState(false);
+  const [desktopControlEnabled, setDesktopControlEnabled] = useState(false);
+  const [handCalibration, setHandCalibration] = useState(() => loadSavedHandCalibration());
+  const [calibrationSession, setCalibrationSession] = useState(null);
+  const [micRequesting, setMicRequesting] = useState(false);
+
+  const [micStream, setMicStream] = useState(null);
+
+  const [ttsPlaying, setTtsPlaying] = useState(false);
+  const ttsPlayingRef = useRef(false);
+  const [wakePulse, setWakePulse] = useState(false);
+  const wakePulseTimerRef = useRef(null);
+
+  const [voiceSessionActive, setVoiceSessionActive] = useState(false);
+  const voiceSessionRef = useRef(false);
+  const sessionCtlRef = useRef({ token: 0 });
+  useEffect(() => {
+    voiceSessionRef.current = voiceSessionActive;
+  }, [voiceSessionActive]);
+
+  const setVoiceSession = (active) => {
+    voiceSessionRef.current = !!active;
+    setVoiceSessionActive(!!active);
+  };
 
   const camera = useCamera();
-  const micLevel = useMicLevel({ enabled: !micMuted, muted: micMuted });
+  const micLevel = useMicLevel({ enabled: !micMuted, muted: micMuted, stream: micStream });
 
-  const hand = useHandTracking({ enabled: gesturesOn && camera.enabled, stream: camera.stream });
+  // Live backend event stream (thinking / tools / memory / vision / web states)
+  const { connected: eventsConnected, events: novaEvents, activity: novaActivity } = useNovaEvents();
+
+  const handTrackingEnabled = camera.enabled && (gesturesOn || Boolean(calibrationSession?.active));
+  const hand = useHandTracking({ enabled: handTrackingEnabled, stream: camera.stream, calibration: handCalibration });
+  const cameraOverlayAutoGesturesRef = useRef(false);
+  const desktopMoveAtRef = useRef(0);
+  const desktopMoveInFlightRef = useRef(false);
+  const domPressRef = useRef({ active: false, target: null, startX: 0, startY: 0, moved: false, pressedAt: 0 });
+  const latestHandSampleRef = useRef({ status: "off", rawCursor: { x: 0, y: 0, visible: false }, pinchRatio: 1 });
 
   // ===== Voice pipeline state =====
   const [voiceStatus, setVoiceStatus] = useState("idle"); // idle | wake | listening | transcribing | speaking | error
@@ -88,6 +269,64 @@ export default function App() {
   const wakeResumeAtRef = useRef(0);
   const transcribeDoneAtRef = useRef(0);
   const resumeTimerRef = useRef(null);
+
+  const requestCurrentLocation = async ({ silent = false } = {}) => {
+    if (!navigator?.geolocation) {
+      setLocationStatus("unavailable");
+      setLocationNote("Location services are not available in this build.");
+      return null;
+    }
+
+    setLocationStatus("locating");
+    if (!silent) setLocationNote("Requesting your current location...");
+
+    return await new Promise((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const next = {
+            lat: Number(position.coords.latitude),
+            lng: Number(position.coords.longitude),
+            accuracy_m: Number(position.coords.accuracy || 0),
+          };
+          setCurrentLocation(next);
+          setLocationStatus("ready");
+          setLocationNote(
+            next.accuracy_m ? `Using your current location (accuracy about ${Math.round(next.accuracy_m)} meters).` : "Using your current location."
+          );
+          resolve(next);
+        },
+        (error) => {
+          setCurrentLocation(null);
+          if (error?.code === 1) {
+            setLocationStatus("denied");
+            setLocationNote("Location permission was denied. You can type an address manually below.");
+          } else {
+            setLocationStatus("unavailable");
+            setLocationNote("Could not get your current location. You can type an address manually below.");
+          }
+          resolve(null);
+        },
+        { enableHighAccuracy: true, timeout: 12000, maximumAge: 300000 }
+      );
+    });
+  };
+
+  useEffect(() => {
+    requestCurrentLocation({ silent: true });
+  }, []);
+
+  const setManualLocation = (nextLocation, label = "") => {
+    setCurrentLocation(nextLocation);
+    setLocationStatus("manual");
+    setLocationNote(label ? `Using typed location: ${label}` : "Using typed location.");
+  };
+
+  const messageNeedsCurrentLocation = (text) => LOCATION_REQUIRED_MESSAGE_RE.test(String(text || "").trim());
+
+  const locationForMessage = async (text) => {
+    if (currentLocation || !messageNeedsCurrentLocation(text)) return currentLocation;
+    return await requestCurrentLocation({ silent: false });
+  };
 
   const setPhase = (next, meta = {}) => {
     const prev = phaseRef.current;
@@ -105,6 +344,7 @@ export default function App() {
     resumeTimerRef.current = window.setTimeout(() => {
       if (!micUnmutedRef.current) return;
       if (capturingRef.current) return;
+      if (voiceSessionRef.current) return;
       const now = Date.now();
       if (wakeResumeAtRef.current && now < wakeResumeAtRef.current) {
         scheduleWakeResumeCheck();
@@ -141,6 +381,210 @@ export default function App() {
     setMessages((prev) => [...prev, { id, sender: "system", text }]);
   };
 
+  const showSystemMessage = (text) => {
+    try {
+      if (window.__NOVA_SHOW_SYSTEM_CHAT === true) {
+        addSystem(text);
+      }
+    } catch {}
+  };
+
+  const normalize = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .replace(/[\u2019']/g, "'")
+      .replace(/[^a-z0-9\s']/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const isSessionStopPhrase = (raw) => {
+    const t = normalize(raw);
+    if (!t) return false;
+    // Any mention of these words ends the engaged session.
+    return /\b(standby|disengage)\b/.test(t);
+  };
+
+  // Barge-in: short "stop"-style phrases silence Nova without ending the session.
+  const isInterruptPhrase = (raw) => {
+    const t = normalize(raw);
+    if (!t || t.split(" ").length > 4) return false;
+    return /\b(stop( talking)?|be quiet|quiet|shush|shut up|silence|enough)\b/.test(t);
+  };
+
+  const resolveDomTarget = (x, y) => document.elementFromPoint(x, y) || document.body;
+
+  const pointerTypeForMouse = (type) => {
+    if (type === "mousedown") return "pointerdown";
+    if (type === "mouseup") return "pointerup";
+    return "pointermove";
+  };
+
+  const dispatchSyntheticMouse = (target, type, init) => {
+    if (!target?.dispatchEvent) return;
+    try {
+      target.dispatchEvent(new MouseEvent(type, init));
+    } catch {}
+    if (typeof PointerEvent !== "undefined") {
+      try {
+        target.dispatchEvent(new PointerEvent(pointerTypeForMouse(type), {
+          ...init,
+          pointerId: 1,
+          pointerType: "mouse",
+          isPrimary: true,
+        }));
+      } catch {}
+    }
+  };
+
+  const releaseDomPress = (x, y) => {
+    const press = domPressRef.current;
+    if (!press.active) return;
+
+    const target = resolveDomTarget(x, y);
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      clientX: x,
+      clientY: y,
+      view: window,
+      button: 0,
+      buttons: 0,
+    };
+
+    dispatchSyntheticMouse(document, "mouseup", init);
+    if (target && target !== document) {
+      dispatchSyntheticMouse(target, "mouseup", init);
+    }
+
+    const quickTap = !press.moved && Date.now() - press.pressedAt < 450;
+    if (quickTap && target) {
+      dispatchSyntheticMouse(target, "click", init);
+    }
+
+    domPressRef.current = { active: false, target: null, startX: 0, startY: 0, moved: false, pressedAt: 0 };
+  };
+
+  const waitForResponseToFinish = async ({ maxMs = 45_000 } = {}) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      if (!thinkingRef.current && !ttsPlayingRef.current) return;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+  };
+
+  const captureCommandBlob = async ({ debugTag = "command", maxMs = 8000 } = {}) => {
+    const keep = micKeepaliveRef.current;
+    if (keep?.stream) {
+      return recordVoiceActivityFromStreamToBlob(keep.stream, {
+        maxMs,
+        minSpeechMs: 220,
+        trailingSilenceMs: 850,
+        speechThreshold: 0.02,
+        startTimeoutMs: 4500,
+        timesliceMs: 200,
+        debugTag,
+      });
+    }
+    return recordVoiceActivityToBlob({
+      maxMs,
+      minSpeechMs: 220,
+      trailingSilenceMs: 850,
+      speechThreshold: 0.02,
+      startTimeoutMs: 4500,
+      timesliceMs: 200,
+      debugTag,
+    });
+  };
+
+  // WS-H: an engaged voice session auto-disengages after this much silence,
+  // so she isn't left hot-mic'd indefinitely if Marcus walks away. He can
+  // always re-engage with the wake word.
+  const SESSION_IDLE_TIMEOUT_MS = 90_000;
+
+  const runVoiceSessionLoop = async () => {
+    // Session loop: capture -> transcribe -> stop word? -> send -> wait -> repeat
+    const myToken = (sessionCtlRef.current.token = sessionCtlRef.current.token + 1);
+    setVoiceSession(true);
+    showSystemMessage("Engaged listening. Say 'standby' or 'disengage' to stop.");
+    let lastHeardAt = Date.now();
+
+    try {
+      while (micUnmutedRef.current && voiceSessionRef.current && sessionCtlRef.current.token === myToken) {
+        if (capturingRef.current) {
+          await new Promise((r) => setTimeout(r, 120));
+          continue;
+        }
+
+        capturingRef.current = true;
+        try {
+          setPhase("CAPTURING_COMMAND", { reason: "session" });
+          setVoiceStatus("listening");
+
+          clearTtsQueue();
+          const blob = await captureCommandBlob({ debugTag: "session", maxMs: 8000 });
+
+          setVoiceStatus("transcribing");
+          const text = await transcribeBlob(blob, apiUrl("/stt"));
+          if (!text?.trim()) {
+            if (Date.now() - lastHeardAt > SESSION_IDLE_TIMEOUT_MS) {
+              clearTtsQueue();
+              addSystem("Haven't heard anything for a bit — standing by. Say 'Hey Nova' when you need me.");
+              setVoiceSession(false);
+              setVoiceStatus("idle");
+              setPhase("IDLE_LISTENING", { reason: "session_idle_timeout" });
+              wakeResumeAtRef.current = Date.now();
+              try { startWake?.(); } catch {}
+              break;
+            }
+            setVoiceStatus("idle");
+            await new Promise((r) => setTimeout(r, 200));
+            continue;
+          }
+          lastHeardAt = Date.now();
+
+          if (isInterruptPhrase(text)) {
+            clearTtsQueue();
+            setVoiceStatus("idle");
+            continue;
+          }
+
+          if (isSessionStopPhrase(text)) {
+            clearTtsQueue();
+            addSystem("Standing by.");
+            setVoiceSession(false);
+            setVoiceStatus("idle");
+            setPhase("IDLE_LISTENING", { reason: "session_stop_word" });
+            wakeResumeAtRef.current = Date.now();
+            try { startWake?.(); } catch {}
+            break;
+          }
+
+          // Send as normal chat message
+          setVoiceStatus("speaking");
+          await sendMessage(text);
+          if (!ttsPlayingRef.current) setVoiceStatus("idle");
+          setPhase("RESPONDING", { reason: "session_sent" });
+          await waitForResponseToFinish();
+          setPhase("CAPTURING_COMMAND", { reason: "session_next" });
+        } catch (e) {
+          console.warn(e);
+          setVoiceStatus("error");
+          addSystem("Voice session error.");
+          await new Promise((r) => setTimeout(r, 600));
+          setVoiceStatus("idle");
+        } finally {
+          capturingRef.current = false;
+        }
+      }
+    } finally {
+      // If the loop exits without an explicit stop phrase, return to wake listening.
+      if (micUnmutedRef.current && !voiceSessionRef.current) {
+        wakeResumeAtRef.current = Date.now();
+        scheduleWakeResumeCheck();
+      }
+    }
+  };
+
   // Ensure window.__NOVA_API_BASE exists for Electron prod
   useEffect(() => {
     try {
@@ -148,7 +592,230 @@ export default function App() {
     } catch {}
   }, []);
 
+  useEffect(() => {
+    latestHandSampleRef.current = {
+      status: hand?.status || "off",
+      rawCursor: hand?.rawCursor || { x: 0, y: 0, visible: false },
+      pinchRatio: Number(hand?.telemetry?.pinchRatio ?? 1),
+    };
+  }, [hand?.status, hand?.rawCursor, hand?.telemetry?.pinchRatio]);
+
+  useEffect(() => {
+    try {
+      if (handCalibration) {
+        window.localStorage.setItem(HAND_CALIBRATION_KEY, JSON.stringify(handCalibration));
+      } else {
+        window.localStorage.removeItem(HAND_CALIBRATION_KEY);
+      }
+    } catch {}
+  }, [handCalibration]);
+
+  useEffect(() => {
+    if (!handCalibration || handCalibration.mirrorX !== undefined) return;
+    const rebuilt = buildHandCalibration(handCalibration.samples || {});
+    if (rebuilt) {
+      setHandCalibration(rebuilt);
+    }
+  }, [handCalibration]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDesktopGestureStatus() {
+      try {
+        const status = await window.novaDesktop?.desktopGestureStatus?.();
+        if (!cancelled) {
+          const supported = Boolean(status?.supported);
+          setDesktopControlAvailable(supported);
+          if (!supported) setDesktopControlEnabled(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setDesktopControlAvailable(false);
+          setDesktopControlEnabled(false);
+        }
+      }
+    }
+
+    loadDesktopGestureStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const startHandCalibration = async ({ cameraReady = false } = {}) => {
+    if (!camera.enabled && !cameraReady) {
+      try {
+        await camera.start();
+        addSystem("Camera on (required for calibration).");
+      } catch (e) {
+        console.warn(e);
+        addSystem("Calibration needs camera permission.");
+        return;
+      }
+    }
+
+    if (desktopControlEnabled && hand?.pinch?.down) {
+      Promise.resolve(
+        window.novaDesktop?.mouseUpSystemCursor?.({
+          x: hand?.cursor?.x ?? 0.5,
+          y: hand?.cursor?.y ?? 0.5,
+        })
+      ).catch(() => {});
+      setDesktopControlEnabled(false);
+    }
+
+    if (domPressRef.current.active) {
+      const x = Math.round((hand?.cursor?.x ?? 0.5) * window.innerWidth);
+      const y = Math.round((hand?.cursor?.y ?? 0.5) * window.innerHeight);
+      releaseDomPress(x, y);
+    }
+
+    setCalibrationSession({
+      active: true,
+      stepIndex: 0,
+      capturing: false,
+      samples: {},
+      error: "",
+      lastCompletedAt: null,
+    });
+    addSystem("Hand calibration started.");
+  };
+
+  const cancelHandCalibration = () => {
+    setCalibrationSession(null);
+    addSystem("Hand calibration canceled.");
+  };
+
+  const resetHandCalibration = () => {
+    setHandCalibration(null);
+    addSystem("Hand calibration reset.");
+  };
+
+  const captureHandCalibrationStep = async () => {
+    if (!calibrationSession?.active || calibrationSession.capturing) return;
+
+    const step = HAND_CALIBRATION_STEPS[calibrationSession.stepIndex];
+    if (!step) return;
+
+    const before = latestHandSampleRef.current;
+    if (before.status !== "ready" || !before.rawCursor?.visible) {
+      setCalibrationSession((prev) => prev ? { ...prev, error: "Show one hand clearly to the camera before capturing." } : prev);
+      return;
+    }
+
+    setCalibrationSession((prev) => prev ? { ...prev, capturing: true, error: "" } : prev);
+
+    const startedAt = Date.now();
+    const samples = [];
+    while (Date.now() - startedAt < 900) {
+      const sample = latestHandSampleRef.current;
+      if (sample.status === "ready" && sample.rawCursor?.visible) {
+        samples.push({
+          rawX: Number(sample.rawCursor.x ?? 0),
+          rawY: Number(sample.rawCursor.y ?? 0),
+          pinchRatio: Number(sample.pinchRatio ?? 1),
+        });
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => window.setTimeout(resolve, 35));
+    }
+
+    const averaged = averageCalibrationSamples(samples);
+    if (!averaged) {
+      setCalibrationSession((prev) => prev ? { ...prev, capturing: false, error: "Could not sample your hand. Hold still and try again." } : prev);
+      return;
+    }
+
+    const nextSamples = { ...(calibrationSession.samples || {}), [step.key]: averaged };
+    const nextIndex = calibrationSession.stepIndex + 1;
+
+    if (nextIndex >= HAND_CALIBRATION_STEPS.length) {
+      const built = buildHandCalibration(nextSamples);
+      if (!built) {
+        setCalibrationSession((prev) => prev ? { ...prev, capturing: false, error: "Calibration data was incomplete. Restart and try again." } : prev);
+        return;
+      }
+
+      setHandCalibration(built);
+      setCalibrationSession({
+        active: false,
+        stepIndex: HAND_CALIBRATION_STEPS.length,
+        capturing: false,
+        samples: nextSamples,
+        error: "",
+        lastCompletedAt: built.createdAt,
+      });
+      addSystem("Hand calibration saved.");
+      return;
+    }
+
+    setCalibrationSession((prev) => prev ? {
+      ...prev,
+      capturing: false,
+      samples: nextSamples,
+      stepIndex: nextIndex,
+      error: "",
+    } : prev);
+  };
+
   // ===== Chat streaming helpers =====
+  const beginTtsPlayback = () => {
+    ttsPlayingRef.current = true;
+    setTtsPlaying(true);
+    setVoiceStatus("speaking");
+  };
+  const endTtsPlayback = () => {
+    ttsPlayingRef.current = false;
+    setTtsPlaying(false);
+    // Only fall back to idle if we're not actively capturing/listening for the
+    // next voice command — otherwise this would clobber that state and the
+    // avatar/jaw-drive fallback would never see it latch on "speaking" forever.
+    if (!capturingRef.current) setVoiceStatus("idle");
+  };
+
+  // ===== Sequential TTS queue (backend streams one audio clip per sentence) =====
+  const ttsQueueRef = useRef([]);
+  const ttsBusyRef = useRef(false);
+
+  const clearTtsQueue = () => {
+    ttsQueueRef.current = [];
+    ttsBusyRef.current = false;
+    try { stopActiveAudio(); } catch {}
+    endTtsPlayback();
+  };
+
+  const pumpTtsQueue = () => {
+    if (ttsBusyRef.current) return;
+    const next = ttsQueueRef.current.shift();
+    if (!next) {
+      endTtsPlayback();
+      return;
+    }
+    ttsBusyRef.current = true;
+    beginTtsPlayback();
+    const advance = () => {
+      ttsBusyRef.current = false;
+      if (ttsQueueRef.current.length) pumpTtsQueue();
+      else endTtsPlayback();
+    };
+    playAudioUrl(next.url, {
+      debugTag: "tts",
+      preloadedBlob: next.blobPromise,
+      onEnded: advance,
+      onError: () => {},
+    }).catch(() => advance());
+  };
+
+  const enqueueTts = (url) => {
+    // Start fetching+decoding this clip's audio the moment it's enqueued
+    // instead of waiting for the previous clip to finish — by the time
+    // playback advances here, the blob is usually already resolved, which
+    // removes the audible dead-air between sentences.
+    ttsQueueRef.current.push({ url, blobPromise: prefetchAudioBlob(url) });
+    pumpTtsQueue();
+  };
+
   const setReply = (text, isError = false) => {
     setMessages((prev) => {
       const next = [...prev];
@@ -173,6 +840,19 @@ export default function App() {
       return next;
     });
   };
+  const attachImage = (imageUrl, prompt) => {
+    setMessages((prev) => {
+      const next = [...prev];
+      const last = next[next.length - 1];
+      const entry = { url: imageUrl, prompt };
+      if (last && last.sender === "nova") {
+        next[next.length - 1] = { ...last, images: [...(last.images || []), entry] };
+      } else {
+        next.push({ id: `nova-image-${Date.now()}`, sender: "nova", text: "", images: [entry] });
+      }
+      return next;
+    });
+  };
   const finalizeReply = () => {
     setMessages((prev) => {
       const next = [...prev];
@@ -184,13 +864,27 @@ export default function App() {
     });
   };
 
-  async function nonStreamingFallback(text) {
+  async function nonStreamingFallback(text, files = []) {
+    const resolvedLocation = await locationForMessage(text);
     const resp = await fetch(apiUrl("/chat"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, ...(conversationId ? { conversation_id: conversationId } : {}) }),
+      body: JSON.stringify({
+        message: text || null,
+        attachments: files,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
+        ...(resolvedLocation ? { current_location: resolvedLocation } : {}),
+      }),
     });
-    if (!resp.ok) throw new Error(await resp.text());
+    if (!resp.ok) {
+      const raw = await resp.text();
+      try {
+        const obj = JSON.parse(raw);
+        const detail = obj?.detail || obj?.error || "";
+        if (detail) throw new Error(String(detail));
+      } catch {}
+      throw new Error(raw || `HTTP ${resp.status}`);
+    }
     const data = await resp.json();
     const reply = data?.assistant ?? data?.response ?? data?.text ?? "";
     setReply(reply);
@@ -204,16 +898,23 @@ export default function App() {
       streamCtlRef.current?.abort?.();
     } catch {}
     streamCtlRef.current = null;
+    clearTtsQueue();
     setThinking(false);
     finalizeReply();
     addSystem("Stopped.");
   };
 
   // Main sendMessage for ChatPanel
-  const sendMessage = async (text) => {
+  const sendMessage = async (text, files = []) => {
+    const cleanText = (text || "").trim();
+    const attachments = Array.isArray(files) ? files.filter(Boolean) : [];
+    if (!cleanText && !attachments.length) return;
+
+    const resolvedLocation = await locationForMessage(cleanText);
+
     const userId = `user-${Date.now()}`;
     const replyId = `nova-${Date.now()}`;
-    setMessages((prev) => [...prev, { id: userId, sender: "user", text }]);
+    setMessages((prev) => [...prev, { id: userId, sender: "user", text: cleanText, files: attachments }]);
     setMessages((prev) => [...prev, { id: replyId, sender: "nova", text: "", streaming: true }]);
     setThinking(true);
 
@@ -235,11 +936,12 @@ export default function App() {
           "Accept": "text/event-stream, text/plain",
         },
         body: JSON.stringify({
-          system_prompt: "You are Nova.",
-          msg: text,
+          msg: cleanText || null,
+          attachments,
           hint: "",
           speak: true,
           ...(conversationId ? { conversation_id: conversationId } : {}),
+          ...(resolvedLocation ? { current_location: resolvedLocation } : {}),
         }),
         signal: ctl.signal,
       });
@@ -285,14 +987,27 @@ export default function App() {
                       wakeResumeAtRef.current = Math.min(wakeResumeAtRef.current || now, now);
                       scheduleWakeResumeCheck();
                     }
-                    try {
-                      await playAudioUrl(String(aurl), { debugTag: "tts" });
-                    } catch {}
+                    // Sentence clips arrive as the reply streams; queue them in order.
+                    enqueueTts(apiUrl(String(aurl)));
                   }
                   continue;
                 }
                 if (currentEvent === "tts_error") {
-                  if (voiceDebug) addSystem(`TTS error: ${piece?.error || "unknown"}`);
+                  addSystem(`TTS error: ${piece?.error || "unknown"}`);
+                  continue;
+                }
+                if (currentEvent === "action") {
+                  try {
+                    if (piece?.type === "open_overlay" && piece?.overlay) {
+                      if (piece.overlay === "maps" && piece.map_payload) {
+                        setMapsRoutePreload(piece.map_payload);
+                      }
+                      setActiveOverlay(piece.overlay);
+                    }
+                    if (piece?.type === "image_generated" && piece?.image_url) {
+                      attachImage(piece.image_url, piece.prompt || "");
+                    }
+                  } catch {}
                   continue;
                 }
 
@@ -327,11 +1042,7 @@ export default function App() {
             }
             if (currentEvent === "tts") {
               const aurl = piece?.audio_url;
-              if (aurl) {
-                try {
-                  await playAudioUrl(String(aurl), { debugTag: "tts" });
-                } catch {}
-              }
+              if (aurl) enqueueTts(apiUrl(String(aurl)));
             } else if (currentEvent === "message") {
               const token = piece?.content ?? "";
               if (token) {
@@ -351,17 +1062,18 @@ export default function App() {
 
         return assistantText;
       } else {
-        const reply = await nonStreamingFallback(text);
+        const reply = await nonStreamingFallback(cleanText, attachments);
         return reply;
       }
     } catch (err) {
       if (ctl.signal.aborted) return;
       console.error("stream error:", err);
       try {
-        const reply = await nonStreamingFallback(text);
+        const reply = await nonStreamingFallback(cleanText, attachments);
         return reply;
-      } catch {
-        setReply("Sorry — I hit a connection error.", true);
+      } catch (e2) {
+        const msg = (e2 && e2.message) ? String(e2.message) : "Sorry — I hit a connection error.";
+        setReply(msg, true);
         finalizeReply();
       }
     } finally {
@@ -378,18 +1090,12 @@ export default function App() {
     try {
       setPhase("CAPTURING_COMMAND");
       setVoiceStatus("listening");
-      addSystem("Listening…");
+      showSystemMessage("Listening…");
 
-      // Prefer the keepalive stream so we don't create competing MediaRecorder sessions.
-      let blob;
-      const keep = micKeepaliveRef.current;
-      if (keep?.stream) {
-        blob = await recordFromStreamToBlob(keep.stream, { maxMs: 8000, timesliceMs: 250, debugTag: "capture" });
-      } else {
-        blob = await recordOnceToBlob({ seconds: 8, debugTag: "capture" });
-      }
+      clearTtsQueue();
+      const blob = await captureCommandBlob({ debugTag: "capture", maxMs: 8000 });
       setVoiceStatus("transcribing");
-      addSystem("Transcribing…");
+      showSystemMessage("Transcribing…");
 
       // Transcription finished gate for wake resumption.
       transcribeDoneAtRef.current = 0;
@@ -398,15 +1104,16 @@ export default function App() {
       transcribeDoneAtRef.current = Date.now();
 
       if (!text?.trim()) {
-        addSystem("No speech detected.");
+        showSystemMessage("No speech detected.");
         setVoiceStatus("idle");
         setPhase("IDLE_LISTENING", { reason: "empty_transcript" });
         return;
       }
 
       setPhase("RESPONDING");
+      // We'll stay in "speaking" while actual TTS audio is playing.
       setVoiceStatus("speaking");
-      addSystem(`You said: ${text}`);
+      showSystemMessage(`You said: ${text}`);
 
       // Do not restart wake until transcription is done AND we either:
       // - wait a short cooldown (default), or
@@ -416,18 +1123,22 @@ export default function App() {
 
       // Send message and then speak last assistant reply
       await sendMessage(text);
-      setVoiceStatus("idle");
+
+      // If TTS is not playing, return to idle immediately.
+      if (!ttsPlayingRef.current) {
+        setVoiceStatus("idle");
+      }
       setPhase("IDLE_LISTENING", { reason: "response_complete" });
     } catch (e) {
       console.warn(e);
       setVoiceStatus("error");
-      addSystem("Voice error.");
+      showSystemMessage("Voice error.");
       setTimeout(() => setVoiceStatus("idle"), 1200);
     } finally {
       capturingRef.current = false;
 
       // Resume wake only when allowed by the state machine + cooldown.
-      if (micKeepaliveRef.current && micUnmutedRef.current) {
+      if (micKeepaliveRef.current && micUnmutedRef.current && !voiceSessionRef.current) {
         setPhase("IDLE_LISTENING", { reason: "capture_finally" });
         scheduleWakeResumeCheck();
       }
@@ -438,14 +1149,28 @@ export default function App() {
     // IDLE_LISTENING -> ARMED
     setPhase("ARMED");
     setVoiceStatus("wake");
-    if (voiceDebug) addSystem("Wake word detected.");
-    // Stop wake while we record the command (prevents concurrent MediaRecorder usage).
+    try {
+      if (wakePulseTimerRef.current) window.clearTimeout(wakePulseTimerRef.current);
+    } catch {}
+    setWakePulse(true);
+    wakePulseTimerRef.current = window.setTimeout(() => setWakePulse(false), 1200);
+    showSystemMessage("Wake word detected (Hey Nova).");
+    try { clearTtsQueue(); } catch {}
+    // Stop wake while we enter engaged session.
     try { stopWake?.(); } catch {}
-    // Ensure wake won't restart until we explicitly allow it.
+    // Ensure wake won't restart while engaged.
     wakeResumeAtRef.current = Date.now() + 60_000;
-    // brief delay for UX then capture
-    setTimeout(() => captureAndSend(), 120);
-  }, "hey nova");
+    setPhase("ARMED", { reason: "wake_engage" });
+    // Start engaged listening session.
+    setTimeout(() => runVoiceSessionLoop(), 120);
+  }, "Hey Nova", {
+    onStatus: (msg) => {
+      try {
+        // Avoid spamming: keep these short and system-only.
+        showSystemMessage(String(msg));
+      } catch {}
+    },
+  });
 
   // Enable wake listening when not muted
   useEffect(() => {
@@ -459,99 +1184,354 @@ export default function App() {
     scheduleWakeResumeCheck();
   }, [micMuted, startWake, stopWake]);
 
-  // gestures status
-  const gesturesStatus = useMemo(() => {
-    if (!gesturesOn) return "off";
-    if (!camera.enabled) return "needs camera";
-    if (hand.status === "loading") return "starting";
-    if (hand.status === "error") return "error";
-    return "ready";
-  }, [gesturesOn, camera.enabled, hand.status]);
-
-  // Pinch-to-click
   useEffect(() => {
-    if (!gesturesOn || !camera.enabled) return;
-    if (hand?.status !== "ready") return;
-    if (!hand?.cursor?.visible) return;
-    if (!hand?.pinch?.justPressed) return;
+    if (calibrationSession?.active) return;
 
-    const x = Math.round((hand.cursor.x ?? 0) * window.innerWidth);
-    const y = Math.round((hand.cursor.y ?? 0) * window.innerHeight);
-    const el = document.elementFromPoint(x, y);
-    if (!el) return;
+    const ready = gesturesOn && camera.enabled && hand?.status === "ready" && hand?.cursor?.visible;
 
-    try {
-      el.dispatchEvent(
-        new MouseEvent("click", {
-          bubbles: true,
-          cancelable: true,
-          clientX: x,
-          clientY: y,
-          view: window,
-        })
-      );
-    } catch {}
-  }, [gesturesOn, camera.enabled, hand?.status, hand?.cursor?.visible, hand?.cursor?.x, hand?.cursor?.y, hand?.pinch?.justPressed]);
+    if (!ready) {
+      if (domPressRef.current.active) {
+        const lastX = Math.round((hand?.cursor?.x ?? 0.5) * window.innerWidth);
+        const lastY = Math.round((hand?.cursor?.y ?? 0.5) * window.innerHeight);
+        releaseDomPress(lastX, lastY);
+      }
+      if (desktopControlEnabled && hand?.pinch?.down) {
+        Promise.resolve(
+          window.novaDesktop?.mouseUpSystemCursor?.({
+            x: hand?.cursor?.x ?? 0.5,
+            y: hand?.cursor?.y ?? 0.5,
+          })
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    const normX = hand.cursor.x ?? 0;
+    const normY = hand.cursor.y ?? 0;
+    const x = Math.round(normX * window.innerWidth);
+    const y = Math.round(normY * window.innerHeight);
+
+    if (desktopControlEnabled) {
+      const now = Date.now();
+      if (now - desktopMoveAtRef.current >= 16 && !desktopMoveInFlightRef.current) {
+        desktopMoveAtRef.current = now;
+        desktopMoveInFlightRef.current = true;
+        Promise.resolve(
+          window.novaDesktop?.moveSystemCursor?.({ x: normX, y: normY })
+        ).finally(() => {
+          desktopMoveInFlightRef.current = false;
+        });
+      }
+
+      if (hand?.pinch?.justPressed) {
+        Promise.resolve(
+          window.novaDesktop?.mouseDownSystemCursor?.({ x: normX, y: normY })
+        ).catch(() => {});
+      }
+
+      if (hand?.pinch?.justReleased) {
+        Promise.resolve(
+          window.novaDesktop?.mouseUpSystemCursor?.({ x: normX, y: normY })
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    const buttons = domPressRef.current.active ? 1 : 0;
+    const moveInit = {
+      bubbles: true,
+      cancelable: true,
+      clientX: x,
+      clientY: y,
+      view: window,
+      button: 0,
+      buttons,
+    };
+
+    dispatchSyntheticMouse(document, "mousemove", moveInit);
+    const hoverTarget = resolveDomTarget(x, y);
+    if (hoverTarget && hoverTarget !== document) {
+      dispatchSyntheticMouse(hoverTarget, "mousemove", moveInit);
+    }
+
+    if (domPressRef.current.active) {
+      const moved = Math.hypot(x - domPressRef.current.startX, y - domPressRef.current.startY);
+      if (moved > 8) domPressRef.current.moved = true;
+    }
+
+    if (hand?.pinch?.justPressed && !domPressRef.current.active) {
+      const target = hoverTarget;
+      domPressRef.current = {
+        active: true,
+        target,
+        startX: x,
+        startY: y,
+        moved: false,
+        pressedAt: Date.now(),
+      };
+      const downInit = {
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+        view: window,
+        button: 0,
+        buttons: 1,
+      };
+      dispatchSyntheticMouse(document, "mousedown", downInit);
+      if (target && target !== document) {
+        dispatchSyntheticMouse(target, "mousedown", downInit);
+      }
+      return;
+    }
+
+    if (hand?.pinch?.justReleased) {
+      releaseDomPress(x, y);
+    }
+  }, [
+    gesturesOn,
+    camera.enabled,
+    desktopControlEnabled,
+    hand?.status,
+    hand?.cursor?.visible,
+    hand?.cursor?.x,
+    hand?.cursor?.y,
+    hand?.pinch?.down,
+    hand?.pinch?.justPressed,
+    hand?.pinch?.justReleased,
+    calibrationSession?.active,
+  ]);
 
   // Dock actions
   const onToggleMic = async () => {
     // User gesture entrypoint: request permission here.
     if (micMuted) {
+      setMicRequesting(true);
+      showSystemMessage("Requesting microphone permission…");
       try {
         // Acquire and keep the stream open while unmuted.
         if (!micKeepaliveRef.current) {
-          micKeepaliveRef.current = await acquireMicStreamHandle({ debugTag: "toggle" });
+          // If permission prompt hangs, at least show UI feedback.
+          micKeepaliveRef.current = await Promise.race([
+            acquireMicStreamHandle({ debugTag: "toggle" }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("mic_permission_timeout")), 12000)),
+          ]);
         }
+
+        // Ensure AudioContext is unlocked while we still have a user gesture.
+        try { await unlockAudioContext(); } catch {}
+
+        try {
+          setMicStream(micKeepaliveRef.current?.stream || null);
+        } catch {
+          setMicStream(null);
+        }
+
         setMicMuted(false);
-        addSystem("Mic unmuted.");
+        showSystemMessage("Mic unmuted.");
         // Start wake from the same user gesture, but still honor state machine.
         setPhase("IDLE_LISTENING", { reason: "toggle_unmute" });
         wakeResumeAtRef.current = Date.now();
+        try { startWake?.(); } catch {}
         scheduleWakeResumeCheck();
       } catch (e) {
         console.warn(e);
-        addSystem("Mic permission denied or unavailable.");
+        showSystemMessage("Mic permission denied or unavailable.");
         setMicMuted(true);
         try {
           micKeepaliveRef.current?.release?.();
         } catch {}
         micKeepaliveRef.current = null;
+      } finally {
+        setMicRequesting(false);
       }
       return;
     }
 
     // Muting
     setMicMuted(true);
-    addSystem("Mic muted.");
+    showSystemMessage("Mic muted.");
     try { stopWake?.(); } catch {}
+    setVoiceSession(false);
+    // bump token so any session loop exits quickly
+    sessionCtlRef.current.token = sessionCtlRef.current.token + 1;
     setPhase("IDLE_LISTENING", { reason: "toggle_mute" });
     try { micKeepaliveRef.current?.release?.(); } catch {}
     micKeepaliveRef.current = null;
+    setMicStream(null);
+    setMicRequesting(false);
   };
-  const onToggleCamera = async () => {
+  const onToggleCameraPower = async () => {
     try {
       if (!camera.enabled) {
         await camera.start();
         addSystem("Camera on.");
-      } else {
-        await camera.stop();
-        addSystem("Camera off.");
+        return;
       }
+
+      await camera.stop();
+      if (calibrationSession?.active) {
+        setCalibrationSession(null);
+        addSystem("Hand calibration canceled.");
+      }
+      if (gesturesOn) {
+        setGesturesOn(false);
+        cameraOverlayAutoGesturesRef.current = false;
+        addSystem("Hand tracking disabled.");
+      }
+      addSystem("Camera off.");
+      setActiveOverlay((cur) => (cur === "camera" ? null : cur));
     } catch (e) {
       console.warn(e);
       addSystem("Camera error.");
     }
   };
-  const onToggleGestures = () => {
-    setGesturesOn((v) => {
-      const next = !v;
-      if (next && !camera.enabled) addSystem("Gestures enabled (camera required).");
-      else addSystem(next ? "Gestures enabled." : "Gestures disabled.");
-      return next;
-    });
+
+  const onToggleCameraOverlay = async () => {
+    const opening = activeOverlay !== "camera";
+
+    if (!opening) {
+      setActiveOverlay(null);
+      if (cameraOverlayAutoGesturesRef.current && gesturesOn) {
+        setGesturesOn(false);
+        addSystem("Hand tracking disabled.");
+      }
+      cameraOverlayAutoGesturesRef.current = false;
+      return;
+    }
+
+    setActiveOverlay("camera");
+
+    if (!camera.enabled) {
+      try {
+        await camera.start();
+        addSystem("Camera on (required for hand tracking).");
+      } catch (e) {
+        console.warn(e);
+        addSystem("Gestures need camera permission.");
+        return;
+      }
+    }
+
+    if (!handCalibration) {
+      cameraOverlayAutoGesturesRef.current = false;
+      await startHandCalibration({ cameraReady: true });
+      return;
+    }
+
+    if (!gesturesOn) {
+      setGesturesOn(true);
+      cameraOverlayAutoGesturesRef.current = true;
+      addSystem("Hand tracking linked to camera window.");
+    } else {
+      cameraOverlayAutoGesturesRef.current = false;
+    }
+  };
+
+  const onCloseCameraOverlay = () => {
+    setActiveOverlay(null);
+    if (calibrationSession?.active) {
+      setCalibrationSession(null);
+      addSystem("Hand calibration canceled.");
+    }
+    if (cameraOverlayAutoGesturesRef.current && gesturesOn) {
+      setGesturesOn(false);
+      addSystem("Hand tracking disabled.");
+    }
+    cameraOverlayAutoGesturesRef.current = false;
+  };
+
+  const onToggleGestures = async () => {
+    const next = !gesturesOn;
+    cameraOverlayAutoGesturesRef.current = false;
+    if (next && !camera.enabled) {
+      try {
+        await camera.start();
+        addSystem("Camera on (required for gestures).");
+      } catch (e) {
+        console.warn(e);
+        addSystem("Gestures need camera permission.");
+        return;
+      }
+    }
+    if (!next) {
+      if (domPressRef.current.active) {
+        const x = Math.round((hand?.cursor?.x ?? 0.5) * window.innerWidth);
+        const y = Math.round((hand?.cursor?.y ?? 0.5) * window.innerHeight);
+        releaseDomPress(x, y);
+      }
+      if (desktopControlEnabled && hand?.pinch?.down) {
+        Promise.resolve(
+          window.novaDesktop?.mouseUpSystemCursor?.({
+            x: hand?.cursor?.x ?? 0.5,
+            y: hand?.cursor?.y ?? 0.5,
+          })
+        ).catch(() => {});
+      }
+    }
+    setGesturesOn(next);
+    addSystem(next ? "Gestures enabled." : "Gestures disabled.");
+  };
+  const onToggleDesktopControl = async () => {
+    if (!desktopControlAvailable) {
+      addSystem("Desktop hand control is unavailable here.");
+      return;
+    }
+    const next = !desktopControlEnabled;
+
+    if (next && domPressRef.current.active) {
+      const x = Math.round((hand?.cursor?.x ?? 0.5) * window.innerWidth);
+      const y = Math.round((hand?.cursor?.y ?? 0.5) * window.innerHeight);
+      releaseDomPress(x, y);
+    }
+
+    if (!next && hand?.pinch?.down) {
+      Promise.resolve(
+        window.novaDesktop?.mouseUpSystemCursor?.({
+          x: hand?.cursor?.x ?? 0.5,
+          y: hand?.cursor?.y ?? 0.5,
+        })
+      ).catch(() => {});
+    }
+
+    setDesktopControlEnabled(next);
+    addSystem(next ? "Desktop hand control enabled." : "Desktop hand control disabled.");
   };
   const onOpenOverlay = (key) => {
     setActiveOverlay((cur) => (cur === key ? null : key));
+  };
+
+  const onToggleChat = () => setChatOpen((v) => !v);
+
+  const onSelectSection = (key) => {
+    setActiveSection(key);
+    if (key === "chat") {
+      setChatOpen(true);
+      return;
+    }
+    if (key === "settings") {
+      setActiveOverlay("settings");
+      return;
+    }
+    if (key === "memory") {
+      setActiveOverlay("memory");
+      return;
+    }
+    if (key === "system") {
+      setActiveOverlay("system");
+      return;
+    }
+    if (key === "tasks") {
+      setActiveOverlay("tasks");
+      return;
+    }
+    if (key === "improvements") {
+      setActiveOverlay("improvements");
+      return;
+    }
+    if (key === "home") {
+      setActiveOverlay(null);
+    }
   };
 
   // Time text for top bar
@@ -566,55 +1546,364 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  // Orb state mapping
+  const [coreStatus, setCoreStatus] = useState({
+    status: "offline",
+    statusText: "Booting",
+    model: "Loading",
+    contextLength: "8192 tokens",
+    gpu: "Unknown",
+    temperature: "--",
+    tokenUsage: "—",
+  });
+
+  useEffect(() => {
+    let canceled = false;
+
+    const updateStatus = async () => {
+      try {
+        const resp = await fetch(apiUrl("/status"));
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const status = await resp.json();
+        if (canceled) return;
+
+        const modelName = status?.model?.name || "No model";
+        const gpuActive = Boolean(status?.model?.enforcement?.active);
+        const gpu = status?.gpu || {};
+        const ctxTokens = Number(status?.model?.context_tokens || 0);
+        const usage = status?.model?.usage || {};
+        const avgTokens = Number(usage?.avg_reply_tokens || 0);
+
+        setCoreStatus((prev) => ({
+          ...prev,
+          status: gpuActive ? "online" : "offline",
+          statusText: gpuActive ? "Online" : "Idle",
+          model: modelName,
+          contextLength: ctxTokens ? `${ctxTokens.toLocaleString()} tokens` : "Unknown",
+          gpu: gpu?.available && gpu?.name ? gpu.name : String(status?.model?.enforcement?.status || "unknown").replace(/_/g, " "),
+          temperature: gpu?.available && gpu?.temperature_c != null ? `${gpu.temperature_c}°C` : "--",
+          vram:
+            gpu?.available && gpu?.vram_total_mb
+              ? `${Math.round((gpu.vram_used_mb || 0) / 1024 * 10) / 10} / ${Math.round(gpu.vram_total_mb / 1024 * 10) / 10} GB`
+              : null,
+          tokenUsage: avgTokens > 0 ? `${Math.round(avgTokens)} avg/call` : "—",
+        }));
+      } catch {
+        if (!canceled) {
+          setCoreStatus((prev) => ({
+            ...prev,
+            status: "offline",
+            statusText: "Offline",
+            gpu: "Unavailable",
+            temperature: "--",
+          }));
+        }
+      }
+    };
+
+    updateStatus();
+    const id = setInterval(updateStatus, 6000);
+    return () => {
+      canceled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  // Token usage comes from /status (real per-reply averages tracked by the
+  // LLM runtime) — no client-side estimation.
+
+  // ===== Project builder reports (from the live event stream) =====
+  const speakNotice = async (text) => {
+    try {
+      const resp = await fetch(apiUrl("/speak"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!resp.ok) return;
+      const blob = await resp.blob();
+      enqueueTts(URL.createObjectURL(blob));
+    } catch {}
+  };
+
+  const lastProjectEventSeqRef = useRef(null);
+  useEffect(() => {
+    if (!novaEvents.length) return;
+    // First batch is a replay of past events — skip it so old completions
+    // don't re-post into chat on every app start.
+    if (lastProjectEventSeqRef.current === null) {
+      lastProjectEventSeqRef.current = Math.max(...novaEvents.map((e) => e.seq || 0));
+      return;
+    }
+
+    const fresh = novaEvents.filter(
+      (ev) =>
+        (ev.seq || 0) > lastProjectEventSeqRef.current &&
+        (ev.type === "project.completed" || ev.type === "project.error")
+    );
+    if (!fresh.length) {
+      const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
+      if (maxSeq > lastProjectEventSeqRef.current) lastProjectEventSeqRef.current = maxSeq;
+      return;
+    }
+
+    lastProjectEventSeqRef.current = Math.max(
+      ...fresh.map((e) => e.seq || 0),
+      lastProjectEventSeqRef.current
+    );
+
+    fresh.forEach((ev) => {
+      const d = ev.data || {};
+      if (ev.type === "project.completed") {
+        const files = Array.isArray(d.files) && d.files.length ? d.files.join(", ") : "";
+        const suggestions =
+          Array.isArray(d.suggestions) && d.suggestions.length
+            ? `\n\nSuggested improvements:\n${d.suggestions.map((s) => `• ${s}`).join("\n")}\n\nSay "implement those improvements" and I'll do it.`
+            : "";
+        // Be honest about how sure we are. The build/run check only confirms it
+        // launches — it can't verify a visual/interactive feature actually works.
+        const status = d.status || "complete";
+        const isImprove = d.mode === "improve";
+        const note = d.test_note && !/passed/i.test(d.test_note) ? d.test_note : (d.run_note && !/passed/i.test(d.run_note) ? d.run_note : "");
+        let head;
+        if (status === "needs attention") {
+          head = `⚠️ I worked on "${d.project}" but it didn't fully check out${note ? ` — ${note}` : ""}.`;
+        } else if (status === "needs review") {
+          head = `🛠️ I updated "${d.project}"${note ? ` (${note})` : ""}. It runs, but please double-check it does what you wanted.`;
+        } else if (isImprove) {
+          head = `🛠️ Done updating "${d.project}". ${d.summary || ""}\nIt launches cleanly — give it a try and tell me if it works how you wanted (I can't fully test the interactive parts myself).`;
+        } else {
+          head = `✅ Project "${d.project}" is built. ${d.summary || ""}\nGive it a try and let me know how it looks.`;
+        }
+        const text =
+          head +
+          (files ? `\nFiles: ${files}` : "") +
+          (d.run ? `\nRun it with: ${d.run}` : "") +
+          suggestions;
+        setMessages((prev) => [...prev, { id: `nova-project-${ev.seq}`, sender: "nova", text }]);
+        speakNotice(`I finished working on ${String(d.project || "").replace(/-/g, " ")}. Give it a try.`);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `nova-project-${ev.seq}`,
+            sender: "nova",
+            text: `⚠️ Project "${d.project}" hit a problem: ${d.error || "unknown error"}. Ask me to try again and I'll take another pass.`,
+          },
+        ]);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [novaEvents]);
+
+  const lastReminderEventSeqRef = useRef(null);
+  useEffect(() => {
+    if (!novaEvents.length) return;
+    // Same "skip the initial replay batch" pattern as project events, so old
+    // reminders don't re-fire into chat every time the app starts.
+    if (lastReminderEventSeqRef.current === null) {
+      lastReminderEventSeqRef.current = Math.max(...novaEvents.map((e) => e.seq || 0));
+      return;
+    }
+
+    const fresh = novaEvents.filter(
+      (ev) => (ev.seq || 0) > lastReminderEventSeqRef.current && ev.type === "reminder.due"
+    );
+    if (!fresh.length) {
+      const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
+      if (maxSeq > lastReminderEventSeqRef.current) lastReminderEventSeqRef.current = maxSeq;
+      return;
+    }
+    lastReminderEventSeqRef.current = Math.max(...fresh.map((e) => e.seq || 0), lastReminderEventSeqRef.current);
+
+    fresh.forEach((ev) => {
+      const d = ev.data || {};
+      const message = String(d.message || d.title || "Reminder!").trim();
+      const text = d.briefing ? message : `⏰ ${d.title || "Reminder"}: ${message}`;
+      setMessages((prev) => [...prev, { id: `nova-reminder-${ev.seq}`, sender: "nova", text }]);
+      speakNotice(message);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [novaEvents]);
+
+  // PI1: opt-in periodic screen glances. Best-effort — a failed/empty glance
+  // just waits for the next interval, never surfaces an error to the user.
+  useFocusSession({
+    enabled: focusSessionOn,
+    apiBase: apiBase(),
+    onNotable: (text) => {
+      setMessages((prev) => [...prev, { id: `nova-focus-${Date.now()}`, sender: "nova", text: `👀 ${text}` }]);
+      speakNotice(text);
+    },
+  });
+
+  // PI1: the agent asked to look at the screen mid-conversation
+  // (vision.look_at_screen) — surface a confirm prompt; nothing captures
+  // without this explicit click, even though a periodic focus session
+  // might already be running.
+  const lastScreenReqSeqRef = useRef(null);
+  useEffect(() => {
+    if (!novaEvents.length) return;
+    if (lastScreenReqSeqRef.current === null) {
+      lastScreenReqSeqRef.current = Math.max(...novaEvents.map((e) => e.seq || 0));
+      return;
+    }
+    const fresh = novaEvents.filter(
+      (ev) => (ev.seq || 0) > lastScreenReqSeqRef.current && ev.type === "screen.capture_requested"
+    );
+    const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
+    if (maxSeq > lastScreenReqSeqRef.current) lastScreenReqSeqRef.current = maxSeq;
+    if (!fresh.length) return;
+    const latest = fresh[fresh.length - 1];
+    const d = latest.data || {};
+    setScreenLookRequest({ requestId: String(d.request_id || ""), question: String(d.question || "") });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [novaEvents]);
+
+  async function respondToScreenLookRequest(approved) {
+    const req = screenLookRequest;
+    if (!req) return;
+    setScreenLookRequest(null);
+    if (!approved) {
+      try {
+        await fetch(apiUrl("/vision/screen_capture_result"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: req.requestId, approved: false }),
+        });
+      } catch {}
+      return;
+    }
+    try {
+      if (!window.novaDesktop?.captureScreen) {
+        await fetch(apiUrl("/vision/screen_capture_result"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: req.requestId, approved: true, error: "desktop_capture_unavailable" }),
+        });
+        return;
+      }
+      const capture = await window.novaDesktop.captureScreen();
+      if (!capture?.ok || !capture?.dataUrl) {
+        await fetch(apiUrl("/vision/screen_capture_result"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: req.requestId, approved: true, error: capture?.error || "capture_failed" }),
+        });
+        return;
+      }
+      const blob = await (await fetch(capture.dataUrl)).blob();
+      const fd = new FormData();
+      fd.append("file", blob, "screen.png");
+      const q = req.question || "Describe what's on screen.";
+      const resp = await fetch(apiUrl(`/vision/analyze?question=${encodeURIComponent(q)}`), { method: "POST", body: fd });
+      const data = resp.ok ? await resp.json() : null;
+      await fetch(apiUrl("/vision/screen_capture_result"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request_id: req.requestId, approved: true,
+          text: data?.text || "", error: resp.ok ? "" : "vision_analyze_failed",
+        }),
+      });
+    } catch (e) {
+      try {
+        await fetch(apiUrl("/vision/screen_capture_result"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: req.requestId, approved: true, error: String(e?.message || e) }),
+        });
+      } catch {}
+    }
+  }
+
+  // Orb state mapping: voice first, then live backend activity states.
   const orbState = useMemo(() => {
     if (voiceStatus === "wake" || voiceStatus === "listening" || voiceStatus === "transcribing") return "listening";
-    if (voiceStatus === "speaking") return "speaking";
-    if (thinking) return "thinking";
+    if (voiceStatus === "speaking" || ttsPlaying) return "speaking";
+    if (novaActivity.vision) return "vision";
+    if (novaActivity.web) return "searching";
+    if (novaActivity.tool) return "working";
+    if (thinking || novaActivity.thinking) return "thinking";
+    if (novaActivity.memory) return "memory";
     return "idle";
-  }, [voiceStatus, thinking]);
+  }, [voiceStatus, thinking, ttsPlaying, novaActivity]);
+
+  const currentCalibrationStep = calibrationSession?.active
+    ? HAND_CALIBRATION_STEPS[calibrationSession.stepIndex] || null
+    : null;
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden text-zinc-100">
-      {/* Background */}
+    <div className="relative w-screen h-screen overflow-hidden text-nova-gold font-space">
       <div className="absolute inset-0 -z-10 pointer-events-none">
         <Suspense fallback={null}>
           <AnimatedBackground />
         </Suspense>
       </div>
 
-      {/* Top bar */}
       <TopBar
-        version="v2"
-        project="PROJECT: TEMP"
+        version="v3"
+        project={coreStatus.status === "online" ? "SYSTEM ONLINE" : "SYSTEM OFFLINE"}
+        systemOnline={coreStatus.status === "online"}
         micMuted={micMuted}
         micLevel={micLevel}
+        micRequesting={micRequesting}
+        voiceStatus={voiceStatus}
+        voicePhase={voicePhase}
+        voiceSessionActive={voiceSessionActive}
+        ttsPlaying={ttsPlaying}
+        wakePulse={wakePulse}
         timeText={timeText}
+        activity={novaActivity}
+        eventsConnected={eventsConnected}
       />
 
-      {/* Center stage */}
-      <div className="relative z-10 w-full h-full pt-16 pb-24 flex justify-center">
-        <div className="w-[min(980px,94vw)] flex flex-col items-center gap-4">
-          {/* Home card */}
-          <div className="w-full max-w-[620px] rounded-3xl border border-cyan-500/25 bg-black/25 backdrop-blur-2xl shadow-[0_16px_50px_rgba(0,0,0,0.35)] px-4 py-3">
-            <div className="flex items-center justify-between text-xs text-white/60">
-              <div>Status: {micMuted ? "Muted" : "Listening"} • {camera.enabled ? "Cam On" : "Cam Off"} • Gestures: {gesturesOn ? "On" : "Off"}</div>
-              <div className="text-white/50">Voice: {voiceStatus} • {voicePhase}</div>
-            </div>
-
-            <div className="mt-2 grid place-items-center">
-              <div style={{ width: 420, height: 420 }} className="max-w-full">
-                <Suspense fallback={<div className="w-full h-full grid place-items-center text-white/60 text-sm">Loading orb…</div>}>
-                  <NovaOrb3D bloom={false} showText state={orbState} size={420} />
-                </Suspense>
-              </div>
-            </div>
+      <main className="absolute inset-0 pt-14 pb-28 px-3 lg:px-5 z-20">
+        <div className="grid grid-cols-1 lg:grid-cols-[280px_minmax(0,1fr)_420px] gap-4 h-full min-h-0">
+          <div className="hidden lg:block min-h-0">
+            <LeftSidebar activeSection={activeSection} onSelect={onSelectSection} coreStatus={coreStatus} />
           </div>
 
-          {/* Chat card (always visible) */}
-          <div className="w-full flex-1 min-h-0">
-            <div className="h-[min(520px,52vh)]">
-              <Suspense fallback={<div className="w-full h-full grid place-items-center text-white/60 text-sm">Loading chat…</div>}>
+          <section className="nova-center-stage-panel">
+            <HologramStage
+              state={orbState}
+              avatar={
+                <Suspense fallback={<div className="nova-hologram-loading">Loading avatar...</div>}>
+                  <NovaHologramAvatar
+                    state={orbState}
+                    size={Math.min(
+                      510,
+                      typeof window !== "undefined"
+                        ? Math.min(Math.max(300, window.innerWidth * 0.36), window.innerHeight * 0.62)
+                        : 510
+                    )}
+                    micLevel={micLevel}
+                    ttsPlaying={ttsPlaying}
+                  />
+                </Suspense>
+              }
+              waveform={
+                <Waveform
+                  mode={voiceStatus === "speaking" ? "ring" : "bars"}
+                  mediaStream={micMuted ? null : micStream}
+                  height={54}
+                  theme={{
+                    primary: "#8B5CF6",
+                    secondary: "#A78BFA",
+                    glow: "#F5C542",
+                  }}
+                />
+              }
+            />
+          </section>
+
+          <section
+            className={[
+              "min-h-0 transition-all duration-300",
+              chatOpen ? "opacity-100" : "opacity-0 pointer-events-none lg:opacity-45",
+            ].join(" ")}
+          >
+            <div className="h-full">
+              <Suspense fallback={<div className="h-full hud-panel grid place-items-center text-nova-gold/70 text-sm">Loading chat...</div>}>
                 <ChatPanel
                   messages={messages}
                   onSendMessage={sendMessage}
@@ -623,37 +1912,90 @@ export default function App() {
                 />
               </Suspense>
             </div>
-          </div>
+          </section>
         </div>
-      </div>
+      </main>
 
-      {/* Bottom dock */}
       <BottomDock
+        chatOpen={chatOpen}
         micMuted={micMuted}
         cameraOn={camera.enabled}
         gesturesOn={gesturesOn}
+        focusSessionOn={focusSessionOn}
         activeOverlay={activeOverlay}
+        onToggleChat={onToggleChat}
         onToggleMic={onToggleMic}
-        onToggleCamera={onToggleCamera}
+        onToggleCameraPower={onToggleCameraPower}
+        onToggleCameraOverlay={onToggleCameraOverlay}
         onToggleGestures={onToggleGestures}
+        onToggleFocusSession={() => setFocusSessionOn((v) => !v)}
         onOpenOverlay={onOpenOverlay}
+        voiceStatus={voiceStatus}
+        ttsPlaying={ttsPlaying}
       />
 
+      {/* PI1: agent-requested screen look — requires an explicit click, never silent */}
+      {screenLookRequest ? (
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[80] rounded-2xl border border-nova-gold/25 bg-black/70 backdrop-blur-xl px-5 py-4 shadow-[0_10px_30px_rgba(0,0,0,0.5)] max-w-md">
+          <div className="text-sm text-nova-gold">Nova wants to look at your screen{screenLookRequest.question ? ` — ${screenLookRequest.question}` : ""}.</div>
+          <div className="mt-3 flex gap-2 justify-end">
+            <button
+              type="button"
+              onClick={() => respondToScreenLookRequest(false)}
+              className="rounded-xl border border-nova-gold/20 px-3 py-1.5 text-sm text-nova-gold/80 hover:bg-black/25"
+            >
+              Decline
+            </button>
+            <button
+              type="button"
+              onClick={() => respondToScreenLookRequest(true)}
+              className="rounded-xl bg-nova-gold/20 border border-nova-gold/30 px-3 py-1.5 text-sm text-nova-gold hover:bg-nova-gold/30"
+            >
+              Capture
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {/* Gesture cursor overlay */}
+      {gesturesOn && (
+        <div className="fixed left-6 bottom-28 z-[60] pointer-events-none">
+          <div className="rounded-2xl border border-nova-gold/15 bg-black/45 px-4 py-3 shadow-[0_10px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl">
+            <div className="text-[10px] uppercase tracking-[0.24em] text-nova-gold/55">Hand Control</div>
+            <div className="mt-1 text-sm text-nova-gold">
+              {hand?.status === "ready" ? "Tracking" : hand?.status === "no_hands" ? "Looking for a hand" : hand?.status || "off"}
+            </div>
+            <div className="mt-1 text-xs text-nova-gold/70">
+              {desktopControlEnabled ? "Targeting desktop cursor" : "Targeting Nova window"}
+            </div>
+            <div className="mt-1 text-xs text-nova-gold/55">
+              Hands: {Number.isFinite(hand?.handsDetected) ? hand.handsDetected : 0} • Pinch: {hand?.pinch?.down ? "down" : "open"}
+            </div>
+            <div className="mt-1 text-xs text-nova-gold/55">
+              Hold: {Math.round((hand?.pinch?.holdMs ?? 0) / 10) * 10}ms • Strength: {Math.round((hand?.pinch?.strength ?? 0) * 100)}%
+            </div>
+          </div>
+        </div>
+      )}
+
       {gesturesOn && camera.enabled && hand?.cursor?.visible && (
         <div className="fixed inset-0 z-[60] pointer-events-none">
           <div
             className={[
               "absolute -translate-x-1/2 -translate-y-1/2",
-              "w-4 h-4 rounded-full",
-              "border border-white/70",
-              hand?.pinch?.down ? "bg-white/40" : "bg-white/10",
+              "w-5 h-5 rounded-full",
+              "border border-nova-gold/80",
+              hand?.pinch?.down ? "bg-nova-gold/40 scale-110" : "bg-nova-purple/20",
             ].join(" ")}
             style={{
               left: `${(hand.cursor.x ?? 0) * 100}%`,
               top: `${(hand.cursor.y ?? 0) * 100}%`,
             }}
-          />
+          >
+            <div className="absolute left-1/2 top-7 -translate-x-1/2 whitespace-nowrap rounded-full border border-nova-gold/15 bg-black/55 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-nova-gold/80">
+              {desktopControlEnabled ? "Desktop" : "Nova"}
+            </div>
+          </div>
         </div>
       )}
 
@@ -669,33 +2011,45 @@ export default function App() {
       <OverlayHost
         open={activeOverlay === "camera"}
         title={`Camera • ${camera.status}`}
-        onClose={() => setActiveOverlay(null)}
+        onClose={onCloseCameraOverlay}
       >
-        <CameraSheet stream={camera.stream} status={camera.status} />
+        <CameraSheet
+          stream={camera.stream}
+          status={camera.status}
+          gesturesOn={gesturesOn}
+          onToggleGestures={onToggleGestures}
+          handStatus={hand?.status}
+          handsDetected={hand?.handsDetected}
+          pinchHoldMs={hand?.pinch?.holdMs}
+          pinchStrength={hand?.pinch?.strength}
+          rawCursor={hand?.rawCursor}
+          rawPinchRatio={hand?.telemetry?.pinchRatio}
+          calibrationSession={calibrationSession}
+          calibrationProfile={handCalibration}
+          currentCalibrationStep={currentCalibrationStep}
+          onStartCalibration={startHandCalibration}
+          onCaptureCalibrationStep={captureHandCalibrationStep}
+          onCancelCalibration={cancelHandCalibration}
+          onResetCalibration={resetHandCalibration}
+          desktopControlEnabled={desktopControlEnabled}
+          desktopControlAvailable={desktopControlAvailable}
+          onToggleDesktopControl={onToggleDesktopControl}
+        />
       </OverlayHost>
 
       <OverlayHost
-        open={activeOverlay === "gestures"}
-        title="Gestures"
+        open={activeOverlay === "maps"}
+        title="Maps & Directions"
         onClose={() => setActiveOverlay(null)}
       >
-        <GesturesSheet enabled={gesturesOn} status={gesturesStatus} tracker={hand} />
-      </OverlayHost>
-
-      <OverlayHost
-        open={activeOverlay === "smarthome"}
-        title="Smart Home"
-        onClose={() => setActiveOverlay(null)}
-      >
-        <SmartHomeSheet />
-      </OverlayHost>
-
-      <OverlayHost
-        open={activeOverlay === "printer"}
-        title="3D Printer"
-        onClose={() => setActiveOverlay(null)}
-      >
-        <PrinterSheet />
+        <MapsSheet
+          routePreload={mapsRoutePreload}
+          currentLocation={currentLocation}
+          locationStatus={locationStatus}
+          locationNote={locationNote}
+          onRequestCurrentLocation={requestCurrentLocation}
+          onManualLocationSet={setManualLocation}
+        />
       </OverlayHost>
 
       <OverlayHost
@@ -704,6 +2058,46 @@ export default function App() {
         onClose={() => setActiveOverlay(null)}
       >
         <WebSheet />
+      </OverlayHost>
+
+      <OverlayHost
+        open={activeOverlay === "memory"}
+        title="Memory"
+        onClose={() => setActiveOverlay(null)}
+      >
+        <MemorySheet liveEvents={novaEvents} />
+      </OverlayHost>
+
+      <OverlayHost
+        open={activeOverlay === "tasks"}
+        title="Tasks"
+        onClose={() => setActiveOverlay(null)}
+      >
+        <TasksSheet liveEvents={novaEvents} />
+      </OverlayHost>
+
+      <OverlayHost
+        open={activeOverlay === "system"}
+        title="System"
+        onClose={() => setActiveOverlay(null)}
+      >
+        <SystemSheet liveEvents={novaEvents} eventsConnected={eventsConnected} />
+      </OverlayHost>
+
+      <OverlayHost
+        open={activeOverlay === "improvements"}
+        title="Self-Improvement"
+        onClose={() => setActiveOverlay(null)}
+      >
+        <ImprovementsSheet />
+      </OverlayHost>
+
+      <OverlayHost
+        open={activeOverlay === "screenvision"}
+        title="Screen Vision"
+        onClose={() => setActiveOverlay(null)}
+      >
+        <ScreenVisionSheet />
       </OverlayHost>
     </div>
   );

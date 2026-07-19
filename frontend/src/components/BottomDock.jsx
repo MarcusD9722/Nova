@@ -1,120 +1,127 @@
 import React from "react";
+import { motion } from "framer-motion";
+import {
+  Keyboard,
+  Camera,
+  Images,
+  Mic,
+  AppWindow,
+  Globe,
+  SlidersHorizontal,
+  MessageSquare,
+  Hand,
+  MonitorSmartphone,
+  Eye,
+} from "lucide-react";
+import { FloatingContainer, GlassButton, StatusBadge } from "../ui";
 
-function DockButton({ active, onClick, title, children, tone = "cyan" }) {
-  const ring =
-    tone === "green"
-      ? "border-emerald-400/35 hover:border-emerald-300/60"
-      : tone === "purple"
-      ? "border-purple-400/35 hover:border-purple-300/60"
-      : "border-cyan-400/35 hover:border-cyan-300/60";
-
-  const glow =
-    active
-      ? tone === "green"
-        ? "shadow-[0_0_24px_rgba(16,185,129,0.45)]"
-        : tone === "purple"
-        ? "shadow-[0_0_24px_rgba(168,85,247,0.45)]"
-        : "shadow-[0_0_24px_rgba(34,211,238,0.45)]"
-      : "shadow-[0_0_18px_rgba(255,255,255,0.10)]";
-
+function DockButton({ active, onClick, title, icon: Icon }) {
   return (
-    <button
+    <GlassButton
+      type="button"
+      variant={active ? "purple" : "ghost"}
       onClick={onClick}
       title={title}
-      className={[
-        "w-12 h-12 rounded-full grid place-items-center",
-        "bg-black/45 border backdrop-blur-xl",
-        ring,
-        glow,
-        "transition-transform hover:scale-105",
-      ].join(" ")}
+      aria-label={title}
+      aria-pressed={Boolean(active)}
+      className={["nova-dock-orb", active && "nova-dock-orb--active"].filter(Boolean).join(" ")}
     >
-      <span className="text-white/85 text-lg">{children}</span>
-    </button>
+      <Icon size={18} />
+    </GlassButton>
   );
 }
 
 export default function BottomDock({
+  chatOpen,
   micMuted,
   cameraOn,
   gesturesOn,
+  focusSessionOn,
   activeOverlay,
+  onToggleChat,
   onToggleMic,
-  onToggleCamera,
+  onToggleCameraPower,
+  onToggleCameraOverlay,
   onToggleGestures,
+  onToggleFocusSession,
   onOpenOverlay,
+  voiceStatus = "idle",
+  ttsPlaying = false,
 }) {
+  const listening = !micMuted && (voiceStatus === "listening" || voiceStatus === "wake");
+  const speaking = ttsPlaying || voiceStatus === "speaking";
+  const voiceState = speaking ? "speaking" : listening ? "listening" : micMuted ? "offline" : "online";
+  const voiceLabel = speaking
+    ? "Voice Speaking"
+    : listening
+      ? "Voice Listening"
+      : micMuted
+        ? "Voice Offline"
+        : "Voice Online";
+
   return (
-    <div className="fixed left-0 right-0 bottom-6 z-30 flex justify-center pointer-events-none">
-      <div className="pointer-events-auto px-5 py-3 rounded-full border border-white/10 bg-black/35 backdrop-blur-2xl shadow-[0_10px_40px_rgba(0,0,0,0.55)]">
-        <div className="flex items-center gap-4">
-          <DockButton
-            active={!micMuted}
+    <div className="nova-dock-layer">
+      <FloatingContainer
+        as={motion.div}
+        floating={false}
+        tone="mixed"
+        initial={{ y: 14, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+        className="nova-dock-capsule"
+      >
+        <span className="nova-dock-edge nova-dock-edge--left" aria-hidden="true" />
+        <span className="nova-dock-edge nova-dock-edge--right" aria-hidden="true" />
+        <div className="nova-dock-reflection" aria-hidden="true" />
+
+        <div className="nova-dock-actions">
+          <DockButton active={chatOpen} onClick={onToggleChat} title="Keyboard" icon={Keyboard} />
+          <DockButton active={cameraOn} onClick={onToggleCameraPower} title="Camera" icon={Camera} />
+          <DockButton active={activeOverlay === "camera"} onClick={onToggleCameraOverlay} title="Gallery" icon={Images} />
+
+          <GlassButton
+            type="button"
+            variant={speaking ? "gold" : "purple"}
             onClick={onToggleMic}
-            title={micMuted ? "Unmute mic" : "Mute mic"}
-            tone="green"
+            title={micMuted ? "Activate voice" : "Mute voice"}
+            aria-label={micMuted ? "Activate voice" : "Mute voice"}
+            aria-pressed={!micMuted}
+            data-voice-state={voiceState}
+            className={[
+              "nova-dock-voice",
+              !micMuted && "nova-dock-voice--enabled",
+              listening && "nova-dock-voice--listening",
+              speaking && "nova-dock-voice--speaking",
+            ].filter(Boolean).join(" ")}
           >
-            {micMuted ? "🔇" : "🎙️"}
-          </DockButton>
+            <span className="nova-dock-voice-ring" aria-hidden="true" />
+            <Mic size={25} />
+          </GlassButton>
 
+          <DockButton active={gesturesOn} onClick={onToggleGestures} title="Apps" icon={AppWindow} />
+          <DockButton active={activeOverlay === "screenvision"} onClick={() => onOpenOverlay("screenvision")} title="Screen" icon={MonitorSmartphone} />
           <DockButton
-            active={cameraOn}
-            onClick={onToggleCamera}
-            title={cameraOn ? "Turn camera off" : "Turn camera on"}
-          >
-            {cameraOn ? "📷" : "📵"}
-          </DockButton>
-
-          <DockButton
-            active={activeOverlay === "settings"}
-            onClick={() => onOpenOverlay("settings")}
-            title="Settings"
-            tone="purple"
-          >
-            ⚙️
-          </DockButton>
-
-          <DockButton
-            active={gesturesOn}
-            onClick={onToggleGestures}
-            title={gesturesOn ? "Disable gestures" : "Enable gestures"}
-          >
-            ✋
-          </DockButton>
-
-          <DockButton
-            active={activeOverlay === "smarthome"}
-            onClick={() => onOpenOverlay("smarthome")}
-            title="Smart Home"
-          >
-            🏠
-          </DockButton>
-
-          <DockButton
-            active={activeOverlay === "printer"}
-            onClick={() => onOpenOverlay("printer")}
-            title="3D Printer"
-          >
-            🖨️
-          </DockButton>
-
-          <DockButton
-            active={activeOverlay === "web"}
-            onClick={() => onOpenOverlay("web")}
-            title="Web Search"
-          >
-            🌐
-          </DockButton>
-
-          <DockButton
-            active={activeOverlay === "camera"}
-            onClick={() => onOpenOverlay("camera")}
-            title="Camera"
-          >
-            👁️
-          </DockButton>
+            active={focusSessionOn}
+            onClick={onToggleFocusSession}
+            title={focusSessionOn ? "Focus session: on (periodic screen glances) — click to stop" : "Start focus session (periodic screen glances)"}
+            icon={Eye}
+          />
+          <DockButton active={activeOverlay === "web"} onClick={() => onOpenOverlay("web")} title="Browser" icon={Globe} />
+          <DockButton active={activeOverlay === "settings"} onClick={() => onOpenOverlay("settings")} title="Settings" icon={SlidersHorizontal} />
         </div>
-      </div>
+
+        <div className="nova-dock-status-row" aria-live="polite">
+          <span className={chatOpen ? "is-active" : ""}><MessageSquare size={11} /> Chat</span>
+          <span className={gesturesOn ? "is-active" : ""}><Hand size={11} /> Gestures</span>
+          {focusSessionOn ? <span className="is-active"><Eye size={11} /> Focus session</span> : null}
+          <StatusBadge
+            status={speaking ? "warning" : micMuted ? "offline" : "online"}
+            pulse={listening || speaking}
+            label={voiceLabel}
+            className="nova-dock-voice-status"
+          />
+        </div>
+      </FloatingContainer>
     </div>
   );
 }
