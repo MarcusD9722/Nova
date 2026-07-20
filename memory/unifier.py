@@ -149,6 +149,8 @@ class MemoryUnifier:
             return attr == "tree"  # one current plan tree per goal, latest wins
         if ent in ("research_topic", "research_checked"):
             return True  # one entry / one last-checked stamp per topic slug
+        if ent.startswith("agent:"):
+            return True  # one current value per specialist stat (confidence/consulted/helpful)
         return False
 
     async def _fact_ids_for(self, entity: str, attribute: str, value: str | None = None) -> list[str]:
@@ -736,6 +738,66 @@ class MemoryUnifier:
         entries (every finding carries its citation)."""
         await self.initialize()
         return await self._world.query_subject(topic)
+
+    # ── Persistent agent society state (Phase 6 / #5) ─────────────────────────
+
+    async def agent_state(self, agent_id: str) -> dict[str, Any]:
+        """A specialist's durable state: confidence, times consulted (experience),
+        and how often it was helpful. Defaults for a never-consulted agent."""
+        await self.initialize()
+        ent = f"agent:{agent_id}"
+
+        async def _num(attr: str, default: float) -> float:
+            rec = await self.get_latest_fact(entity=ent, attribute=attr)
+            try:
+                return float(rec.value) if rec and rec.value else default
+            except (TypeError, ValueError):
+                return default
+
+        consulted = int(await _num("consulted", 0))
+        helpful = int(await _num("helpful", 0))
+        confidence = await _num("confidence", 0.5)
+        return {
+            "agent_id": agent_id,
+            "confidence": round(confidence, 3),
+            "consulted": consulted,
+            "helpful": helpful,
+            "experience": "seasoned" if consulted >= 20 else "practiced" if consulted >= 5 else "new",
+        }
+
+    async def record_consultation(self, agent_id: str, *, helpful: bool | None = None) -> None:
+        """Log that a specialist participated. Experience always increments;
+        confidence nudges up/down only when there's an explicit helpfulness
+        signal (clamped, so it drifts slowly and never hits certainty)."""
+        await self.initialize()
+        ent = f"agent:{agent_id}"
+        state = await self.agent_state(agent_id)
+        await self.add_fact(entity=ent, attribute="consulted", value=str(state["consulted"] + 1), confidence=1.0)
+        if helpful is True:
+            await self.add_fact(entity=ent, attribute="helpful", value=str(state["helpful"] + 1), confidence=1.0)
+            new_conf = min(0.95, state["confidence"] + 0.03)
+            await self.add_fact(entity=ent, attribute="confidence", value=str(round(new_conf, 3)), confidence=1.0)
+        elif helpful is False:
+            new_conf = max(0.1, state["confidence"] - 0.03)
+            await self.add_fact(entity=ent, attribute="confidence", value=str(round(new_conf, 3)), confidence=1.0)
+
+    async def agent_remember(self, agent_id: str, note: str, *, topic: str = "general") -> None:
+        """A specialist's own internal memory / learning history (accumulates)."""
+        await self.initialize()
+        note = (note or "").strip()
+        if not note:
+            return
+        slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:40] or "general"
+        await self.add_fact(entity=f"agentmem:{agent_id}", attribute=slug, value=note[:400], confidence=0.7)
+
+    async def agent_recall(self, agent_id: str, *, topic: str | None = None, limit: int = 10) -> list[str]:
+        """A specialist's stored memory notes, newest first."""
+        await self.initialize()
+        rows = await self.get_facts(entity=f"agentmem:{agent_id}", limit=max(1, int(limit) * 2), newest_first=True)
+        if topic:
+            t = topic.lower()
+            rows = [r for r in rows if t in (r.attribute or "").lower() or t in (r.value or "").lower()]
+        return [r.value for r in rows[:limit] if r.value]
 
     async def add_fact(
         self,

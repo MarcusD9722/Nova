@@ -208,6 +208,21 @@ async def research(topic: str | None = Query(None)) -> dict:
     return {"topics": await STATE.memory.list_research_topics()}
 
 
+@router.get("/agents")
+async def agents() -> dict:
+    """The persistent agent society (#5): the specialist roster with each one's
+    durable confidence and experience (times consulted)."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    from core.orchestrator.society import roster
+    out = []
+    for spec in roster():
+        state = await STATE.memory.agent_state(spec["id"])
+        out.append({**spec, "consulted": state["consulted"], "confidence": state["confidence"],
+                    "experience": state["experience"]})
+    return {"specialists": out}
+
+
 # ── Reminders / scheduling (real "remind me at 5pm", proactive check-ins) ────
 
 class ReminderCreateRequest(BaseModel):

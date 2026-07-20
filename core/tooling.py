@@ -327,6 +327,23 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             {"summary": f["object"], "source": f.get("source"), "confidence": f.get("confidence")} for f in findings
         ]}
 
+    async def _agents_roster(args: dict[str, Any]) -> dict[str, Any]:
+        from core.orchestrator.society import roster as _roster
+        out = []
+        for spec in _roster():
+            state = await memory.agent_state(spec["id"])
+            out.append({**spec, "consulted": state["consulted"], "confidence": state["confidence"],
+                        "experience": state["experience"]})
+        return {"ok": True, "specialists": out}
+
+    async def _agent_recall(args: dict[str, Any]) -> dict[str, Any]:
+        agent_id = str(args.get("agent_id") or args.get("id") or args.get("specialist") or "").strip()
+        topic = str(args.get("topic") or "").strip() or None
+        if not agent_id:
+            return {"ok": False, "error": "missing_agent_id"}
+        notes = await memory.agent_recall(agent_id, topic=topic)
+        return {"ok": True, "agent_id": agent_id, "notes": notes}
+
     _INDEX_SKIP_DIR_NAMES = {
         "__pycache__", "node_modules", ".git", ".venv", "venv",
         "$recycle.bin", "system volume information",
@@ -649,6 +666,8 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "research.track": _research_track,
         "research.list": _research_list,
         "research.findings": _research_findings,
+        "agents.roster": _agents_roster,
+        "agent.recall": _agent_recall,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
         "memory.index_folder": _memory_index_folder,
@@ -726,6 +745,11 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "research.list": ("List the research topics Nova is currently tracking and when each was last checked. args: {}"),
         "research.findings": ("Show what Nova has learned about a tracked research topic — each finding with its "
                                "source citation. args: {topic}"),
+        "agents.roster": ("List Nova's council of specialist agents (Chief Engineer, Research Scientist, "
+                           "Psychologist, coaches, ...) with how experienced/confident each has become. Use when "
+                           "Marcus asks who's on the team or about a specialist. args: {}"),
+        "agent.recall": ("Recall a specific specialist's own accumulated notes/learning history. "
+                          "args: {agent_id, topic?}"),
         "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
                                  "('where's that PDF about the mortgage', 'photos from the beach trip'). "
                                  "args: {path, max_files?}. Skips files already indexed and unchanged."),
