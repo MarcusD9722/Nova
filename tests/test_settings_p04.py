@@ -37,6 +37,18 @@ def main():
     unused = sorted(set(CATALOG) - used)
     check(not unused, f"no cataloged var is unused in code (stale: {unused or 'none'})")
 
+    # ── .env.example must not document a variable the catalog doesn't know.
+    # This is the exact drift that shipped NOVA_AUTONOMY_MAX_STEPS (a knob the
+    # code never read) and put it in Marcus's .env doing nothing.
+    env_example = REPO / ".env.example"
+    documented = {
+        line.split("=", 1)[0].strip()
+        for line in env_example.read_text(encoding="utf-8").splitlines()
+        if re.match(r"^NOVA_[A-Z_]+=", line)
+    }
+    ghost = sorted(documented - set(CATALOG))
+    check(not ghost, f".env.example documents only real (cataloged) vars (dead: {ghost or 'none'})")
+
     # ── Validation behaviors (pure, on a supplied environ) ──
     warnings = validate_environment({"NOVA_PROT": "9000"})
     check(any("NOVA_PROT" in w for w in warnings), "unknown var flagged")
