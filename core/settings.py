@@ -91,6 +91,8 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_EMBED_DEVICE", "str", "auto", "Embedding device (cuda|cpu|auto)."),
         _s("NOVA_INDEX_TURNS", "bool", "1", "Semantically index substantive conversation turns."),
         _s("NOVA_MEMORY_PROVENANCE", "bool", "1", "Record fact provenance (source, evidence, verification status, last-confirmed) so assumptions are never stored as settled facts (#19)."),
+        _s("NOVA_WORLD_MODEL", "bool", "1", "Maintain a semantic world model of general knowledge (subject-predicate-object + source) so Nova can answer without re-searching the web (#11)."),
+        _s("NOVA_INTERNAL_THOUGHTS", "bool", "1", "Keep persistent internal thoughts (ideas/questions/improvements) across sessions, surfaced only on request (#6)."),
         _s("NOVA_RECENT_CHAT_TURNS", "int", "20", "Recent turns kept in the reply prompt."),
         _s("NOVA_SUMMARY_EVERY_N", "int", "8", "Summarize the conversation every N turns."),
         _s("NOVA_FOLLOWUP_WINDOW", "int", "10", "Follow-up dedup window (turns)."),

@@ -133,7 +133,8 @@ async def main():
 
         be = SQLiteMemoryBackend(db_path)
         await be.initialize()
-        check(await be.schema_version() == 3, f"existing v2 DB upgrades to v3 (got {await be.schema_version()})")
+        latest = max(v for v, _, _ in SQLiteMemoryBackend._MIGRATIONS)
+        check(await be.schema_version() == latest, f"existing v2 DB upgrades to latest v{latest} (got {await be.schema_version()})")
 
         async with aiosqlite.connect(db_path) as db:
             async with db.execute("PRAGMA table_info(facts);") as cur:

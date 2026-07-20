@@ -114,11 +114,57 @@ async def memory_graph_stats() -> dict:
     return await STATE.memory.graph.stats()
 
 
+@router.get("/memory/graph/subgraph")
+async def memory_subgraph(key: str = Query(min_length=1), depth: int = Query(2, ge=1, le=3),
+                          limit: int = Query(60, ge=1, le=200)) -> dict:
+    """Bounded neighborhood around a node (KG 2.0) — nodes + edges for the graph
+    UI or reasoning."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return await STATE.memory.graph_subgraph(key, depth=int(depth), limit=int(limit))
+
+
+@router.get("/memory/path")
+async def memory_path(from_: str = Query(alias="from", min_length=1),
+                      to: str = Query(min_length=1),
+                      max_depth: int = Query(4, ge=1, le=6)) -> dict:
+    """Shortest connection path between two nodes (KG 2.0) — 'how are X and Y
+    related'. Returns the hop chain or an empty path."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    path = await STATE.memory.graph_path(from_, to, max_depth=int(max_depth))
+    return {"from": from_, "to": to, "connected": bool(path), "path": path}
+
+
 @router.get("/memory/timeline")
 async def memory_timeline(about: str | None = Query(None), days: int = Query(14, ge=1, le=120)) -> dict:
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
     return {"entries": await STATE.memory.timeline(about=about, days=days)}
+
+
+@router.get("/memory/world")
+async def memory_world(subject: str | None = Query(None), q: str | None = Query(None)) -> dict:
+    """Semantic world model (#11): recall what Nova knows about a subject, or
+    keyword-search across world facts. Each triple carries source + confidence."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    if subject:
+        return await STATE.memory.world_recall(subject)
+    if q:
+        return {"query": q, "results": await STATE.memory.world_search(q)}
+    return {"stats": await STATE.memory.world.stats()}
+
+
+@router.get("/thoughts")
+async def memory_thoughts(kind: str | None = Query(None), topic: str | None = Query(None),
+                          limit: int = Query(30, ge=1, le=100)) -> dict:
+    """Nova's persistent internal thoughts (#6) — private notes surfaced on
+    request. Ideas, unresolved questions, potential improvements, discoveries."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    thoughts = await STATE.memory.recall_thoughts(topic=topic, kind=kind, limit=int(limit))
+    return {"thoughts": thoughts, "stats": await STATE.memory.thoughts.stats()}
 
 
 # ── Reminders / scheduling (real "remind me at 5pm", proactive check-ins) ────

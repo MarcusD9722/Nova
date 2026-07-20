@@ -261,6 +261,17 @@ class SelfImproveWorker:
         except Exception as e:  # noqa: BLE001
             logger.debug("lesson_consolidation_failed", error=str(e)[:160])
 
+        # 3b) Knowledge-graph association discovery (Phase 4 / #8) — infer
+        # low-confidence links between nodes that share several neighbors.
+        # Deterministic, no LLM call; bounded work per cycle.
+        try:
+            found = await self._memory.discover_graph_associations()
+            if found.get("discovered"):
+                BUS.publish("memory.graph_discovery", {"discovered": found["discovered"]})
+                logger.info("graph_associations_discovered", count=found["discovered"])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("graph_discovery_failed", error=str(e)[:160])
+
         # 4) Self-eval (Phase 2.5) — once per UTC day, snapshot the metrics
         # into a durable fact and announce it on the bus.
         try:
@@ -286,11 +297,19 @@ class SelfImproveWorker:
                     if _self_benchmark_enabled():
                         report = await self.benchmark_report()
                         if report.get("regressions"):
-                            BUS.publish("autonomy.benchmark_regression", {
-                                "day": snap["day"],
-                                "regressions": [r["label"] for r in report["regressions"]],
-                            })
+                            labels = [r["label"] for r in report["regressions"]]
+                            BUS.publish("autonomy.benchmark_regression", {"day": snap["day"], "regressions": labels})
                             logger.info("benchmark_regressions", day=snap["day"], count=len(report["regressions"]))
+                            # #6: a real, measured regression becomes a persistent
+                            # "improvement" thought to revisit — deterministic, honest.
+                            try:
+                                await self._memory.note_thought(
+                                    "improvement",
+                                    f"Benchmark regression on {', '.join(labels)} (as of {snap['day']}) — worth investigating.",
+                                    topic="self-benchmark",
+                                )
+                            except Exception:
+                                pass
                 except Exception as e:  # noqa: BLE001
                     logger.debug("benchmark_check_failed", error=str(e)[:160])
         except Exception as e:  # noqa: BLE001

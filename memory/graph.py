@@ -147,6 +147,119 @@ class GraphStore:
                 row = await cur.fetchone()
         return {"edges": int(row[0] or 0), "src_nodes": int(row[1] or 0), "dst_nodes": int(row[2] or 0)}
 
+    # ── KG 2.0 (Phase 4): reasoning, traversal, discovery ────────────────────
+
+    async def path_between(self, a: str, b: str, *, max_depth: int = 4) -> list[dict[str, Any]]:
+        """Shortest connection path between two nodes (BFS over edges) — the
+        'how are X and Y related' answer. Returns an ordered list of hops
+        [{key, kind, predicate(via)}...] starting at `a` and ending at `b`, or
+        [] if they aren't connected within max_depth. Bounded so it stays cheap."""
+        from collections import deque
+
+        start, goal = norm_key(a), norm_key(b)
+        if not start or not goal:
+            return []
+        if start == goal:
+            return [{"key": start, "kind": None, "predicate": None}]
+        visited = {start}
+        queue: deque[tuple[str, list[dict[str, Any]]]] = deque(
+            [(start, [{"key": start, "kind": None, "predicate": None}])]
+        )
+        while queue:
+            cur, path = queue.popleft()
+            if len(path) - 1 >= max_depth:
+                continue
+            for row in await self.edges_for(cur, limit=50):
+                if row["src_key"] == cur:
+                    nk_kind, nk = row["dst_kind"], row["dst_key"]
+                else:
+                    nk_kind, nk = row["src_kind"], row["src_key"]
+                if nk in visited:
+                    continue
+                step = {"key": nk, "kind": nk_kind, "predicate": row["predicate"]}
+                new_path = path + [step]
+                if nk == goal:
+                    return new_path
+                visited.add(nk)
+                queue.append((nk, new_path))
+        return []
+
+    async def subgraph(self, key: str, *, depth: int = 2, limit: int = 60) -> dict[str, Any]:
+        """A bounded neighborhood around `key` for visualization/reasoning:
+        every node within `depth` hops and the edges among them."""
+        origin = norm_key(key)
+        if not origin:
+            return {"nodes": [], "edges": []}
+        node_kinds: dict[str, str] = {origin: "origin"}
+        seen_edges: set[tuple] = set()
+        edges_out: list[dict[str, Any]] = []
+        frontier = {origin}
+        for _ in range(max(1, depth)):
+            nxt: set[str] = set()
+            for k in list(frontier):
+                for row in await self.edges_for(k, limit=limit):
+                    sig = (row["src_key"], row["predicate"], row["dst_key"])
+                    if sig not in seen_edges:
+                        seen_edges.add(sig)
+                        edges_out.append({
+                            "src": row["src_key"], "dst": row["dst_key"], "predicate": row["predicate"],
+                            "weight": row["weight"], "confidence": row["confidence"],
+                        })
+                    for kind, kk in ((row["src_kind"], row["src_key"]), (row["dst_kind"], row["dst_key"])):
+                        if kk not in node_kinds:
+                            node_kinds[kk] = kind
+                            nxt.add(kk)
+            frontier = nxt
+            if not frontier or len(node_kinds) >= limit:
+                break
+        return {
+            "nodes": [{"key": k, "kind": v} for k, v in node_kinds.items()],
+            "edges": edges_out,
+        }
+
+    async def discover_associations(self, *, min_shared: int = 2, max_new: int = 40, confidence: float = 0.4) -> dict[str, int]:
+        """Automatic relationship discovery (#8): two nodes that share several
+        common neighbors but aren't directly linked get a low-confidence
+        `associated_with` edge. Deterministic, no LLM. Reinforced on re-run if
+        the pattern persists (via upsert). Bounded work per call."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT src_kind, src_key, predicate, dst_kind, dst_key FROM edges") as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+
+        adj: dict[str, set[str]] = {}
+        kind_of: dict[str, str] = {}
+        direct: set[frozenset] = set()
+        for r in rows:
+            a, b = r["src_key"], r["dst_key"]
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+            kind_of[a] = r["src_kind"]
+            kind_of[b] = r["dst_kind"]
+            direct.add(frozenset((a, b)))
+
+        # Don't invent associations off the special hub node 'user' — nearly
+        # everything connects through Marcus, so shared-'user' neighbors are noise.
+        nodes = [n for n in adj if n != "user"]
+        made = 0
+        scanned = 0
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                a, b = nodes[i], nodes[j]
+                if frozenset((a, b)) in direct:
+                    continue
+                shared = (adj[a] & adj[b]) - {a, b, "user"}
+                if len(shared) >= min_shared:
+                    await self.upsert_edge(
+                        Edge(kind_of.get(a, "topic"), a, "associated_with", kind_of.get(b, "topic"), b),
+                        confidence=confidence,
+                    )
+                    made += 1
+                    if made >= max_new:
+                        return {"discovered": made, "candidates_scanned": scanned}
+                scanned += 1
+        return {"discovered": made, "candidates_scanned": scanned}
+
 
 # ── Deterministic extraction (no LLM on the hot path) ────────────────────────
 
