@@ -130,13 +130,21 @@ API-accessible).
 - Backend/API only. **Google OAuth (calendar/email) still unlocks the Executive's full
   value** — it degrades honestly without it (uses reminders/goals/habits/twin).
 
-### Phase 6 — Persistent Agent Society
-- **#5 Multi-Agent Society** (persistent specialists — Engineer/Architect/Researcher/
-  Coach/etc. — each with durable memory, confidence, experience, reasoning style;
-  Executive routes which participate; structured turn-based collaboration) — **XL**
-- **Depends on:** Phase 2 orchestrator + Phase 4 (world model/memory to specialize on).
-- **Honest note:** serialized on one GPU today; genuinely concurrent debate arrives
-  with a second model.
+### Phase 6 — Persistent Agent Society *(✅ SHIPPED 2026-07-20)*
+- **#5 Multi-Agent Society** (`NOVA_AGENT_SOCIETY`) — `core/orchestrator/society.py`:
+  an 11-strong roster of durable specialists (Chief Executive/Engineer, Software
+  Architect, Research Scientist, Creative Director, Psychologist, Fitness & Snowboard
+  Coaches, Media Curator, Financial Planner [general-only, not licensed], Security
+  Specialist), each with a specialization + reasoning style + persona + routing
+  keywords. Deterministic `select_specialists` (Executive routing); `AgentSociety.
+  deliberate` runs a turn-based council (each contributes → coordinator synthesizes).
+- Durable per-specialist **confidence + experience + memory** (facts-based, no
+  migration): `record_consultation` nudges confidence, `agent_remember`/`agent_recall`.
+- `society.consult` (registered in runtime where the LLM lives) + `agents.roster` /
+  `agent.recall` tools + `/agents`.
+- **Honest note (in code + persona):** serialized on one GPU — persistent = durable
+  prompt+memory+confidence bundles deliberating turn-by-turn; genuine concurrency
+  arrives with a second model (ModelRouter already makes that a config change).
 
 ### Phase 7 — Autonomous Software Engineering
 - **#10 Continuous Codebase Understanding** (index every registered project: files/
@@ -182,12 +190,12 @@ model-swap-safe interfaces (ModelRouter); privacy-by-default (all local unless y
 configure an external service); migration paths (the schema-version system).
 
 ## Immediate next step
-Phases 3.5, 4, and 5 are ✅ shipped. **Next up is Phase 6 (Persistent Agent
-Society)** — durable specialist agents (#5) with their own memory/confidence/
-experience, routed by the Executive layer — pending Marcus's go-ahead. Honest note
-for Phase 6: still serialized on one GPU, so agents are durable prompt+memory
-bundles collaborating turn-by-turn; genuine concurrency waits on the RTX 3080.
-Phase 3 (Awareness Substrate) remains deferred to after Phase 8.
+Phases 3.5, 4, 5, and 6 are ✅ shipped. **Next up is Phase 7 (Autonomous Software
+Engineering)** — Continuous Codebase Understanding (#10), the SW-Engineering Platform
+(#18: auto docs/tests/security/health), and Autonomous Experimentation (#15) — pending
+Marcus's go-ahead. It leans on the self-editing + benchmarking + agent-society
+foundations now in place; #15 is the highest-risk item so far (approval-gated,
+sandboxed). Phase 3 (Awareness Substrate) remains deferred to after Phase 8.
 
 **Open decisions for Marcus:** (1) confirm this sequencing or reprioritize a specific
 goal earlier; (2) run the Google OAuth setup before Phase 5 (Executive needs it);

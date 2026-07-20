@@ -47,6 +47,7 @@ from core.workers.memory_ingest import MemoryIngestWorker
 from core.workers.self_improve import SelfImproveWorker
 from core.workers.reminder_worker import ReminderWorker
 from core.workers.research_worker import ResearchWorker
+from core.orchestrator.society import AgentSociety
 from core.error_log import ErrorLog
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.unifier import MemoryUnifier
@@ -546,6 +547,36 @@ class RuntimeManager:
             "what he's asking. args: {question?}",
         )
 
+        # Persistent agent society (Phase 6 / #5): a council of durable specialists
+        # the Executive routes. Registered here where the LLM + semaphore live.
+        self._society = AgentSociety(memory=self._memory, llm=self._llm, llm_semaphore=self._llm_sem)
+
+        async def _tool_society_consult(args: dict[str, Any]) -> dict[str, Any]:
+            if (os.getenv("NOVA_AGENT_SOCIETY", "1").strip() or "1").lower() in {"0", "false", "no", "off"}:
+                return {"ok": False, "error": "agent_society_disabled"}
+            question = str(args.get("question") or args.get("query") or "").strip()
+            if not question:
+                return {"ok": False, "error": "missing_question"}
+            context = str(args.get("context") or "").strip()
+            result = await self._society.deliberate(question, context=context)
+            if not result.get("synthesis"):
+                return {"ok": False, "error": "no_synthesis", "note": "The council couldn't produce an answer this time."}
+            return {
+                "ok": True,
+                "participants": result["participants"],
+                "answer": result["synthesis"],
+                "perspectives": [{"specialist": c["agent"], "view": c["text"]} for c in result["contributions"]],
+            }
+
+        self._router.register(
+            "society.consult", _tool_society_consult,
+            "Convene Nova's council of specialists (Chief Engineer, Research Scientist, Psychologist, Fitness/"
+            "Snowboard Coach, Media Curator, Financial Planner, Security Specialist, ...) for a question that "
+            "genuinely benefits from multiple expert angles or a cross-domain decision. The Executive picks who "
+            "weighs in and synthesizes their views. Slower than a normal reply (several model calls) — use only "
+            "when the depth is worth it. args: {question, context?}",
+        )
+
     @property
     def router(self) -> ToolRouter:
         return self._router
@@ -577,6 +608,10 @@ class RuntimeManager:
     @property
     def screen_broker(self) -> ScreenCaptureBroker:
         return self._screen_broker
+
+    @property
+    def society(self) -> AgentSociety:
+        return self._society
 
     def start(self) -> None:
         self._memory_worker.start()

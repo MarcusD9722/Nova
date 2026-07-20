@@ -95,6 +95,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_INTERNAL_THOUGHTS", "bool", "1", "Keep persistent internal thoughts (ideas/questions/improvements) across sessions, surfaced only on request (#6)."),
         _s("NOVA_DIGITAL_TWIN", "bool", "1", "Model Marcus's working patterns (work hours, procrastination likelihood, focus window) from recorded signals — predicts, never impersonates (#4)."),
         _s("NOVA_EXECUTIVE", "bool", "1", "Executive intelligence: proactively synthesize goals/reminders/habits/twin/weather into confidence-gated recommendations (#1)."),
+        _s("NOVA_AGENT_SOCIETY", "bool", "1", "Enable the persistent agent society: a council of durable specialists the Executive routes for multi-perspective questions (#5)."),
         _s("NOVA_RECENT_CHAT_TURNS", "int", "20", "Recent turns kept in the reply prompt."),
         _s("NOVA_SUMMARY_EVERY_N", "int", "8", "Summarize the conversation every N turns."),
         _s("NOVA_FOLLOWUP_WINDOW", "int", "10", "Follow-up dedup window (turns)."),
