@@ -344,6 +344,40 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         notes = await memory.agent_recall(agent_id, topic=topic)
         return {"ok": True, "agent_id": agent_id, "notes": notes}
 
+    async def _experiment_record(args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or args.get("experiment") or "").strip()
+        hypothesis = str(args.get("hypothesis") or "").strip()
+        if not name:
+            return {"ok": False, "error": "missing_name"}
+        exp_id = await memory.record_experiment(name, hypothesis)
+        if not exp_id:
+            return {"ok": False, "error": "experiments_disabled"}
+        return {"ok": True, "experiment_id": exp_id}
+
+    async def _experiment_trial(args: dict[str, Any]) -> dict[str, Any]:
+        exp_id = str(args.get("experiment_id") or args.get("experiment") or args.get("id") or "").strip()
+        variant = str(args.get("variant") or "").strip()
+        metrics = args.get("metrics") if isinstance(args.get("metrics"), dict) else {}
+        if not exp_id or not variant:
+            return {"ok": False, "error": "missing_experiment_or_variant"}
+        if await memory.add_experiment_trial(exp_id, variant, metrics):
+            return {"ok": True, "recorded": {"variant": variant, "metrics": metrics}}
+        return {"ok": False, "error": "not_recorded"}
+
+    async def _experiment_analyze(args: dict[str, Any]) -> dict[str, Any]:
+        exp_id = str(args.get("experiment_id") or args.get("experiment") or args.get("id") or "").strip()
+        if not exp_id:
+            return {"ok": False, "error": "missing_experiment_id"}
+        result = await memory.analyze_experiment(exp_id)
+        if result is None:
+            return {"ok": False, "error": "not_found"}
+        # Reinforce the safety contract in the tool response itself.
+        return {"ok": True, "experiment_id": exp_id, **result,
+                "reminder": "This is a recommendation only — adopting a variant needs your explicit approval; nothing is applied automatically."}
+
+    async def _experiment_list(args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "experiments": await memory.list_experiments()}
+
     _INDEX_SKIP_DIR_NAMES = {
         "__pycache__", "node_modules", ".git", ".venv", "venv",
         "$recycle.bin", "system volume information",
@@ -668,6 +702,10 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "research.findings": _research_findings,
         "agents.roster": _agents_roster,
         "agent.recall": _agent_recall,
+        "experiment.record": _experiment_record,
+        "experiment.trial": _experiment_trial,
+        "experiment.analyze": _experiment_analyze,
+        "experiment.list": _experiment_list,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
         "memory.index_folder": _memory_index_folder,
@@ -750,6 +788,13 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                            "Marcus asks who's on the team or about a specialist. args: {}"),
         "agent.recall": ("Recall a specific specialist's own accumulated notes/learning history. "
                           "args: {agent_id, topic?}"),
+        "experiment.record": ("Start a safe A/B experiment to compare approaches (prompt variants, retrieval, "
+                               "ranking, scheduling, ...). args: {name, hypothesis?}"),
+        "experiment.trial": ("Log one trial's measured metrics for a variant (accuracy, reliability, latency_s, "
+                              "resource). args: {experiment_id, variant, metrics:{...}}"),
+        "experiment.analyze": ("Compare an experiment's variants and get a ranked RECOMMENDATION. It never applies a "
+                                "change — adopting a variant is always your call. args: {experiment_id}"),
+        "experiment.list": ("List recorded experiments and their trial counts. args: {}"),
         "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
                                  "('where's that PDF about the mortgage', 'photos from the beach trip'). "
                                  "args: {path, max_files?}. Skips files already indexed and unchanged."),

@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from core.dates import parse_month_day
 from core.digital_twin import DigitalTwinInputs, derive_profile
 from core.executive import ExecutiveContext, recommend
+from core.experiments import compare_variants
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from core.settings import get_bool
@@ -151,6 +152,10 @@ class MemoryUnifier:
             return True  # one entry / one last-checked stamp per topic slug
         if ent.startswith("agent:"):
             return True  # one current value per specialist stat (confidence/consulted/helpful)
+        if ent == "experiment":
+            return True  # one definition per experiment id (attribute = id)
+        if ent.startswith("exptrials:"):
+            return True  # one accumulating trials blob per experiment
         return False
 
     async def _fact_ids_for(self, entity: str, attribute: str, value: str | None = None) -> list[str]:
@@ -798,6 +803,69 @@ class MemoryUnifier:
             t = topic.lower()
             rows = [r for r in rows if t in (r.attribute or "").lower() or t in (r.value or "").lower()]
         return [r.value for r in rows[:limit] if r.value]
+
+    # ── Autonomous experimentation (Phase 7 / #15) ───────────────────────────
+
+    async def record_experiment(self, name: str, hypothesis: str = "") -> str | None:
+        """Register an experiment. Returns its id, or None when disabled/invalid."""
+        await self.initialize()
+        if not get_bool("NOVA_EXPERIMENTS"):
+            return None
+        name = (name or "").strip()
+        if not name:
+            return None
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:32] or "exp"
+        exp_id = f"{slug}-{uuid4().hex[:6]}"
+        defn = {"id": exp_id, "name": name[:200], "hypothesis": hypothesis[:400],
+                "created_at": _now().isoformat(), "status": "open"}
+        await self.add_fact(entity="experiment", attribute=exp_id, value=json.dumps(defn), confidence=1.0)
+        return exp_id
+
+    async def add_experiment_trial(self, exp_id: str, variant: str, metrics: dict[str, Any]) -> bool:
+        await self.initialize()
+        if not get_bool("NOVA_EXPERIMENTS"):
+            return False
+        variant = (variant or "").strip()
+        if not exp_id or not variant or not isinstance(metrics, dict):
+            return False
+        rec = await self.get_latest_fact(entity=f"exptrials:{exp_id}", attribute="data")
+        try:
+            trials = json.loads(rec.value) if rec and rec.value else []
+        except Exception:
+            trials = []
+        clean = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+        trials.append({"variant": variant, "metrics": clean})
+        await self.add_fact(entity=f"exptrials:{exp_id}", attribute="data",
+                            value=json.dumps(trials)[:20000], confidence=1.0)
+        return True
+
+    async def analyze_experiment(self, exp_id: str) -> dict[str, Any] | None:
+        """Compare an experiment's variants into a RECOMMENDATION (never applied)."""
+        await self.initialize()
+        rec = await self.get_latest_fact(entity=f"exptrials:{exp_id}", attribute="data")
+        if not rec or not rec.value:
+            return {"verdict": "inconclusive", "reason": "no trials recorded", "ranking": [], "requires_approval": True}
+        try:
+            trials = json.loads(rec.value)
+        except Exception:
+            trials = []
+        return compare_variants(trials)
+
+    async def list_experiments(self) -> list[dict[str, Any]]:
+        await self.initialize()
+        out: list[dict[str, Any]] = []
+        for r in await self.get_facts(entity="experiment", limit=100, newest_first=True):
+            try:
+                defn = json.loads(r.value)
+            except Exception:
+                continue
+            trials_rec = await self.get_latest_fact(entity=f"exptrials:{defn['id']}", attribute="data")
+            try:
+                n_trials = len(json.loads(trials_rec.value)) if trials_rec and trials_rec.value else 0
+            except Exception:
+                n_trials = 0
+            out.append({**defn, "trials": n_trials})
+        return out
 
     async def add_fact(
         self,

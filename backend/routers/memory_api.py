@@ -208,6 +208,17 @@ async def research(topic: str | None = Query(None)) -> dict:
     return {"topics": await STATE.memory.list_research_topics()}
 
 
+@router.get("/experiments")
+async def experiments(experiment_id: str | None = Query(None)) -> dict:
+    """Autonomous experimentation (#15): list experiments, or analyze one into a
+    ranked RECOMMENDATION. Never applies a change — adoption is approval-gated."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    if experiment_id:
+        return await STATE.memory.analyze_experiment(experiment_id)
+    return {"experiments": await STATE.memory.list_experiments()}
+
+
 @router.get("/agents")
 async def agents() -> dict:
     """The persistent agent society (#5): the specialist roster with each one's

@@ -48,6 +48,7 @@ from core.workers.self_improve import SelfImproveWorker
 from core.workers.reminder_worker import ReminderWorker
 from core.workers.research_worker import ResearchWorker
 from core.orchestrator.society import AgentSociety
+from core import code_intel
 from core.error_log import ErrorLog
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.unifier import MemoryUnifier
@@ -576,6 +577,98 @@ class RuntimeManager:
             "weighs in and synthesizes their views. Slower than a normal reply (several model calls) — use only "
             "when the depth is worth it. args: {question, context?}",
         )
+
+        # Continuous codebase understanding (Phase 7 / #10 + #18). Registered here
+        # where repo_root / projects_dir / dev_mode resolve a project to a path.
+        self._code_index_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+        def _resolve_project_root(name: str) -> Path | None:
+            name = (name or "").strip().lower()
+            if name in ("", "self", "nova", "repo", "."):
+                return self._repo_root
+            try:
+                for entry in self._dev_mode.list_external_roots():
+                    if entry["project"].lower() == name:
+                        return Path(entry["path"])
+            except Exception:
+                pass
+            cand = self._projects_dir / name
+            return cand if cand.is_dir() else None
+
+        def _get_index(root: Path) -> dict[str, Any]:
+            import time as _t
+            key = str(root)
+            cached = self._code_index_cache.get(key)
+            if cached and (_t.monotonic() - cached[0]) < 120:
+                return cached[1]
+            idx = code_intel.index_project(root)
+            self._code_index_cache[key] = (_t.monotonic(), idx)
+            return idx
+
+        async def _tool_code_index(args: dict[str, Any]) -> dict[str, Any]:
+            root = _resolve_project_root(str(args.get("project") or ""))
+            if root is None:
+                return {"ok": False, "error": "unknown_project", "note": "Register it first with self.register_project, or use 'self' for Nova's own code."}
+            idx = _get_index(root)
+            if not idx.get("exists"):
+                return {"ok": False, "error": "not_a_directory", "path": str(root)}
+            return {"ok": True, "project": str(root), "architecture": code_intel.architecture_summary(idx),
+                    "health": code_intel.health_score(idx)}
+
+        async def _tool_code_symbols(args: dict[str, Any]) -> dict[str, Any]:
+            root = _resolve_project_root(str(args.get("project") or ""))
+            if root is None:
+                return {"ok": False, "error": "unknown_project"}
+            q = str(args.get("query") or args.get("name") or "").strip().lower()
+            idx = _get_index(root)
+            hits = [{"symbol": s, "files": locs} for s, locs in idx.get("symbols", {}).items()
+                    if not q or q in s.lower()]
+            hits.sort(key=lambda h: h["symbol"].lower())
+            return {"ok": True, "count": len(hits), "symbols": hits[:60]}
+
+        async def _tool_code_impact(args: dict[str, Any]) -> dict[str, Any]:
+            root = _resolve_project_root(str(args.get("project") or ""))
+            if root is None:
+                return {"ok": False, "error": "unknown_project"}
+            symbol = str(args.get("symbol") or args.get("name") or "").strip()
+            if not symbol:
+                return {"ok": False, "error": "missing_symbol"}
+            return {"ok": True, **code_intel.impact_of(_get_index(root), symbol)}
+
+        async def _tool_code_health(args: dict[str, Any]) -> dict[str, Any]:
+            root = _resolve_project_root(str(args.get("project") or ""))
+            if root is None:
+                return {"ok": False, "error": "unknown_project"}
+            idx = _get_index(root)
+            debt = code_intel.tech_debt(idx)
+            return {"ok": True, "health": code_intel.health_score(idx),
+                    "debt_summary": debt["by_severity"], "top_debt": debt["items"][:12]}
+
+        async def _tool_code_security(args: dict[str, Any]) -> dict[str, Any]:
+            root = _resolve_project_root(str(args.get("project") or ""))
+            if root is None:
+                return {"ok": False, "error": "unknown_project"}
+            scan = code_intel.security_scan(root)
+            return {"ok": True, "by_severity": scan["by_severity"], "findings": scan["findings"][:25],
+                    "disclaimer": scan["disclaimer"]}
+
+        for _name, _fn, _desc in [
+            ("code.index", _tool_code_index,
+             "Get a structural understanding of a project: architecture outline (languages, top dirs, largest files, "
+             "dependencies, entry points) + a health score. Use 'self' for Nova's own code. args: {project?}"),
+            ("code.symbols", _tool_code_symbols,
+             "Search a project's classes/functions by name and see which files define them. args: {project?, query}"),
+            ("code.impact", _tool_code_impact,
+             "Impact analysis BEFORE editing: what references a symbol (who uses it / imports its module) and how "
+             "wide the blast radius is. args: {project?, symbol}"),
+            ("code.health", _tool_code_health,
+             "Project health score + ranked technical-debt report (long files, undocumented API, TODOs, missing "
+             "tests, syntax errors). args: {project?}"),
+            ("code.security", _tool_code_security,
+             "Defensive security scan of a registered project's own code: flags risky patterns (eval/exec, shell=True, "
+             "hardcoded secrets, disabled TLS, weak hashes) for human review. args: {project?}"),
+        ]:
+            self._router.register(_name, _fn, _desc)
 
     @property
     def router(self) -> ToolRouter:
