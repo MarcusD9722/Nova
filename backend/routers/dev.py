@@ -7,7 +7,7 @@ Moved verbatim from backend/app.py in Phase 0.6 — behavior unchanged.
 
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.state import STATE
@@ -16,6 +16,37 @@ if TYPE_CHECKING:
     from core.dev_mode import DevMode
 
 router = APIRouter()
+
+
+# ── Continuous codebase understanding (Phase 7 / #10 + #18) ──────────────────
+# These reuse the runtime-registered code.* tools (which own the project→root
+# resolver + index cache), so the REST surface and the agent tools stay in sync.
+
+async def _code_tool(name: str, project: str) -> dict:
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    from core.tool_router import ToolCall
+
+    res = await STATE.runtime.router.execute(ToolCall(name=name, args={"project": project}), timeout_s=45.0, retries=0)
+    return res.result if (res.ok and isinstance(res.result, dict)) else {"ok": False, "error": "execution_failed"}
+
+
+@router.get("/code/index")
+async def code_index(project: str = Query("")) -> dict:
+    """Structural understanding + health for a project ('' or 'self' = Nova)."""
+    return await _code_tool("code.index", project)
+
+
+@router.get("/code/health")
+async def code_health(project: str = Query("")) -> dict:
+    """Health score + ranked technical-debt report."""
+    return await _code_tool("code.health", project)
+
+
+@router.get("/code/security")
+async def code_security(project: str = Query("")) -> dict:
+    """Defensive security scan (risky-pattern heuristics for human review)."""
+    return await _code_tool("code.security", project)
 
 
 class DevInspectRequest(BaseModel):

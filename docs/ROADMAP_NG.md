@@ -146,16 +146,23 @@ API-accessible).
   prompt+memory+confidence bundles deliberating turn-by-turn; genuine concurrency
   arrives with a second model (ModelRouter already makes that a config change).
 
-### Phase 7 — Autonomous Software Engineering
-- **#10 Continuous Codebase Understanding** (index every registered project: files/
-  classes/functions/deps/TODOs/tests/debt; semantic navigation; impact analysis
-  before edits) — **L**
-- **#18 Autonomous SW-Engineering Platform** (auto architecture/API docs, DB diagrams,
-  tests, security + dependency + health reports; self-maintaining where safe) — **XL**
-- **#15 Autonomous Experimentation** (safe A/B of prompt/retrieval/ranking/scheduling
-  variants; measure speed/accuracy/reliability/resources; adopt only with approval) — **L**
-- **Depends on:** self-editing (built), #14 benchmarking, Phase 6 agents (architect/
-  coder/critic). **Risk:** highest so far → approval-gated, sandboxed.
+### Phase 7 — Autonomous Software Engineering *(✅ SHIPPED 2026-07-20)*
+- **#10 Continuous Codebase Understanding** — `core/code_intel.py`: deterministic
+  indexer (Python via `ast`, regex for JS/TS/etc.) → files/classes/functions/imports/
+  docstrings/TODOs; symbol search; **impact analysis** (`impact_of`: precise blast
+  radius = who *uses* a symbol, vs. softer module-importers). `code.index`/`code.symbols`/
+  `code.impact` tools + `/code/index`. On the real repo: 800 files, MemoryUnifier→high.
+- **#18 SW-Engineering Platform** — deterministic reports over the index: `health_score`
+  (doc coverage, long files, TODO density, tests, syntax errors → 0-100 + grade),
+  `tech_debt` (ranked), `architecture_summary`, and a **defensive `security_scan`**
+  (risky-pattern heuristics for the user's own code, honestly labeled "not proof").
+  `code.health`/`code.security` + `/code/health`, `/code/security`.
+- **#15 Autonomous Experimentation** (`NOVA_EXPERIMENTS`) — `core/experiments.py`:
+  `compare_variants` ranks A/B trials (accuracy/reliability/latency/resource), declines
+  on thin data or slim **relative** margin, and is **RECOMMEND-ONLY** (`requires_approval:
+  True` — never auto-applies). Experiment store + `experiment.record`/`trial`/`analyze`/
+  `list` + `/experiments`.
+- No schema migration (facts-based). Backend/API only.
 
 ### Phase 8 — Computer Control & Skill Learning *(Hands)*
 - Permission tiers (read/standard/admin/critical) + confirm-broker + audit log —
@@ -190,12 +197,14 @@ model-swap-safe interfaces (ModelRouter); privacy-by-default (all local unless y
 configure an external service); migration paths (the schema-version system).
 
 ## Immediate next step
-Phases 3.5, 4, 5, and 6 are ✅ shipped. **Next up is Phase 7 (Autonomous Software
-Engineering)** — Continuous Codebase Understanding (#10), the SW-Engineering Platform
-(#18: auto docs/tests/security/health), and Autonomous Experimentation (#15) — pending
-Marcus's go-ahead. It leans on the self-editing + benchmarking + agent-society
-foundations now in place; #15 is the highest-risk item so far (approval-gated,
-sandboxed). Phase 3 (Awareness Substrate) remains deferred to after Phase 8.
+Phases 3.5, 4, 5, 6, and 7 are ✅ shipped. **Next up is Phase 8 (Computer Control &
+Skill Learning)** — permission tiers first, then staged computer control (observe →
+allowlisted actions → gated input synthesis), then Autonomous Skill Learning (#2:
+detect repeated workflows → offer to learn → parameterize/version/branch). This is the
+**highest-blast-radius phase** — permissions ship before any actuator, and it stays
+deliberately conservative. After Phase 8, the deferred **Phase 3 (Awareness Substrate
+& Always-On)** finally lands, then Phase 9 (Physical World) and Phase 10 (Nova OS
+unification).
 
 **Open decisions for Marcus:** (1) confirm this sequencing or reprioritize a specific
 goal earlier; (2) run the Google OAuth setup before Phase 5 (Executive needs it);
