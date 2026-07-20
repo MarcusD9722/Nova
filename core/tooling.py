@@ -250,6 +250,83 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": True, "thoughts": [], "note": "No open internal thoughts recorded" + (f" about '{topic}'" if topic else "") + "."}
         return {"ok": True, "thoughts": [{"kind": t["kind"], "topic": t["topic"], "content": t["content"]} for t in thoughts]}
 
+    async def _twin_profile(args: dict[str, Any]) -> dict[str, Any]:
+        profile = await memory.digital_twin_profile()
+        if not profile.get("enabled", True):
+            return {"ok": False, "error": "digital_twin_disabled"}
+        if not profile.get("enough_data"):
+            return {"ok": True, "enough_data": False, "note": profile.get("note", "Still learning your patterns.")}
+        return {"ok": True, **profile}
+
+    async def _executive_brief(args: dict[str, Any]) -> dict[str, Any]:
+        recs = await memory.executive_recommendations(throttle=False)
+        if not recs:
+            return {"ok": True, "recommendations": [], "note": "Nothing worth flagging right now — no looming deadlines, stalled goals, or timing nudges."}
+        return {"ok": True, "recommendations": [
+            {"message": r["message"], "why": r["rationale"], "confidence": r["confidence"]} for r in recs
+        ]}
+
+    async def _plan_save(args: dict[str, Any]) -> dict[str, Any]:
+        from core.goal_planner import build_plan, progress
+        goal_id = str(args.get("goal_id") or args.get("goal") or args.get("id") or "").strip()
+        vision = str(args.get("vision") or args.get("objective") or "").strip()
+        if not goal_id or not vision:
+            return {"ok": False, "error": "missing_goal_id_or_vision"}
+        milestones = args.get("milestones") if isinstance(args.get("milestones"), list) else []
+        items = args.get("items") if isinstance(args.get("items"), list) else []
+        try:
+            horizon = int(args.get("horizon_days") or 90)
+        except (TypeError, ValueError):
+            horizon = 90
+        plan = build_plan(vision, horizon_days=horizon, milestones=milestones, items=items)
+        await memory.save_plan(goal_id, plan)
+        return {"ok": True, "goal_id": goal_id, "milestones": len(plan["milestones"]),
+                "items": len(plan["items"]), "progress": progress(plan)}
+
+    async def _plan_status(args: dict[str, Any]) -> dict[str, Any]:
+        from core.goal_planner import progress
+        goal_id = str(args.get("goal_id") or args.get("goal") or args.get("id") or "").strip()
+        if not goal_id:
+            return {"ok": False, "error": "missing_goal_id"}
+        plan = await memory.load_plan(goal_id)
+        if plan is None:
+            return {"ok": False, "error": "no_plan", "note": f"No plan saved for goal '{goal_id}' yet."}
+        return {"ok": True, "goal_id": goal_id, "vision": plan.get("vision"),
+                "progress": progress(plan), "milestones": plan.get("milestones", []), "items": plan.get("items", [])}
+
+    async def _plan_advance(args: dict[str, Any]) -> dict[str, Any]:
+        goal_id = str(args.get("goal_id") or args.get("goal") or args.get("id") or "").strip()
+        if not goal_id:
+            return {"ok": False, "error": "missing_goal_id"}
+        summary = await memory.advance_plan(goal_id)
+        if summary is None:
+            return {"ok": False, "error": "no_plan"}
+        return {"ok": True, "goal_id": goal_id, **summary}
+
+    async def _research_track(args: dict[str, Any]) -> dict[str, Any]:
+        topic = str(args.get("topic") or args.get("subject") or "").strip()
+        if not topic:
+            return {"ok": False, "error": "missing_topic"}
+        if await memory.track_research_topic(topic):
+            return {"ok": True, "tracking": topic,
+                    "note": "I'll keep an eye on this and save findings (with sources) as I learn them. Enable NOVA_RESEARCH for automatic periodic updates."}
+        return {"ok": False, "error": "invalid_topic"}
+
+    async def _research_list(args: dict[str, Any]) -> dict[str, Any]:
+        topics = await memory.list_research_topics()
+        return {"ok": True, "topics": topics}
+
+    async def _research_findings(args: dict[str, Any]) -> dict[str, Any]:
+        topic = str(args.get("topic") or args.get("subject") or "").strip()
+        if not topic:
+            return {"ok": False, "error": "missing_topic"}
+        findings = await memory.research_findings(topic)
+        if not findings:
+            return {"ok": True, "topic": topic, "findings": [], "note": f"No findings recorded for '{topic}' yet."}
+        return {"ok": True, "topic": topic, "findings": [
+            {"summary": f["object"], "source": f.get("source"), "confidence": f.get("confidence")} for f in findings
+        ]}
+
     _INDEX_SKIP_DIR_NAMES = {
         "__pycache__", "node_modules", ".git", ".venv", "venv",
         "$recycle.bin", "system volume information",
@@ -564,6 +641,14 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "world.learn": _world_learn,
         "thoughts.note": _thoughts_note,
         "thoughts.recall": _thoughts_recall,
+        "twin.profile": _twin_profile,
+        "executive.brief": _executive_brief,
+        "plan.save": _plan_save,
+        "plan.status": _plan_status,
+        "plan.advance": _plan_advance,
+        "research.track": _research_track,
+        "research.list": _research_list,
+        "research.findings": _research_findings,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
         "memory.index_folder": _memory_index_folder,
@@ -618,6 +703,29 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "thoughts.recall": ("Surface your own internal thoughts — use ONLY when Marcus asks what you've been "
                              "thinking about / pondering / your ideas. Never volunteer these unprompted. "
                              "args: {topic?, kind?}"),
+        "twin.profile": ("Get Marcus's working-pattern profile (preferred work hours, peak focus period, "
+                          "procrastination likelihood, interests) derived from his recorded activity. Use when he "
+                          "asks about his own habits/productivity or when timing a suggestion. Predicts patterns; "
+                          "never claims to read his mind. args: {}"),
+        "executive.brief": ("Get Nova's current proactive recommendations — looming deadlines, stalled goals, focus "
+                             "windows, break suggestions — synthesized from goals/reminders/habits/patterns. Use when "
+                             "Marcus asks 'what should I focus on', 'what's on my plate', 'brief me', or you want to "
+                             "proactively help him prioritize. Each item includes why + a confidence. args: {}"),
+        "plan.save": ("Save a long-term plan for a goal: a vision plus milestones (with target_date + risk) and "
+                       "dated action items (cadence once|daily|weekly|monthly). Compose the plan yourself from the "
+                       "goal, then persist it here. args: {goal_id, vision, milestones:[{title,target_date,risk}], "
+                       "items:[{title,cadence,due,milestone_id?}], horizon_days?}"),
+        "plan.status": ("Show a goal's plan and progress (milestones/items done, % complete, at-risk, overdue). "
+                         "args: {goal_id}"),
+        "plan.advance": ("Roll a plan forward: missed recurring items move to their next occurrence instead of "
+                          "becoming overdue, and open milestones past their target date are flagged at-risk. Run "
+                          "this when catching up on a goal. args: {goal_id}"),
+        "research.track": ("Start tracking a research topic Marcus wants Nova to follow over time (AI, GPUs, "
+                            "snowboarding, a framework, ...). Findings accrue into the world model with sources. "
+                            "args: {topic}"),
+        "research.list": ("List the research topics Nova is currently tracking and when each was last checked. args: {}"),
+        "research.findings": ("Show what Nova has learned about a tracked research topic — each finding with its "
+                               "source citation. args: {topic}"),
         "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
                                  "('where's that PDF about the mortgage', 'photos from the beach trip'). "
                                  "args: {path, max_files?}. Skips files already indexed and unchanged."),

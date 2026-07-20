@@ -167,6 +167,47 @@ async def memory_thoughts(kind: str | None = Query(None), topic: str | None = Qu
     return {"thoughts": thoughts, "stats": await STATE.memory.thoughts.stats()}
 
 
+@router.get("/twin")
+async def digital_twin() -> dict:
+    """Marcus's personal digital-twin profile (#4): working-pattern predictions
+    derived from recorded signals. Predicts, never impersonates."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return await STATE.memory.digital_twin_profile()
+
+
+@router.get("/executive")
+async def executive_brief() -> dict:
+    """Executive recommendations (#1): confidence-gated proactive suggestions
+    synthesized from goals, reminders, habits, and the digital-twin profile."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return {"recommendations": await STATE.memory.executive_recommendations(throttle=False)}
+
+
+@router.get("/plans/{goal_id}")
+async def goal_plan(goal_id: str) -> dict:
+    """A goal's long-term plan (#3): milestones, dated items, and progress."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    from core.goal_planner import progress
+    plan = await STATE.memory.load_plan(goal_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="No plan for this goal")
+    return {"goal_id": goal_id, "plan": plan, "progress": progress(plan)}
+
+
+@router.get("/research")
+async def research(topic: str | None = Query(None)) -> dict:
+    """Autonomous research (#9): tracked topics, or the sourced findings for one
+    topic. Every finding carries its citation; nothing is fabricated."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    if topic:
+        return {"topic": topic, "findings": await STATE.memory.research_findings(topic)}
+    return {"topics": await STATE.memory.list_research_topics()}
+
+
 # ── Reminders / scheduling (real "remind me at 5pm", proactive check-ins) ────
 
 class ReminderCreateRequest(BaseModel):

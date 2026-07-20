@@ -12,6 +12,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from core.dates import parse_month_day
+from core.digital_twin import DigitalTwinInputs, derive_profile
+from core.executive import ExecutiveContext, recommend
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from core.settings import get_bool
@@ -97,6 +99,9 @@ class MemoryUnifier:
         # Persistent internal thoughts (Phase 4 / #6) — same SQLite file, own table.
         self._thoughts = ThoughtStore(memory_dir / "sqlite" / "nova.sqlite3")
         self._known_names_cache: tuple[float, list[str]] | None = None
+        # Executive recommendations cache (Phase 5 / #1) — recomputed at most
+        # every few minutes so the per-turn grounding hook stays cheap.
+        self._exec_cache: tuple[float, list[dict[str, Any]]] | None = None
 
     @property
     def graph(self) -> GraphStore:
@@ -138,6 +143,12 @@ class MemoryUnifier:
             return True  # one self-eval snapshot per day (attribute=date), days accumulate
         if ent == "session":
             return True  # bookkeeping facts (last_active, *_nudged_at, habit_suggested:*) — one current value each
+        if ent == "executive":
+            return True  # one last-surfaced timestamp per recommendation key (throttle bookkeeping)
+        if ent.startswith("plan:"):
+            return attr == "tree"  # one current plan tree per goal, latest wins
+        if ent in ("research_topic", "research_checked"):
+            return True  # one entry / one last-checked stamp per topic slug
         return False
 
     async def _fact_ids_for(self, entity: str, attribute: str, value: str | None = None) -> list[str]:
@@ -470,6 +481,261 @@ class MemoryUnifier:
     async def resolve_thought(self, thought_id: str, *, status: str = "resolved") -> None:
         await self.initialize()
         await self._thoughts.resolve(thought_id, status=status)
+
+    # ── Personal digital twin (Phase 5 / #4) ─────────────────────────────────
+
+    async def digital_twin_profile(self) -> dict:
+        """Gather Marcus's working-pattern signals and derive his digital-twin
+        profile. All signals are ones Nova already records; the twin predicts
+        patterns, never impersonates. Gated by NOVA_DIGITAL_TWIN."""
+        await self.initialize()
+        if not get_bool("NOVA_DIGITAL_TWIN"):
+            return {"enabled": False}
+
+        # Local hour-of-day for recent turns (created_at is UTC).
+        turn_hours: list[int] = []
+        try:
+            for row in await self._sqlite.recent_turns(conversation_id=None, limit=300):
+                dt = self._parse_dt(row.get("created_at"))
+                if dt is not None:
+                    turn_hours.append(dt.astimezone().hour)
+        except Exception:
+            pass
+
+        mood = wellbeing = ""
+        try:
+            mood = await self.recent_mood_trend(days=5)
+            wellbeing = await self.recent_wellbeing_trend(days=7)
+        except Exception:
+            pass
+
+        interests: list[str] = []
+        try:
+            interests = [r.value for r in await self.get_facts(entity="interest_focus", limit=6, newest_first=True) if r.value]
+        except Exception:
+            pass
+
+        lessons_recent = 0
+        try:
+            cut = _now() - timedelta(days=14)
+            for r in await self.get_facts(entity=LESSON_ENTITY, limit=60, newest_first=True):
+                if r.created_at >= cut:
+                    lessons_recent += 1
+        except Exception:
+            pass
+
+        ontime = late = 0
+        try:
+            for r in await self.list_reminders(status="fired", limit=200):
+                if str(r.get("title") or "").startswith("__nova_"):
+                    continue
+                due, fired = self._parse_dt(r.get("due_at")), self._parse_dt(r.get("updated_at"))
+                if due and fired:
+                    if (fired - due).total_seconds() > 3600:
+                        late += 1
+                    else:
+                        ontime += 1
+        except Exception:
+            pass
+
+        goals_active = goals_stalled = 0
+        try:
+            stale_cut = _now() - timedelta(days=7)
+            for g in await self.list_goals(limit=100):
+                if str(g.get("status") or "") != "active":
+                    continue
+                goals_active += 1
+                up = self._parse_dt(g.get("updated_at"))
+                if up is None or up < stale_cut:
+                    goals_stalled += 1
+        except Exception:
+            pass
+
+        profile = derive_profile(DigitalTwinInputs(
+            turn_hours=turn_hours, mood_trend=mood, wellbeing_trend=wellbeing,
+            interests=interests, lessons_recent=lessons_recent,
+            reminders_ontime=ontime, reminders_late=late,
+            goals_active=goals_active, goals_stalled=goals_stalled,
+        ))
+        profile["enabled"] = True
+        return profile
+
+    # ── Executive intelligence (Phase 5 / #1) ────────────────────────────────
+
+    async def _gather_executive(self) -> list[dict[str, Any]]:
+        """Collect live signals and produce confidence-gated recommendations.
+        Cached ~5 min so the per-turn grounding hook doesn't re-scan every turn."""
+        import time as _time
+        if self._exec_cache and (_time.monotonic() - self._exec_cache[0]) < 300:
+            return self._exec_cache[1]
+
+        now = _now()
+        now_local = datetime.now().astimezone()
+
+        overdue: list[str] = []
+        upcoming: list[dict[str, Any]] = []
+        try:
+            for r in await self.list_reminders(status="pending", limit=100):
+                title = str(r.get("title") or "")
+                if title.startswith("__nova_"):
+                    continue
+                due = self._parse_dt(r.get("due_at"))
+                if not due:
+                    continue
+                delta_h = (due - now).total_seconds() / 3600.0
+                if delta_h < 0:
+                    overdue.append(title)
+                elif delta_h <= 24:
+                    upcoming.append({"label": title, "hours_until": max(0.0, delta_h)})
+        except Exception:
+            pass
+
+        upcoming_dates: list[dict[str, Any]] = []
+        try:
+            upcoming_dates = [
+                {"name": u["name"], "label": u["label"], "days_until": u["days_until"]}
+                for u in await self.list_people_with_upcoming_dates(within_days=3)
+            ]
+        except Exception:
+            pass
+
+        active_goals: list[str] = []
+        stalled_goals: list[str] = []
+        try:
+            stale_cut = now - timedelta(days=7)
+            for g in await self.list_goals(limit=100):
+                if str(g.get("status") or "") != "active":
+                    continue
+                title = str(g.get("title") or "")
+                active_goals.append(title)
+                up = self._parse_dt(g.get("updated_at"))
+                if up is None or up < stale_cut:
+                    stalled_goals.append(title)
+        except Exception:
+            pass
+
+        peak = None
+        procrastination = 0.0
+        stress = "low"
+        try:
+            prof = await self.digital_twin_profile()
+            if prof.get("enough_data"):
+                peak = prof["peak_period"]["value"]
+                procrastination = float(prof["procrastination_likelihood"]["value"])
+                stress = prof["stress_level"]["value"]
+        except Exception:
+            pass
+
+        recs = recommend(ExecutiveContext(
+            now_hour=now_local.hour, overdue=overdue, upcoming=upcoming,
+            upcoming_dates=upcoming_dates, active_goals=active_goals, stalled_goals=stalled_goals,
+            peak_period=peak, procrastination=procrastination, stress_level=stress, weather=None,
+        ))
+        self._exec_cache = (_time.monotonic(), recs)
+        return recs
+
+    async def executive_recommendations(self, *, throttle: bool = False, throttle_hours: float = 6.0) -> list[dict[str, Any]]:
+        """Proactive, confidence-gated recommendations (#1). With throttle=True
+        (the unprompted grounding path) recently-surfaced items are suppressed and
+        the returned ones marked, so Nova never repeats the same nudge; without it
+        (an explicit /executive or executive.brief request) everything shows."""
+        await self.initialize()
+        if not get_bool("NOVA_EXECUTIVE"):
+            return []
+        recs = await self._gather_executive()
+        if not throttle:
+            return recs
+        out: list[dict[str, Any]] = []
+        for r in recs:
+            attr = f"surfaced:{r['key']}"[:120]
+            last = await self.get_latest_fact(entity="executive", attribute=attr)
+            if last and last.value:
+                last_dt = self._parse_dt(last.value)
+                if last_dt and (_now() - last_dt).total_seconds() < throttle_hours * 3600:
+                    continue
+            out.append(r)
+            await self.add_fact(entity="executive", attribute=attr, value=_now().isoformat(), confidence=1.0)
+        return out
+
+    # ── Long-term goal planning (Phase 5 / #3) ───────────────────────────────
+
+    async def save_plan(self, goal_id: str, plan: dict[str, Any]) -> None:
+        """Persist a goal's plan tree as a JSON fact (one current tree per goal)."""
+        await self.initialize()
+        await self.add_fact(entity=f"plan:{goal_id}", attribute="tree",
+                            value=json.dumps(plan, ensure_ascii=False)[:20000], confidence=1.0)
+
+    async def load_plan(self, goal_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        rec = await self.get_latest_fact(entity=f"plan:{goal_id}", attribute="tree")
+        if not rec or not rec.value:
+            return None
+        try:
+            return json.loads(rec.value)
+        except Exception:
+            return None
+
+    async def advance_plan(self, goal_id: str) -> dict[str, Any] | None:
+        """Roll a plan forward (missed recurring items → next occurrence; open
+        milestones past target → at_risk) and persist. Returns the roll summary."""
+        from core.goal_planner import roll_forward
+        plan = await self.load_plan(goal_id)
+        if plan is None:
+            return None
+        result = roll_forward(plan)
+        await self.save_plan(goal_id, result["plan"])
+        return {"rolled": result["rolled"], "at_risk": result["at_risk"], "overdue": result["overdue"]}
+
+    # ── Autonomous research topics (Phase 5 / #9) ────────────────────────────
+
+    @staticmethod
+    def _research_slug(topic: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", (topic or "").strip().lower()).strip("-")[:60]
+
+    async def track_research_topic(self, topic: str) -> bool:
+        """Add an ongoing research topic. Findings accrue into the world model
+        with citations; nothing is fabricated."""
+        await self.initialize()
+        topic = (topic or "").strip()
+        slug = self._research_slug(topic)
+        if not slug:
+            return False
+        await self.add_fact(entity="research_topic", attribute=slug, value=topic[:200], confidence=1.0)
+        return True
+
+    async def untrack_research_topic(self, topic: str) -> int:
+        await self.initialize()
+        slug = self._research_slug(topic)
+        res = await self.purge_facts(entity="research_topic", attribute=slug, dry_run=False)
+        await self.purge_facts(entity="research_checked", attribute=slug, dry_run=False)
+        return int(res.get("deleted") or 0)
+
+    async def list_research_topics(self) -> list[dict[str, Any]]:
+        await self.initialize()
+        topics = await self.get_facts(entity="research_topic", limit=100, newest_first=True)
+        checked = {r.attribute: r.value for r in await self.get_facts(entity="research_checked", limit=200)}
+        return [{"topic": t.value, "slug": t.attribute, "last_checked": checked.get(t.attribute)} for t in topics]
+
+    async def next_research_topic(self) -> str | None:
+        """The tracked topic least-recently checked (never-checked first) — the
+        one an autonomous-research cycle should look at next."""
+        topics = await self.list_research_topics()
+        if not topics:
+            return None
+        topics.sort(key=lambda t: t.get("last_checked") or "")
+        return topics[0]["topic"]
+
+    async def mark_research_checked(self, topic: str) -> None:
+        await self.initialize()
+        slug = self._research_slug(topic)
+        if slug:
+            await self.add_fact(entity="research_checked", attribute=slug, value=_now().isoformat(), confidence=1.0)
+
+    async def research_findings(self, topic: str) -> list[dict[str, Any]]:
+        """What Nova has learned about a research topic — the sourced world-model
+        entries (every finding carries its citation)."""
+        await self.initialize()
+        return await self._world.query_subject(topic)
 
     async def add_fact(
         self,

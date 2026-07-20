@@ -110,17 +110,25 @@ API-accessible).
 - Flags: `NOVA_WORLD_MODEL`, `NOVA_INTERNAL_THOUGHTS`. Migration v4 verified on a
   copy of the real DB (v2→v4, 128 facts intact).
 
-### Phase 5 — Executive Intelligence & Planning *(the synthesis layer)*
-- **#3 Long-Term Goal Planning** (vision→milestones→quarterly→monthly→weekly→daily,
-  dependencies, risk, adaptive roll-forward of missed tasks) — **L**
-- **#4 Personal Digital Twin** (work hours, energy patterns, procrastination
-  likelihood, completion estimates; extends mood/habits; predicts, never impersonates) — **L**
-- **#1 Executive Intelligence** (proactive, confidence-gated coordinator over calendar/
-  reminders/goals/weather/traffic/location/habits/WorldState; the "understands and
-  coordinates my life" layer) — **XL**
-- **#9 Autonomous Research** (ongoing topics; periodic search→read→summarize→cite;
-  never fabricates; paced background worker) — **M**
-- **Depends on:** Phases 3–4. **Gate:** Google OAuth (calendar/email) for full Exec value.
+### Phase 5 — Executive Intelligence & Planning *(✅ SHIPPED 2026-07-20)*
+- **#4 Personal Digital Twin** (`NOVA_DIGITAL_TWIN`) — `core/digital_twin.py`: work
+  hours, peak focus period, procrastination likelihood, stress, learning speed,
+  interests, all derived from recorded signals with a `basis` each; predicts, never
+  impersonates; honest cold-start. `twin.profile` tool + `/twin`.
+- **#1 Executive Intelligence** (`NOVA_EXECUTIVE`) — `core/executive.py`: confidence-
+  gated, ranked, deduped, throttled recommendations (overdue/looming deadlines, focus
+  window, stalled goals, weather, breaks) synthesized from goals/reminders/habits/twin.
+  Stays silent on weak signals; surfaces ≤2 into grounding; `executive.brief` + `/executive`.
+- **#3 Long-Term Goal Planning** — `core/goal_planner.py`: vision→milestones→dated items,
+  **adaptive roll-forward** (missed recurring items advance instead of going overdue;
+  open milestones past target → at_risk), progress scoring. Plan stored as a JSON fact
+  per goal (no migration). `plan.save`/`plan.status`/`plan.advance` + `/plans/{goal_id}`.
+- **#9 Autonomous Research** (`NOVA_RESEARCH`, OFF by default) —
+  `core/workers/research_worker.py`: paced, killable topic worker that
+  search→summarize→**cites** into the world model; never fabricates. Topic store +
+  `research.track`/`research.list`/`research.findings` + `/research`.
+- Backend/API only. **Google OAuth (calendar/email) still unlocks the Executive's full
+  value** — it degrades honestly without it (uses reminders/goals/habits/twin).
 
 ### Phase 6 — Persistent Agent Society
 - **#5 Multi-Agent Society** (persistent specialists — Engineer/Architect/Researcher/
@@ -174,12 +182,12 @@ model-swap-safe interfaces (ModelRouter); privacy-by-default (all local unless y
 configure an external service); migration paths (the schema-version system).
 
 ## Immediate next step
-Phases 3.5 and 4 are ✅ shipped. **Next up is Phase 5 (Executive Intelligence &
-Planning)** — Long-Term Goal Planning (#3), Personal Digital Twin (#4), the proactive
-Executive coordinator (#1), and Autonomous Research (#9) — pending Marcus's go-ahead.
-**Before Phase 5:** the Executive layer reaches full value once Marcus runs the
-one-time Google OAuth setup (calendar/email). Phase 3 (Awareness Substrate) remains
-deferred to after Phase 8; see the Build order note above.
+Phases 3.5, 4, and 5 are ✅ shipped. **Next up is Phase 6 (Persistent Agent
+Society)** — durable specialist agents (#5) with their own memory/confidence/
+experience, routed by the Executive layer — pending Marcus's go-ahead. Honest note
+for Phase 6: still serialized on one GPU, so agents are durable prompt+memory
+bundles collaborating turn-by-turn; genuine concurrency waits on the RTX 3080.
+Phase 3 (Awareness Substrate) remains deferred to after Phase 8.
 
 **Open decisions for Marcus:** (1) confirm this sequencing or reprioritize a specific
 goal earlier; (2) run the Google OAuth setup before Phase 5 (Executive needs it);
