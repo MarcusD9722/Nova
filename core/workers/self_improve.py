@@ -30,11 +30,21 @@ from core.error_log import ErrorLog, error_message, is_error_event
 from core.event_bus import BUS, clip
 from core.llm_runtime import LLMRuntime
 from core.logging_setup import get_logger
+from core.orchestrator.benchmarks import compute_benchmark_report
+from core.orchestrator.internal_state import InternalStateInputs, derive_internal_state
 from core.orchestrator.metrics import MetricsCollector
 from core.policy._json_extract import extract_first_json_object
 from memory.unifier import MemoryUnifier
 
 logger = get_logger(__name__)
+
+
+def _internal_state_enabled() -> bool:
+    return os.getenv("NOVA_INTERNAL_STATE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _self_benchmark_enabled() -> bool:
+    return os.getenv("NOVA_SELF_BENCHMARK", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 _CODE_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9+\-_.]*)\n(.*?)```", re.DOTALL)
 _FILE_IN_TRACE_RE = re.compile(r'File "([^"]+\.py)"|([A-Za-z0-9_./\\]+\.py)')
@@ -116,6 +126,62 @@ class SelfImproveWorker:
     def metrics(self) -> dict:
         """Live self-eval snapshot for /autonomy/metrics (Phase 2.5)."""
         return self._metrics.snapshot()
+
+    async def internal_state(self) -> dict:
+        """Nova's current internal operational state (#12): reasoning/operational
+        metrics derived from live telemetry — never simulated feelings. Combines
+        the self-eval snapshot with live background-work counts."""
+        if not _internal_state_enabled():
+            return {"enabled": False}
+        queued = running = active_goals = 0
+        try:
+            queued = len(await self._memory.list_tasks(status="queued", limit=200))
+            running = len(await self._memory.list_tasks(status="running", limit=200))
+            active_goals = len([g for g in await self._memory.list_goals(limit=200)
+                                if str(g.get("status") or "") == "active"])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("internal_state_counts_failed", error=str(e)[:160])
+        state = derive_internal_state(InternalStateInputs(
+            snapshot=self._metrics.snapshot(),
+            queued_tasks=queued,
+            running_tasks=running,
+            active_goals=active_goals,
+        ))
+        state["enabled"] = True
+        return state
+
+    def operating_hints(self) -> list[str]:
+        """Cheap, synchronous operating hints from the in-memory metrics snapshot
+        (no DB) — safe to call on every chat turn from the grounding layer. The
+        task-count-driven workload term is approximated as 0 here (conservative:
+        fewer hints, never more); the full picture lives in internal_state()."""
+        if not _internal_state_enabled():
+            return []
+        try:
+            state = derive_internal_state(InternalStateInputs(snapshot=self._metrics.snapshot()))
+            return state.get("operating_hints") or []
+        except Exception:
+            return []
+
+    async def benchmark_report(self, *, days: int = 30) -> dict:
+        """Self-benchmark (#14): trends + regressions over the daily self_eval
+        history. Read-only, no LLM call — pure computation over facts already
+        written by the self-eval snapshot."""
+        if not _self_benchmark_enabled():
+            return {"enabled": False}
+        snaps: list[dict] = []
+        try:
+            rows = await self._memory.get_facts(entity="self_eval", limit=int(days), newest_first=True)
+            for r in rows:
+                try:
+                    snaps.append(json.loads(r.value))
+                except Exception:
+                    continue
+        except Exception as e:  # noqa: BLE001
+            logger.debug("benchmark_read_failed", error=str(e)[:160])
+        report = compute_benchmark_report(snaps)
+        report["enabled"] = True
+        return report
 
     # ── capture loop ─────────────────────────────────────────────────────────
 
@@ -201,6 +267,12 @@ class SelfImproveWorker:
             snap = self._metrics.snapshot()
             if snap["day"] != self._last_eval_day and snap["turns"] > 0:
                 self._last_eval_day = snap["day"]
+                # #12: capture the derived internal state alongside raw metrics so
+                # confidence/uncertainty/workload/etc. can be trended over time.
+                try:
+                    snap["internal_state"] = await self.internal_state()
+                except Exception:
+                    pass
                 await self._memory.add_fact(
                     entity="self_eval", attribute=snap["day"], value=json.dumps(snap), confidence=1.0
                 )
@@ -208,6 +280,19 @@ class SelfImproveWorker:
                             "tool_failure_rate": snap["tool_failure_rate"],
                             "avg_latency_s": snap["reply_latency_s"]["avg"]})
                 logger.info("self_eval_recorded", day=snap["day"], turns=snap["turns"])
+                # #14: once per day, refresh the benchmark and surface regressions
+                # (paced by the daily gate above — never spammy).
+                try:
+                    if _self_benchmark_enabled():
+                        report = await self.benchmark_report()
+                        if report.get("regressions"):
+                            BUS.publish("autonomy.benchmark_regression", {
+                                "day": snap["day"],
+                                "regressions": [r["label"] for r in report["regressions"]],
+                            })
+                            logger.info("benchmark_regressions", day=snap["day"], count=len(report["regressions"]))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("benchmark_check_failed", error=str(e)[:160])
         except Exception as e:  # noqa: BLE001
             logger.debug("self_eval_failed", error=str(e)[:160])
 

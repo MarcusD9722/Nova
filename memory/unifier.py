@@ -14,11 +14,13 @@ from uuid import UUID, uuid4
 from core.dates import parse_month_day
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
+from core.settings import get_bool
 from memory.backends.chroma_backend import ChromaMemoryBackend
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.backends.json_backend import JsonAuditBackend
 from memory.backends.sqlite_backend import SQLiteMemoryBackend
 from memory.graph import GraphStore, build_timeline, extract_turn_edges, fact_edge, person_relation_edge
+from memory.provenance import classify_default, normalize_status, observed_at_write
 from memory.schemas import FactRecord, MemoryHit
 
 
@@ -355,7 +357,17 @@ class MemoryUnifier:
         await self.initialize()
         return await build_timeline(self._sqlite, about=about, days=days, limit=limit)
 
-    async def add_fact(self, entity: str, attribute: str, value: str, confidence: float = 0.7) -> UUID:
+    async def add_fact(
+        self,
+        entity: str,
+        attribute: str,
+        value: str,
+        confidence: float = 0.7,
+        *,
+        source: str | None = None,
+        evidence: str | None = None,
+        verification_status: str | None = None,
+    ) -> UUID:
 
         # ---- write guard: prevent storing non-name tokens as relationship values ----
         deny_by_attr = {
@@ -384,6 +396,21 @@ class MemoryUnifier:
         await self.initialize()
         fact_id = uuid4()
         created_at = _now().isoformat()
+
+        # Provenance (#19): resolve where this fact came from and how trustworthy
+        # it is. When the flag is off we store NULLs (columns stay harmless). When
+        # a caller doesn't specify, classify_default encodes what's genuinely known
+        # about the write path — never a guess about the fact's truth. last_confirmed_at
+        # starts at created_at only for directly-observed statuses; assumptions
+        # (inferred/unverified) stay unconfirmed (NULL) so they can never masquerade
+        # as settled facts.
+        prov_source = prov_status = prov_evidence = prov_confirmed = None
+        if get_bool("NOVA_MEMORY_PROVENANCE"):
+            d_source, d_status = classify_default(entity, attribute)
+            prov_source = source or d_source
+            prov_status = normalize_status(verification_status or d_status)
+            prov_evidence = evidence
+            prov_confirmed = created_at if observed_at_write(prov_status) else None
 
         async with self._write_lock:
             # Supersede stale values for single-valued attributes; skip exact
@@ -414,7 +441,17 @@ class MemoryUnifier:
                     pass
 
             tasks = [
-                self._sqlite.add_fact(fact_id, entity=entity, attribute=attribute, value=value, confidence=confidence),
+                self._sqlite.add_fact(
+                    fact_id,
+                    entity=entity,
+                    attribute=attribute,
+                    value=value,
+                    confidence=confidence,
+                    source=prov_source,
+                    evidence=prov_evidence,
+                    verification_status=prov_status,
+                    last_confirmed_at=prov_confirmed,
+                ),
                 self._json.append_audit(
                     {
                         "kind": "fact",
@@ -424,6 +461,8 @@ class MemoryUnifier:
                         "value": value,
                         "confidence": confidence,
                         "created_at": created_at,
+                        "source": prov_source,
+                        "verification_status": prov_status,
                     }
                 ),
                 self._diskcache.set(
@@ -452,7 +491,7 @@ class MemoryUnifier:
         BUS.publish(
             "memory.write",
             {"kind": "fact", "entity": entity, "attribute": attribute, "value": clip(value, 120), "source": "long_term",
-             "superseded": len(stale_ids)},
+             "superseded": len(stale_ids), "verification": prov_status},
         )
 
         # Phase 1.1: a relationship-shaped fact also becomes a graph edge
@@ -661,18 +700,19 @@ class MemoryUnifier:
         BUS.publish("memory.write", {"kind": "event", "date": clip(date, 40), "note": clip(note, 120), "source": "long_term"})
         return event_id
 
-    def _fact_from_row(self, row: dict[str, Any]) -> FactRecord:
-        created_at = row.get("created_at")
-        if isinstance(created_at, str):
+    @staticmethod
+    def _parse_dt(raw: Any) -> "datetime | None":
+        if isinstance(raw, datetime):
+            return raw
+        if isinstance(raw, str) and raw.strip():
             try:
-                created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
             except Exception:
-                created_dt = _now()
-        elif isinstance(created_at, datetime):
-            created_dt = created_at
-        else:
-            created_dt = _now()
+                return None
+        return None
 
+    def _fact_from_row(self, row: dict[str, Any]) -> FactRecord:
+        created_dt = self._parse_dt(row.get("created_at")) or _now()
         return FactRecord(
             id=UUID(str(row["id"])),
             entity=str(row["entity"]),
@@ -680,6 +720,10 @@ class MemoryUnifier:
             value=str(row["value"]),
             confidence=float(row.get("confidence", 0.7)),
             created_at=created_dt,
+            source=(row.get("source") or None),
+            evidence=(row.get("evidence") or None),
+            verification_status=normalize_status(row.get("verification_status")),
+            last_confirmed_at=self._parse_dt(row.get("last_confirmed_at")),
         )
 
     async def get_facts(
@@ -702,7 +746,8 @@ class MemoryUnifier:
             params.append(attr)
 
         sql = (
-            "SELECT id, entity, attribute, value, confidence, created_at "
+            "SELECT id, entity, attribute, value, confidence, created_at, "
+            "source, evidence, verification_status, last_confirmed_at "
             f"FROM facts {where} ORDER BY created_at {order} LIMIT ?"
         )
         params.append(int(limit))
@@ -717,6 +762,25 @@ class MemoryUnifier:
     async def get_latest_fact(self, entity: str, attribute: str) -> FactRecord | None:
         hits = await self.get_facts(entity=entity, attribute=attribute, limit=1, newest_first=True)
         return hits[0] if hits else None
+
+    # ── Provenance (#19): confirm / re-verify ────────────────────────────────
+
+    async def confirm_fact(self, fact_id: str, *, evidence: str | None = None) -> None:
+        """Re-verify a fact against a fresh observation: stamp last_confirmed_at
+        and promote its status to 'confirmed'. Turns an assumption into a checked
+        fact only when there's genuine evidence — never silently."""
+        await self.initialize()
+        async with self._write_lock:
+            await self._sqlite.confirm_fact(fact_id, evidence=evidence)
+        self._search_gen += 1
+
+    async def facts_needing_reverification(self, *, older_than_days: float = 180.0, limit: int = 50) -> list[dict[str, Any]]:
+        """Directly-observed facts whose last confirmation is older than
+        `older_than_days` — the queue a future re-verification pass would work.
+        Read-only; assumptions are excluded (already flagged, not stale)."""
+        await self.initialize()
+        before = (_now() - timedelta(days=float(older_than_days))).isoformat()
+        return await self._sqlite.facts_needing_reverification(before_iso=before, limit=limit)
 
     # ── Behavioral lessons (self-learning) ───────────────────────────────────
 
@@ -1387,13 +1451,22 @@ class MemoryUnifier:
             base = 0.95
             if str(row.get("entity") or "").strip().lower() == "note":
                 base *= _staleness_factor(row.get("created_at"), row.get("last_reinforced_at"))
+            fact_prov = {"backend": "sqlite", "table": "facts"}
+            # #19: carry the trust label into recall so consumers (and the CH1
+            # hedge) can tell a settled fact from an assumption. Only attach when
+            # actually recorded — legacy rows stay unlabeled rather than pretend.
+            vstatus = normalize_status(row.get("verification_status"))
+            if row.get("verification_status"):
+                fact_prov["verification"] = vstatus
+                if row.get("source"):
+                    fact_prov["source"] = str(row["source"])
             hits.append(
                 MemoryHit(
                     id=row["id"],
                     kind="fact",
                     text=text,
                     score=base,
-                    provenance={"backend": "sqlite", "table": "facts"},
+                    provenance=fact_prov,
                 )
             )
 
@@ -1550,6 +1623,11 @@ class MemoryUnifier:
                     "source": "long_term",
                     "text": f"{row.get('entity')} · {row.get('attribute')} = {row.get('value')}",
                     "created_at": str(row.get("created_at") or ""),
+                    # #19: expose provenance to the Memory panel — assumptions
+                    # should read differently from settled facts.
+                    "verification": normalize_status(row.get("verification_status")),
+                    "provenance_source": (row.get("source") or None),
+                    "last_confirmed_at": (row.get("last_confirmed_at") or None),
                 }
             )
         for row in people:

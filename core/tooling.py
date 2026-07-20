@@ -74,7 +74,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         topic = _slug_topic(str(args.get("topic") or args.get("attribute") or ""))
         if not fact:
             return {"ok": False, "error": "missing_fact"}
-        await memory.add_fact(entity="note", attribute=topic, value=fact[:400], confidence=0.9)
+        # The user explicitly asked Nova to remember this — record it as stated
+        # (#19), the highest-trust provenance, so recall never hedges on it later.
+        await memory.add_fact(
+            entity="note", attribute=topic, value=fact[:400], confidence=0.9,
+            source="user", verification_status="stated",
+        )
         return {"ok": True, "saved": fact[:400], "topic": topic}
 
     async def _memory_recall(args: dict[str, Any]) -> dict[str, Any]:
@@ -104,7 +109,17 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         # (a passing remark, a stale/low-similarity hit) worth hedging on rather
         # than stating as settled fact.
         confidence = "high" if best_score >= 0.80 else "low"
-        return {"ok": True, "results": [h.text for h in hits], "confidence": confidence}
+        # #19: a high score isn't enough — if the top hit is an ASSUMPTION Nova
+        # inferred (not something stated/observed), hedge anyway. Never present
+        # an inference as a settled fact.
+        top = max(hits, key=lambda h: h.score, default=None)
+        verification = top.provenance.get("verification") if top else None
+        if verification in {"inferred", "contradicted"}:
+            confidence = "low"
+        out: dict[str, Any] = {"ok": True, "results": [h.text for h in hits], "confidence": confidence}
+        if verification:
+            out["verification"] = verification
+        return out
 
     async def _memory_learn_lesson(args: dict[str, Any]) -> dict[str, Any]:
         lesson = str(args.get("lesson") or args.get("text") or args.get("value") or "").strip()
