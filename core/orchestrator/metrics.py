@@ -37,6 +37,13 @@ class MetricsCollector:
         self._tool_failures = 0
         self._vision_errors = 0
         self._tools_used_total = 0
+        # #12: memory-activity counters, all sourced from bus events already
+        # flowing through observe() — no new instrumentation. These feed the
+        # internal-state derivation (curiosity, learning_rate, uncertainty).
+        self._fact_writes = 0
+        self._assumption_writes = 0
+        self._lessons_learned = 0
+        self._memory_searches = 0
         # _pending_start intentionally survives a rollover (a turn straddling
         # midnight still gets a latency), everything else resets.
 
@@ -80,6 +87,20 @@ class MetricsCollector:
         elif etype == "vision.error":
             self._vision_errors += 1
 
+        elif etype == "memory.write":
+            # New knowledge captured. #19 tagged each fact write with a
+            # verification label, so we can distinguish settled facts from
+            # assumptions here — the honest signal behind "uncertainty".
+            if str(data.get("kind") or "") == "fact":
+                self._fact_writes += 1
+                if str(data.get("verification") or "") in {"inferred", "unverified", "contradicted"}:
+                    self._assumption_writes += 1
+                if str(data.get("entity") or "") == "lesson":
+                    self._lessons_learned += 1
+
+        elif etype == "memory.search":
+            self._memory_searches += 1
+
     @staticmethod
     def _pct(vals: list[float], p: float) -> float:
         if not vals:
@@ -107,4 +128,8 @@ class MetricsCollector:
             "tool_failure_rate": round(rate, 3),
             "avg_tools_per_turn": round(self._tools_used_total / self._turns, 2) if self._turns else 0.0,
             "vision_errors": self._vision_errors,
+            "fact_writes": self._fact_writes,
+            "assumption_writes": self._assumption_writes,
+            "lessons_learned": self._lessons_learned,
+            "memory_searches": self._memory_searches,
         }

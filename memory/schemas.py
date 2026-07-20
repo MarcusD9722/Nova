@@ -22,6 +22,13 @@ class FactRecord(BaseModel):
     value: str
     confidence: float = Field(ge=0.0, le=1.0, default=0.7)
     created_at: datetime
+    # Provenance (#19). Optional/defaulted so pre-provenance rows and callers
+    # that don't care keep working unchanged. verification_status distinguishes
+    # a settled fact from an assumption; see memory/provenance.py.
+    source: str | None = None
+    evidence: str | None = None
+    verification_status: str = "unverified"
+    last_confirmed_at: datetime | None = None
 
 
 class PersonRecord(BaseModel):

@@ -130,24 +130,29 @@ async def main():
                 _MIGRATIONS = [SQLiteMemoryBackend._MIGRATIONS[0]]
 
             db_path = Path(td2) / "nova.sqlite3"
-            # Build a DB WITHOUT the v2 schema bits, stamped v1 (simulates pre-P1)
+            # Build a DB WITHOUT any post-v1 schema bits, stamped v1 (simulates pre-P1).
             v1 = V1Only(db_path)
             await v1.initialize()
             async with aiosqlite.connect(db_path) as db:
                 await db.execute("DROP TABLE IF EXISTS edges")
-                # remove the column fresh-create added, to simulate a real v1 DB
+                # The current create-block builds the LATEST facts schema, so strip
+                # every column added after v1 to faithfully simulate a real v1 DB —
+                # otherwise replaying v2/v3 would collide with a column already present.
                 cols = [r[1] for r in await (await db.execute("PRAGMA table_info(facts)")).fetchall()]
-                if "last_reinforced_at" in cols:
-                    await db.execute("ALTER TABLE facts DROP COLUMN last_reinforced_at")
+                for post_v1_col in ("last_reinforced_at", "source", "evidence", "verification_status", "last_confirmed_at"):
+                    if post_v1_col in cols:
+                        await db.execute(f"ALTER TABLE facts DROP COLUMN {post_v1_col}")
                 await db.commit()
             v2 = SQLiteMemoryBackend(db_path)
             await v2.initialize()
-            check(await v2.schema_version() == 2, "v1-stamped DB migrates to v2")
+            latest = max(v for v, _, _ in SQLiteMemoryBackend._MIGRATIONS)
+            check(await v2.schema_version() == latest, f"v1-stamped DB migrates to latest (v{latest})")
             async with aiosqlite.connect(db_path) as db:
                 tables = [r[0] for r in await (await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='edges'")).fetchall()]
                 cols = [r[1] for r in await (await db.execute("PRAGMA table_info(facts)")).fetchall()]
-            check("edges" in tables, "migration created edges table")
-            check("last_reinforced_at" in cols, "migration added facts.last_reinforced_at")
+            check("edges" in tables, "migration created edges table (v2)")
+            check("last_reinforced_at" in cols, "migration added facts.last_reinforced_at (v2)")
+            check("verification_status" in cols, "migration added facts provenance columns (v3)")
 
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)

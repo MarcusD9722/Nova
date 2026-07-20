@@ -1479,6 +1479,18 @@ class RuntimeManager:
         except Exception:
             pass
 
+        # Internal operational state (#12) — advisory operating hints derived
+        # from live telemetry (uncertainty / workload / energy / confidence).
+        # Present ONLY when a threshold is crossed, so most turns add nothing.
+        # These influence HOW Nova responds (hedge, stay concise, ask a question),
+        # never WHAT is true. Cheap (in-memory snapshot, no DB read).
+        try:
+            op_hints = self._self_improve.operating_hints()
+            if op_hints:
+                context["operating_state"] = op_hints
+        except Exception:
+            pass
+
         tool_names = sorted({str(t).strip() for t in (available_tools or []) if str(t).strip()})
         if tool_names:
             context["available_tools"] = tool_names
@@ -1572,6 +1584,13 @@ class RuntimeManager:
                 str(context["catchup_summary"]).rstrip(".")
                 + " — this is the start of a new conversation after a while away; naturally open with something "
                 "like this instead of a generic greeting, but keep it brief and conversational, not a bulleted report"
+            )
+
+        op_state = context.get("operating_state") or []
+        if op_state:
+            parts.append(
+                "internal operating note (guides HOW you respond, not what's true; never mention it aloud): "
+                + " ".join(str(h) for h in op_state)
             )
 
         caps = context.get("capabilities") or {}

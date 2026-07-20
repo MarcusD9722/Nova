@@ -56,7 +56,11 @@ class SQLiteMemoryBackend:
                         value TEXT NOT NULL,
                         confidence REAL NOT NULL,
                         created_at TEXT NOT NULL,
-                        last_reinforced_at TEXT
+                        last_reinforced_at TEXT,
+                        source TEXT,
+                        evidence TEXT,
+                        verification_status TEXT,
+                        last_confirmed_at TEXT
                     );
                     """
                 )
@@ -373,6 +377,16 @@ class SQLiteMemoryBackend:
                 "ALTER TABLE facts ADD COLUMN last_reinforced_at TEXT;",
             ],
         ),
+        (
+            3,
+            "Phase 3.5/#19: memory provenance columns on facts (source, evidence, verification_status, last_confirmed_at)",
+            [
+                "ALTER TABLE facts ADD COLUMN source TEXT;",
+                "ALTER TABLE facts ADD COLUMN evidence TEXT;",
+                "ALTER TABLE facts ADD COLUMN verification_status TEXT;",
+                "ALTER TABLE facts ADD COLUMN last_confirmed_at TEXT;",
+            ],
+        ),
     ]
 
     async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
@@ -651,14 +665,68 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def add_fact(self, fact_id: UUID, entity: str, attribute: str, value: str, confidence: float) -> None:
+    async def add_fact(
+        self,
+        fact_id: UUID,
+        entity: str,
+        attribute: str,
+        value: str,
+        confidence: float,
+        *,
+        source: str | None = None,
+        evidence: str | None = None,
+        verification_status: str | None = None,
+        last_confirmed_at: str | None = None,
+    ) -> None:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO facts(id, entity, attribute, value, confidence, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-                (str(fact_id), entity, attribute, value, float(confidence), self._now_iso()),
+                "INSERT INTO facts(id, entity, attribute, value, confidence, created_at, "
+                "source, evidence, verification_status, last_confirmed_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(fact_id),
+                    entity,
+                    attribute,
+                    value,
+                    float(confidence),
+                    self._now_iso(),
+                    source,
+                    evidence,
+                    verification_status,
+                    last_confirmed_at,
+                ),
             )
             await db.commit()
+
+    async def confirm_fact(self, fact_id: str, *, evidence: str | None = None) -> None:
+        """Mark a fact re-verified against a fresh observation (#19): stamp
+        last_confirmed_at, set status to 'confirmed', and attach evidence if
+        given without clobbering any existing evidence."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "UPDATE facts SET verification_status='confirmed', last_confirmed_at=?, "
+                "evidence=COALESCE(?, evidence) WHERE id=?",
+                (self._now_iso(), evidence, fact_id),
+            )
+            await db.commit()
+
+    async def facts_needing_reverification(self, *, before_iso: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Directly-observed facts whose last confirmation predates `before_iso`
+        (assumptions are excluded — they are already flagged, not 'stale'). A
+        future re-verification worker consumes this; kept read-only for now."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, entity, attribute, value, verification_status, last_confirmed_at, created_at "
+                "FROM facts WHERE verification_status IN ('stated','observed','external','confirmed') "
+                "AND COALESCE(last_confirmed_at, created_at) < ? ORDER BY COALESCE(last_confirmed_at, created_at) ASC LIMIT ?",
+                (before_iso, int(limit)),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def upsert_person(self, person_id: UUID, name: str, attributes_json: str) -> None:
         await self.initialize()
@@ -742,7 +810,8 @@ class SQLiteMemoryBackend:
         async with aiosqlite.connect(self._db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT id, entity, attribute, value, confidence, created_at, last_reinforced_at FROM facts "
+                "SELECT id, entity, attribute, value, confidence, created_at, last_reinforced_at, "
+                "source, evidence, verification_status, last_confirmed_at FROM facts "
                 "WHERE entity LIKE ? OR attribute LIKE ? OR value LIKE ? ORDER BY created_at DESC LIMIT ?",
                 (like, like, like, int(limit)),
             ) as cur:
@@ -751,12 +820,16 @@ class SQLiteMemoryBackend:
 
     async def reinforce_fact(self, fact_id: str) -> None:
         """Re-mention of an existing fact: touch last_reinforced_at and nudge
-        confidence toward (but never past) 0.95 — Phase 1.3."""
+        confidence toward (but never past) 0.95 — Phase 1.3. A re-mention is
+        also a fresh observation of the fact, so stamp last_confirmed_at too
+        (#19) — the verification_status label is left unchanged (only an
+        explicit confirm_fact promotes it)."""
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "UPDATE facts SET last_reinforced_at=?, confidence=MIN(0.95, confidence + 0.05) WHERE id=?",
-                (self._now_iso(), fact_id),
+                "UPDATE facts SET last_reinforced_at=?, last_confirmed_at=?, "
+                "confidence=MIN(0.95, confidence + 0.05) WHERE id=?",
+                (self._now_iso(), self._now_iso(), fact_id),
             )
             await db.commit()
 
@@ -811,7 +884,10 @@ class SQLiteMemoryBackend:
 
     async def all_facts(self, limit: int | None = None) -> list[dict[str, Any]]:
         await self.initialize()
-        sql = "SELECT id, entity, attribute, value, confidence, created_at FROM facts ORDER BY created_at ASC"
+        sql = (
+            "SELECT id, entity, attribute, value, confidence, created_at, "
+            "source, evidence, verification_status, last_confirmed_at FROM facts ORDER BY created_at ASC"
+        )
         params: tuple[Any, ...] = ()
         if limit is not None:
             sql += " LIMIT ?"

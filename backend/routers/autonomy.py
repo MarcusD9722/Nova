@@ -69,6 +69,27 @@ async def autonomy_metrics() -> dict:
     return STATE.runtime.self_improve.metrics()
 
 
+@router.get("/autonomy/state")
+async def autonomy_internal_state() -> dict:
+    """Nova's internal operational state (#12): confidence, uncertainty,
+    mental_workload, focus, energy, curiosity, learning_rate — each with the
+    real signal it was derived from. Internal reasoning metrics, not feelings."""
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return await STATE.runtime.self_improve.internal_state()
+
+
+@router.get("/autonomy/benchmarks")
+async def autonomy_benchmarks(days: int = Query(30)) -> dict:
+    """Self-benchmark report (#14): trends and regressions across the daily
+    self-eval history (latency, tool success, empty replies, internal state).
+    Quality dimensions with no measurement harness yet are reported honestly
+    under `not_measured`, never faked."""
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return await STATE.runtime.self_improve.benchmark_report(days=int(days))
+
+
 # ── Goals (multi-session objectives, advanced by AgentSupervisor) ────────────
 
 class GoalCreateRequest(BaseModel):
