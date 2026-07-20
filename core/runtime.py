@@ -46,6 +46,7 @@ from core.workers.autonomy_supervisor import AutonomySupervisorWorker
 from core.workers.memory_ingest import MemoryIngestWorker
 from core.workers.self_improve import SelfImproveWorker
 from core.workers.reminder_worker import ReminderWorker
+from core.workers.research_worker import ResearchWorker
 from core.error_log import ErrorLog
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.unifier import MemoryUnifier
@@ -507,6 +508,12 @@ class RuntimeManager:
         # briefing — distinct from internal worker pacing.
         self._reminder_worker = ReminderWorker(memory=self._memory, router=self._router)
 
+        # Autonomous research (Phase 5 / #9) — OFF by default (NOVA_RESEARCH),
+        # self-gates in start(); keeps tracked topics fresh into the world model.
+        self._research_worker = ResearchWorker(
+            memory=self._memory, llm=self._llm, llm_semaphore=self._llm_sem, router=self._router,
+        )
+
         # PI1: lets the agent ask to look at the screen mid-conversation —
         # still requires the user's confirm click frontend-side (see
         # vision.look_at_screen below), never a silent capture.
@@ -581,6 +588,8 @@ class RuntimeManager:
         # Reminders/scheduling are a direct user-facing feature (not autonomy),
         # so they start regardless of NOVA_AUTONOMY.
         self._reminder_worker.start()
+        # Autonomous research self-gates on NOVA_RESEARCH (off by default).
+        self._research_worker.start()
         # NOVA_AUTONOMY=0 disables the background task/goal workers entirely
         # (chat, memory, tools, and the project builder keep working).
         if (os.getenv("NOVA_AUTONOMY", "1").strip() or "1").lower() in {"0", "false", "no", "off"}:
@@ -593,6 +602,7 @@ class RuntimeManager:
         await self._memory_worker.stop()
         await self._self_improve.stop()
         await self._reminder_worker.stop()
+        await self._research_worker.stop()
         await self._autonomy_worker.stop()
         await self._agent_supervisor.stop()
 
@@ -1479,6 +1489,17 @@ class RuntimeManager:
         except Exception:
             pass
 
+        # Executive intelligence (#1) — at most a couple of proactive, confidence-
+        # gated recommendations (looming deadline, focus window, take a break),
+        # throttled so the same nudge never repeats. These are opportunities to be
+        # helpful if they fit naturally, NOT a script to recite.
+        try:
+            exec_recs = await self._memory.executive_recommendations(throttle=True)
+            if exec_recs:
+                context["executive_recommendations"] = [r["message"] for r in exec_recs[:2]]
+        except Exception:
+            pass
+
         # Internal operational state (#12) — advisory operating hints derived
         # from live telemetry (uncertainty / workload / energy / confidence).
         # Present ONLY when a threshold is crossed, so most turns add nothing.
@@ -1591,6 +1612,13 @@ class RuntimeManager:
             parts.append(
                 "internal operating note (guides HOW you respond, not what's true; never mention it aloud): "
                 + " ".join(str(h) for h in op_state)
+            )
+
+        exec_recs = context.get("executive_recommendations") or []
+        if exec_recs:
+            parts.append(
+                "proactive context you MAY raise if it fits naturally (don't force it, don't list all of it): "
+                + " | ".join(str(r) for r in exec_recs)
             )
 
         caps = context.get("capabilities") or {}
