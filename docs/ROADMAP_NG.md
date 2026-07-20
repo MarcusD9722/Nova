@@ -94,14 +94,21 @@ API-accessible).
   extends the P2.5 metrics collector) — **M**
 - **Depends on:** P1.3, P2.5. **Gate:** none.
 
-### Phase 4 — Deep Memory & World Understanding
-- **#8 Knowledge Graph 2.0** (universal node types, automatic relationship discovery,
-  traversal/reasoning; extends P1 graph) — **L**
-- **#11 Semantic World Model** (entities/concepts/relations; web searches *update* it;
-  confidence + source attribution; reduces repeat searching) — **L**
-- **#6 Persistent Internal Thought System** (ongoing private thoughts across sessions;
-  influences planning; surfaced only on request) — **M**
-- **Depends on:** Phase 3.5 (provenance), P1. **Gate:** none.
+### Phase 4 — Deep Memory & World Understanding *(✅ SHIPPED 2026-07-20)*
+- **#8 Knowledge Graph 2.0** — `path_between` (shortest-path reasoning), `subgraph`
+  (bounded neighborhood), `discover_associations` (shared-neighbor auto-discovery,
+  paced in the self-improve cycle), universal typed `link()` for any node kind;
+  `memory.path`/`memory.link` tools + `/memory/path`, `/memory/graph/subgraph`.
+- **#11 Semantic World Model** — new `world_model` table (migration v4), sourced
+  subject-predicate-object triples with confidence + freshness, kept separate from
+  the personal graph; refuses unsourced facts; `world.recall`/`world.learn` tools +
+  `/memory/world`; `remember_web_finding` folds web results in.
+- **#6 Persistent Internal Thought** — new `thoughts` table (v4), private notes
+  (idea/question/unresolved/improvement/discovery/…) surfaced only on request;
+  `thoughts.note`/`thoughts.recall` + `/thoughts`; a benchmark regression auto-files
+  an improvement thought.
+- Flags: `NOVA_WORLD_MODEL`, `NOVA_INTERNAL_THOUGHTS`. Migration v4 verified on a
+  copy of the real DB (v2→v4, 128 facts intact).
 
 ### Phase 5 — Executive Intelligence & Planning *(the synthesis layer)*
 - **#3 Long-Term Goal Planning** (vision→milestones→quarterly→monthly→weekly→daily,
@@ -167,11 +174,12 @@ model-swap-safe interfaces (ModelRouter); privacy-by-default (all local unless y
 configure an external service); migration paths (the schema-version system).
 
 ## Immediate next step
-Phase 3.5 (Cognitive Instrumentation) is ✅ shipped (#19 → #12 → #14, all merged
-behind flags). **Next up is Phase 4 (Deep Memory & World Understanding)** —
-Knowledge Graph 2.0 (#8), Semantic World Model (#11), Persistent Internal Thought
-(#6) — pending Marcus's go-ahead. Phase 3 (Awareness Substrate) remains deferred
-to after Phase 8; see the Build order note above.
+Phases 3.5 and 4 are ✅ shipped. **Next up is Phase 5 (Executive Intelligence &
+Planning)** — Long-Term Goal Planning (#3), Personal Digital Twin (#4), the proactive
+Executive coordinator (#1), and Autonomous Research (#9) — pending Marcus's go-ahead.
+**Before Phase 5:** the Executive layer reaches full value once Marcus runs the
+one-time Google OAuth setup (calendar/email). Phase 3 (Awareness Substrate) remains
+deferred to after Phase 8; see the Build order note above.
 
 **Open decisions for Marcus:** (1) confirm this sequencing or reprioritize a specific
 goal earlier; (2) run the Google OAuth setup before Phase 5 (Executive needs it);

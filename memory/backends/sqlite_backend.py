@@ -169,6 +169,45 @@ class SQLiteMemoryBackend:
                 )
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_tool_usage_name_time ON tool_usage_log(tool_name, called_at);")
 
+                # --- Semantic world model (Phase 4 / #11): general knowledge
+                # (subject-predicate-object) with confidence + SOURCE attribution,
+                # kept separate from the personal knowledge graph so world facts
+                # never pollute "who is connected to Marcus". ---
+                await db.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS world_model (
+                        id TEXT PRIMARY KEY,
+                        subject TEXT NOT NULL,
+                        predicate TEXT NOT NULL,
+                        object TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.6,
+                        source TEXT,
+                        created_at TEXT NOT NULL,
+                        last_confirmed_at TEXT NOT NULL
+                    );
+                    '''
+                )
+                await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_world_triple ON world_model(subject, predicate, object);")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_world_subject ON world_model(subject);")
+
+                # --- Persistent internal thoughts (Phase 4 / #6): Nova's ongoing
+                # private notes (ideas/questions/improvements/discoveries) that
+                # survive across sessions. Surfaced only on request. ---
+                await db.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS thoughts (
+                        id TEXT PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'open',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    '''
+                )
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_thoughts_kind_status ON thoughts(kind, status, updated_at);")
+
                 # --- Agentic goal/task system (Nova Hybrid Autonomy) ---
                 # These tables may be introduced after an existing DB already has a `tasks` table
                 # from earlier prototypes. We use best-effort migrations before creating indexes.
@@ -385,6 +424,34 @@ class SQLiteMemoryBackend:
                 "ALTER TABLE facts ADD COLUMN evidence TEXT;",
                 "ALTER TABLE facts ADD COLUMN verification_status TEXT;",
                 "ALTER TABLE facts ADD COLUMN last_confirmed_at TEXT;",
+            ],
+        ),
+        (
+            4,
+            "Phase 4/#11+#6: semantic world_model + persistent thoughts tables",
+            [
+                """CREATE TABLE IF NOT EXISTS world_model (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.6,
+                    source TEXT,
+                    created_at TEXT NOT NULL,
+                    last_confirmed_at TEXT NOT NULL
+                );""",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_world_triple ON world_model(subject, predicate, object);",
+                "CREATE INDEX IF NOT EXISTS idx_world_subject ON world_model(subject);",
+                """CREATE TABLE IF NOT EXISTS thoughts (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );""",
+                "CREATE INDEX IF NOT EXISTS idx_thoughts_kind_status ON thoughts(kind, status, updated_at);",
             ],
         ),
     ]

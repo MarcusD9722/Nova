@@ -179,6 +179,77 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": True, "entries": [], "note": f"Nothing recorded in the last {days} day(s)" + (f" about '{about}'" if about else "") + "."}
         return {"ok": True, "days": days, "about": about, "entries": entries}
 
+    async def _memory_path(args: dict[str, Any]) -> dict[str, Any]:
+        a = str(args.get("from") or args.get("a") or args.get("source") or "").strip()
+        b = str(args.get("to") or args.get("b") or args.get("target") or "").strip()
+        if not a or not b:
+            return {"ok": False, "error": "missing_endpoints", "note": "need both 'from' and 'to'"}
+        path = await memory.graph_path(a, b)
+        if not path:
+            return {"ok": True, "connected": False, "from": a, "to": b,
+                    "note": f"No recorded connection between '{a}' and '{b}' in the knowledge graph."}
+        hops = [{"key": h["key"], "via": h.get("predicate")} for h in path]
+        return {"ok": True, "connected": True, "from": a, "to": b, "steps": len(path) - 1, "path": hops}
+
+    async def _memory_link(args: dict[str, Any]) -> dict[str, Any]:
+        src = str(args.get("from") or args.get("a") or args.get("source") or "").strip()
+        dst = str(args.get("to") or args.get("b") or args.get("target") or "").strip()
+        predicate = str(args.get("predicate") or args.get("relation") or args.get("as") or "related_to").strip()
+        src_kind = str(args.get("from_kind") or args.get("source_kind") or "topic").strip()
+        dst_kind = str(args.get("to_kind") or args.get("target_kind") or "topic").strip()
+        if not src or not dst:
+            return {"ok": False, "error": "missing_endpoints", "note": "need both 'from' and 'to'"}
+        ok = await memory.link(src_kind, src, predicate, dst_kind, dst)
+        if not ok:
+            return {"ok": False, "error": "invalid_edge"}
+        return {"ok": True, "linked": f"{src} —{predicate}→ {dst}"}
+
+    async def _world_recall(args: dict[str, Any]) -> dict[str, Any]:
+        subject = str(args.get("subject") or args.get("topic") or args.get("about") or args.get("query") or "").strip()
+        if not subject:
+            return {"ok": False, "error": "missing_subject"}
+        result = await memory.world_recall(subject)
+        if not result.get("enabled"):
+            return {"ok": False, "error": "world_model_disabled"}
+        if not result["facts"]:
+            return {"ok": True, "subject": subject, "known": False,
+                    "note": f"Nothing recorded about '{subject}' in the world model yet — search the web, then save what you learn with world.learn."}
+        return {"ok": True, "subject": subject, "known": True, "fresh": result["fresh"], "facts": result["facts"]}
+
+    async def _world_learn(args: dict[str, Any]) -> dict[str, Any]:
+        subject = str(args.get("subject") or args.get("topic") or "").strip()
+        predicate = str(args.get("predicate") or args.get("relation") or "is").strip()
+        obj = str(args.get("object") or args.get("value") or args.get("fact") or "").strip()
+        source = str(args.get("source") or args.get("url") or "").strip()
+        if not subject or not obj:
+            return {"ok": False, "error": "missing_subject_or_object"}
+        if not source:
+            return {"ok": False, "error": "missing_source",
+                    "note": "World facts require a source (a URL or where you learned it) — never store general knowledge unsourced."}
+        ok = await memory.world_learn(subject, predicate, obj, source=source)
+        if not ok:
+            return {"ok": False, "error": "not_stored"}
+        return {"ok": True, "learned": f"{subject} {predicate} {obj}", "source": source}
+
+    async def _thoughts_note(args: dict[str, Any]) -> dict[str, Any]:
+        content = str(args.get("content") or args.get("thought") or args.get("text") or "").strip()
+        kind = str(args.get("kind") or "note").strip()
+        topic = str(args.get("topic") or "general").strip()
+        if not content:
+            return {"ok": False, "error": "missing_content"}
+        tid = await memory.note_thought(kind, content, topic=topic)
+        if not tid:
+            return {"ok": False, "error": "thoughts_disabled"}
+        return {"ok": True, "noted": content[:200], "kind": kind}
+
+    async def _thoughts_recall(args: dict[str, Any]) -> dict[str, Any]:
+        topic = str(args.get("topic") or args.get("about") or "").strip() or None
+        kind = str(args.get("kind") or "").strip() or None
+        thoughts = await memory.recall_thoughts(topic=topic, kind=kind)
+        if not thoughts:
+            return {"ok": True, "thoughts": [], "note": "No open internal thoughts recorded" + (f" about '{topic}'" if topic else "") + "."}
+        return {"ok": True, "thoughts": [{"kind": t["kind"], "topic": t["topic"], "content": t["content"]} for t in thoughts]}
+
     _INDEX_SKIP_DIR_NAMES = {
         "__pycache__", "node_modules", ".git", ".venv", "venv",
         "$recycle.bin", "system volume information",
@@ -487,6 +558,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.recall_person": _memory_recall_person,
         "memory.related": _memory_related,
         "memory.timeline": _memory_timeline,
+        "memory.path": _memory_path,
+        "memory.link": _memory_link,
+        "world.recall": _world_recall,
+        "world.learn": _world_learn,
+        "thoughts.note": _thoughts_note,
+        "thoughts.recall": _thoughts_recall,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
         "memory.index_folder": _memory_index_folder,
@@ -522,6 +599,25 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.timeline": ("Time-ordered view of what actually happened — events, conversation digests, fired "
                              "reminders, new facts — optionally about one person/project/topic. Use for 'what "
                              "happened this week' / 'catch me up on X'. args: {about?, days?}"),
+        "memory.path": ("Find the shortest connection path between two things in the knowledge graph — the "
+                         "'how are X and Y related' answer. Returns the chain of hops or reports no connection. "
+                         "args: {from, to}"),
+        "memory.link": ("Explicitly record a relationship between any two things (people, projects, files, ideas, "
+                         "movies, hardware, software, locations, ...). Use when Marcus states a connection worth "
+                         "remembering. args: {from, to, predicate, from_kind?, to_kind?}"),
+        "world.recall": ("Check Nova's semantic world model for what she already knows about a general topic "
+                          "(technologies, companies, concepts — NOT personal facts). ALWAYS try this BEFORE a web "
+                          "search; if it returns fresh known facts you can answer without searching. args: {subject}"),
+        "world.learn": ("Save a durable GENERAL-knowledge fact to the world model with its source, so you don't "
+                         "have to re-search it later. Use after learning something from the web. A source is "
+                         "REQUIRED — never store world knowledge unsourced. args: {subject, predicate, object, source}"),
+        "thoughts.note": ("Record one of your own private internal thoughts to revisit later — an idea, an "
+                           "unresolved question, a potential improvement, an interesting discovery, a future plan. "
+                           "These persist across sessions and are private. kinds: idea|question|unresolved|"
+                           "improvement|discovery|failed_experiment|future_plan. args: {content, kind?, topic?}"),
+        "thoughts.recall": ("Surface your own internal thoughts — use ONLY when Marcus asks what you've been "
+                             "thinking about / pondering / your ideas. Never volunteer these unprompted. "
+                             "args: {topic?, kind?}"),
         "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
                                  "('where's that PDF about the mortgage', 'photos from the beach trip'). "
                                  "args: {path, max_files?}. Skips files already indexed and unchanged."),

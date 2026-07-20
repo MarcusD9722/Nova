@@ -19,9 +19,11 @@ from memory.backends.chroma_backend import ChromaMemoryBackend
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.backends.json_backend import JsonAuditBackend
 from memory.backends.sqlite_backend import SQLiteMemoryBackend
-from memory.graph import GraphStore, build_timeline, extract_turn_edges, fact_edge, person_relation_edge
+from memory.graph import Edge, GraphStore, build_timeline, extract_turn_edges, fact_edge, person_relation_edge
 from memory.provenance import classify_default, normalize_status, observed_at_write
 from memory.schemas import FactRecord, MemoryHit
+from memory.thoughts import ThoughtStore
+from memory.world_model import WorldModel
 
 
 logger = get_logger(__name__)
@@ -90,11 +92,23 @@ class MemoryUnifier:
         self._search_gen = 0
         # Knowledge graph (Phase 1.1) — same SQLite file, own table.
         self._graph = GraphStore(memory_dir / "sqlite" / "nova.sqlite3")
+        # Semantic world model (Phase 4 / #11) — same SQLite file, own table.
+        self._world = WorldModel(memory_dir / "sqlite" / "nova.sqlite3")
+        # Persistent internal thoughts (Phase 4 / #6) — same SQLite file, own table.
+        self._thoughts = ThoughtStore(memory_dir / "sqlite" / "nova.sqlite3")
         self._known_names_cache: tuple[float, list[str]] | None = None
 
     @property
     def graph(self) -> GraphStore:
         return self._graph
+
+    @property
+    def world(self) -> WorldModel:
+        return self._world
+
+    @property
+    def thoughts(self) -> ThoughtStore:
+        return self._thoughts
 
     def _is_singleton_fact(self, entity: str, attribute: str) -> bool:
         ent = (entity or "").strip().lower()
@@ -356,6 +370,106 @@ class MemoryUnifier:
         new facts), optionally filtered to one person/project/topic."""
         await self.initialize()
         return await build_timeline(self._sqlite, about=about, days=days, limit=limit)
+
+    # ── KG 2.0 (Phase 4): path, subgraph, discovery, arbitrary links ─────────
+
+    async def graph_path(self, a: str, b: str, *, max_depth: int = 4) -> list[dict[str, Any]]:
+        """Shortest connection path between two nodes — 'how are X and Y related'."""
+        await self.initialize()
+        return await self._graph.path_between(a, b, max_depth=max_depth)
+
+    async def graph_subgraph(self, key: str, *, depth: int = 2, limit: int = 60) -> dict[str, Any]:
+        """Bounded neighborhood around a node for visualization/reasoning."""
+        await self.initialize()
+        return await self._graph.subgraph(key, depth=depth, limit=limit)
+
+    async def discover_graph_associations(self, *, min_shared: int = 2, max_new: int = 40) -> dict[str, int]:
+        """Run one automatic relationship-discovery pass over the graph."""
+        await self.initialize()
+        return await self._graph.discover_associations(min_shared=min_shared, max_new=max_new)
+
+    async def link(
+        self, src_kind: str, src_key: str, predicate: str, dst_kind: str, dst_key: str, *, confidence: float = 0.7
+    ) -> bool:
+        """Record an explicit typed edge between any two nodes — the universal
+        relationship engine (#8) that supports node kinds beyond person/project
+        (movie, book, hardware, software, idea, location, ...). Returns False if
+        the edge was degenerate (empty/self)."""
+        await self.initialize()
+        pred = re.sub(r"[^a-z0-9]+", "_", (predicate or "").strip().lower()).strip("_")[:40] or "related_to"
+        edge = Edge((src_kind or "topic").strip().lower(), src_key, pred, (dst_kind or "topic").strip().lower(), dst_key)
+        if not edge.src_key.strip() or not edge.dst_key.strip():
+            return False
+        try:
+            await self._graph.upsert_edge(edge, confidence=confidence)
+            self._search_gen += 1
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug("graph_link_failed", error=str(e)[:160])
+            return False
+
+    # ── Semantic world model (Phase 4 / #11) ─────────────────────────────────
+
+    async def world_learn(self, subject: str, predicate: str, obj: str, *, source: str, confidence: float = 0.6) -> bool:
+        """Record a general world fact with source attribution. Refuses
+        unsourced facts (returns False) — world knowledge is never stored as an
+        assumption."""
+        await self.initialize()
+        if not get_bool("NOVA_WORLD_MODEL"):
+            return False
+        return await self._world.upsert(subject, predicate, obj, confidence=confidence, source=source)
+
+    async def world_recall(self, subject: str) -> dict[str, Any]:
+        """What Nova knows about a subject from the world model, plus whether it's
+        fresh enough to answer without re-searching the web."""
+        await self.initialize()
+        if not get_bool("NOVA_WORLD_MODEL"):
+            return {"subject": subject, "facts": [], "fresh": False, "enabled": False}
+        facts = await self._world.query_subject(subject)
+        return {
+            "subject": subject,
+            "facts": facts,
+            "fresh": await self._world.is_fresh(subject),
+            "enabled": True,
+        }
+
+    async def world_search(self, term: str, *, limit: int = 30) -> list[dict[str, Any]]:
+        await self.initialize()
+        if not get_bool("NOVA_WORLD_MODEL"):
+            return []
+        return await self._world.search(term, limit=limit)
+
+    async def remember_web_finding(self, topic: str, summary: str, url: str, *, confidence: float = 0.55) -> bool:
+        """Fold a web finding into the world model with the URL as source, so a
+        repeat question can be answered without searching again."""
+        await self.initialize()
+        if not get_bool("NOVA_WORLD_MODEL"):
+            return False
+        return await self._world.upsert(topic, "summary", summary, confidence=confidence, source=url or "web")
+
+    # ── Persistent internal thoughts (Phase 4 / #6) ──────────────────────────
+
+    async def note_thought(self, kind: str, content: str, *, topic: str = "general") -> str:
+        """Record one of Nova's private internal thoughts. Gated by the flag;
+        returns '' when disabled or empty."""
+        await self.initialize()
+        if not get_bool("NOVA_INTERNAL_THOUGHTS"):
+            return ""
+        return await self._thoughts.add(kind, topic, content)
+
+    async def recall_thoughts(self, *, topic: str | None = None, kind: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        """Surface Nova's internal thoughts — only ever called on explicit
+        request (a tool/endpoint), never injected into ordinary replies."""
+        await self.initialize()
+        if not get_bool("NOVA_INTERNAL_THOUGHTS"):
+            return []
+        if kind:
+            return await self._thoughts.list(kind=kind, status="open", limit=limit)
+        return await self._thoughts.recall(topic=topic, limit=limit)
+
+    async def resolve_thought(self, thought_id: str, *, status: str = "resolved") -> None:
+        await self.initialize()
+        await self._thoughts.resolve(thought_id, status=status)
 
     async def add_fact(
         self,
