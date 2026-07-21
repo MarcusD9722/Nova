@@ -378,6 +378,54 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     async def _experiment_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "experiments": await memory.list_experiments()}
 
+    async def _skill_detect(args: dict[str, Any]) -> dict[str, Any]:
+        candidate = await memory.detect_learnable_workflow()
+        if not candidate:
+            return {"ok": True, "found": False, "note": "No repeated workflow detected yet — patterns build up as you work."}
+        return {"ok": True, "found": True, "workflow": candidate,
+                "suggestion": f"I noticed you've repeated this {candidate['occurrences']} times. Want me to learn it as a skill?"}
+
+    async def _skill_learn(args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or "").strip()
+        steps = args.get("steps") if isinstance(args.get("steps"), list) else []
+        if not name or not steps:
+            return {"ok": False, "error": "missing_name_or_steps"}
+        skill_id = await memory.learn_skill(name, [str(s) for s in steps])
+        if not skill_id:
+            return {"ok": False, "error": "not_learned"}
+        return {"ok": True, "skill_id": skill_id, "learned": name}
+
+    async def _skill_list(args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "skills": await memory.list_skills()}
+
+    async def _skill_get(args: dict[str, Any]) -> dict[str, Any]:
+        skill = await memory.get_skill(str(args.get("skill_id") or args.get("id") or "").strip())
+        if skill is None:
+            return {"ok": False, "error": "not_found"}
+        return {"ok": True, **skill}
+
+    async def _skill_update(args: dict[str, Any]) -> dict[str, Any]:
+        skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
+        steps = args.get("steps") if isinstance(args.get("steps"), list) else []
+        updated = await memory.update_skill(skill_id, [str(s) for s in steps])
+        if updated is None:
+            return {"ok": False, "error": "not_found_or_empty"}
+        return {"ok": True, "skill_id": skill_id, "version": updated["version"]}
+
+    async def _skill_branch(args: dict[str, Any]) -> dict[str, Any]:
+        skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
+        new_name = str(args.get("new_name") or args.get("name") or "").strip()
+        if not new_name:
+            return {"ok": False, "error": "missing_new_name"}
+        new_id = await memory.branch_skill(skill_id, new_name)
+        if not new_id:
+            return {"ok": False, "error": "not_found"}
+        return {"ok": True, "new_skill_id": new_id}
+
+    async def _skill_delete(args: dict[str, Any]) -> dict[str, Any]:
+        skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
+        return {"ok": await memory.delete_skill(skill_id), "skill_id": skill_id}
+
     _INDEX_SKIP_DIR_NAMES = {
         "__pycache__", "node_modules", ".git", ".venv", "venv",
         "$recycle.bin", "system volume information",
@@ -706,6 +754,13 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "experiment.trial": _experiment_trial,
         "experiment.analyze": _experiment_analyze,
         "experiment.list": _experiment_list,
+        "skill.detect": _skill_detect,
+        "skill.learn": _skill_learn,
+        "skill.list": _skill_list,
+        "skill.get": _skill_get,
+        "skill.update": _skill_update,
+        "skill.branch": _skill_branch,
+        "skill.delete": _skill_delete,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
         "memory.index_folder": _memory_index_folder,
@@ -795,6 +850,15 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "experiment.analyze": ("Compare an experiment's variants and get a ranked RECOMMENDATION. It never applies a "
                                 "change — adopting a variant is always your call. args: {experiment_id}"),
         "experiment.list": ("List recorded experiments and their trial counts. args: {}"),
+        "skill.detect": ("Check whether Marcus has repeated a multi-step workflow enough to be worth learning. "
+                          "If so, OFFER to learn it (never auto-learn). args: {}"),
+        "skill.learn": ("Save an approved repeated workflow as a reusable skill (after Marcus says yes). Steps may "
+                         "contain {parameters}. args: {name, steps:[...]}"),
+        "skill.list": ("List learned workflow skills. args: {}"),
+        "skill.get": ("Show a learned skill's steps, version, and parameters. args: {skill_id}"),
+        "skill.update": ("Edit a skill's steps (bumps its version, keeps history). args: {skill_id, steps:[...]}"),
+        "skill.branch": ("Fork a skill into a new variant workflow. args: {skill_id, new_name}"),
+        "skill.delete": ("Delete a learned skill. args: {skill_id}"),
         "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
                                  "('where's that PDF about the mortgage', 'photos from the beach trip'). "
                                  "args: {path, max_files?}. Skips files already indexed and unchanged."),

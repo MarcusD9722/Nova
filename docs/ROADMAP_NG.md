@@ -164,16 +164,26 @@ API-accessible).
   `list` + `/experiments`.
 - No schema migration (facts-based). Backend/API only.
 
-### Phase 8 — Computer Control & Skill Learning *(Hands)*
-- Permission tiers (read/standard/admin/critical) + confirm-broker + audit log —
-  **ships before any actuator** — **M**
-- Staged computer control: observe running apps/windows → allowlisted actions →
-  gated input synthesis (reuses the hand-tracking cursor bridge) — **L**
-- **#2 Autonomous Skill Learning** (detect repeated multi-step workflows → "want me to
-  learn this?" → parameterize / edit / version / branch → later, conditional
-  auto-triggers) — **XL**
-- **Depends on:** observation (computer control). **Deliberately late:** highest blast
-  radius; needs months of clean permission-audit history first.
+### Phase 8 — Computer Control & Skill Learning *(✅ SHIPPED 2026-07-20)*
+- **Permission foundation (shipped first, on purpose)** — `core/permissions.py`: four
+  tiers (read/standard/admin/critical), capability→tier registry, policy modes
+  (`locked`/`guarded` [default]/`trusted`), a pure `evaluate`, and an async
+  `PermissionBroker` (allow/confirm/deny handshake + durable JSONL audit + bus events).
+  ADMIN/CRITICAL can *never* be auto-allowed; unknown capabilities default to ADMIN.
+  Flag `NOVA_PERMISSION_MODE`. `/permissions/audit`, `/permissions/resolve`.
+- **Computer control — `core/computer_control.py`, propose-only** — every action routes
+  through the broker, and even an *allowed* action is a **dry run** unless BOTH
+  `NOVA_COMPUTER_CONTROL=1` AND a platform adapter are present (neither ships). Observe
+  honestly reports "no adapter" rather than faking sight. `computer.observe`/`computer.act`.
+  **No armed autonomous actuator by default.**
+- **#2 Autonomous Skill Learning** — `core/skills.py`: deterministic
+  `detect_repeated_workflow` (longest recurring non-overlapping subsequence) → Nova
+  OFFERS to learn, never auto-learns. Learned skills are parameterized, versioned (with
+  history), and branchable; running one re-checks every step through the permission gate
+  (never a bypass). `skill.detect`/`learn`/`list`/`get`/`update`/`branch`/`delete`/`run`
+  + `/skills`.
+- No schema migration (facts-based). **Deliberately conservative** — the whole point of
+  the phase is the gate, not the actuator.
 
 ### Phase 9 — Physical World *(hardware/device-gated)*
 - **#16 Smart Home Intelligence** (abstraction layer buildable now; context-aware rules;
@@ -197,14 +207,15 @@ model-swap-safe interfaces (ModelRouter); privacy-by-default (all local unless y
 configure an external service); migration paths (the schema-version system).
 
 ## Immediate next step
-Phases 3.5, 4, 5, 6, and 7 are ✅ shipped. **Next up is Phase 8 (Computer Control &
-Skill Learning)** — permission tiers first, then staged computer control (observe →
-allowlisted actions → gated input synthesis), then Autonomous Skill Learning (#2:
-detect repeated workflows → offer to learn → parameterize/version/branch). This is the
-**highest-blast-radius phase** — permissions ship before any actuator, and it stays
-deliberately conservative. After Phase 8, the deferred **Phase 3 (Awareness Substrate
-& Always-On)** finally lands, then Phase 9 (Physical World) and Phase 10 (Nova OS
-unification).
+Phases 3.5, 4, 5, 6, 7, and 8 are ✅ shipped. **Next up is the deferred Phase 3
+(Awareness Substrate & Always-On)** — WorldState + system pollers (Hardware
+Intelligence #13), tray/autostart/native notifications, backup/restore, Jellyfin
+media v1 (#17). This is the substrate that finally gives the Executive layer (Phase 5)
+its **proactive push channel** (tray notifications) and gives experimentation (#15) its
+hardware-resource metrics. It's hardware/OS-facing rather than pure-logic, so expect
+more platform-adapter honesty (some pieces inert until a real environment). After Phase
+3: Phase 9 (Physical World — smart home, vision memory) and Phase 10 (Nova OS
+unification, #20).
 
 **Open decisions for Marcus:** (1) confirm this sequencing or reprioritize a specific
 goal earlier; (2) run the Google OAuth setup before Phase 5 (Executive needs it);
