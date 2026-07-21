@@ -49,6 +49,31 @@ async def code_security(project: str = Query("")) -> dict:
     return await _code_tool("code.security", project)
 
 
+# ── Permission broker (Phase 8): audit trail + confirm/deny pending actions ──
+
+class PermissionResolveRequest(BaseModel):
+    request_id: str
+    approved: bool
+
+
+@router.get("/permissions/audit")
+async def permissions_audit(limit: int = Query(100)) -> dict:
+    """The append-only audit trail of every permission request and outcome."""
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    b = STATE.runtime.permission_broker
+    return {"mode": b.mode, "audit": b.audit_log(limit=int(limit)), "pending": b.pending()}
+
+
+@router.post("/permissions/resolve")
+async def permissions_resolve(req: PermissionResolveRequest) -> dict:
+    """Approve or deny a pending action that needed Marcus's confirmation."""
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    ok = STATE.runtime.permission_broker.resolve(req.request_id, bool(req.approved))
+    return {"resolved": ok, "request_id": req.request_id, "approved": bool(req.approved)}
+
+
 class DevInspectRequest(BaseModel):
     path: str
     project: str = ""  # registered external project name; "" = Nova's own code

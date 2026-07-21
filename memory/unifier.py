@@ -15,6 +15,7 @@ from core.dates import parse_month_day
 from core.digital_twin import DigitalTwinInputs, derive_profile
 from core.executive import ExecutiveContext, recommend
 from core.experiments import compare_variants
+from core.skills import detect_repeated_workflow, workflow_parameters
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from core.settings import get_bool
@@ -156,6 +157,10 @@ class MemoryUnifier:
             return True  # one definition per experiment id (attribute = id)
         if ent.startswith("exptrials:"):
             return True  # one accumulating trials blob per experiment
+        if ent == "skill":
+            return True  # one current definition per learned skill id
+        if ent == "activity":
+            return True  # one rolling activity log (attribute = "log")
         return False
 
     async def _fact_ids_for(self, entity: str, attribute: str, value: str | None = None) -> list[str]:
@@ -866,6 +871,102 @@ class MemoryUnifier:
                 n_trials = 0
             out.append({**defn, "trials": n_trials})
         return out
+
+    # ── Activity log + autonomous skill learning (Phase 8 / #2) ──────────────
+
+    async def log_activity(self, event: str, *, cap: int = 300) -> None:
+        """Append a coarse activity token to the rolling log the skill learner
+        watches for repeated workflows. Kept small and capped."""
+        await self.initialize()
+        event = (event or "").strip()[:120]
+        if not event:
+            return
+        rec = await self.get_latest_fact(entity="activity", attribute="log")
+        try:
+            log = json.loads(rec.value) if rec and rec.value else []
+        except Exception:
+            log = []
+        log.append(event)
+        log = log[-cap:]
+        await self.add_fact(entity="activity", attribute="log", value=json.dumps(log)[:20000], confidence=1.0)
+
+    async def recent_activity(self, limit: int = 100) -> list[str]:
+        await self.initialize()
+        rec = await self.get_latest_fact(entity="activity", attribute="log")
+        try:
+            log = json.loads(rec.value) if rec and rec.value else []
+        except Exception:
+            log = []
+        return log[-int(limit):]
+
+    async def detect_learnable_workflow(self, *, min_repeats: int = 3) -> dict[str, Any] | None:
+        """A repeated workflow in the activity log worth OFFERING to learn — or
+        None. Never learns on its own; this only surfaces a candidate."""
+        return detect_repeated_workflow(await self.recent_activity(limit=300), min_repeats=min_repeats)
+
+    async def learn_skill(self, name: str, steps: list[str]) -> str | None:
+        """Store an approved workflow as a learned skill (v1)."""
+        await self.initialize()
+        name = (name or "").strip()
+        steps = [str(s).strip() for s in (steps or []) if str(s).strip()]
+        if not name or not steps:
+            return None
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:32] or "skill"
+        skill_id = f"{slug}-{uuid4().hex[:6]}"
+        skill = {"id": skill_id, "name": name[:120], "steps": steps, "version": 1, "versions": [],
+                 "parameters": workflow_parameters(steps), "created_at": _now().isoformat(),
+                 "updated_at": _now().isoformat()}
+        await self.add_fact(entity="skill", attribute=skill_id, value=json.dumps(skill)[:20000], confidence=1.0)
+        return skill_id
+
+    async def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        rec = await self.get_latest_fact(entity="skill", attribute=skill_id)
+        if not rec or not rec.value:
+            return None
+        try:
+            return json.loads(rec.value)
+        except Exception:
+            return None
+
+    async def list_skills(self) -> list[dict[str, Any]]:
+        await self.initialize()
+        out = []
+        for r in await self.get_facts(entity="skill", limit=100, newest_first=True):
+            try:
+                s = json.loads(r.value)
+                out.append({"id": s["id"], "name": s["name"], "steps": len(s["steps"]),
+                            "version": s["version"], "parameters": s.get("parameters", [])})
+            except Exception:
+                continue
+        return out
+
+    async def update_skill(self, skill_id: str, steps: list[str]) -> dict[str, Any] | None:
+        """Edit a skill's steps, bumping the version and keeping prior versions."""
+        skill = await self.get_skill(skill_id)
+        if skill is None:
+            return None
+        steps = [str(s).strip() for s in (steps or []) if str(s).strip()]
+        if not steps:
+            return None
+        skill.setdefault("versions", []).append({"version": skill["version"], "steps": skill["steps"]})
+        skill["version"] += 1
+        skill["steps"] = steps
+        skill["parameters"] = workflow_parameters(steps)
+        skill["updated_at"] = _now().isoformat()
+        await self.add_fact(entity="skill", attribute=skill_id, value=json.dumps(skill)[:20000], confidence=1.0)
+        return skill
+
+    async def branch_skill(self, skill_id: str, new_name: str) -> str | None:
+        """Fork a skill into a new independent one (variant workflow)."""
+        skill = await self.get_skill(skill_id)
+        if skill is None:
+            return None
+        return await self.learn_skill(new_name, skill["steps"])
+
+    async def delete_skill(self, skill_id: str) -> bool:
+        res = await self.purge_facts(entity="skill", attribute=skill_id, dry_run=False)
+        return int(res.get("deleted") or 0) > 0
 
     async def add_fact(
         self,

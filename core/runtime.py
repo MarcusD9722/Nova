@@ -49,6 +49,8 @@ from core.workers.reminder_worker import ReminderWorker
 from core.workers.research_worker import ResearchWorker
 from core.orchestrator.society import AgentSociety
 from core import code_intel
+from core.permissions import PermissionBroker
+from core.computer_control import ComputerControl
 from core.error_log import ErrorLog
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.unifier import MemoryUnifier
@@ -652,6 +654,56 @@ class RuntimeManager:
             return {"ok": True, "by_severity": scan["by_severity"], "findings": scan["findings"][:25],
                     "disclaimer": scan["disclaimer"]}
 
+        # ── Computer control (Phase 8) — permission-gated, propose-only ──────
+        # The broker is the single gate; no platform adapter ships, so actions
+        # are dry-run/unavailable by default (see core/computer_control.py).
+        self._permission_broker = PermissionBroker(
+            mode=os.getenv("NOVA_PERMISSION_MODE", "guarded"),
+            audit_path=(memory_dir / "permission_audit.jsonl"),
+        )
+        self._computer = ComputerControl(self._permission_broker, adapter=None)
+
+        async def _tool_computer_observe(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._computer.observe(str(args.get("what") or "windows"))
+
+        async def _tool_computer_act(args: dict[str, Any]) -> dict[str, Any]:
+            kind = str(args.get("kind") or args.get("action") or "").strip()
+            if not kind:
+                return {"ok": False, "error": "missing_kind"}
+            details = args.get("details") if isinstance(args.get("details"), dict) else {}
+            # Non-blocking: return the permission decision (needs_confirmation with a
+            # request_id) rather than hanging the turn waiting for approval.
+            return await self._computer.act(kind, target=str(args.get("target") or ""),
+                                            details=details, wait_for_confirm=False)
+
+        async def _tool_skill_run(args: dict[str, Any]) -> dict[str, Any]:
+            skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
+            skill = await self._memory.get_skill(skill_id) if skill_id else None
+            if not skill:
+                return {"ok": False, "error": "unknown_skill"}
+            from core.skills import render_steps
+            params = args.get("params") if isinstance(args.get("params"), dict) else {}
+            steps = render_steps(skill["steps"], params)
+            # Every step is re-checked through the permission gate — a "learned"
+            # skill is never a bypass. With no adapter, each step is a dry run.
+            results = []
+            for step in steps:
+                results.append({"step": step, **await self._computer.act("type", target=step,
+                                                                          details={"step": step}, wait_for_confirm=False)})
+            return {"ok": True, "skill": skill["name"], "steps_evaluated": results,
+                    "note": "Each step is permission-checked individually; nothing executed without an enabled adapter."}
+
+        self._router.register("computer.observe", _tool_computer_observe,
+            "Observe the computer (list windows/apps, read state) — read-only. Honestly reports when no observation "
+            "adapter is installed. args: {what?}")
+        self._router.register("computer.act", _tool_computer_act,
+            "Propose a computer action (click/type/scroll/launch_app/...). It is permission-gated: standard/admin "
+            "actions need Marcus's explicit approval, and NOTHING executes unless computer control is enabled with a "
+            "platform adapter (off by default — otherwise a dry run). args: {kind, target?, details?}")
+        self._router.register("skill.run", _tool_skill_run,
+            "Run a learned workflow skill by id, substituting {params}. Every step is re-checked through the "
+            "permission gate; a learned skill is never a bypass. args: {skill_id, params?}")
+
         for _name, _fn, _desc in [
             ("code.index", _tool_code_index,
              "Get a structural understanding of a project: architecture outline (languages, top dirs, largest files, "
@@ -705,6 +757,10 @@ class RuntimeManager:
     @property
     def society(self) -> AgentSociety:
         return self._society
+
+    @property
+    def permission_broker(self) -> PermissionBroker:
+        return self._permission_broker
 
     def start(self) -> None:
         self._memory_worker.start()

@@ -119,6 +119,8 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_BRIEFING_TIME", "hhmm", "08:00", "Morning briefing time (empty disables)."),
         # ── Developer mode / security ───────────────────────────────────────
         _s("NOVA_DEV_MODE", "bool", "0", "Enable guarded self-editing."),
+        _s("NOVA_PERMISSION_MODE", "str", "guarded", "Actuator permission policy: locked (read-only) | guarded (default; standard/admin need confirmation, critical denied) | trusted (auto-allow through standard)."),
+        _s("NOVA_COMPUTER_CONTROL", "bool", "0", "Allow computer-control actions to actually EXECUTE (still gated per-action + needs a platform adapter). OFF by default — actions are otherwise dry-run only (Phase 8)."),
         _s("NOVA_API_TOKEN", "str", "", "Bearer token required on all endpoints when set.", secret=True),
         _s("NOVA_ADMIN_TOKEN", "str", "", "Extra token for maintenance endpoints.", secret=True),
         _s("NOVA_ALLOWED_ORIGINS", "csv", "", "CORS origins override (comma-separated)."),

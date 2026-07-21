@@ -208,6 +208,19 @@ async def research(topic: str | None = Query(None)) -> dict:
     return {"topics": await STATE.memory.list_research_topics()}
 
 
+@router.get("/skills")
+async def skills(skill_id: str | None = Query(None)) -> dict:
+    """Learned workflow skills (#2): the roster, or one skill's steps/versions."""
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    if skill_id:
+        skill = await STATE.memory.get_skill(skill_id)
+        if skill is None:
+            raise HTTPException(status_code=404, detail="No such skill")
+        return skill
+    return {"skills": await STATE.memory.list_skills()}
+
+
 @router.get("/experiments")
 async def experiments(experiment_id: str | None = Query(None)) -> dict:
     """Autonomous experimentation (#15): list experiments, or analyze one into a
