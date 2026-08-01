@@ -37,7 +37,8 @@ from core.project_builder import (
 )
 from core.orchestrator.agent import Agent, ToolLoopExecutor
 from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
-from core.orchestrator.model_router import ModelRouter, parse_role_map
+from core.orchestrator.model_router import ModelHandle, ModelRouter, parse_role_map
+from core.cloud_runtime import CloudRuntime, cloud_enabled
 from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
@@ -335,12 +336,31 @@ class RuntimeManager:
 
         self._llm_sem = asyncio.Semaphore(1)
 
-        # ModelRouter (Phase 2.4): today every role resolves to this one 9B on
-        # its one GPU semaphore. NOVA_MODEL_ROLES can remap roles once a second
-        # model handle is registered — the call sites already go through here.
-        self._models = ModelRouter.single(
-            self._llm, self._llm_sem, role_map=parse_role_map(os.getenv("NOVA_MODEL_ROLES", "")),
-        )
+        # ModelRouter (Phase 2.4 + U2). The local model on its single GPU
+        # semaphore is the DEFAULT for every role — chat, memory and decisions
+        # stay local, always. When cloud is configured, a SECOND handle is
+        # registered with its OWN semaphore (remote calls don't contend for the
+        # GPU), and `coder`/`planner` default to it. An explicit NOVA_MODEL_ROLES
+        # entry always wins, so routing stays fully user-controlled.
+        self._identity_cache: tuple[str | None, list[str]] = (None, [])
+        self._cloud = CloudRuntime(fallback=self._llm, identities=lambda: self._identity_cache)
+
+        handles = {"primary": ModelHandle(name="primary", runtime=self._llm, semaphore=self._llm_sem)}
+        role_map = parse_role_map(os.getenv("NOVA_MODEL_ROLES", ""))
+        if cloud_enabled():
+            try:
+                concurrency = max(1, int(os.getenv("NOVA_CLOUD_CONCURRENCY", "4") or 4))
+            except ValueError:
+                concurrency = 4
+            handles["cloud"] = ModelHandle(
+                name="cloud", runtime=self._cloud, semaphore=asyncio.Semaphore(concurrency),
+            )
+            for _role in ("coder", "planner"):
+                role_map.setdefault(_role, "cloud")
+            logger.info("cloud_roles_enabled", provider=self._cloud.provider,
+                        model=self._cloud.model or "(unset)", concurrency=concurrency)
+
+        self._models = ModelRouter(handles, default="primary", role_map=role_map)
         # Orchestrator (Phase 2.1): the reason→act→observe loop runs here. The
         # default chat agent reproduces the previous inline loop exactly.
         self._tool_loop = ToolLoopExecutor(models=self._models, tool_router=router)
@@ -761,6 +781,15 @@ class RuntimeManager:
     @property
     def permission_broker(self) -> PermissionBroker:
         return self._permission_broker
+
+    @property
+    def cloud(self) -> CloudRuntime:
+        return self._cloud
+
+    def model_routing(self) -> dict[str, Any]:
+        """Which model serves each role, plus cloud state — for /status so it's
+        always plain which roles are remote and which stay on this machine."""
+        return {"roles": self._models.describe(), "cloud": self._cloud.status()}
 
     def start(self) -> None:
         self._memory_worker.start()
@@ -1666,6 +1695,15 @@ class RuntimeManager:
         if relations:
             context["known_family"].update(relations["family"])
             context["known_people"].update(relations["people"])
+            # Feed the cloud context firewall's redaction list for free — these
+            # names were just fetched anyway, so nothing extra is queried.
+            names: list[str] = []
+            for value in list(relations["family"].values()) + list(relations["people"].values()):
+                names.extend(value if isinstance(value, list) else [value])
+            self._identity_cache = (
+                (user_name or "").strip() or None,
+                [n for n in names if isinstance(n, str) and n.strip()],
+            )
         if focus_ctx:
             context["current_focus"] = focus_ctx
         if mood_trend:

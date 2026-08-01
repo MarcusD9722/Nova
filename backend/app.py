@@ -1264,6 +1264,8 @@ async def status() -> dict:
         "integrations": _plugin_config_status(),
         "tools": tools,
         "models": (STATE.runtime.models.describe() if STATE.runtime is not None else {}),
+        # Which roles are remote vs local, plus cloud state (never the API key).
+        "cloud": (STATE.runtime.cloud.status() if STATE.runtime is not None else {"enabled": False}),
         "dev_mode": (os.getenv("NOVA_DEV_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}),
     }
 
