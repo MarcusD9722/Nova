@@ -107,10 +107,17 @@ class MemoryUnifier:
         # Optional LLM query expander (U3), wired by the runtime which owns the
         # model. None = pure deterministic term extraction, exactly as before.
         self._query_expander: Any | None = None
+        # Optional LLM phrasing helper (U4). None = hardcoded templates.
+        self._expression: Any | None = None
 
     def set_query_expander(self, expander: Any | None) -> None:
         """Install an `async (query, terms) -> list[str]` term expander."""
         self._query_expander = expander
+
+    def set_expression(self, expression: Any | None) -> None:
+        """Install the U4 Expression helper (LLM phrasing / naming / signal
+        reading). None = the deterministic templates, exactly as before."""
+        self._expression = expression
 
     @property
     def graph(self) -> GraphStore:
@@ -596,6 +603,27 @@ class MemoryUnifier:
             reminders_ontime=ontime, reminders_late=late,
             goals_active=goals_active, goals_stalled=goals_stalled,
         ))
+
+        # U4: the derived stress level comes from substring-matching a fixed word
+        # list, so "I'm fine, just been a lot lately" reads as low. When a model
+        # is wired in, let it read the same evidence instead — keeping the
+        # deterministic value as the fallback and the basis string honest.
+        if profile.get("enough_data") and self._expression is not None and getattr(self._expression, "available", False):
+            evidence = f"{mood} {wellbeing}".strip()
+            if evidence:
+                try:
+                    read = await self._expression.read_signal(
+                        evidence, labels=["low", "some", "elevated"],
+                        fallback=profile["stress_level"]["value"],
+                    )
+                    if read != profile["stress_level"]["value"]:
+                        profile["stress_level"] = {
+                            "value": read,
+                            "basis": f"read from the mood/wellbeing signal: {evidence[:120]}",
+                        }
+                except Exception:
+                    pass  # keep the deterministic read
+
         profile["enabled"] = True
         return profile
 
@@ -684,6 +712,27 @@ class MemoryUnifier:
         self._exec_cache = (_time.monotonic(), recs)
         return recs
 
+    async def _phrase_recommendations(self, recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """U4: make the WORDING fluid while leaving the decision untouched.
+
+        Detection, ranking and the confidence gate above are what keep the
+        executive layer from being annoying — those stay deterministic. Only the
+        message text is rephrased, and only when a model is wired in; the
+        original template survives any failure."""
+        if not recs or self._expression is None or not getattr(self._expression, "available", False):
+            return recs
+        out: list[dict[str, Any]] = []
+        for r in recs:
+            phrased = dict(r)
+            try:
+                phrased["message"] = await self._expression.rephrase(
+                    r["message"], context=f"proactive nudge about {r.get('kind', 'something')}",
+                )
+            except Exception:
+                pass  # keep the template
+            out.append(phrased)
+        return out
+
     async def executive_recommendations(self, *, throttle: bool = False, throttle_hours: float = 6.0) -> list[dict[str, Any]]:
         """Proactive, confidence-gated recommendations (#1). With throttle=True
         (the unprompted grounding path) recently-surfaced items are suppressed and
@@ -693,6 +742,7 @@ class MemoryUnifier:
         if not get_bool("NOVA_EXECUTIVE"):
             return []
         recs = await self._gather_executive()
+        recs = await self._phrase_recommendations(recs)
         if not throttle:
             return recs
         out: list[dict[str, Any]] = []
@@ -939,8 +989,23 @@ class MemoryUnifier:
 
     async def detect_learnable_workflow(self, *, min_repeats: int = 3) -> dict[str, Any] | None:
         """A repeated workflow in the activity log worth OFFERING to learn — or
-        None. Never learns on its own; this only surfaces a candidate."""
-        return detect_repeated_workflow(await self.recent_activity(limit=300), min_repeats=min_repeats)
+        None. Never learns on its own; this only surfaces a candidate.
+
+        U4: detection stays deterministic (it must be — it decides *whether* to
+        interrupt), but the model proposes a human NAME for the workflow so the
+        offer reads like "want me to learn 'Invoice Filing'?" instead of echoing
+        raw step tokens."""
+        found = detect_repeated_workflow(await self.recent_activity(limit=300), min_repeats=min_repeats)
+        if not found:
+            return None
+        if self._expression is not None and getattr(self._expression, "available", False):
+            try:
+                found["suggested_name"] = await self._expression.name_for(
+                    found["steps"], fallback=" then ".join(found["steps"][:2]),
+                )
+            except Exception:
+                pass
+        return found
 
     async def learn_skill(self, name: str, steps: list[str]) -> str | None:
         """Store an approved workflow as a learned skill (v1)."""

@@ -98,6 +98,7 @@ CATALOG: dict[str, Setting] = dict(
         # ── Memory ──────────────────────────────────────────────────────────
         _s("NOVA_EMBED_MODEL", "str", "BAAI/bge-small-en-v1.5", "Embedding model for semantic memory."),
         _s("NOVA_EMBED_DEVICE", "str", "auto", "Embedding device (cuda|cpu|auto)."),
+        _s("NOVA_LLM_EXPRESSION", "bool", "1", "Let the model phrase proactive nudges, name learned workflows, and read the stress signal, instead of hardcoded templates. Templates remain the fallback (U4)."),
         _s("NOVA_LLM_UNDERSTANDING", "bool", "1", "Let the model (not regexes) judge task-vs-chat, specialist routing and memory query expansion. Deterministic heuristics remain the fallback (U3)."),
         _s("NOVA_INDEX_TURNS", "bool", "1", "Semantically index substantive conversation turns."),
         _s("NOVA_MEMORY_PROVENANCE", "bool", "1", "Record fact provenance (source, evidence, verification status, last-confirmed) so assumptions are never stored as settled facts (#19)."),
