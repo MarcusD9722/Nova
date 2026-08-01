@@ -129,6 +129,11 @@ class ProjectBuilder:
         self._models = models
         self._active: dict[str, asyncio.Task] = {}
 
+    def active_projects(self) -> set[str]:
+        """Slugs with a build/improve task still running — used to refuse
+        deleting a project out from under an in-flight build."""
+        return {slug for slug, task in self._active.items() if task and not task.done()}
+
     def _handle(self, role: str) -> tuple[Any, asyncio.Semaphore]:
         """(runtime, semaphore) for a role — the local model when unrouted.
 

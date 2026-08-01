@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -34,6 +36,107 @@ class ProjectManager:
     def project_path(self, name: str) -> Path:
         safe_name = self._sanitize(name)
         return ensure_safe_subdir(self._repo_root, self._projects_dir, self._projects_dir / safe_name)
+
+    # ── Deletion: recoverable by default ────────────────────────────────────
+    # Nova can remove a project, but never irreversibly on the first step.
+    # delete_project() MOVES the folder into projects/.trash/, so a mistaken
+    # delete (wrong name, misheard request) is always undoable with restore.
+    # Only purge_trash() erases bytes, and that sits behind the CRITICAL
+    # permission tier — denied in the default 'guarded' mode.
+
+    TRASH_DIRNAME = ".trash"
+
+    def _trash_dir(self) -> Path:
+        return self._projects_dir / self.TRASH_DIRNAME
+
+    @staticmethod
+    def _measure(path: Path) -> tuple[int, int]:
+        """(file count, total bytes) — so a delete can report what it moved."""
+        files = 0
+        size = 0
+        for p in path.rglob("*"):
+            if p.is_file():
+                files += 1
+                try:
+                    size += p.stat().st_size
+                except OSError:
+                    pass
+        return files, size
+
+    def list_projects(self) -> list[str]:
+        """Project names, excluding the trash folder and other dot-dirs."""
+        if not self._projects_dir.exists():
+            return []
+        return sorted(
+            p.name for p in self._projects_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+
+    def delete_project(self, name: str) -> dict[str, Any]:
+        """Move a project into .trash/ (recoverable). Never deletes bytes."""
+        proj = self.project_path(name)          # sandboxed by ensure_safe_subdir
+        if proj.resolve() == self._projects_dir.resolve():
+            raise ValueError("refusing to delete the projects directory itself")
+        if not proj.exists() or not proj.is_dir():
+            raise FileNotFoundError(f"no such project: {name}")
+
+        files, size = self._measure(proj)
+        trash = self._trash_dir()
+        trash.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = trash / f"{proj.name}--{stamp}"
+        shutil.move(str(proj), str(target))
+        return {
+            "project": proj.name, "moved_to_trash": target.name,
+            "files": files, "bytes": size, "recoverable": True,
+        }
+
+    def list_trash(self) -> list[dict[str, Any]]:
+        trash = self._trash_dir()
+        if not trash.exists():
+            return []
+        out: list[dict[str, Any]] = []
+        for p in sorted(trash.iterdir(), reverse=True):
+            if not p.is_dir():
+                continue
+            files, size = self._measure(p)
+            out.append({"entry": p.name, "original": p.name.rsplit("--", 1)[0],
+                        "files": files, "bytes": size})
+        return out
+
+    def restore_project(self, entry: str) -> dict[str, Any]:
+        """Move a trashed project back. Refuses to clobber a live project."""
+        safe = self._sanitize(entry)
+        src = ensure_safe_subdir(self._repo_root, self._trash_dir(), self._trash_dir() / safe)
+        if not src.exists() or not src.is_dir():
+            raise FileNotFoundError(f"nothing in trash named: {entry}")
+        original = src.name.rsplit("--", 1)[0]
+        dest = self.project_path(original)
+        if dest.exists():
+            raise FileExistsError(f"'{original}' already exists — rename or delete it first")
+        shutil.move(str(src), str(dest))
+        return {"restored": original, "from_trash": src.name}
+
+    def purge_trash(self, entry: str | None = None) -> dict[str, Any]:
+        """PERMANENTLY erase one trashed project, or all of them. This is the
+        only method here that destroys data; it is gated at CRITICAL."""
+        trash = self._trash_dir()
+        if not trash.exists():
+            return {"purged": [], "note": "trash is already empty"}
+        if entry:
+            safe = self._sanitize(entry)
+            target = ensure_safe_subdir(self._repo_root, trash, trash / safe)
+            if not target.exists():
+                raise FileNotFoundError(f"nothing in trash named: {entry}")
+            targets = [target]
+        else:
+            targets = [p for p in trash.iterdir() if p.is_dir()]
+        purged = []
+        for t in targets:
+            files, size = self._measure(t)
+            shutil.rmtree(t, ignore_errors=False)
+            purged.append({"entry": t.name, "files": files, "bytes": size})
+        return {"purged": purged, "permanent": True}
 
     def ensure_workspace(self, name: str) -> Path:
         proj = self.project_path(name)

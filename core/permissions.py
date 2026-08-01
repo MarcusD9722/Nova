@@ -52,6 +52,13 @@ CAPABILITY_TIERS: dict[str, int] = {
     "computer.system_setting": CRITICAL,
     "computer.delete": CRITICAL,
     "skill.run": STANDARD,             # a learned workflow (its steps re-checked individually)
+    # Projects. Deleting is RECOVERABLE (the folder moves to projects/.trash/),
+    # so it needs confirmation but is allowed in the default 'guarded' mode.
+    # Purging erases bytes for good, so it sits at CRITICAL — denied by default,
+    # and requires deliberately raising NOVA_PERMISSION_MODE to allow it.
+    "project.restore": STANDARD,
+    "project.delete": ADMIN,
+    "project.purge": CRITICAL,
 }
 
 DECISION_ALLOW, DECISION_CONFIRM, DECISION_DENY = "allow", "confirm", "deny"

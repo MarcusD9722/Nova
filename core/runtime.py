@@ -750,6 +750,79 @@ class RuntimeManager:
             return {"ok": True, "skill": skill["name"], "steps_evaluated": results,
                     "note": "Each step is permission-checked individually; nothing executed without an enabled adapter."}
 
+        # ── Project deletion: permission-gated, recoverable by default ───────
+        from core.project_manager import ProjectManager as _PM
+        _projects = _PM(repo_root=self._repo_root, projects_dir=projects_dir)
+
+        async def _gate(capability: str, details: dict[str, Any]) -> dict[str, Any] | None:
+            """Ask permission; return an error dict to abort, or None to proceed."""
+            decision = await self._permission_broker.request(capability, details=details)
+            if decision["decision"] == "allowed":
+                return None
+            if decision["decision"] == "denied":
+                return {"ok": False, "status": "denied", "reason": decision.get("reason")}
+            approved = await self._permission_broker.await_decision(decision["request_id"], timeout_s=120.0)
+            if not approved:
+                return {"ok": False, "status": "not_approved",
+                        "note": "You didn't approve it (declined or timed out) — nothing was touched."}
+            return None
+
+        async def _tool_project_delete(args: dict[str, Any]) -> dict[str, Any]:
+            name = str(args.get("name") or args.get("project") or "").strip()
+            if not name:
+                return {"ok": False, "error": "missing_name"}
+            if name in self._project_builder.active_projects():
+                return {"ok": False, "error": "build_in_progress",
+                        "note": f"'{name}' is still being built — stop it before deleting."}
+            blocked = await _gate("project.delete", {"project": name, "recoverable": True})
+            if blocked:
+                return blocked
+            try:
+                result = await asyncio.to_thread(_projects.delete_project, name)
+            except FileNotFoundError:
+                return {"ok": False, "error": "not_found", "project": name}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": str(e)[:200]}
+            return {"ok": True, **result,
+                    "note": f"Moved to trash — recoverable with project.restore('{result['moved_to_trash']}')."}
+
+        async def _tool_project_trash(args: dict[str, Any]) -> dict[str, Any]:
+            return {"ok": True, "trash": await asyncio.to_thread(_projects.list_trash)}
+
+        async def _tool_project_restore(args: dict[str, Any]) -> dict[str, Any]:
+            entry = str(args.get("entry") or args.get("name") or "").strip()
+            if not entry:
+                return {"ok": False, "error": "missing_entry"}
+            blocked = await _gate("project.restore", {"entry": entry})
+            if blocked:
+                return blocked
+            try:
+                return {"ok": True, **await asyncio.to_thread(_projects.restore_project, entry)}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": str(e)[:200]}
+
+        async def _tool_project_purge(args: dict[str, Any]) -> dict[str, Any]:
+            entry = str(args.get("entry") or "").strip() or None
+            blocked = await _gate("project.purge", {"entry": entry or "ALL", "permanent": True})
+            if blocked:
+                return blocked
+            try:
+                return {"ok": True, **await asyncio.to_thread(_projects.purge_trash, entry)}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": str(e)[:200]}
+
+        self._router.register("project.delete", _tool_project_delete,
+            "Delete a project Marcus asks you to remove. The folder is MOVED to projects/.trash/ so it stays "
+            "recoverable, and it needs his explicit approval first. args: {name}")
+        self._router.register("project.trash", _tool_project_trash,
+            "List deleted projects still sitting in the trash (recoverable). args: {}")
+        self._router.register("project.restore", _tool_project_restore,
+            "Restore a deleted project from the trash back into projects/. args: {entry}")
+        self._router.register("project.purge", _tool_project_purge,
+            "PERMANENTLY erase trashed projects — this destroys the files for good and cannot be undone. "
+            "Only use when Marcus explicitly asks to permanently delete. Omit 'entry' to purge everything. "
+            "args: {entry?}")
+
         self._router.register("computer.observe", _tool_computer_observe,
             "Observe the computer (list windows/apps, read state) — read-only. Honestly reports when no observation "
             "adapter is installed. args: {what?}")
