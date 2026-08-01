@@ -40,6 +40,7 @@ from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
 from core.orchestrator.model_router import ModelHandle, ModelRouter, parse_role_map
 from core.cloud_runtime import CloudRuntime, cloud_enabled
 from core.understanding import Understanding
+from core.expression import Expression
 from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
@@ -394,6 +395,14 @@ class RuntimeManager:
         try:
             self._memory.set_query_expander(_expand_query)
         except Exception:  # older memory objects without the hook
+            pass
+
+        # U4: LLM phrasing/naming/signal-reading. Also local-only — it phrases
+        # personal nudges. Deterministic templates remain the fallback.
+        self._expression = Expression(_utility.runtime, semaphore=_utility.semaphore)
+        try:
+            self._memory.set_expression(self._expression)
+        except Exception:
             pass
 
         self._decider = ChatDecider(llm, llm_semaphore=self._llm_sem, understanding=self._understanding)
