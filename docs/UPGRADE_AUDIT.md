@@ -179,9 +179,9 @@ the machine. Everything except the explicitly-routed roles stays 100% local.
 |---|---|---|---|
 | **U1 — Async parallelization** ✅ **SHIPPED** | B1, B2, B3 | Low | Pure speedup, no behavior change, immediately felt every turn. Do first. |
 | **U2 — Cloud LLM handle** ✅ **SHIPPED** | C1–C6 | Medium | Unlocks better coding *and* real concurrency. Firewall + fallback are the work. |
-| **U3 — LLM-driven understanding** | A1, A2, A3, A6 | Medium | The fluency win. Fast-path/fallback keeps it safe. |
-| **U4 — LLM-driven expression & extraction** | A4, A5, A7, A8 | Low-Med | Natural phrasing + richer graph. |
-| **U5 — New capabilities** | D (pick from menu) | Varies | After the foundation is faster and smarter. |
+| **U3 — LLM-driven understanding** ✅ **SHIPPED** | A1, A2, A3, A6 | Medium | The fluency win. Fast-path/fallback keeps it safe. |
+| **U4 — LLM-driven expression & extraction** ✅ **SHIPPED** | A4, A5, A7, A8 | Low-Med | Natural phrasing + richer graph. |
+| **U5 — New capabilities** ✅ **SHIPPED** | D (pick from menu) | Varies | After the foundation is faster and smarter. |
 
 Each phase keeps the existing ritual: feature-flagged, tests green, PR, pause for review.
 
@@ -246,3 +246,30 @@ fully offline via monkeypatched httpx — no key, no network). Suite **39/39**.
    vLLM, LM Studio, …) plus an Anthropic adapter, selected by `NOVA_CLOUD_PROVIDER` with
    a configurable `NOVA_CLOUD_BASE_URL`/`NOVA_CLOUD_MODEL` — swapping models/providers is
    an `.env` edit and a restart, never a code change.
+
+
+### U3–U5 results (shipped 2026-07-20)
+
+**U3 — understanding** (`core/understanding.py`, flag `NOVA_LLM_UNDERSTANDING`).
+`classify`/`rank`/`expand_query`/`extract`, each fallback-safe. Wired into task-vs-chat
+routing (which decides whether Nova starts *building*), specialist selection, and memory
+query expansion. Contract: **never worse than the heuristic** — model raises, empty reply,
+garbage, out-of-set label, timeout, no model, flag off all return the deterministic answer.
+
+**U4 — expression** (`core/expression.py`, flag `NOVA_LLM_EXPRESSION`). Deterministic
+*what*, fluid *how*: executive nudges keep identical detection/ranking/confidence and only
+change wording; the twin's stress read comes from evidence instead of a fixed word list;
+learned workflows get human names. Model output is sanity-checked (rejects leaked framing,
+over-long text, paragraph dumps) before replacing a template.
+
+**U5 — capabilities.**
+* `core/semantic_cache.py` — reuse a recent answer when a question *means* the same thing.
+  Strict admission: never a tool-backed turn, never time-sensitive, never short exchanges,
+  high similarity bar, short TTL, and **any memory write invalidates everything**.
+* `MemoryUnifier.correct_fact` + `memory.correct` — a correction now SUPERSEDES the wrong
+  value instead of writing a second contradictory fact, records it as `stated`, and keeps
+  the old value as evidence so the correction is auditable.
+
+Suite **42/42**. Deliberately NOT converted to LLM control (unchanged, by design):
+`permissions.py`, dev-mode deny-lists, experiment math, `code_intel` AST parsing, schema
+migrations, date arithmetic, GPU enforcement.

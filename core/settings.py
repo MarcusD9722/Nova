@@ -98,6 +98,9 @@ CATALOG: dict[str, Setting] = dict(
         # ── Memory ──────────────────────────────────────────────────────────
         _s("NOVA_EMBED_MODEL", "str", "BAAI/bge-small-en-v1.5", "Embedding model for semantic memory."),
         _s("NOVA_EMBED_DEVICE", "str", "auto", "Embedding device (cuda|cpu|auto)."),
+        _s("NOVA_SEMANTIC_CACHE", "bool", "1", "Reuse a recent answer when a question means the same thing (embedding similarity). Never caches tool-backed or time-sensitive turns; any memory write invalidates it (U5)."),
+        _s("NOVA_SEMANTIC_CACHE_THRESHOLD", "float", "0.95", "Cosine similarity required for a semantic cache hit."),
+        _s("NOVA_SEMANTIC_CACHE_TTL_S", "float", "3600", "How long a cached answer stays valid, in seconds."),
         _s("NOVA_LLM_EXPRESSION", "bool", "1", "Let the model phrase proactive nudges, name learned workflows, and read the stress signal, instead of hardcoded templates. Templates remain the fallback (U4)."),
         _s("NOVA_LLM_UNDERSTANDING", "bool", "1", "Let the model (not regexes) judge task-vs-chat, specialist routing and memory query expansion. Deterministic heuristics remain the fallback (U3)."),
         _s("NOVA_INDEX_TURNS", "bool", "1", "Semantically index substantive conversation turns."),

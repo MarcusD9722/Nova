@@ -82,6 +82,15 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         )
         return {"ok": True, "saved": fact[:400], "topic": topic}
 
+    async def _memory_correct(args: dict[str, Any]) -> dict[str, Any]:
+        entity = str(args.get("entity") or "user").strip()
+        attribute = str(args.get("attribute") or args.get("topic") or "").strip()
+        new_value = str(args.get("value") or args.get("new_value") or args.get("correction") or "").strip()
+        old_value = str(args.get("old_value") or "").strip() or None
+        if not attribute or not new_value:
+            return {"ok": False, "error": "missing_attribute_or_value"}
+        return await memory.correct_fact(entity, attribute, new_value, old_value=old_value)
+
     async def _memory_recall(args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query") or args.get("q") or "").strip()
         if not query:
@@ -728,6 +737,7 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.rebuild_index": _memory_rebuild,
         "memory.remember": _memory_remember,
         "memory.recall": _memory_recall,
+        "memory.correct": _memory_correct,
         "memory.learn_lesson": _memory_learn_lesson,
         "memory.remember_person": _memory_remember_person,
         "memory.remember_event": _memory_remember_event,
@@ -778,6 +788,7 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.rebuild_index": "Rebuild the semantic memory index from the primary store. args: {}",
         "memory.remember": "Save a fact or note to permanent long-term memory when the user asks you to remember something. args: {fact, topic?}",
         "memory.recall": "Search permanent long-term memory for previously saved facts and notes. args: {query}",
+        "memory.correct": ("Fix something you remembered WRONG when Marcus corrects you ('no, her birthday is the 14th'). This SUPERSEDES the old value instead of storing a second contradictory fact. args: {attribute, value, entity?, old_value?}"),
         "memory.learn_lesson": ("Save a durable lesson about how Marcus wants you to behave (a correction or "
                                  "preference) so you apply it in future replies. args: {lesson, topic?}"),
         "memory.remember_person": ("Save someone Marcus mentions (a friend, coworker, family member) so you can "
