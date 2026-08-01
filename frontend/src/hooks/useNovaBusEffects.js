@@ -56,7 +56,13 @@ export default function useNovaBusEffects({ novaEvents, appendNovaMessage, speak
         } else if (status === "needs review") {
           head = `🛠️ I updated "${d.project}"${note ? ` (${note})` : ""}. It runs, but please double-check it does what you wanted.`;
         } else if (isImprove) {
-          head = `🛠️ Done updating "${d.project}". ${d.summary || ""}\nIt launches cleanly — give it a try and tell me if it works how you wanted (I can't fully test the interactive parts myself).`;
+          // Honest framing: `summary` is written by the planner BEFORE the code
+          // is generated, so it describes what was ATTEMPTED, not a confirmed
+          // fix. The run check only proves the program starts without crashing —
+          // it cannot tell a working game loop from one frozen on frame one.
+          // Saying "Done — resolved X" here is how a silent no-op got reported
+          // as a fix four times in a row.
+          head = `🛠️ I changed "${d.project}". Attempted: ${d.summary || "see files below"}\n⚠️ I verified only that it starts without crashing — I could NOT verify the behavior you asked about. Please run it and tell me what actually happens.`;
         } else {
           head = `✅ Project "${d.project}" is built. ${d.summary || ""}\nGive it a try and let me know how it looks.`;
         }

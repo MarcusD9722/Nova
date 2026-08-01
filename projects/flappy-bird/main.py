@@ -6,9 +6,9 @@ import sys
 
 # --- Error Handling for Tkinter Import ---
 try:
-    import tkinter as tk
+    from tkinter import ttk
 except ImportError:
-    print("Error: The 'tkinter' module is not available. Please install it using:")
+    print("Error: The 'tkinter' module is not available.")
     if sys.platform == "win32":
         print("  pip install tk")
     elif sys.platform == "darwin":
@@ -30,20 +30,20 @@ class FlappyBirdGame:
         self.gap_height = 150
         self.gravity = 0.5
         self.jump_strength = -8
+        self.pipe_speed = 4
         
         # Initialize canvas with a background color
         self.canvas = tk.Canvas(root, width=self.width, height=self.height, bg='sky blue', highlightthickness=0)
         self.canvas.pack()
         
         # Game state variables
-        self.bird_y = 300  # Start in the middle vertically
+        self.bird_y = None  
         self.bird_velocity = 0
         self.pipes = []
         self.score = 0
         self.game_over = False
-        self.is_running = False  # Explicit flag to control game loop state
+        self.is_running = False 
         self.start_time = None
-        self.elapsed_seconds = 0.0
         
         # UI Elements for Timer, Countdown, and Game Over Frame
         self.timer_label_id = None
@@ -77,19 +77,26 @@ class FlappyBirdGame:
         self.countdown_label_id = self.canvas.create_text(200, 150, text=str(count), font=('Arial', 60, 'bold'), fill='white')
         
         def countdown_step():
+            # `nonlocal` is required: assigning to `count` below would otherwise
+            # make it local to this function, and reading it would raise
+            # UnboundLocalError. Tkinter swallows exceptions raised inside
+            # `after` callbacks, so that failure showed up as a silent freeze.
+            nonlocal count
+            count -= 1
             if self.countdown_label_id and count >= 1:
-                count -= 1
                 try:
                     self.canvas.itemconfig(self.countdown_label_id, text=str(count))
                 except tk.TclError:
                     pass
-                
+
                 # Schedule next step after 1 second (1000ms)
                 self.root.after(1000, countdown_step)
             else:
                 # Countdown finished, start the game loop
                 try:
-                    self.canvas.delete(self.countdown_label_id)
+                    if self.countdown_label_id:
+                        self.canvas.delete(self.countdown_label_id)
+                        self.countdown_label_id = None
                 except tk.TclError:
                     pass
                 
@@ -97,7 +104,12 @@ class FlappyBirdGame:
                 if not self.game_over and self.bird_y is not None:
                     self.start_time = time.time()
                     self.is_running = True  # Explicitly enable the loop
-                    self.update()
+                    self.update_game_loop()
+
+        # Actually START the countdown. Without this the callback above was only
+        # ever referenced from inside itself, so the first tick never fired and
+        # the game sat on "3" forever — the freeze that was being reported.
+        self.root.after(1000, countdown_step)
 
     def jump(self):
         """Applies upward velocity to the bird."""
@@ -122,7 +134,7 @@ class FlappyBirdGame:
             'passed': False
         })
 
-    def update(self):
+    def update_game_loop(self):
         """Main game loop logic."""
         
         # If the game is not running (e.g., during countdown or paused), do nothing
@@ -150,7 +162,7 @@ class FlappyBirdGame:
 
         # Move and manage pipes
         for pipe in self.pipes[:]:
-            pipe['x'] -= 3
+            pipe['x'] -= self.pipe_speed
             
             # --- Improved Collision Detection (AABB with padding) ---
             bird_left = 50 
@@ -186,98 +198,128 @@ class FlappyBirdGame:
         # Draw everything
         self.draw()
 
-        # If the game just ended, show the rest
-        if self.game_over:
-            self.show_game_over_screen()
-
     def draw(self):
-        """Draws all game elements on the canvas."""
+        """Draws the current state."""
+        
         # Clear canvas
         self.canvas.delete("all")
         
-        # Draw Bird (Yellow Square)
-        bird_left = 50
-        bird_right = 80
-        bird_top = self.bird_y - 2
-        bird_bottom = (self.bird_y + self.bird_size) + 2
-        
-        self.canvas.create_rectangle(bird_left, bird_top, bird_right, bird_bottom, fill='yellow', outline='black')
-
-        # Draw Pipes (Green Rectangles)
-        for pipe in self.pipes:
-            x = pipe['x']
-            
-            # Top Pipe
-            top_y = 0
-            bottom_y = pipe['top_height']
-            self.canvas.create_rectangle(x, top_y, x + self.pipe_width, bottom_y, fill='green', outline='black')
-            
-            # Bottom Pipe
-            top_y = pipe['bottom_y']
-            bottom_y = self.height
-            self.canvas.create_rectangle(x, top_y, x + self.pipe_width, bottom_y, fill='green', outline='black')
-
-        # Draw Score (if game is running)
-        if not self.game_over:
-            score_text = f"Score: {self.score}"
-            timer_text = f"{self.elapsed_seconds}s"
-            
-            self.timer_label_id = self.canvas.create_text(20, 10, text=timer_text, font=('Arial', 16), fill='black')
-            self.canvas.create_text(self.width // 2 - len(score_text) * 5, 30, text=score_text, font=('Arial', 24, 'bold'), fill='white')
-
-    def show_game_over_screen(self):
-        """Displays the game over screen with score and restart option."""
-        # Stop the game loop immediately to prevent further updates during UI rendering
-        self.is_running = False
-        
-        # Create a frame for the Game Over message centered on canvas
-        go_frame = tk.Frame(self.canvas, bg='red', width=self.width, height=200)
-        go_frame.place(x=0, y=(self.height - 200)//2)
-
-        # Add labels to the game over frame
-        score_label = tk.Label(go_frame, text=f"Game Over! Score: {self.score}", font=('Arial', 16), bg='red')
-        score_label.pack(pady=50)
-        
-        restart_label = tk.Label(go_frame, text="Press 'R' or Enter to Restart", font=('Arial', 12), fg='white', bg='red')
-        restart_label.pack()
-
-    def restart_game(self):
-        """Restarts the game from the beginning."""
-        # Reset all state variables
-        self.bird_y = 300
-        self.bird_velocity = 0
-        self.pipes = []
-        self.score = 0
-        self.game_over = False
-        self.is_running = False
-        
-        # Clear canvas completely to remove any old UI elements (countdown, game over screen)
-        self.canvas.delete("all")
-
-        if self.timer_label_id:
+        # Draw Timer if game is running and not over
+        if self.is_running and not self.game_over:
             try:
-                self.canvas.delete(self.timer_label_id)
+                text = f"{self.elapsed_seconds}s"
+                self.timer_label_id = self.canvas.create_text(20, 15, text=text, font=('Arial', 30), fill='black')
             except tk.TclError:
                 pass
 
-        # Reset Timer and start countdown sequence
-        self.start_time = time.time()
+        # Draw Bird (Yellow Square)
+        if self.bird_y is not None and not self.game_over:
+            try:
+                bird_rect = [50, self.bird_y - 15, 80, self.bird_y + 15]
+                self.canvas.create_rectangle(bird_rect[0], bird_rect[1], bird_rect[2], bird_rect[3], fill='yellow', outline='black')
+            except tk.TclError:
+                pass
+
+        # Draw Pipes (Green Rectangles)
+        for pipe in self.pipes:
+            try:
+                top_pipe = [pipe['x'], 0, pipe['x'] + self.pipe_width, pipe['top_height']]
+                bottom_pipe = [pipe['x'], pipe['bottom_y'], pipe['x'] + self.pipe_width, self.height]
+                
+                # Draw Top Pipe
+                self.canvas.create_rectangle(top_pipe[0], top_pipe[1], top_pipe[2], top_pipe[3], fill='green', outline='black')
+                # Draw Bottom Pipe
+                self.canvas.create_rectangle(bottom_pipe[0], bottom_pipe[1], bottom_pipe[2], bottom_pipe[3], fill='green', outline='black')
+            except tk.TclError:
+                pass
+
+        # Draw Score if game is running and not over
+        if self.is_running and not self.game_over:
+            try:
+                score_text = f"Score: {self.score}"
+                self.canvas.create_text(20, 350, text=score_text, font=('Arial', 20), fill='black')
+            except tk.TclError:
+                pass
+
+        # Draw Game Over Screen if game is over
+        if self.game_over:
+            try:
+                # Create the frame for game over details
+                self.game_over_frame.pack(fill=tk.BOTH, expand=True)
+                
+                # Label for "Game Over"
+                go_label = tk.Label(self.game_over_frame, text="GAME OVER", font=('Arial', 40), fg='red')
+                go_label.pack(pady=20)
+
+                # Score Display
+                score_label = tk.Label(self.game_over_frame, text=f"Score: {self.score}", font=('Arial', 30))
+                score_label.pack()
+
+                # Restart Button (or instruction to press R/Enter)
+                restart_btn = tk.Button(
+                    self.game_over_frame, 
+                    text="Restart Game", 
+                    command=self.restart_game,
+                    bg='green',
+                    fg='white',
+                    font=('Arial', 16),
+                    padx=20,
+                    pady=10
+                )
+                restart_btn.pack(pady=20)
+
+            except tk.TclError:
+                pass
+
+    def start_game(self):
+        """Initializes the bird and starts the countdown."""
+        # Reset state for a fresh game attempt (but keep score if desired, here we reset everything)
+        self.reset_game()
         
-        # Start the 3-second countdown
+        # Initialize Bird Position
+        self.bird_y = 300
+        
+        # Start Countdown
         self.start_countdown()
 
+    def restart_game(self):
+        """Restarts the game from the beginning."""
+        # Reset state completely
+        self.game_over = False
+        self.is_running = False
+        self.score = 0
+        self.bird_y = None
+        
+        # Clear pipes and reset timer logic
+        self.pipes = []
+        
+        # Destroy any existing UI elements related to the previous game loop (Timer)
+        if self.timer_label_id:
+            try:
+                self.canvas.delete(self.timer_label_id)
+                self.timer_label_id = None
+            except tk.TclError:
+                pass
+        
+        # Clear Game Over Frame if it exists
+        for widget in list(self.game_over_frame.winfo_children()):
+            widget.destroy()
 
-# Main Application Entry Point
-if __name__ == "__main__":
+        # Start a new game instance (which triggers the countdown)
+        self.start_game()
+
+def main():
     root = tk.Tk()
     
-    # Set window size to match game dimensions
-    root.geometry(f"{game.game_width}x{game.game_height}")
-    
+    # Create an instance of our game class and start it
     game = FlappyBirdGame(root)
-    
-    # Start the countdown immediately when app launches
-    game.start_countdown()
+    game.start_game()  # This initializes bird_y and starts the countdown
     
     # Run the Tkinter event loop
-    root.mainloop()
+    try:
+        root.mainloop()
+    except tk.TclError as e:
+        print(f"Tkinter Error during mainloop: {e}")
+
+if __name__ == "__main__":
+    main()

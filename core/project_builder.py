@@ -845,7 +845,12 @@ class ProjectBuilder:
                 f"PROJECT.md:\n{project_md[:2500]}\n\nFiles:\n{listing}\n\n"
                 f"Requested improvements: {instructions}\n\n"
                 'Reply ONLY with JSON: {"changes": [{"path": "main.py", "what": "short description"}], "summary": "one sentence"}\n'
-                "Rules: at most 3 files, only files that exist or one new file, relative paths only."
+                "Rules: at most 3 files, only files that exist or one new file, relative paths only.\n"
+                "IMPORTANT — this summary is written BEFORE the code is generated or tested, so it is a "
+                "statement of INTENT, not an accomplishment. Describe what you will CHANGE, e.g. "
+                "'rewrite the countdown to use nonlocal state and schedule the first tick'. Do NOT write "
+                "'fixed', 'resolved', 'stabilized' or 'ensured' — nothing is verified at this point, and "
+                "claiming a fix that didn't happen is worse than saying nothing."
             )
             changes = (plan or {}).get("changes") or []
             if not changes:
