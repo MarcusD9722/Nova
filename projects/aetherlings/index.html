@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Aetherlings">
+<meta name="theme-color" content="#10141b">
+<meta name="description" content="Aetherlings — a monster-taming RPG across the ten towns of Verdane.">
+<title>Aetherlings</title>
+<style>
+  :root {
+    --bg: #0b0e15;
+    --panel: #1b2230;
+    --panel2: #232c3d;
+    --ink: #e7edf5;
+    --muted: #8ea0b8;
+    --accent: #ffd84a;
+    --line: #313d52;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: var(--bg); color: var(--ink);
+    font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+    overflow: hidden;
+    overscroll-behavior: none;
+    touch-action: manipulation;
+  }
+  #app {
+    display: flex; flex-direction: column;
+    height: 100%; width: 100%;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  #stage {
+    flex: 1 1 auto;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 0; padding: 6px;
+  }
+  #screen {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #0b0e15;
+    border-radius: 6px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+
+  /* ---- on-screen controls ---- */
+  #pad {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: 132px 1fr 132px;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px 14px;
+    max-width: 560px; width: 100%; margin: 0 auto;
+  }
+
+  #dpad { position: relative; width: 132px; height: 132px; }
+  #dpad button {
+    position: absolute; width: 44px; height: 44px;
+    background: var(--panel2); border: 1px solid var(--line);
+    color: var(--ink); font-size: 15px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0; cursor: pointer;
+  }
+  #dpad button.on { background: var(--accent); color: #10141b; }
+  .d-up    { left: 44px; top: 0;    border-radius: 8px 8px 0 0; }
+  .d-left  { left: 0;    top: 44px; border-radius: 8px 0 0 8px; }
+  .d-mid   { left: 44px; top: 44px; background: var(--panel2); border: 1px solid var(--line); }
+  .d-right { left: 88px; top: 44px; border-radius: 0 8px 8px 0; }
+  .d-down  { left: 44px; top: 88px; border-radius: 0 0 8px 8px; }
+
+  #mid { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  #mid button {
+    background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+    border-radius: 14px; padding: 7px 16px; font-size: 11px; font-weight: 700;
+    letter-spacing: .8px; cursor: pointer;
+  }
+  #mid button.on { background: var(--accent); color: #10141b; }
+  #hint { font-size: 10px; color: var(--muted); text-align: center; line-height: 1.5; }
+
+  #ab { position: relative; width: 132px; height: 132px; }
+  #ab button {
+    position: absolute; width: 58px; height: 58px; border-radius: 50%;
+    border: 1px solid var(--line); background: var(--panel2);
+    color: var(--ink); font-size: 19px; font-weight: 800; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; padding: 0;
+  }
+  #ab button.on { background: var(--accent); color: #10141b; }
+  .b-a { right: 0;  top: 30px; }
+  .b-b { left: 0;   top: 66px; }
+
+  /* On a roomy landscape screen the controls sit beside the screen instead. */
+  @media (min-width: 720px) and (orientation: landscape) {
+    #app { flex-direction: row; align-items: center; }
+    #stage { flex: 1 1 auto; height: 100%; }
+    #pad { width: 340px; grid-template-columns: 140px 1fr; grid-template-rows: auto auto; }
+    #ab { grid-column: 2; }
+    #mid { grid-column: 1 / -1; }
+  }
+
+  /* ---- self-test panel (?test=1) ---- */
+  #tests {
+    display: none; position: fixed; inset: 0; z-index: 50;
+    background: rgba(8,11,17,.96); color: var(--ink);
+    padding: 20px; overflow: auto; font-size: 13px; line-height: 1.5;
+  }
+  #tests h2 { margin: 0 0 12px; font-size: 17px; color: var(--accent); }
+  #tests ul { margin: 0; padding-left: 18px; }
+  #tests li { margin-bottom: 10px; color: #ff9aa8; }
+  #tests .d { color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage"><canvas id="screen" width="240" height="320"></canvas></div>
+
+  <div id="pad">
+    <div id="dpad">
+      <button class="d-up"    data-btn="up"    aria-label="Up">▲</button>
+      <button class="d-left"  data-btn="left"  aria-label="Left">◀</button>
+      <div    class="d-mid"   style="position:absolute;width:44px;height:44px;"></div>
+      <button class="d-right" data-btn="right" aria-label="Right">▶</button>
+      <button class="d-down"  data-btn="down"  aria-label="Down">▼</button>
+    </div>
+
+    <div id="mid">
+      <button data-btn="start" aria-label="Menu">MENU</button>
+      <div id="hint">Arrows / WASD · Z or Space = A<br>X = B · Esc or M = Menu</div>
+    </div>
+
+    <div id="ab">
+      <button class="b-a" data-btn="a" aria-label="A">A</button>
+      <button class="b-b" data-btn="b" aria-label="B">B</button>
+    </div>
+  </div>
+</div>
+
+<div id="tests"></div>
+
+<!-- Classic scripts, not modules: these load fine straight from file://,
+     where ES modules would be blocked by CORS. Order matters. -->
+<script src="src/data-types.js"></script>
+<script src="src/data-moves.js"></script>
+<script src="src/data-species.js"></script>
+<script src="src/data-items.js"></script>
+<script src="src/render-sprites.js"></script>
+<script src="src/engine-core.js"></script>
+<script src="src/data-maps.js"></script>
+<script src="src/data-story.js"></script>
+<script src="src/engine-battle.js"></script>
+<script src="src/engine-overworld.js"></script>
+<script src="src/engine-ui.js"></script>
+<script src="src/tests.js"></script>
+<script src="src/main.js"></script>
+</body>
+</html>
