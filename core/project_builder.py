@@ -116,12 +116,32 @@ def _now_str() -> str:
 
 
 class ProjectBuilder:
-    def __init__(self, *, projects_dir: Path, llm: Any, llm_semaphore: asyncio.Semaphore, memory: Any) -> None:
+    def __init__(self, *, projects_dir: Path, llm: Any, llm_semaphore: asyncio.Semaphore, memory: Any,
+                 models: Any | None = None) -> None:
         self._projects_dir = Path(projects_dir).resolve()
         self._llm = llm
         self._sem = llm_semaphore
         self._memory = memory
+        # ModelRouter (optional). Without it, everything runs on the local model
+        # exactly as before. With it, planning uses the `planner` role and file
+        # generation uses `coder` — so pointing those at a stronger remote model
+        # actually improves project building instead of only affecting deep mode.
+        self._models = models
         self._active: dict[str, asyncio.Task] = {}
+
+    def _handle(self, role: str) -> tuple[Any, asyncio.Semaphore]:
+        """(runtime, semaphore) for a role — the local model when unrouted.
+
+        The semaphore travels WITH the model: the local one serializes on the
+        GPU, while a cloud handle carries its own concurrency, so a remote
+        build no longer blocks local chat."""
+        if self._models is not None:
+            try:
+                handle = self._models.for_role(role)
+                return handle.runtime, handle.semaphore
+            except Exception:
+                pass
+        return self._llm, self._sem
 
     # ── Path safety ──────────────────────────────────────────────────────────
 
@@ -279,9 +299,10 @@ class ProjectBuilder:
         # background and is stripped before JSON extraction. One retry covers
         # the occasional run where reasoning eats the whole token budget and
         # the JSON arrives truncated.
+        runtime, sem = self._handle("planner")
         for _ in range(2):
-            async with self._sem:
-                raw = await self._llm.chat(
+            async with sem:
+                raw = await runtime.chat(
                     [{"role": "user", "content": prompt}],
                     max_tokens=max_tokens,
                     temperature=0.15,
@@ -293,8 +314,10 @@ class ProjectBuilder:
         return None
 
     async def _llm_file(self, prompt: str) -> str:
-        async with self._sem:
-            raw = await self._llm.chat(
+        # Writing/rewriting an actual source file — the `coder` role.
+        runtime, sem = self._handle("coder")
+        async with sem:
+            raw = await runtime.chat(
                 [{"role": "user", "content": prompt}],
                 max_tokens=_FILE_TOKENS,
                 temperature=0.2,

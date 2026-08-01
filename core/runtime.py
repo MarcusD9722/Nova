@@ -445,6 +445,10 @@ class RuntimeManager:
             llm=llm,
             llm_semaphore=self._llm_sem,
             memory=memory,
+            # Route planning/codegen through the role map, so NOVA_CLOUD_ENABLED
+            # actually reaches the thing that writes code. Without this the
+            # builder bypassed the router and the `coder` role had no consumer.
+            models=self._models,
         )
 
         async def _tool_project_start(args: dict[str, Any]) -> dict[str, Any]:
