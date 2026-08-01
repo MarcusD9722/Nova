@@ -1106,8 +1106,11 @@ async def _startup() -> None:
     if cfg.model_path is not None:
         try:
             BUS.publish("model.loading", {"model": cfg.model_path.name, "context_tokens": cfg.context_tokens})
+            # NOTE: no "Model loaded" print here — llm.initialize() already logs
+            # `llm_loaded`, which logging_setup renders as that exact line. This
+            # printed the same thing a second time from the *config* values; the
+            # logger reports what actually loaded, so it's the one to keep.
             await llm.initialize()
-            print(f"• Model loaded: {cfg.model_path.name} (ctx={cfg.context_tokens})")
             BUS.publish("model.loaded", {"model": cfg.model_path.name, "context_tokens": cfg.context_tokens})
             BUS.publish("model.gpu_confirmed", {"status": llm.gpu_status.status})
             if cfg.mmproj_path is not None:

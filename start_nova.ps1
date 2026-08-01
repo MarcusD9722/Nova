@@ -65,10 +65,11 @@ Write-Host ""
 # --- AUTONOMY DEFAULTS ---
 # You asked Nova to be fully autonomous by default.
 $env:NOVA_AUTONOMY = "1"
-$env:NOVA_AUTONOMY_MAX_STEPS = "12"
 $env:NOVA_ALLOW_SHELL = "1"
 $env:NOVA_ALLOW_NETWORK_TOOLS = "1"
-$env:NOVA_MEMORY_SAVE_MODE = "all"
+# Removed: NOVA_AUTONOMY_MAX_STEPS and NOVA_MEMORY_SAVE_MODE. Nothing in the
+# codebase ever read either one, so they did nothing but emit a config warning
+# on every boot. The real per-turn tool-step cap is NOVA_AGENT_MAX_STEPS.
 $env:NOVA_VOICE_DIR = (Join-Path $repoRoot "voices")
 $env:NOVA_DEFAULT_VOICE = "nova.wav"
 $env:NOVA_TTS_DEVICE = "cuda"
