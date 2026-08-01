@@ -128,7 +128,31 @@ class ChatDecider:
     Explicit task requests still return a structured task decision so Nova can queue work.
     """
 
-    def __init__(self, llm: LLMRuntime, *, llm_semaphore) -> None:
+    async def _classify_task_request(self, user_text: str) -> bool:
+        """Is this a request to DO something (build/fix/run) vs. talk?
+
+        U3: the regex pair below decides a high-consequence branch — whether
+        Nova starts building. Ask the model instead when one is wired in, using
+        the heuristic as the fallback label so a model failure can never change
+        the previous behavior."""
+        heuristic = _looks_like_task_request(user_text)
+        u = getattr(self, "_understanding", None)
+        if u is None or not getattr(u, "available", False):
+            return heuristic
+        label = await u.classify(
+            user_text,
+            labels=["task", "conversation"],
+            fallback="task" if heuristic else "conversation",
+            instruction=(
+                "'task' = asking the assistant to DO something concrete (build, fix, run, "
+                "install, refactor, set up, investigate). 'conversation' = chatting, asking "
+                "a question, requesting an explanation, story, joke, weather, directions or time."
+            ),
+        )
+        return label == "task"
+
+    def __init__(self, llm: LLMRuntime, *, llm_semaphore, understanding=None) -> None:
+        self._understanding = understanding
         self._llm = llm
         self._sem = llm_semaphore
         self._followup_gen = FollowUpGeneratorLLM(llm, llm_semaphore=llm_semaphore)
@@ -186,7 +210,7 @@ class ChatDecider:
         del project_name
 
         text = (user_text or "").strip()
-        if _looks_like_task_request(text):
+        if await self._classify_task_request(text):
             return await self._decide_task(
                 user_text=text,
                 user_name=user_name,

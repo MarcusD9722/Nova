@@ -140,6 +140,33 @@ def select_specialists(query: str, *, max_participants: int = 3) -> list[str]:
     return chosen
 
 
+async def select_specialists_smart(
+    query: str, *, understanding=None, max_participants: int = 3
+) -> list[str]:
+    """LLM-routed specialist selection (U3), falling back to the deterministic
+    keyword scoring. Keyword overlap misses cross-domain requests — "I keep
+    putting off my training" scores Fitness Coach on 'training' and never sees
+    the procrastination angle the Psychologist owns. The model reads intent;
+    the keyword path remains the safety net."""
+    keyword_pick = select_specialists(query, max_participants=max_participants)
+    if understanding is None or not getattr(understanding, "available", False):
+        return keyword_pick
+
+    options = {
+        s.id: f"{s.name} — {s.specialization}"
+        for s in SPECIALISTS.values() if not s.coordinator
+    }
+    picked = await understanding.rank(
+        query, options=options, fallback=[], limit=max_participants,
+        instruction="You are routing a request to the right specialists on an assistant's team.",
+    )
+    if not picked:
+        return keyword_pick
+    if len(picked) >= 2 and COORDINATOR_ID not in picked:
+        picked.append(COORDINATOR_ID)  # someone must synthesize a multi-voice council
+    return picked
+
+
 def roster() -> list[dict]:
     return [
         {"id": s.id, "name": s.name, "specialization": s.specialization,
@@ -153,10 +180,11 @@ class AgentSociety:
     contributions are the thin orchestration. GPU-serialized via the semaphore —
     contributions happen one at a time, honestly reflecting the single model."""
 
-    def __init__(self, *, memory, llm, llm_semaphore) -> None:
+    def __init__(self, *, memory, llm, llm_semaphore, understanding=None) -> None:
         self._memory = memory
         self._llm = llm
         self._sem = llm_semaphore
+        self._understanding = understanding
 
     async def _one_call(self, prompt: str, *, max_tokens: int) -> str:
         try:
@@ -172,7 +200,9 @@ class AgentSociety:
     async def deliberate(self, query: str, *, context: str = "", max_participants: int = 3) -> dict:
         """Executive selects participants → each contributes in turn → the
         coordinator synthesizes (when 2+ engaged) → experience is recorded."""
-        ids = select_specialists(query, max_participants=max_participants)
+        ids = await select_specialists_smart(
+            query, understanding=self._understanding, max_participants=max_participants,
+        )
         specs = [SPECIALISTS[i] for i in ids]
         contributors = [s for s in specs if not s.coordinator]
         coordinator = next((s for s in specs if s.coordinator), None)
