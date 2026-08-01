@@ -179,6 +179,39 @@ async def main():
     # ── Adapters are pluggable by name ──
     check(set(_ADAPTERS) == {"openai", "anthropic"}, "both provider adapters registered")
 
+
+    # ── REGRESSION: a cloud->local fallback MUST re-serialize on the GPU ──
+    # A cloud role runs under the cloud handle's semaphore (multiple permits).
+    # When it falls back it drives the LOCAL model, which llama.cpp cannot run
+    # concurrently on one context — doing so crashed the CUDA backend outright.
+    use_cloud("openai")
+    _FakeClient.status_code = 500          # force every call to fall back
+
+    import asyncio as _a
+    gpu_sem = _a.Semaphore(1)
+    concurrent = {"now": 0, "max": 0}
+
+    class TrackingLocal:
+        async def chat(self, messages, **kw):
+            concurrent["now"] += 1
+            concurrent["max"] = max(concurrent["max"], concurrent["now"])
+            await _a.sleep(0.02)           # hold the "GPU" briefly
+            concurrent["now"] -= 1
+            return "LOCAL-REPLY"
+
+    guarded = CloudRuntime(fallback=TrackingLocal(), fallback_semaphore=gpu_sem)
+    await _a.gather(*(guarded.chat([{"role": "user", "content": "build something"}]) for _ in range(4)))
+    check(concurrent["max"] == 1,
+          f"4 concurrent fallbacks are serialized on the GPU semaphore (max in flight={concurrent['max']})")
+
+    # and without a semaphore wired, they genuinely would overlap (proves the guard matters)
+    concurrent["max"] = 0
+    unguarded = CloudRuntime(fallback=TrackingLocal())
+    await _a.gather(*(unguarded.chat([{"role": "user", "content": "build something"}]) for _ in range(4)))
+    check(concurrent["max"] > 1,
+          f"without the semaphore they DO overlap — this was the crash (max in flight={concurrent['max']})")
+    _FakeClient.status_code = 200
+
     for k in ("NOVA_CLOUD_ENABLED", "NOVA_CLOUD_PROVIDER", "NOVA_CLOUD_MODEL", "NOVA_CLOUD_API_KEY"):
         os.environ.pop(k, None)
 

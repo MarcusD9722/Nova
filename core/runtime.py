@@ -345,7 +345,14 @@ class RuntimeManager:
         # GPU), and `coder`/`planner` default to it. An explicit NOVA_MODEL_ROLES
         # entry always wins, so routing stays fully user-controlled.
         self._identity_cache: tuple[str | None, list[str]] = (None, [])
-        self._cloud = CloudRuntime(fallback=self._llm, identities=lambda: self._identity_cache)
+        self._cloud = CloudRuntime(
+            fallback=self._llm,
+            # The GPU semaphore, so a cloud->local fallback re-serializes on the
+            # single llama.cpp context instead of running concurrently with the
+            # background workers (which crashed the CUDA backend).
+            fallback_semaphore=self._llm_sem,
+            identities=lambda: self._identity_cache,
+        )
 
         handles = {"primary": ModelHandle(name="primary", runtime=self._llm, semaphore=self._llm_sem)}
         role_map = parse_role_map(os.getenv("NOVA_MODEL_ROLES", ""))

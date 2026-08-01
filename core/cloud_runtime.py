@@ -146,8 +146,16 @@ class CloudRuntime:
     local fallback. Constructed with the local runtime it falls back to."""
 
     def __init__(self, *, fallback: Any | None = None,
+                 fallback_semaphore: Any | None = None,
                  identities: Callable[[], tuple[str | None, list[str]]] | None = None) -> None:
         self._fallback = fallback
+        # CRITICAL: the semaphore guarding the LOCAL model's GPU. A cloud role
+        # runs under the cloud handle's semaphore (several permits, since remote
+        # calls don't contend for the GPU) — but the moment we fall back, we are
+        # driving the local model again and MUST re-serialize on its semaphore.
+        # Without this, a fallback ran llama.cpp concurrently with background
+        # workers on one context, which crashes the CUDA backend outright.
+        self._fallback_sem = fallback_semaphore
         self._identities = identities
         self._last_error: str = ""
         self._calls = 0
@@ -224,6 +232,10 @@ class CloudRuntime:
         BUS.publish("cloud.fallback", {"reason": reason[:160], "provider": self.provider})
         if self._fallback is None:
             raise RuntimeError(f"cloud unavailable and no local fallback: {reason}")
+        if self._fallback_sem is not None:
+            # Re-serialize on the GPU before touching the local model again.
+            async with self._fallback_sem:
+                return await self._fallback.chat(messages, **kw)
         return await self._fallback.chat(messages, **kw)
 
     # ── LLMRuntime-compatible surface ──
