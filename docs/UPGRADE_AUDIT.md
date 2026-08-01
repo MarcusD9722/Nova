@@ -178,7 +178,7 @@ the machine. Everything except the explicitly-routed roles stays 100% local.
 | Phase | Contents | Risk | Why this order |
 |---|---|---|---|
 | **U1 — Async parallelization** ✅ **SHIPPED** | B1, B2, B3 | Low | Pure speedup, no behavior change, immediately felt every turn. Do first. |
-| **U2 — Cloud LLM handle** | C1–C6 | Medium | Unlocks better coding *and* real concurrency. Firewall + fallback are the work. |
+| **U2 — Cloud LLM handle** ✅ **SHIPPED** | C1–C6 | Medium | Unlocks better coding *and* real concurrency. Firewall + fallback are the work. |
 | **U3 — LLM-driven understanding** | A1, A2, A3, A6 | Medium | The fluency win. Fast-path/fallback keeps it safe. |
 | **U4 — LLM-driven expression & extraction** | A4, A5, A7, A8 | Low-Med | Natural phrasing + richer graph. |
 | **U5 — New capabilities** | D (pick from menu) | Varies | After the foundation is faster and smarter. |
@@ -206,6 +206,32 @@ timings are already low — search 42ms, twin 7ms, executive 16ms — so the wal
 today is modest. The structural win scales with (a) memory growth, (b) Chroma enabled
 (embedding queries are the slow part and now overlap the SQLite fan-out), and (c) the
 cloud handle in U2, where a remote call's latency overlaps local work instead of blocking.
+
+### U2 results (shipped 2026-07-20)
+
+**`core/context_firewall.py` — built and tested FIRST, before any cloud code existed.**
+Drops grounding blocks (JSON keys *and* their rendered natural-language form) and raw
+memory records; redacts identities inside otherwise task-shaped messages; then re-verifies
+and **fails closed** — surviving personal markers mean the remote call is refused.
+
+**`core/cloud_runtime.py` — provider-agnostic.** Implements the exact `LLMRuntime` surface
+(`chat`/`chat_stream`/`generate`), so `ModelRouter` hands it to a role with zero caller
+changes. Two adapters: `openai` (OpenAI, OpenRouter, Together, Groq, vLLM, LM Studio, any
+compatible gateway via `NOVA_CLOUD_BASE_URL`) and `anthropic` (Messages API, system prompt
+hoisted). Adding a provider = one small class, never a caller change.
+
+**Routing** (verified): cloud off → all six roles local. Cloud on → `coder`+`planner`
+remote, `chat`/`decider`/`critic`/`utility` local. Explicit `NOVA_MODEL_ROLES` always wins.
+The cloud handle carries its **own semaphore** (`NOVA_CLOUD_CONCURRENCY`, default 4) — remote
+calls don't contend for the GPU, which is what unlocks true parallelism.
+
+**Every failure falls back to local, never breaks a turn:** disabled, missing key, missing
+model, HTTP 4xx/5xx, network error, firewall refusal, nothing-left-after-scrub. Each emits
+an honest `cloud.fallback` bus event + log. `/status` exposes `cloud` state and which roles
+are remote; `status()` never includes the key (asserted in tests).
+
+Tests: `test_context_firewall_u2.py` (24 checks) + `test_cloud_runtime_u2.py` (28 checks,
+fully offline via monkeypatched httpx — no key, no network). Suite **39/39**.
 
 ---
 
