@@ -39,6 +39,7 @@ from core.orchestrator.agent import Agent, ToolLoopExecutor
 from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
 from core.orchestrator.model_router import ModelHandle, ModelRouter, parse_role_map
 from core.cloud_runtime import CloudRuntime, cloud_enabled
+from core.understanding import Understanding
 from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
@@ -380,7 +381,22 @@ class RuntimeManager:
         )
 
         # Policies
-        self._decider = ChatDecider(llm, llm_semaphore=self._llm_sem)
+        # U3: LLM-driven understanding (task-vs-chat, specialist routing, memory
+        # query expansion). Runs on the local `utility` role — these are small,
+        # frequent judgement calls and they involve personal text, so they stay
+        # local by design. Every consumer keeps its deterministic fallback.
+        _utility = self._models.for_role("utility")
+        self._understanding = Understanding(_utility.runtime, semaphore=_utility.semaphore)
+
+        async def _expand_query(query: str, terms: list[str]) -> list[str]:
+            return await self._understanding.expand_query(query, fallback=terms)
+
+        try:
+            self._memory.set_query_expander(_expand_query)
+        except Exception:  # older memory objects without the hook
+            pass
+
+        self._decider = ChatDecider(llm, llm_semaphore=self._llm_sem, understanding=self._understanding)
         self._extractor = MemoryExtractorLLM(llm, llm_semaphore=self._llm_sem)
         self._summarizer = SummarizerLLM(llm, llm_semaphore=self._llm_sem)
         self._storyteller = StorytellerLLM(llm, llm_semaphore=self._llm_sem)
@@ -572,7 +588,8 @@ class RuntimeManager:
 
         # Persistent agent society (Phase 6 / #5): a council of durable specialists
         # the Executive routes. Registered here where the LLM + semaphore live.
-        self._society = AgentSociety(memory=self._memory, llm=self._llm, llm_semaphore=self._llm_sem)
+        self._society = AgentSociety(memory=self._memory, llm=self._llm, llm_semaphore=self._llm_sem,
+                                    understanding=self._understanding)
 
         async def _tool_society_consult(args: dict[str, Any]) -> dict[str, Any]:
             if (os.getenv("NOVA_AGENT_SOCIETY", "1").strip() or "1").lower() in {"0", "false", "no", "off"}:

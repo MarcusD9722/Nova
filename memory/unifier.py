@@ -104,6 +104,13 @@ class MemoryUnifier:
         # Executive recommendations cache (Phase 5 / #1) — recomputed at most
         # every few minutes so the per-turn grounding hook stays cheap.
         self._exec_cache: tuple[float, list[dict[str, Any]]] | None = None
+        # Optional LLM query expander (U3), wired by the runtime which owns the
+        # model. None = pure deterministic term extraction, exactly as before.
+        self._query_expander: Any | None = None
+
+    def set_query_expander(self, expander: Any | None) -> None:
+        """Install an `async (query, terms) -> list[str]` term expander."""
+        self._query_expander = expander
 
     @property
     def graph(self) -> GraphStore:
@@ -2004,6 +2011,19 @@ class MemoryUnifier:
 
         seen2: set[str] = set()
         terms = [t for t in expanded if not (t in seen2 or seen2.add(t))]
+
+        # U3: let the model widen the term set when one is wired in. The
+        # hardcoded synonym dict above only knows mom/dad; an LLM expansion
+        # catches "spouse"->"wife/partner", "car"->"vehicle", etc. The expander
+        # UNIONS with the deterministic terms (never removes them) and any
+        # failure leaves `terms` exactly as the heuristic produced it.
+        if self._query_expander is not None:
+            try:
+                widened = await self._query_expander(q, terms)
+                if widened:
+                    terms = list(dict.fromkeys([*terms, *widened]))[:12]
+            except Exception as e:  # noqa: BLE001
+                logger.debug("query_expansion_failed", error=str(e)[:160])
 
         BUS.publish("memory.search", {"query": clip(q, 120)})
 
