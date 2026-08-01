@@ -504,64 +504,84 @@ class MemoryUnifier:
         if not get_bool("NOVA_DIGITAL_TWIN"):
             return {"enabled": False}
 
-        # Local hour-of-day for recent turns (created_at is UTC).
-        turn_hours: list[int] = []
-        try:
-            for row in await self._sqlite.recent_turns(conversation_id=None, limit=300):
-                dt = self._parse_dt(row.get("created_at"))
-                if dt is not None:
-                    turn_hours.append(dt.astimezone().hour)
-        except Exception:
-            pass
+        # ── Six independent signal fetches, run CONCURRENTLY (U1) ────────────
+        # Each helper owns its try/except and returns a safe default, preserving
+        # the previous "a failed signal degrades that field only" behavior.
 
-        mood = wellbeing = ""
-        try:
-            mood = await self.recent_mood_trend(days=5)
-            wellbeing = await self.recent_wellbeing_trend(days=7)
-        except Exception:
-            pass
+        async def _turn_hours() -> list[int]:
+            # Local hour-of-day for recent turns (created_at is UTC).
+            try:
+                hours: list[int] = []
+                for row in await self._sqlite.recent_turns(conversation_id=None, limit=300):
+                    dt = self._parse_dt(row.get("created_at"))
+                    if dt is not None:
+                        hours.append(dt.astimezone().hour)
+                return hours
+            except Exception:
+                return []
 
-        interests: list[str] = []
-        try:
-            interests = [r.value for r in await self.get_facts(entity="interest_focus", limit=6, newest_first=True) if r.value]
-        except Exception:
-            pass
+        async def _trends() -> tuple[str, str]:
+            try:
+                return await asyncio.gather(
+                    self.recent_mood_trend(days=5),
+                    self.recent_wellbeing_trend(days=7),
+                )
+            except Exception:
+                return "", ""
 
-        lessons_recent = 0
-        try:
-            cut = _now() - timedelta(days=14)
-            for r in await self.get_facts(entity=LESSON_ENTITY, limit=60, newest_first=True):
-                if r.created_at >= cut:
-                    lessons_recent += 1
-        except Exception:
-            pass
+        async def _interests() -> list[str]:
+            try:
+                return [r.value for r in await self.get_facts(entity="interest_focus", limit=6, newest_first=True) if r.value]
+            except Exception:
+                return []
 
-        ontime = late = 0
-        try:
-            for r in await self.list_reminders(status="fired", limit=200):
-                if str(r.get("title") or "").startswith("__nova_"):
-                    continue
-                due, fired = self._parse_dt(r.get("due_at")), self._parse_dt(r.get("updated_at"))
-                if due and fired:
-                    if (fired - due).total_seconds() > 3600:
-                        late += 1
-                    else:
-                        ontime += 1
-        except Exception:
-            pass
+        async def _lessons_recent() -> int:
+            try:
+                cut = _now() - timedelta(days=14)
+                return sum(
+                    1 for r in await self.get_facts(entity=LESSON_ENTITY, limit=60, newest_first=True)
+                    if r.created_at >= cut
+                )
+            except Exception:
+                return 0
 
-        goals_active = goals_stalled = 0
-        try:
-            stale_cut = _now() - timedelta(days=7)
-            for g in await self.list_goals(limit=100):
-                if str(g.get("status") or "") != "active":
-                    continue
-                goals_active += 1
-                up = self._parse_dt(g.get("updated_at"))
-                if up is None or up < stale_cut:
-                    goals_stalled += 1
-        except Exception:
-            pass
+        async def _reminder_punctuality() -> tuple[int, int]:
+            on_time = behind = 0
+            try:
+                for r in await self.list_reminders(status="fired", limit=200):
+                    if str(r.get("title") or "").startswith("__nova_"):
+                        continue
+                    due, fired = self._parse_dt(r.get("due_at")), self._parse_dt(r.get("updated_at"))
+                    if due and fired:
+                        if (fired - due).total_seconds() > 3600:
+                            behind += 1
+                        else:
+                            on_time += 1
+            except Exception:
+                pass
+            return on_time, behind
+
+        async def _goal_progress() -> tuple[int, int]:
+            active = stalled = 0
+            try:
+                stale_cut = _now() - timedelta(days=7)
+                for g in await self.list_goals(limit=100):
+                    if str(g.get("status") or "") != "active":
+                        continue
+                    active += 1
+                    up = self._parse_dt(g.get("updated_at"))
+                    if up is None or up < stale_cut:
+                        stalled += 1
+            except Exception:
+                pass
+            return active, stalled
+
+        turn_hours, (mood, wellbeing), interests, lessons_recent, (ontime, late), (goals_active, goals_stalled) = (
+            await asyncio.gather(
+                _turn_hours(), _trends(), _interests(), _lessons_recent(),
+                _reminder_punctuality(), _goal_progress(),
+            )
+        )
 
         profile = derive_profile(DigitalTwinInputs(
             turn_hours=turn_hours, mood_trend=mood, wellbeing_trend=wellbeing,
@@ -584,59 +604,70 @@ class MemoryUnifier:
         now = _now()
         now_local = datetime.now().astimezone()
 
-        overdue: list[str] = []
-        upcoming: list[dict[str, Any]] = []
-        try:
-            for r in await self.list_reminders(status="pending", limit=100):
-                title = str(r.get("title") or "")
-                if title.startswith("__nova_"):
-                    continue
-                due = self._parse_dt(r.get("due_at"))
-                if not due:
-                    continue
-                delta_h = (due - now).total_seconds() / 3600.0
-                if delta_h < 0:
-                    overdue.append(title)
-                elif delta_h <= 24:
-                    upcoming.append({"label": title, "hours_until": max(0.0, delta_h)})
-        except Exception:
-            pass
+        # ── Four independent signal fetches, run CONCURRENTLY (U1) ───────────
 
-        upcoming_dates: list[dict[str, Any]] = []
-        try:
-            upcoming_dates = [
-                {"name": u["name"], "label": u["label"], "days_until": u["days_until"]}
-                for u in await self.list_people_with_upcoming_dates(within_days=3)
-            ]
-        except Exception:
-            pass
+        async def _reminders() -> tuple[list[str], list[dict[str, Any]]]:
+            late: list[str] = []
+            soon: list[dict[str, Any]] = []
+            try:
+                for r in await self.list_reminders(status="pending", limit=100):
+                    title = str(r.get("title") or "")
+                    if title.startswith("__nova_"):
+                        continue
+                    due = self._parse_dt(r.get("due_at"))
+                    if not due:
+                        continue
+                    delta_h = (due - now).total_seconds() / 3600.0
+                    if delta_h < 0:
+                        late.append(title)
+                    elif delta_h <= 24:
+                        soon.append({"label": title, "hours_until": max(0.0, delta_h)})
+            except Exception:
+                pass
+            return late, soon
 
-        active_goals: list[str] = []
-        stalled_goals: list[str] = []
-        try:
-            stale_cut = now - timedelta(days=7)
-            for g in await self.list_goals(limit=100):
-                if str(g.get("status") or "") != "active":
-                    continue
-                title = str(g.get("title") or "")
-                active_goals.append(title)
-                up = self._parse_dt(g.get("updated_at"))
-                if up is None or up < stale_cut:
-                    stalled_goals.append(title)
-        except Exception:
-            pass
+        async def _important_dates() -> list[dict[str, Any]]:
+            try:
+                return [
+                    {"name": u["name"], "label": u["label"], "days_until": u["days_until"]}
+                    for u in await self.list_people_with_upcoming_dates(within_days=3)
+                ]
+            except Exception:
+                return []
 
-        peak = None
-        procrastination = 0.0
-        stress = "low"
-        try:
-            prof = await self.digital_twin_profile()
-            if prof.get("enough_data"):
-                peak = prof["peak_period"]["value"]
-                procrastination = float(prof["procrastination_likelihood"]["value"])
-                stress = prof["stress_level"]["value"]
-        except Exception:
-            pass
+        async def _goals() -> tuple[list[str], list[str]]:
+            active: list[str] = []
+            stalled: list[str] = []
+            try:
+                stale_cut = now - timedelta(days=7)
+                for g in await self.list_goals(limit=100):
+                    if str(g.get("status") or "") != "active":
+                        continue
+                    title = str(g.get("title") or "")
+                    active.append(title)
+                    up = self._parse_dt(g.get("updated_at"))
+                    if up is None or up < stale_cut:
+                        stalled.append(title)
+            except Exception:
+                pass
+            return active, stalled
+
+        async def _twin_signals() -> tuple[str | None, float, str]:
+            try:
+                prof = await self.digital_twin_profile()
+                if prof.get("enough_data"):
+                    return (
+                        prof["peak_period"]["value"],
+                        float(prof["procrastination_likelihood"]["value"]),
+                        prof["stress_level"]["value"],
+                    )
+            except Exception:
+                pass
+            return None, 0.0, "low"
+
+        (overdue, upcoming), upcoming_dates, (active_goals, stalled_goals), (peak, procrastination, stress) = (
+            await asyncio.gather(_reminders(), _important_dates(), _goals(), _twin_signals())
+        )
 
         recs = recommend(ExecutiveContext(
             now_hour=now_local.hour, overdue=overdue, upcoming=upcoming,
@@ -1981,35 +2012,51 @@ class MemoryUnifier:
         if isinstance(cached, list) and cached:
             return [MemoryHit.model_validate(x) for x in cached]
 
-        # Gather signals (run LIKE searches over multiple terms and merge)
-        recent = await self._sqlite.recent_turns(conversation_id=conversation_id, limit=60)
+        # ── Gather signals CONCURRENTLY (U1) ─────────────────────────────────
+        # recent turns, the per-term LIKE searches, and the semantic (Chroma)
+        # query are mutually independent. Previously this ran up to 1 + 32 + 1
+        # awaits strictly one at a time on every recall; now the whole fan-out
+        # is a single round-trip. Result ordering is preserved exactly (gather
+        # returns in argument order), so ranking/dedup downstream is unchanged.
 
-        fact_rows: list[dict[str, Any]] = []
-        people_rows: list[dict[str, Any]] = []
-        event_rows: list[dict[str, Any]] = []
-        document_rows: list[dict[str, Any]] = []
+        async def _term_batch(t: str) -> tuple[list, list, list, list]:
+            return await asyncio.gather(
+                self._sqlite.search_facts(t, limit=12),
+                self._sqlite.search_people(t, limit=8),
+                self._sqlite.search_events(t, limit=8),
+                self._sqlite.search_documents(t, limit=8),
+            )
 
-        if terms:
-            for t in terms[:8]:
-                fact_rows.extend(await self._sqlite.search_facts(t, limit=12))
-                people_rows.extend(await self._sqlite.search_people(t, limit=8))
-                event_rows.extend(await self._sqlite.search_events(t, limit=8))
-                document_rows.extend(await self._sqlite.search_documents(t, limit=8))
-        else:
-            fact_rows = await self._sqlite.search_facts(q, limit=12)
-            people_rows = await self._sqlite.search_people(q, limit=8)
-            event_rows = await self._sqlite.search_events(q, limit=8)
-            document_rows = await self._sqlite.search_documents(q, limit=8)
+        async def _keyword_rows() -> tuple[list, list, list, list]:
+            if terms:
+                facts_a: list[dict[str, Any]] = []
+                people_a: list[dict[str, Any]] = []
+                events_a: list[dict[str, Any]] = []
+                docs_a: list[dict[str, Any]] = []
+                for f_rows, p_rows, e_rows, d_rows in await asyncio.gather(*(_term_batch(t) for t in terms[:8])):
+                    facts_a.extend(f_rows)
+                    people_a.extend(p_rows)
+                    events_a.extend(e_rows)
+                    docs_a.extend(d_rows)
+                return facts_a, people_a, events_a, docs_a
+            return await _term_batch(q)
 
-        # Semantic recall is optional; do not fail the request.
-        if self._chroma is None:
-            chroma_hits = []
-        else:
+        async def _semantic_hits() -> list[dict[str, Any]]:
+            # Semantic recall is optional; do not fail the request.
+            if self._chroma is None:
+                return []
             try:
-                chroma_hits = await self._chroma.query(q, limit=limit)
+                return await self._chroma.query(q, limit=limit)
             except Exception as e:
                 logger.debug("chroma_query_failed", error=str(e))
-                chroma_hits = []
+                return []
+
+        recent, keyword_rows, chroma_hits = await asyncio.gather(
+            self._sqlite.recent_turns(conversation_id=conversation_id, limit=60),
+            _keyword_rows(),
+            _semantic_hits(),
+        )
+        fact_rows, people_rows, event_rows, document_rows = keyword_rows
 
         hits: list[MemoryHit] = []
 

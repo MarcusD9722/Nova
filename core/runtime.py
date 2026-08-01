@@ -1551,45 +1551,62 @@ class RuntimeManager:
         if (user_name or "").strip():
             context["known_user"]["name"] = (user_name or "").strip()
 
-        try:
-            mother = await self._memory.get_latest_fact(entity="user", attribute="mother")
-            father = await self._memory.get_latest_fact(entity="user", attribute="father")
-            spouse = await self._memory.get_latest_fact(entity="user", attribute="spouse")
-            children = await self._memory.get_facts(entity="user", attribute="child", limit=25, newest_first=False)
-            siblings = await self._memory.get_facts(entity="user", attribute="sibling", limit=25, newest_first=False)
-            cousins = await self._memory.get_facts(entity="user", attribute="cousin", limit=25, newest_first=False)
-            friends = await self._memory.get_facts(entity="user", attribute="friend", limit=25, newest_first=False)
-            pets = await self._memory.get_facts(entity="user", attribute="pet", limit=25, newest_first=False)
+        # ── Independent read-only signals, fetched CONCURRENTLY (U1) ─────────
+        # These five blocks hit different tables and don't depend on each other,
+        # so they run in one round-trip instead of ~12 sequential awaits — on
+        # every single turn. Each helper keeps its own try/except and returns
+        # None on failure, preserving the previous "one bad signal never breaks
+        # the turn" semantics exactly (including: if any family read fails, the
+        # whole family block is skipped, as before).
+        #
+        # The write-involving blocks BELOW (wellbeing nudge, session gap,
+        # executive throttle) stay sequential on purpose — they mutate state and
+        # are order-dependent.
 
+        async def _load_family() -> dict[str, Any] | None:
+            try:
+                mother, father, spouse, children, siblings, cousins, friends, pets = await asyncio.gather(
+                    self._memory.get_latest_fact(entity="user", attribute="mother"),
+                    self._memory.get_latest_fact(entity="user", attribute="father"),
+                    self._memory.get_latest_fact(entity="user", attribute="spouse"),
+                    self._memory.get_facts(entity="user", attribute="child", limit=25, newest_first=False),
+                    self._memory.get_facts(entity="user", attribute="sibling", limit=25, newest_first=False),
+                    self._memory.get_facts(entity="user", attribute="cousin", limit=25, newest_first=False),
+                    self._memory.get_facts(entity="user", attribute="friend", limit=25, newest_first=False),
+                    self._memory.get_facts(entity="user", attribute="pet", limit=25, newest_first=False),
+                )
+            except Exception:
+                return None
+
+            family: dict[str, Any] = {}
+            people: dict[str, Any] = {}
             if mother and mother.value.strip():
-                context["known_family"]["mother"] = mother.value.strip()
+                family["mother"] = mother.value.strip()
             if father and father.value.strip():
-                context["known_family"]["father"] = father.value.strip()
+                family["father"] = father.value.strip()
             if spouse and spouse.value.strip():
-                context["known_family"]["spouse"] = spouse.value.strip()
+                family["spouse"] = spouse.value.strip()
 
             child_vals = self._dedup_vals([c.value for c in children])
             if child_vals:
-                context["known_family"]["children"] = child_vals
+                family["children"] = child_vals
 
             sibling_vals = self._dedup_vals([c.value for c in siblings])
             if sibling_vals:
-                context["known_family"]["siblings"] = sibling_vals
+                family["siblings"] = sibling_vals
 
             cousin_vals = self._dedup_vals([c.value for c in cousins])
             if cousin_vals:
-                context["known_family"]["cousins"] = cousin_vals
+                family["cousins"] = cousin_vals
 
             friend_vals = self._dedup_vals([c.value for c in friends])
             if friend_vals:
-                context["known_people"]["friends"] = friend_vals
+                people["friends"] = friend_vals
 
             pet_vals = self._dedup_vals([c.value for c in pets])
             if pet_vals:
-                pretty = [(p.split("|", 1)[0] if "|" in p else p) for p in pet_vals]
-                context["known_people"]["pets"] = pretty
-        except Exception:
-            pass
+                people["pets"] = [(p.split("|", 1)[0] if "|" in p else p) for p in pet_vals]
+            return {"family": family, "people": people}
 
         # Current focus — which project we're working on and what else exists.
         # Without this, the free-form agent tool loop (_decide_tool) decides
@@ -1597,50 +1614,66 @@ class RuntimeManager:
         # active, which is how a follow-up got turned into a duplicate/junk
         # project. Give the model the same "what are we on" context the regex
         # pre-pass uses.
-        try:
-            pb = self._project_builder
-            known_projects = pb.list_projects()
-            active = await pb.last_active()
-            focus: dict[str, Any] = {}
-            if active:
-                focus["active_project"] = active
-            if known_projects:
-                focus["known_projects"] = known_projects[:20]
-            if focus:
-                context["current_focus"] = focus
-        except Exception:
-            pass
+        async def _load_focus() -> dict[str, Any] | None:
+            try:
+                pb = self._project_builder
+                known_projects = pb.list_projects()
+                active = await pb.last_active()
+                focus: dict[str, Any] = {}
+                if active:
+                    focus["active_project"] = active
+                if known_projects:
+                    focus["known_projects"] = known_projects[:20]
+                return focus or None
+            except Exception:
+                return None
 
         # Recent mood trend (M1) — a coarse, honestly-labeled signal so replies
         # can be a little warmer/more attentive when it's been a rough
         # stretch, without claiming deep insight into how Marcus feels.
-        try:
-            trend = await self._memory.recent_mood_trend(days=3)
-            if trend:
-                context["recent_mood"] = trend
-        except Exception:
-            pass
+        async def _load_mood() -> str | None:
+            try:
+                return (await self._memory.recent_mood_trend(days=3)) or None
+            except Exception:
+                return None
 
         # Upcoming birthdays/anniversaries (MR1) — same window as the
         # reminder-worker's proactive nudge, so if it comes up naturally in
         # conversation she already has it, without re-announcing every turn.
-        try:
-            upcoming = await self._memory.list_people_with_upcoming_dates(within_days=3)
-            if upcoming:
-                context["relationship_reminders"] = [
+        async def _load_upcoming_dates() -> list[dict[str, Any]] | None:
+            try:
+                upcoming = await self._memory.list_people_with_upcoming_dates(within_days=3)
+                if not upcoming:
+                    return None
+                return [
                     {"name": u["name"], "label": u["label"], "days_until": u["days_until"]} for u in upcoming[:5]
                 ]
-        except Exception:
-            pass
+            except Exception:
+                return None
 
         # Long-horizon interest drift (MR1) — distilled periodically by the
         # self-improve reflection cycle, not computed fresh every turn.
-        try:
-            drift = await self._memory.recent_interest_drift(weeks=6)
-            if drift:
-                context["interest_drift"] = drift
-        except Exception:
-            pass
+        async def _load_drift() -> str | None:
+            try:
+                return (await self._memory.recent_interest_drift(weeks=6)) or None
+            except Exception:
+                return None
+
+        relations, focus_ctx, mood_trend, upcoming_dates, drift_line = await asyncio.gather(
+            _load_family(), _load_focus(), _load_mood(), _load_upcoming_dates(), _load_drift(),
+        )
+
+        if relations:
+            context["known_family"].update(relations["family"])
+            context["known_people"].update(relations["people"])
+        if focus_ctx:
+            context["current_focus"] = focus_ctx
+        if mood_trend:
+            context["recent_mood"] = mood_trend
+        if upcoming_dates:
+            context["relationship_reminders"] = upcoming_dates
+        if drift_line:
+            context["interest_drift"] = drift_line
 
         # Wellbeing trend (WB1) — gentler than mood: only surfaced once every
         # few days (should_nudge_wellbeing), never every single turn.
