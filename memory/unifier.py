@@ -1477,6 +1477,48 @@ class MemoryUnifier:
         hits = await self.get_facts(entity=entity, attribute=attribute, limit=1, newest_first=True)
         return hits[0] if hits else None
 
+    async def correct_fact(self, entity: str, attribute: str, new_value: str,
+                           *, old_value: str | None = None) -> dict[str, Any]:
+        """Conversational correction (U5): "no, Leslie's birthday is the 14th".
+
+        Previously a correction just wrote a SECOND fact, leaving two
+        contradictory rows that search would surface side by side. This
+        supersedes the old value properly: the prior fact(s) are removed, the
+        new one is stored as `stated` (Marcus said it) with the superseded value
+        recorded as evidence — so the correction itself is auditable rather than
+        silently overwriting history."""
+        await self.initialize()
+        new_value = (new_value or "").strip()
+        if not entity or not attribute or not new_value:
+            return {"ok": False, "error": "missing_fields"}
+
+        prior = [r for r in await self.get_facts(entity=entity, attribute=attribute, limit=25)
+                 if (old_value is None or r.value.strip().lower() == old_value.strip().lower())]
+        removed = 0
+        if prior:
+            ids = [str(r.id) for r in prior]
+            try:
+                removed = await self._sqlite.delete_facts_by_ids(ids)
+                self._search_gen += 1
+                if self._chroma is not None:
+                    try:
+                        await self._chroma.delete_ids(ids)
+                    except Exception:
+                        pass
+            except Exception as e:  # noqa: BLE001
+                logger.debug("correction_delete_failed", error=str(e)[:160])
+
+        was = ", ".join(r.value for r in prior[:3]) if prior else ""
+        await self.add_fact(
+            entity=entity, attribute=attribute, value=new_value, confidence=0.95,
+            source="user", verification_status="stated",
+            evidence=(f"corrected by Marcus (was: {was})" if was else "stated by Marcus as a correction"),
+        )
+        BUS.publish("memory.corrected", {"entity": entity, "attribute": attribute,
+                                         "was": clip(was, 80), "now": clip(new_value, 80)})
+        return {"ok": True, "entity": entity, "attribute": attribute,
+                "previous": was or None, "now": new_value, "superseded": removed}
+
     # ── Provenance (#19): confirm / re-verify ────────────────────────────────
 
     async def confirm_fact(self, fact_id: str, *, evidence: str | None = None) -> None:
