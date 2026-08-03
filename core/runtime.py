@@ -1558,7 +1558,7 @@ class RuntimeManager:
                 return f"Yes. Your name is {name_fact.value.strip()}.", [], "smalltalk"
             return "I don't know your name yet. Tell me your name and I'll remember it.", [], "smalltalk"
 
-        stated_name = _extract_user_name(text)
+        stated_name = _extract_user_name(text) or await self._llm_slot("name", text)
         if stated_name:
             return f"Okay. I'll remember your name as {stated_name}.", [], "smalltalk"
 
@@ -1566,7 +1566,7 @@ class RuntimeManager:
             return _format_clock_reply(text), [], "smalltalk"
 
         if "weather" in text.lower():
-            city = _extract_weather_city(text)
+            city = _extract_weather_city(text) or await self._llm_slot("weather", text)
             if city:
                 call = ToolCall(name="weather.current", args={"city": city, "units": "imperial"})
                 res = await self._router.execute(call, timeout_s=10.0, retries=0)
@@ -1612,7 +1612,7 @@ class RuntimeManager:
 
             return f"I could not find a map result for {place_query} right now.", tool_calls, "smalltalk"
 
-        local_destination = _extract_destination_from_here(text)
+        local_destination = _extract_destination_from_here(text) or await self._llm_slot("destination", text)
         if local_destination is not None or (_FROM_HERE_RE.search(text) and " to " in text.lower()):
             destination = local_destination or text
             # Always ask where he's starting from (never silently assume the
@@ -1632,6 +1632,49 @@ class RuntimeManager:
             return await self._run_route(origin, destination, mode)
 
         return None
+
+    # ── U7: LLM slot extraction, only where the regexes actually miss ────────
+    # The precise patterns above are a FAST PATH and stay first — they cost
+    # nothing and handle the common phrasings. But they fail silently on
+    # anything nobody wrote a pattern for ("my name is marcus" in lowercase,
+    # "what's the best way over to Chipotle").
+    #
+    # These broad triggers say "this message IS about a name / weather / a
+    # destination". If a broad trigger fires but the precise regex returned
+    # nothing, the message is almost certainly that intent phrased unusually —
+    # and only THEN is a model call worth making. Ordinary turns never pay for
+    # one, and a model failure just leaves the previous behavior.
+    _SLOT_TRIGGERS = {
+        "name": re.compile(r"\b(?:my name|call me|i'?m called|name'?s)\b", re.IGNORECASE),
+        "weather": re.compile(r"\b(?:weather|forecast|temperature)\b", re.IGNORECASE),
+        "destination": re.compile(
+            r"\b(?:get to|way to|way over to|head to|drive to|route to|directions?|navigate)\b", re.IGNORECASE),
+    }
+    _SLOT_FIELDS = {
+        "name": {"name": "the name this person is telling you to call them (just the name)"},
+        "weather": {"city": "the city or place they want the weather for (just the place)"},
+        "destination": {"destination": "the place they want directions TO (just the place)"},
+    }
+
+    async def _llm_slot(self, kind: str, text: str) -> str | None:
+        """Fill a slot the fast path missed, or return None."""
+        trigger = self._SLOT_TRIGGERS.get(kind)
+        if trigger is None or not trigger.search(text or ""):
+            return None
+        understanding = getattr(self, "_understanding", None)
+        if understanding is None or not getattr(understanding, "available", False):
+            return None
+        try:
+            got = await understanding.extract(text, fields=self._SLOT_FIELDS[kind])
+        except Exception:
+            return None
+        value = str(next(iter(got.values()), "") if got else "").strip().strip('"').strip()
+        # A slot is a short noun phrase. A sentence means the model misread the
+        # request, and acting on that is worse than falling through.
+        if not value or len(value) > 60 or len(value.split()) > 8:
+            return None
+        logger.info("slot_recovered_by_llm", kind=kind, value=value[:40])
+        return value
 
     async def _try_tool_assist(self, user_text: str) -> tuple[str, list[dict]]:
         """Pre-call live tools (weather, directions) so the LLM gets real data."""
