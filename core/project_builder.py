@@ -129,6 +129,83 @@ class ProjectBuilder:
         self._models = models
         self._active: dict[str, asyncio.Task] = {}
 
+    # ── Test-first repair (U8) ──────────────────────────────────────────────
+    # The flappy-bird failure taught the lesson this implements: the run check
+    # proves a program STARTS, never that it WORKS. A window frozen on frame one
+    # starts perfectly. So when Marcus reports a bug, don't just regenerate code
+    # and claim victory — first write a check that REPRODUCES the bug, prove it
+    # fails, then fix until it passes.
+    #
+    # The critical subtlety: a check that passes BEFORE the fix is a BAD check
+    # (it doesn't detect the reported problem). That is reported honestly rather
+    # than treated as success, because "the test passed" would otherwise mean
+    # nothing at all.
+
+    async def write_repro_check(self, slug: str, path: Path, complaint: str,
+                                source_files: list[str]) -> str | None:
+        """Ask for a standalone script that FAILS while the reported bug exists.
+        Returns the relative path of the check, or None if one couldn't be made."""
+        listing = "\n".join(f"- {f}" for f in source_files[:8]) or "(none)"
+        excerpt = ""
+        for rel in source_files[:2]:
+            try:
+                excerpt += f"\n--- {rel} ---\n{(path / rel).read_text(encoding='utf-8')[:4000]}\n"
+            except Exception:
+                continue
+        code = await self._llm_file(
+            f"Marcus reports this problem with the project `{slug}`:\n\"{complaint}\"\n\n"
+            f"Files:\n{listing}\n{excerpt}\n\n"
+            "Write a STANDALONE Python check script that FAILS (exits non-zero) while that exact problem "
+            "exists, and passes once it is fixed. Requirements:\n"
+            "- import the project's module(s) WITHOUT running any GUI main loop\n"
+            "- if the code is a GUI/tk app, drive it headlessly: create the object, call the relevant "
+            "methods, advance timers/state manually, and ASSERT the behavior Marcus described\n"
+            "- never call mainloop(); never wait on real user input; finish in under 10 seconds\n"
+            "- print what it observed, then sys.exit(0) on pass or sys.exit(1) on fail\n"
+            "Reply with ONLY the file content in a single fenced code block."
+        )
+        if self._looks_like_failed_generation(code):
+            return None
+        rel = "nova_check.py"
+        (path / rel).write_text(code, encoding="utf-8")
+        return rel
+
+    async def run_repro_check(self, path: Path, rel: str, timeout_s: float = 20.0) -> tuple[bool, str]:
+        """(passed, output). Passing = exit code 0."""
+        import subprocess
+        import sys as _sys
+
+        def _run() -> tuple[bool, str]:
+            try:
+                proc = subprocess.run(
+                    [_sys.executable, rel], cwd=str(path), capture_output=True,
+                    text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                return False, "check timed out (it hung — treated as a failure)"
+            except Exception as e:  # noqa: BLE001
+                return False, f"could not run the check: {e}"[:400]
+            out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            return proc.returncode == 0, out[-1500:]
+
+        return await asyncio.to_thread(_run)
+
+    @staticmethod
+    def summarize_repair(reproduced: bool | None, passed_after: bool | None) -> str:
+        """The honest one-liner. Never claims a fix that wasn't demonstrated."""
+        if reproduced is None:
+            return ("I couldn't write a check for that, so I changed the code but have NOT verified it "
+                    "actually fixes what you described — please run it and tell me.")
+        if not reproduced:
+            return ("I wrote a check for that, but it PASSED before I changed anything — so it isn't "
+                    "capturing the problem you're seeing. I made the change, but treat it as unverified "
+                    "and tell me more about what you observe.")
+        if passed_after:
+            return ("I wrote a check that reproduced the problem (it failed), then fixed until that check "
+                    "PASSES. That's verified, not assumed.")
+        return ("I wrote a check that reproduced the problem, but I could NOT get it to pass. The bug is "
+                "still there — I haven't fixed it.")
+
     def active_projects(self) -> set[str]:
         """Slugs with a build/improve task still running — used to refuse
         deleting a project out from under an in-flight build."""

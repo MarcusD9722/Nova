@@ -200,6 +200,15 @@ export default function App() {
     } catch {}
   }, [conversationId]);
   const [thinking, setThinking] = useState(false);
+  // U8: current project-build stage ("writing: main.py"), or "" when idle.
+  const [buildProgress, setBuildProgress] = useState("");
+  // The status poller below runs on an interval with empty deps, so it would
+  // capture buildProgress at mount. Mirror it into a ref (same pattern as
+  // thinkingRef) so the interval always reads the current stage.
+  const buildProgressRef = useRef("");
+  useEffect(() => {
+    buildProgressRef.current = buildProgress;
+  }, [buildProgress]);
   const thinkingRef = useRef(false);
   useEffect(() => {
     thinkingRef.current = thinking;
@@ -1582,7 +1591,7 @@ export default function App() {
         setCoreStatus((prev) => ({
           ...prev,
           status: gpuActive ? "online" : "offline",
-          statusText: gpuActive ? "Online" : "Idle",
+          statusText: buildProgressRef.current || (gpuActive ? "Online" : "Idle"),
           model: modelName,
           contextLength: ctxTokens ? `${ctxTokens.toLocaleString()} tokens` : "Unknown",
           gpu: gpu?.available && gpu?.name ? gpu.name : String(status?.model?.enforcement?.status || "unknown").replace(/_/g, " "),
@@ -1630,6 +1639,30 @@ export default function App() {
       enqueueTts(URL.createObjectURL(blob));
     } catch {}
   };
+
+  // U8: live build progress. `project.progress` events already fired for every
+  // stage but nothing rendered them, so a multi-minute build looked like total
+  // silence — which is what made the flappy-bird session so opaque. Show the
+  // current stage in the status line, and clear it when the build ends.
+  useEffect(() => {
+    if (!novaEvents?.length) return;
+    let latest = null;
+    for (const ev of novaEvents) {
+      if (ev.type === "project.progress" || ev.type === "project.completed" || ev.type === "project.error") {
+        latest = ev;
+      }
+    }
+    if (!latest) return;
+
+    if (latest.type !== "project.progress") {
+      setBuildProgress("");   // build finished (or failed) — stop showing a stage
+      return;
+    }
+    const d = latest.data || {};
+    const stage = String(d.stage || "").replace(/_/g, " ").trim();
+    if (!stage) return;
+    setBuildProgress(d.file ? `${stage}: ${d.file}` : stage);
+  }, [novaEvents]);
 
   // Bus-event side effects (project reports, reminders, screen-look
   // requests) live in hooks/useNovaBusEffects.js — extracted in Phase 0.6.
