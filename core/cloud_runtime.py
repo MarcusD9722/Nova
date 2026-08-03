@@ -25,6 +25,7 @@ Non-negotiables baked in here:
 
 import json
 import os
+from datetime import datetime
 from typing import Any, AsyncIterator, Callable
 
 import httpx
@@ -160,6 +161,58 @@ class CloudRuntime:
         self._last_error: str = ""
         self._calls = 0
         self._fallbacks = 0
+        # Spend tracking (U6). Every build now hits a paid API; without this
+        # there is no visibility and no ceiling, so a runaway loop could spend
+        # real money silently. Counters reset at the local-day boundary.
+        self._day = datetime.now().strftime("%Y-%m-%d")
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._capped = False
+
+    def _roll_day(self) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._day:
+            self._day = today
+            self._prompt_tokens = 0
+            self._completion_tokens = 0
+            self._capped = False
+
+    @property
+    def _daily_cap(self) -> int:
+        try:
+            return int(os.getenv("NOVA_CLOUD_DAILY_TOKEN_CAP", "0") or 0)
+        except ValueError:
+            return 0
+
+    def _over_cap(self) -> bool:
+        cap = self._daily_cap
+        if cap <= 0:
+            return False
+        return (self._prompt_tokens + self._completion_tokens) >= cap
+
+    def _record_usage(self, data: dict[str, Any]) -> None:
+        """Pull token counts out of a provider response (shapes differ)."""
+        self._roll_day()
+        usage = data.get("usage") or {}
+        # openai: prompt_tokens/completion_tokens · anthropic: input_tokens/output_tokens
+        self._prompt_tokens += int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        self._completion_tokens += int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        if self._over_cap() and not self._capped:
+            self._capped = True
+            logger.warning("cloud_daily_cap_reached", cap=self._daily_cap,
+                           tokens=self._prompt_tokens + self._completion_tokens)
+            BUS.publish("cloud.capped", {"cap": self._daily_cap,
+                                         "tokens": self._prompt_tokens + self._completion_tokens})
+
+    def estimated_cost_usd(self) -> float:
+        """Rough spend estimate from configurable per-1M-token rates. Clearly an
+        ESTIMATE — the provider's own billing is the source of truth."""
+        try:
+            in_rate = float(os.getenv("NOVA_CLOUD_COST_PER_MTOK_IN", "0") or 0)
+            out_rate = float(os.getenv("NOVA_CLOUD_COST_PER_MTOK_OUT", "0") or 0)
+        except ValueError:
+            return 0.0
+        return round(self._prompt_tokens / 1e6 * in_rate + self._completion_tokens / 1e6 * out_rate, 4)
 
     # ── config (re-read each call so .env edits apply on restart only) ──
     @property
@@ -180,7 +233,10 @@ class CloudRuntime:
 
     @property
     def available(self) -> bool:
-        return bool(cloud_enabled() and self._api_key and self.model)
+        # Over the daily token cap counts as unavailable, so the normal (and
+        # already well-tested) local-fallback path handles it — no new branch.
+        self._roll_day()
+        return bool(cloud_enabled() and self._api_key and self.model and not self._over_cap())
 
     def status(self) -> dict[str, Any]:
         """Operator-visible state. Never includes the key."""
@@ -193,6 +249,15 @@ class CloudRuntime:
             "calls": self._calls,
             "fallbacks_to_local": self._fallbacks,
             "last_error": self._last_error or None,
+            "today": {
+                "day": self._day,
+                "prompt_tokens": self._prompt_tokens,
+                "completion_tokens": self._completion_tokens,
+                "total_tokens": self._prompt_tokens + self._completion_tokens,
+                "estimated_cost_usd": self.estimated_cost_usd(),
+                "daily_token_cap": self._daily_cap or None,
+                "cap_reached": self._capped,
+            },
         }
 
     # ── firewall ──
@@ -244,8 +309,14 @@ class CloudRuntime:
                    thinking: bool = False) -> str:
         kw = {"max_tokens": max_tokens, "temperature": temperature, "stop": stop, "thinking": thinking}
         if not self.available:
-            why = "cloud disabled" if not cloud_enabled() else (
-                "NOVA_CLOUD_API_KEY not set" if not self._api_key else "NOVA_CLOUD_MODEL not set")
+            if self._over_cap():
+                why = f"daily token cap reached ({self._prompt_tokens + self._completion_tokens}/{self._daily_cap})"
+            elif not cloud_enabled():
+                why = "cloud disabled"
+            elif not self._api_key:
+                why = "NOVA_CLOUD_API_KEY not set"
+            else:
+                why = "NOVA_CLOUD_MODEL not set"
             return await self._fallback_chat(why, messages, **kw)
         try:
             safe, scrub = self._prepare(messages)
@@ -261,6 +332,8 @@ class CloudRuntime:
             return await self._fallback_chat(f"{type(e).__name__}: {e}"[:200], messages, **kw)
 
         self._calls += 1
+        if isinstance(data, dict):
+            self._record_usage(data)
         text = adapter.parse(data if isinstance(data, dict) else {})
         logger.info("cloud_call", provider=self.provider, model=self.model,
                     sent_messages=len(safe), firewall=scrub.summary())

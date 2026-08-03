@@ -89,6 +89,32 @@ async def main():
                          memory=None, models=BrokenRouter())
     check(pb4._handle("coder")[0] is local, "router failure falls back to local (build never breaks)")
 
+    # ── U6: file generation fans out, bounded by the MODEL's own semaphore ──
+    # A cloud handle (4 permits) runs them concurrently; the local 1-permit GPU
+    # handle re-serializes. Same code path, no branching — the semaphore travels
+    # with the model, which is what makes parallel builds safe for free.
+    class SlowLLM:
+        def __init__(self):
+            self.now = 0
+            self.max = 0
+
+        async def chat(self, messages, **kw):
+            self.now += 1
+            self.max = max(self.max, self.now)
+            await asyncio.sleep(0.02)
+            self.now -= 1
+            return "x"
+
+    async def fan_out(permits: int) -> int:
+        llm = SlowLLM()
+        pb = ProjectBuilder(projects_dir=Path("."), llm=llm,
+                            llm_semaphore=asyncio.Semaphore(permits), memory=None)
+        await asyncio.gather(*(pb._llm_file(f"file {i}") for i in range(4)))
+        return llm.max
+
+    check(await fan_out(4) > 1, "4-permit (cloud) handle -> file generation runs CONCURRENTLY")
+    check(await fan_out(1) == 1, "1-permit (GPU) handle -> re-serializes, unchanged locally")
+
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)
 
