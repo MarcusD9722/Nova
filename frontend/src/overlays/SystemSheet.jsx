@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Cpu, Thermometer, MemoryStick, Gauge, Eye, Mic2, Volume2, PlugZap, RefreshCw } from "lucide-react";
+import { Cpu, Thermometer, MemoryStick, Gauge, Eye, Mic2, Volume2, PlugZap, RefreshCw, Cloud, Coins } from "lucide-react";
 
 function apiUrl(path) {
   try {
@@ -123,6 +123,52 @@ export default function SystemSheet({ liveEvents = [], eventsConnected = false }
           ) : (
             <Row icon={Cpu} label="GPU telemetry" value={gpu?.error || "Unavailable"} ok={false} />
           )}
+
+          {/* Cloud model + spend (U6). Only shown when cloud routing is on, so
+              a fully-local setup sees no extra noise. */}
+          {status?.cloud?.enabled ? (
+            <>
+              <div className="text-[10px] uppercase tracking-[0.24em] text-nova-gold/50 pt-2">Cloud model</div>
+              <Row
+                icon={Cloud}
+                label="Routing"
+                value={
+                  status.cloud.configured
+                    ? `${status.cloud.model} via ${status.cloud.provider}`
+                    : status.cloud.last_error || "Enabled but not configured"
+                }
+                ok={status.cloud.configured ? true : false}
+              />
+              <Row
+                icon={Gauge}
+                label="Calls today"
+                value={`${status.cloud.calls ?? 0} cloud · ${status.cloud.fallbacks_to_local ?? 0} fell back to local`}
+                ok={(status.cloud.fallbacks_to_local ?? 0) === 0 ? true : undefined}
+              />
+              {status.cloud.today ? (
+                <Row
+                  icon={Coins}
+                  label="Tokens today"
+                  value={
+                    `${(status.cloud.today.total_tokens ?? 0).toLocaleString()}` +
+                    (status.cloud.today.estimated_cost_usd
+                      ? ` · ~$${status.cloud.today.estimated_cost_usd.toFixed(2)} est.`
+                      : "") +
+                    (status.cloud.today.daily_token_cap
+                      ? ` · cap ${status.cloud.today.daily_token_cap.toLocaleString()}`
+                      : "")
+                  }
+                  ok={status.cloud.today.cap_reached ? false : undefined}
+                />
+              ) : null}
+              {status.cloud.today?.cap_reached ? (
+                <Row icon={Coins} label="Daily cap" value="Reached — now using the local model" ok={false} />
+              ) : null}
+              {status.cloud.last_error && status.cloud.configured ? (
+                <Row icon={PlugZap} label="Last cloud error" value={status.cloud.last_error} ok={false} />
+              ) : null}
+            </>
+          ) : null}
 
           <div className="text-[10px] uppercase tracking-[0.24em] text-nova-gold/50 pt-2">Subsystems</div>
           <Row icon={Eye} label="Vision" value={status?.vision?.enabled ? "Ready" : status?.vision?.reason || "Not configured"} ok={status?.vision?.enabled ? true : undefined} />

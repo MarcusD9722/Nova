@@ -399,8 +399,17 @@ class ProjectBuilder:
                 log_lines=[f"Planned {len(files)} file(s): " + ", ".join(f["path"] for f in files)],
             )
 
-            # 2) Generate each file
+            # 2) Generate each file — CONCURRENTLY (U6).
+            #
+            # Generation is pure (prompt -> text) and the files don't depend on
+            # each other, so they fan out. Concurrency is bounded by the MODEL's
+            # own semaphore, which means this needs no tuning and no branching:
+            # routed to cloud it runs NOVA_CLOUD_CONCURRENCY at a time; routed
+            # locally the same code re-serializes on the 1-permit GPU semaphore,
+            # exactly as before. Writing stays sequential and in plan order so
+            # the on-disk result is deterministic.
             written: list[str] = []
+            planned: list[tuple[str, Path, str]] = []
             for spec in files:
                 rel = spec["path"].replace("\\", "/").lstrip("/")
                 if ".." in rel.split("/"):
@@ -408,9 +417,7 @@ class ProjectBuilder:
                 target = (path / rel).resolve()
                 if not str(target).startswith(str(path)):
                     continue
-
-                BUS.publish("project.progress", {"project": slug, "stage": "writing", "file": rel})
-                file_prompt = (
+                planned.append((rel, target, (
                     f"Write the COMPLETE contents of `{rel}` for this project.\n"
                     f"Project request: {brief}\n"
                     f"Plan summary: {summary}\n"
@@ -421,13 +428,22 @@ class ProjectBuilder:
                     "calculations) in small functions that run without a live window or network, so they "
                     "can be unit-tested. Keep the entry point under `if __name__ == \"__main__\":`. "
                     "Reply with ONLY the file content inside a single fenced code block."
-                )
-                content = await self._llm_file(file_prompt)
+                )))
+
+            async def _generate(rel: str, prompt: str) -> str:
+                BUS.publish("project.progress", {"project": slug, "stage": "writing", "file": rel})
+                content = await self._llm_file(prompt)
                 if self._looks_like_failed_generation(content):
                     # Retry once — the first attempt likely got truncated mid-reasoning.
-                    content = await self._llm_file(file_prompt)
+                    content = await self._llm_file(prompt)
                 if self._looks_like_failed_generation(content):
                     raise RuntimeError(f"generation for {rel} came back empty/incomplete")
+                BUS.publish("project.progress", {"project": slug, "stage": "wrote", "file": rel})
+                return content
+
+            contents = await asyncio.gather(*(_generate(rel, prompt) for rel, _, prompt in planned))
+
+            for (rel, target, _), content in zip(planned, contents):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
                 written.append(rel)
