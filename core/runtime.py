@@ -105,8 +105,26 @@ _TO_DESTINATION_PATTERNS = [
     re.compile(r"\bhow\s+do\s+i\s+get\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
     re.compile(r"\bdirections?\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
     re.compile(r"\bhow\s+long\s+will\s+it\s+take(?:\s+to\s+get)?\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
-    re.compile(r"\b(?:get|go|drive|walk|navigate|head)\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
+    # ANCHORED to the start of the message (after an optional address/politeness
+    # lead). Unanchored, this matched ANY mid-sentence "go to": "we are about to
+    # go to sleep" extracted "sleep" as a destination and Nova offered to route
+    # Marcus there. A real navigation request leads with the verb; a declarative
+    # about your evening does not.
+    re.compile(
+        r"^(?:\s*(?:hey\s+)?nova[,:\s]+)?"
+        r"(?:(?:can|could|would)\s+you\s+|please\s+|let'?s\s+)?"
+        r"(?:get|go|drive|walk|navigate|head)\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\btake\s+me\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
 ]
+
+# Things you "go to" that are not places on a map. Defense in depth behind the
+# anchoring above — a routing offer for one of these is always wrong.
+_NON_DESTINATIONS = {
+    "sleep", "bed", "rest", "work out", "sleep now", "bed now",
+    "the bathroom", "bathroom", "town",
+}
 _NAME_QUERY_RE = re.compile(
     r"\b(?:do\s+you\s+know\s+my\s+name|what\s+is\s+my\s+name|who\s+am\s+i)\b",
     re.IGNORECASE,
@@ -177,7 +195,9 @@ def _extract_destination_from_here(text: str) -> str | None:
         match = pattern.search(text)
         if match:
             destination = match.group(1).strip(" .,!?")
-            return destination or None
+            if not destination or destination.lower() in _NON_DESTINATIONS:
+                return None
+            return destination
     return None
 
 
