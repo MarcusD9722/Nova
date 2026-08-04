@@ -16,6 +16,7 @@ from core.dates import parse_reminder_time
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from core.tool_router import ToolCall, ToolRouter
+from core.workers.lifecycle import stop_worker
 from memory.unifier import MemoryUnifier
 
 logger = get_logger(__name__)
@@ -60,12 +61,7 @@ class ReminderWorker:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except Exception:
-                pass
+        await stop_worker(self._task, name="reminders")
 
     async def _run(self) -> None:
         await self._memory.initialize()

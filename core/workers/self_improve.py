@@ -34,6 +34,7 @@ from core.orchestrator.benchmarks import compute_benchmark_report
 from core.orchestrator.internal_state import InternalStateInputs, derive_internal_state
 from core.orchestrator.metrics import MetricsCollector
 from core.policy._json_extract import extract_first_json_object
+from core.workers.lifecycle import stop_worker
 from memory.unifier import MemoryUnifier
 
 logger = get_logger(__name__)
@@ -102,13 +103,9 @@ class SelfImproveWorker:
         self._stop.set()
         if self._bus_q is not None:
             BUS.unsubscribe(self._bus_q)
-        for t in (self._capture_task, self._improve_task):
-            if t:
-                t.cancel()
-                try:
-                    await asyncio.wait_for(t, timeout=5.0)
-                except Exception:
-                    pass
+        for t, label in ((self._capture_task, "self-improve-capture"),
+                         (self._improve_task, "self-improve-loop")):
+            await stop_worker(t, name=label)
 
     def set_enabled(self, value: bool) -> None:
         self._enabled = bool(value)

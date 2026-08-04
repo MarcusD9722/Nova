@@ -125,6 +125,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_AGENT_TICK_S", "float", "1", "Goal supervisor tick seconds."),
         _s("NOVA_AGENT_MAX_STEPS", "int", "6", "Max tool steps per chat turn."),
         _s("NOVA_SELF_IMPROVE_INTERVAL_S", "float", "1800", "Self-improve cycle interval."),
+        _s("NOVA_WORKER_STOP_GRACE_S", "float", "3", "Seconds a background worker gets to finish its current step at shutdown before it is cancelled. Cancelling mid-write loses the write and leaks aiosqlite's non-daemon connection thread (see core/workers/lifecycle.py)."),
         _s("NOVA_RESEARCH", "bool", "0", "Enable the autonomous research worker (periodic web search→summarize→cite into the world model). OFF by default: makes network calls (#9)."),
         _s("NOVA_RESEARCH_INTERVAL_S", "float", "3600", "Autonomous research cycle interval (seconds)."),
         _s("NOVA_RESUME_BACKGROUND_TASKS", "bool", "0", "Resume queued autonomy tasks on boot."),

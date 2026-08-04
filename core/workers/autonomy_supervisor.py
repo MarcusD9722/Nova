@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from core.logging_setup import get_logger
 from core.policy.autonomy_planner import AutonomyPlannerLLM
 from core.tool_router import ToolCall, ToolRouter
+from core.workers.lifecycle import stop_worker
 from memory.unifier import MemoryUnifier
 
 
@@ -42,12 +43,7 @@ class AutonomySupervisorWorker:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except Exception:
-                pass
+        await stop_worker(self._task, name="autonomy-supervisor")
 
     async def _run(self) -> None:
         await self._memory.initialize()

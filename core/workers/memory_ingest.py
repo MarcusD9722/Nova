@@ -9,6 +9,7 @@ from core.logging_setup import get_logger
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
 from core.conversation_state import ConversationStateStore
+from core.workers.lifecycle import stop_worker
 from memory.unifier import MemoryUnifier
 
 
@@ -51,12 +52,10 @@ class MemoryIngestWorker:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except Exception:
-                pass
+        # Graceful first: this worker writes turns to SQLite, and cancelling it
+        # mid-transaction both loses the write and leaks aiosqlite's non-daemon
+        # connection thread (see core/workers/lifecycle.py).
+        await stop_worker(self._task, name="memory-ingest")
 
     async def _run(self) -> None:
         await self._memory.initialize()
