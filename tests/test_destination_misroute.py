@@ -4,13 +4,17 @@
 "Happy to route you to sleep — where are you starting from?" because the
 directions pattern matched any mid-sentence "go to". Chatting about your
 evening is not a navigation request.
+
+This suite pins the extraction PATTERN. `tests/test_it_navigation.py` pins the
+same rule end to end on a booted backend — a pattern that is right in
+isolation can still be reached in the wrong order.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.runtime import _extract_destination_from_here as extract
+from core.capabilities.navigation import extract_destination_from_here as extract
 
 _fail = False
 

@@ -24,6 +24,7 @@ from core.policy.storyteller import StorytellerLLM, is_story_request, story_syst
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.intent import is_question
+from core.capabilities.navigation import Navigation, extract_directions
 from core.project_builder import (
     ProjectBuilder,
     BUILD_ACTION_RE,
@@ -84,47 +85,6 @@ _WEATHER_CITY_RE = re.compile(
 _WEATHER_CITY_LEAD_RE = re.compile(
     r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+weather\b',
 )
-_DIRS_KEYWORD_RE = re.compile(
-    r'\b(?:directions?|route|navigate|how\s+(?:do\s+i\s+)?(?:get|go)|how\s+far)\b',
-    re.IGNORECASE,
-)
-_DIRS_FROM_TO_RE = re.compile(
-    r'\bfrom\b\s+(.+?)\s+\bto\b\s+(.+?)(?:\s+\bby\b\s+(\w+))?(?:\?|$)',
-    re.IGNORECASE,
-)
-_FROM_HERE_RE = re.compile(r"\b(?:from\s+here|from\s+my\s+location|near\s+me|around\s+me)\b", re.IGNORECASE)
-_NEAREST_QUERY_RE = re.compile(r"\b(?:nearest|closest)\s+(.+?)(?:\?|$)", re.IGNORECASE)
-_PLACE_LOOKUP_PATTERNS = [
-    re.compile(r"\bwhere\s+is\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
-    re.compile(r"\bwhere's\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
-    re.compile(r"\bfind\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
-    re.compile(r"\blocate\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
-    re.compile(r"\bshow\s+me\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
-]
-_TO_DESTINATION_PATTERNS = [
-    re.compile(r"\bhow\s+do\s+i\s+get\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
-    re.compile(r"\bdirections?\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
-    re.compile(r"\bhow\s+long\s+will\s+it\s+take(?:\s+to\s+get)?\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
-    # ANCHORED to the start of the message (after an optional address/politeness
-    # lead). Unanchored, this matched ANY mid-sentence "go to": "we are about to
-    # go to sleep" extracted "sleep" as a destination and Nova offered to route
-    # Marcus there. A real navigation request leads with the verb; a declarative
-    # about your evening does not.
-    re.compile(
-        r"^(?:\s*(?:hey\s+)?nova[,:\s]+)?"
-        r"(?:(?:can|could|would)\s+you\s+|please\s+|let'?s\s+)?"
-        r"(?:get|go|drive|walk|navigate|head)\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\btake\s+me\s+to\b\s+(.+?)(?:\s+\bfrom\s+here\b|\?|$)", re.IGNORECASE),
-]
-
-# Things you "go to" that are not places on a map. Defense in depth behind the
-# anchoring above — a routing offer for one of these is always wrong.
-_NON_DESTINATIONS = {
-    "sleep", "bed", "rest", "work out", "sleep now", "bed now",
-    "the bathroom", "bathroom", "town",
-}
 _NAME_QUERY_RE = re.compile(
     r"\b(?:do\s+you\s+know\s+my\s+name|what\s+is\s+my\s+name|who\s+am\s+i)\b",
     re.IGNORECASE,
@@ -143,111 +103,6 @@ def _extract_weather_city(text: str) -> str | None:
     if m:
         return m.group(1).strip()
     return None
-
-
-def _extract_directions(text: str) -> tuple[str, str, str] | None:
-    if not _DIRS_KEYWORD_RE.search(text):
-        return None
-    m = _DIRS_FROM_TO_RE.search(text)
-    if not m:
-        return None
-    origin = m.group(1).strip().rstrip(" ,.")
-    dest = m.group(2).strip().rstrip(" ,.")
-    mode_raw = (m.group(3) or "driving").strip().lower()
-    valid = {"driving", "walking", "bicycling", "transit"}
-    mode = mode_raw if mode_raw in valid else "driving"
-    # Guard against overly long/garbage extractions
-    if len(origin.split()) > 6 or len(dest.split()) > 6:
-        return None
-    return origin, dest, mode
-
-
-def _extract_nearest_query(text: str) -> str | None:
-    match = _NEAREST_QUERY_RE.search(text)
-    if not match:
-        return None
-    query = match.group(1).strip(" .,!?")
-    query = re.sub(r"^(?:the|a|an)\s+", "", query, flags=re.IGNORECASE)
-    query = re.sub(r"\b(?:to\s+me|near\s+me|around\s+me|from\s+here)\b.*$", "", query, flags=re.IGNORECASE).strip(" .,!?")
-    return query or None
-
-
-def _extract_place_lookup_query(text: str) -> str | None:
-    for pattern in _PLACE_LOOKUP_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        query = match.group(1).strip(" .,!?")
-        query = re.sub(r"\b(?:nearby|near\s+me|around\s+me|from\s+here)\b.*$", "", query, flags=re.IGNORECASE).strip(" .,!?")
-        if not query:
-            return None
-        lowered = query.lower()
-        if lowered.startswith(("the nearest ", "nearest ", "the closest ", "closest ")):
-            return None
-        if lowered in {"it", "this", "that", "there"}:
-            return None
-        return query
-    return None
-
-
-def _extract_destination_from_here(text: str) -> str | None:
-    for pattern in _TO_DESTINATION_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            destination = match.group(1).strip(" .,!?")
-            if not destination or destination.lower() in _NON_DESTINATIONS:
-                return None
-            return destination
-    return None
-
-
-def _current_coords_text(current_location: dict[str, Any] | None) -> str | None:
-    if not current_location:
-        return None
-    try:
-        lat = float(current_location.get("lat"))
-        lng = float(current_location.get("lng"))
-    except Exception:
-        return None
-    return f"{lat},{lng}"
-
-
-_USE_DEVICE_LOCATION_RE = re.compile(
-    r"\b(?:use\s+my\s+(?:current\s+)?location|my\s+(?:current\s+)?location|from\s+here|near\s+me|around\s+me|current\s+location|where\s+i\s+am)\b",
-    re.IGNORECASE,
-)
-_LOCATION_ANSWER_ABORT = {"no", "nope", "nevermind", "never mind", "cancel", "forget it", "stop", "no thanks"}
-
-
-def _wants_device_location(text: str) -> bool:
-    return bool(_USE_DEVICE_LOCATION_RE.search(text or ""))
-
-
-_READ_STEPS_RE = re.compile(
-    r"\b(?:read|say|tell\s+me|give\s+me|what\s+are)\b.{0,30}\b(?:steps|directions|turn[\s-]?by[\s-]?turn|route|them)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_location_answer(text: str) -> bool:
-    """Heuristic: is this short message plausibly the user answering 'where are
-    you?' with a place/address, rather than a new question or command? Lenient
-    — geocoding rejects genuine garbage, so we only bail on clear non-answers."""
-    t = (text or "").strip().lower()
-    if not t or t in _LOCATION_ANSWER_ABORT:
-        return False
-    if re.match(r"^(what|who|when|why|how|can you|could you|please|make|build|create|remind|set|play|open the|show me the)\b", t):
-        return False
-    return len(t.split()) <= 12
-
-
-def _looks_like_place_search_term(text: str) -> bool:
-    candidate = (text or "").strip()
-    if not candidate or len(candidate.split()) > 6:
-        return False
-    if re.search(r"\d", candidate):
-        return False
-    return True
 
 
 def _looks_like_time_query(text: str) -> bool:
@@ -318,18 +173,6 @@ def _format_weather_reply(city: str, payload: dict[str, Any]) -> str:
     return f"Right now in {city}, it is {temp} degrees Fahrenheit with {description}. Humidity is {humidity}%."
 
 
-def _format_directions_reply(payload: dict[str, Any]) -> str:
-    origin = str(payload.get("origin") or "the starting point").strip()
-    destination = str(payload.get("destination") or "the destination").strip()
-    distance = str(payload.get("distance") or "unknown distance").strip()
-    duration = str(payload.get("duration") or "unknown travel time").strip()
-    mode = str(payload.get("mode") or "driving").strip().lower()
-    base = f"From {origin} to {destination}, it is about {distance} and takes around {duration} by {mode}."
-    if payload.get("steps"):
-        base += " I've got the full route on the map — want me to read the turn-by-turn, or scan the QR to send it to your phone?"
-    return base
-
-
 @dataclass
 class ChatTurnResult:
     conversation_id: UUID
@@ -357,6 +200,11 @@ class RuntimeManager:
         self._router = router
 
         self._llm_sem = asyncio.Semaphore(1)
+
+        # Capabilities (U10). Self-contained things Nova can DO, each owning
+        # its own patterns, state and replies. RuntimeManager stays the
+        # coordinator: it decides the ORDER they get a look at a message.
+        self._navigation = Navigation(router=router, memory=memory)
 
         # ModelRouter (Phase 2.4 + U2). The local model on its single GPU
         # semaphore is the DEFAULT for every role — chat, memory and decisions
@@ -1420,129 +1268,6 @@ class RuntimeManager:
             out.append(vv)
         return out
 
-    # ── Maps: "always ask" location flow (WS-C) ─────────────────────────────
-    # Per Marcus's choice, Nova never silently assumes his location for a
-    # nearby/route request — she asks (or takes an explicit "use my current
-    # location"), remembers the pending request, and completes it once he
-    # answers. State is a short-lived session fact so it survives the turn
-    # boundary without touching the conversation-state plumbing.
-
-    async def _set_pending_map(self, data: dict[str, Any]) -> None:
-        payload = {**data, "ts": _now().isoformat()}
-        await self._memory.add_fact(
-            entity="session", attribute="pending_map_request", value=json.dumps(payload), confidence=1.0
-        )
-
-    async def _get_pending_map(self) -> dict[str, Any] | None:
-        f = await self._memory.get_latest_fact(entity="session", attribute="pending_map_request")
-        if not f or not f.value:
-            return None
-        try:
-            data = json.loads(f.value)
-            ts = datetime.fromisoformat(str(data.get("ts", "")))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
-        if (_now() - ts).total_seconds() > 300:  # expire stale pending requests (5 min)
-            return None
-        return data
-
-    async def _clear_pending_map(self) -> None:
-        await self._memory.add_fact(
-            entity="session", attribute="pending_map_request", value="", confidence=1.0
-        )
-
-    async def _run_nearby(self, query: str, lat: Any, lng: Any) -> tuple[str, list[dict[str, Any]], str]:
-        call = ToolCall(name="maps.places_nearby", args={"query": query, "lat": lat, "lng": lng, "limit": 6})
-        res = await self._router.execute(call, timeout_s=15.0, retries=0)
-        tool_calls = [{"tool": call.name, "ok": res.ok, "error": res.error, "result": res.result}]
-        if res.ok and isinstance(res.result, dict) and res.result.get("places"):
-            top = res.result["places"][0]
-            name = str(top.get("name") or "that place").strip()
-            address = str(top.get("address") or "").strip()
-            dist = top.get("distance_meters")
-            miles = f" ({round(float(dist) / 1609.344, 1)} mi away)" if isinstance(dist, (int, float)) else ""
-            where = f" at {address}" if address else ""
-            return (
-                f"Closest {query}: {name}{where}{miles}. I put the options on the map — tap one and I'll route you there.",
-                tool_calls, "smalltalk",
-            )
-        return f"I couldn't find any {query} near there right now.", tool_calls, "smalltalk"
-
-    async def _run_route(self, origin: str, destination: str, mode: str = "driving") -> tuple[str, list[dict[str, Any]], str]:
-        call = ToolCall(name="maps.directions", args={"origin": origin, "destination": destination, "mode": mode})
-        res = await self._router.execute(call, timeout_s=15.0, retries=0)
-        tool_calls = [{"tool": call.name, "ok": res.ok, "error": res.error, "result": res.result}]
-        if res.ok and isinstance(res.result, dict) and res.result.get("status") == "OK":
-            await self._save_last_route(res.result)
-            return _format_directions_reply(res.result), tool_calls, "smalltalk"
-        return f"I couldn't pull directions to {destination} right now.", tool_calls, "smalltalk"
-
-    async def _save_last_route(self, route: dict[str, Any]) -> None:
-        """Remember the last route's steps so Nova can read the turn-by-turn
-        aloud on request (WS-D desktop narration)."""
-        steps = [
-            str(s.get("instruction") or "").strip()
-            for s in (route.get("steps") or [])
-            if str(s.get("instruction") or "").strip()
-        ]
-        if not steps:
-            return
-        payload = {"destination": route.get("destination"), "steps": steps[:25], "ts": _now().isoformat()}
-        await self._memory.add_fact(entity="session", attribute="last_route", value=json.dumps(payload), confidence=1.0)
-
-    async def _get_last_route(self) -> dict[str, Any] | None:
-        f = await self._memory.get_latest_fact(entity="session", attribute="last_route")
-        if not f or not f.value:
-            return None
-        try:
-            data = json.loads(f.value)
-            ts = datetime.fromisoformat(str(data.get("ts", "")))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
-        if (_now() - ts).total_seconds() > 1800:  # 30 min freshness
-            return None
-        return data
-
-    async def _dispatch_pending_map(
-        self, pending: dict[str, Any], *, lat: Any, lng: Any, coords_text: str
-    ) -> tuple[str, list[dict[str, Any]], str] | None:
-        kind = pending.get("kind")
-        if kind == "nearest":
-            return await self._run_nearby(str(pending.get("query") or ""), lat, lng)
-        if kind == "route":
-            return await self._run_route(coords_text, str(pending.get("dest") or ""), str(pending.get("mode") or "driving"))
-        return None
-
-    async def _resolve_pending_map(
-        self, pending: dict[str, Any], text: str, current_location: dict[str, Any] | None
-    ) -> tuple[str, list[dict[str, Any]], str] | None:
-        # (a) explicit opt-in to device location
-        if _wants_device_location(text):
-            if current_location is None:
-                return ("I don't have a device location right now — what's your address or city?", [], "smalltalk")
-            await self._clear_pending_map()
-            return await self._dispatch_pending_map(
-                pending, lat=current_location.get("lat"), lng=current_location.get("lng"),
-                coords_text=_current_coords_text(current_location) or "",
-            )
-        # (b) not a location answer -> abandon the pending request, let normal handling take over
-        if not _looks_like_location_answer(text):
-            await self._clear_pending_map()
-            return None
-        # (c) treat the message as a stated location -> geocode it
-        geo = await self._router.execute(ToolCall(name="maps.geocode", args={"address": text}), timeout_s=15.0, retries=0)
-        loc = (geo.result or {}).get("location") if (geo.ok and isinstance(geo.result, dict)) else None
-        if not loc or loc.get("lat") is None or loc.get("lng") is None:
-            return (f"I couldn't find '{text}' on the map — can you give me a city or a full address?", [], "smalltalk")
-        await self._clear_pending_map()
-        return await self._dispatch_pending_map(
-            pending, lat=loc["lat"], lng=loc["lng"], coords_text=f"{loc['lat']},{loc['lng']}"
-        )
-
     async def _direct_live_reply(
         self,
         user_text: str,
@@ -1553,24 +1278,13 @@ class RuntimeManager:
         if not text:
             return None
 
-        coords_text = _current_coords_text(current_location)
-
-        # Resolve a pending "where are you?" from a prior maps request first.
-        pending_map = await self._get_pending_map()
-        if pending_map is not None:
-            resolved = await self._resolve_pending_map(pending_map, text, current_location)
-            if resolved is not None:
-                return resolved
-
-        # "Read me the turn-by-turn" for the most recent route (WS-D narration).
-        if _READ_STEPS_RE.search(text):
-            last = await self._get_last_route()
-            if last and last.get("steps"):
-                steps = last["steps"]
-                dest = str(last.get("destination") or "your destination").strip()
-                spoken = " ".join(f"Step {i + 1}: {s}." for i, s in enumerate(steps[:12]))
-                more = f" That's the first 12 of {len(steps)} steps." if len(steps) > 12 else ""
-                return f"Here's the route to {dest}. {spoken}{more}", [], "smalltalk"
+        # An unanswered "where are you starting from?" (or a "read me the
+        # turn-by-turn") owns this message and runs BEFORE anything else —
+        # see core/capabilities/navigation.py for why the capability has two
+        # entry points rather than one.
+        resolved = await self._navigation.resolve_pending(text, current_location=current_location)
+        if resolved is not None:
+            return resolved
 
         if _looks_like_name_query(text):
             name_fact = await self._memory.get_latest_fact(entity="user", attribute="name")
@@ -1595,63 +1309,8 @@ class RuntimeManager:
                     return _format_weather_reply(city, res.result), tool_calls, "smalltalk"
                 return f"I could not pull the live weather for {city} right now.", tool_calls, "smalltalk"
 
-        nearest_query = _extract_nearest_query(text)
-        if nearest_query is not None:
-            # Always ask where to search from (never silently assume the device
-            # location) unless Marcus explicitly opts into it.
-            if _wants_device_location(text) and current_location is not None:
-                return await self._run_nearby(nearest_query, current_location.get("lat"), current_location.get("lng"))
-            await self._set_pending_map({"kind": "nearest", "query": nearest_query})
-            return (
-                f"Sure — where should I look for the nearest {nearest_query}? Give me a city or address, "
-                "or say 'use my current location'.",
-                [], "smalltalk",
-            )
-
-        place_query = _extract_place_lookup_query(text)
-        if place_query is not None:
-            tool_calls: list[dict[str, Any]] = []
-
-            place_call = ToolCall(name="maps.place_search", args={"query": place_query, "limit": 6})
-            place_res = await self._router.execute(place_call, timeout_s=15.0, retries=0)
-            tool_calls.append({"tool": place_call.name, "ok": place_res.ok, "error": place_res.error, "result": place_res.result})
-            if place_res.ok and isinstance(place_res.result, dict) and place_res.result.get("places"):
-                top = place_res.result["places"][0]
-                name = str(top.get("name") or place_query).strip()
-                address = str(top.get("address") or "").strip()
-                if address:
-                    return f"I found {name} at {address}. I opened it on the map.", tool_calls, "smalltalk"
-                return f"I found {name}. I opened it on the map.", tool_calls, "smalltalk"
-
-            geocode_call = ToolCall(name="maps.geocode", args={"address": place_query})
-            geocode_res = await self._router.execute(geocode_call, timeout_s=15.0, retries=0)
-            tool_calls.append({"tool": geocode_call.name, "ok": geocode_res.ok, "error": geocode_res.error, "result": geocode_res.result})
-            if geocode_res.ok and isinstance(geocode_res.result, dict) and geocode_res.result.get("formatted_address"):
-                address = str(geocode_res.result.get("formatted_address") or place_query).strip()
-                return f"I found {place_query} at {address}. I opened it on the map.", tool_calls, "smalltalk"
-
-            return f"I could not find a map result for {place_query} right now.", tool_calls, "smalltalk"
-
-        local_destination = _extract_destination_from_here(text)
-        if local_destination is not None or (_FROM_HERE_RE.search(text) and " to " in text.lower()):
-            destination = local_destination or text
-            # Always ask where he's starting from (never silently assume the
-            # device location) unless he explicitly opts into it.
-            if _wants_device_location(text) and current_location is not None and coords_text is not None:
-                return await self._run_route(coords_text, destination)
-            await self._set_pending_map({"kind": "route", "dest": destination, "mode": "driving"})
-            return (
-                f"Happy to route you to {destination} — where are you starting from? A city or address, "
-                "or say 'use my current location'.",
-                [], "smalltalk",
-            )
-
-        dirs = _extract_directions(text)
-        if dirs:
-            origin, destination, mode = dirs
-            return await self._run_route(origin, destination, mode)
-
-        return None
+        # Nearest / place lookup / destination / directions.
+        return await self._navigation.handle(text, current_location=current_location)
 
     async def _try_tool_assist(self, user_text: str) -> tuple[str, list[dict]]:
         """Pre-call live tools (weather, directions) so the LLM gets real data."""
@@ -1674,7 +1333,7 @@ class RuntimeManager:
                     )
 
         # ── Directions ───────────────────────────────────────────────────────
-        dirs = _extract_directions(user_text)
+        dirs = extract_directions(user_text)
         if dirs:
             origin, destination, mode = dirs
             call = ToolCall(name="maps.directions", args={"origin": origin, "destination": destination, "mode": mode})
