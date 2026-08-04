@@ -5,7 +5,7 @@ import json
 from core.llm_runtime import LLMRuntime
 from core.logging_setup import get_logger
 from core.policy._json_extract import extract_first_json_object
-from core.policy.contracts import MemoryExtractorOutput
+from core.policy.contracts import MemoryExtractorOutput, MemoryFact
 
 
 logger = get_logger(__name__)
@@ -41,8 +41,26 @@ class MemoryExtractorLLM:
         obj = extract_first_json_object(raw)
         if not obj:
             return MemoryExtractorOutput(facts=[])
-        try:
-            return MemoryExtractorOutput.model_validate(obj)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("memory_extractor_invalid", error=str(e), raw=raw[:400])
+
+        # Validate facts INDIVIDUALLY. Validating the batch meant one
+        # unsupported attribute ("favorite_color") discarded every good fact
+        # beside it — "my wife is Leslie and my son is Mateo and my favorite
+        # colour is blue" remembered NOTHING, silently, at debug level. A
+        # single junk entry is a normal small-model slip; losing the whole
+        # message over it is not acceptable.
+        raw_facts = obj.get("facts")
+        if not isinstance(raw_facts, list):
+            logger.debug("memory_extractor_no_facts_list", raw=raw[:400])
             return MemoryExtractorOutput(facts=[])
+
+        kept: list[MemoryFact] = []
+        dropped = 0
+        for item in raw_facts:
+            try:
+                kept.append(MemoryFact.model_validate(item))
+            except Exception as e:  # noqa: BLE001
+                dropped += 1
+                logger.debug("memory_extractor_fact_dropped", error=str(e)[:200], item=str(item)[:200])
+        if dropped:
+            logger.info("memory_extractor_partial", kept=len(kept), dropped=dropped)
+        return MemoryExtractorOutput(facts=kept)
