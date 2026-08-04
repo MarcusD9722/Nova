@@ -90,7 +90,14 @@ class MemoryUnifier:
         self._write_lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._initialized = False
+        # The WARNING is once-only (a broken index would otherwise spam every
+        # write), but the failures themselves must stay countable — otherwise
+        # semantic recall degrades permanently after one buried log line and
+        # nothing ever says so again. semantic_index_health() surfaces this.
         self._chroma_degraded_logged = False
+        self._chroma_failures = 0
+        self._chroma_writes = 0
+        self._chroma_last_error = ""
         # Bumped on every long-term write/delete; part of the search cache key
         # so fresh facts are recallable immediately instead of after the TTL.
         self._search_gen = 0
@@ -109,6 +116,24 @@ class MemoryUnifier:
         self._query_expander: Any | None = None
         # Optional LLM phrasing helper (U4). None = hardcoded templates.
         self._expression: Any | None = None
+
+    def semantic_index_health(self) -> dict[str, Any]:
+        """Honest state of the Chroma index for /status.
+
+        Chroma writes are best-effort by design (SQLite is the source of
+        truth), which means a broken index cannot break memory — but it also
+        means nothing surfaces the breakage. This does: a non-zero `failures`
+        says semantic recall is degraded even though every fact was saved.
+        """
+        if self._chroma is None:
+            return {"enabled": False, "reason": "chroma disabled for this instance"}
+        return {
+            "enabled": True,
+            "degraded": self._chroma_failures > 0,
+            "writes_ok": self._chroma_writes,
+            "failures": self._chroma_failures,
+            "last_error": self._chroma_last_error or None,
+        }
 
     def set_query_expander(self, expander: Any | None) -> None:
         """Install an `async (query, terms) -> list[str]` term expander."""
@@ -199,7 +224,10 @@ class MemoryUnifier:
             return
         try:
             await self._chroma.upsert_text(doc_id=doc_id, text=text, metadata=metadata)
+            self._chroma_writes += 1
         except Exception as e:  # noqa: BLE001
+            self._chroma_failures += 1
+            self._chroma_last_error = str(e)[:300]
             if not self._chroma_degraded_logged:
                 self._chroma_degraded_logged = True
                 logger.warning("chroma_unavailable_semantic_index_degraded", error=str(e)[:300])

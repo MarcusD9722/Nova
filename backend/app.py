@@ -1019,7 +1019,7 @@ async def _stt_transcribe(upload: UploadFile) -> SttResponse:
         in_path = Path(td) / f"in{suffix}"
         out_path = Path(td) / "out.wav"
         data = await upload.read()
-        in_path.write_bytes(data)
+        await asyncio.to_thread(in_path.write_bytes, data)
 
         cmd = [
             ffmpeg,
@@ -1035,7 +1035,15 @@ async def _stt_transcribe(upload: UploadFile) -> SttResponse:
             str(out_path),
         ]
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            # ffmpeg ran DIRECTLY on the event loop here, for up to 60s. While a
+            # voice clip decoded, nothing else in Nova could make progress —
+            # no chat, no token streaming, no WS events, no workers. The decode
+            # itself is fine; doing it on the loop was not.
+            await asyncio.to_thread(
+                lambda: subprocess.run(
+                    cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60
+                )
+            )
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"ffmpeg_decode_failed: {e}") from e
 
@@ -1188,7 +1196,7 @@ async def _shutdown() -> None:
         except Exception:
             pass
     if STATE.tts_voice_cache_dir is not None:
-        shutil.rmtree(STATE.tts_voice_cache_dir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, STATE.tts_voice_cache_dir, ignore_errors=True)
 
 
 @app.get("/health")
@@ -1265,6 +1273,11 @@ async def status() -> dict:
             "model": os.getenv("NOVA_STT_MODEL_SIZE", "base"),
         },
         "integrations": _plugin_config_status(),
+        # Chroma writes are best-effort so a broken index can never break
+        # memory — which also meant a degraded index was invisible after one
+        # log line. `degraded: true` here says recall is impaired even though
+        # every fact was still saved to SQLite.
+        "semantic_index": (STATE.memory.semantic_index_health() if STATE.memory is not None else {}),
         "tools": tools,
         "models": (STATE.runtime.models.describe() if STATE.runtime is not None else {}),
         # Which roles are remote vs local, plus cloud state (never the API key).
@@ -1615,7 +1628,10 @@ async def file_upload(files: list[UploadFile] = File(...)) -> dict:
         data = await f.read()
         stored_name = f"{uuid4().hex}_{name}"
         out = upload_dir / stored_name
-        out.write_bytes(data)
+        # Upload size is caller-controlled and unbounded, so this write does
+        # not belong on the event loop — a large attachment would stall chat,
+        # streaming and every worker for its duration.
+        await asyncio.to_thread(out.write_bytes, data)
         stored.append(
             {
                 "name": name,
