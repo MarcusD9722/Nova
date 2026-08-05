@@ -80,6 +80,27 @@ architecture (structure, isolation, interfaces) more than features.
 | **D11** | **Memory gaps vs. spec.** No cross-memory relationships (graph), no decay/recency weighting at retrieval, no consolidation (observed: many near-duplicate lessons), confidence stored but never updated. | live DB observation | Phase 1 |
 | **D12** | Minor: orphaned `PrinterSheet.jsx`; 3 redundant drag/resize libs; self-improve proposes "fixes" for config-state errors (observed with OAuth-not-connected). | prior audits | Phase 0/3 cleanups |
 
+### Addendum — 2026-08-03 (U10)
+
+The measurements above are as of 2026-07-18 and are left intact. Two rows moved:
+
+**D2 gained a missing category, not just files.** The suite was rigorous but
+every one of its 46 suites ran against fakes — 0 booted a backend. Two bugs
+reached Marcus through a fully green run. `tests/harness.py` now boots the real
+`backend.app` (temp root, scripted model, no network) and four `test_it_*.py`
+suites drive real turns. On their first run they surfaced four defects that unit
+tests structurally could not see: a shutdown sequence that aborted halfway, a
+leaked non-daemon aiosqlite thread that stopped the process from ever exiting, a
+pending map request that hijacked the following turn, and a maps failure that
+reported the wrong cause. Detail: `docs/NEXT_SESSION.md`.
+
+**D3 started shrinking by strangler, not by mechanical split.** `runtime.py` is
+2,209 → 1,868 lines; navigation now lives in `core/capabilities/navigation.py`
+with its own patterns, state and replies. `RuntimeManager` keeps the ORDER
+decision — that ordering is behavior, so the capability exposes two entry points
+rather than one. Weather and identity/clock are the next two, one per commit,
+each behind the integration suites.
+
 ## 4. Target architecture
 
 ### 4.1 The honest constraint that shapes everything

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 class _StrictModel(BaseModel):
@@ -10,6 +10,19 @@ class _StrictModel(BaseModel):
     # In practice, local models often add harmless extra keys; ignore them
     # instead of hard-failing into fallback behavior.
     model_config = ConfigDict(extra="ignore")
+
+
+# "mom"/"dad" are accepted from the model because that is how people talk, but
+# NOTHING downstream reads them: grounding, the singleton-supersession set in
+# memory/unifier.py, and every get_latest_fact call all use "mother"/"father".
+# Stored raw, such a fact was written successfully and then never found again —
+# a memory that silently disappears. Normalized at the contract boundary so
+# there is exactly one spelling past this point.
+#
+# Module-level, NOT a class attribute: pydantic v2 turns a leading-underscore
+# class attribute into a ModelPrivateAttr, so `cls._ALIASES.get(...)` raises
+# and every fact gets dropped.
+_ATTRIBUTE_ALIASES = {"mom": "mother", "dad": "father"}
 
 
 class MemoryFact(_StrictModel):
@@ -32,6 +45,13 @@ class MemoryFact(_StrictModel):
     value: str
     confidence: float = Field(ge=0.0, le=1.0)
     persist: bool = True
+
+    @field_validator("attribute", mode="before")
+    @classmethod
+    def _canonical_attribute(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return _ATTRIBUTE_ALIASES.get(v.strip().lower(), v)
+        return v
 
 
 class TaskToEnqueue(_StrictModel):

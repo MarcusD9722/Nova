@@ -135,7 +135,7 @@ flagged, and swappable.
 | **Memory** | `memory/` — unifier facade over SQLite + Chroma + diskcache + JSON; graph, world model, thoughts, provenance |
 | **World/Action** | `plugins/` (weather, maps, discord, calendar, gmail, web), `core/computer_control.py`, `core/code_intel.py`, permissions |
 | **Services** | `core/workers/` background loops (memory ingest, self-improve/reflection, reminders, autonomy + goal supervisors, research) |
-| **Kernel** | GPU-enforced LLM runtime, config catalog, event bus, API auth |
+| **Kernel** | GPU-enforced LLM runtime, config catalog, event bus, API auth, shared GPU permit (`core/gpu.py`), foreground turn priority (`core/turn_gate.py`) |
 
 ### Repo layout
 
@@ -143,6 +143,7 @@ flagged, and swappable.
 | --- | --- |
 | `backend/` | FastAPI entry package (API routers, SSE chat, voice endpoints) |
 | `core/` | Brain: runtime, tool loop, orchestrator, workers, dev mode, permissions, policies |
+| `core/capabilities/` | Self-contained things Nova can *do*, one module each (navigation so far), extracted from `runtime.py` one at a time |
 | `memory/` | Memory engines + unifier (SQLite is the source of truth) |
 | `plugins/` | Tool integrations (auto-register at startup) |
 | `frontend/` | React/Vite/Electron desktop UI |
@@ -152,7 +153,7 @@ flagged, and swappable.
 | `projects/` | Projects Nova builds autonomously |
 | `tools/` | Isolated services (imagegen), avatar pipeline, setup scripts |
 | `docs/` | Architecture, roadmaps, contributing |
-| `tests/` + `run_tests.ps1` | Offline test suites + runner |
+| `tests/` + `run_tests.ps1` | 61 suites + runner (`harness.py` boots a real backend for the `test_it_*` ones) |
 
 ---
 
@@ -197,6 +198,13 @@ memory_data/
 - **World model** (general knowledge) is kept *separate* from your personal graph, so
   "who's connected to Marcus" never returns "Python is a programming language."
 - **Private thoughts** persist across sessions and are surfaced only on request.
+- **Degradation is visible.** Chroma writes are best-effort so a broken index can never
+  break memory — which also meant a degraded index was invisible after one log line.
+  `/status` now reports `semantic_index`: `degraded: true` says recall is impaired even
+  though every fact still reached SQLite.
+- **Background ingest yields to you.** Fact extraction and summarization share the one
+  GPU permit with your reply, so they wait while a turn is in flight rather than making
+  you queue behind them (`core/turn_gate.py`).
 
 You can inspect and manage all of this from the desktop app's **Memory** and **Knowledge
 Graph** panels, or via the `/memory/*` endpoints.
@@ -306,6 +314,24 @@ of the Next-Gen feature flags (all default **on** except where noted):
 | `NOVA_COMPUTER_CONTROL` | Allow computer actions to actually execute — **off by default** (dry-run otherwise) |
 | `NOVA_DEV_MODE` | Guarded self-editing — **off by default** |
 
+### GPU sharing (read this before changing them)
+
+One physical GPU runs three independent CUDA consumers: llama.cpp, XTTS and the
+embedding model. Nothing coordinated them, and the collision **aborts the backend
+mid-conversation** with `CUDA error: an illegal memory access` from
+`ggml_backend_cuda_synchronize`. Reproduced twice in ten minutes of ordinary speaking
+turns. The defaults below exist because of that; `core/gpu.py` carries the full evidence.
+
+| Flag | Default | Why |
+| --- | --- | --- |
+| `NOVA_TTS_DEVICE` | `cpu` | On `cuda` XTTS is fast (RTF ~0.44) **and crashes the backend**. It can't simply take the GPU semaphore — sentence streaming overlaps synthesis with generation by design, so acquiring it deadlocks. Proper fix is process isolation (the `tools/imagegen/` pattern). |
+| `NOVA_EMBED_DEVICE` | `cpu` | bge-small is 33M params doing background work; the GPU buys almost nothing and its path is synchronous, so it can't take the async semaphore either. |
+| `NOVA_BACKGROUND_YIELD_MAX_S` | `45` | How long background memory work waits for a live turn before proceeding anyway. Bounded so a long conversation can't starve memory ingest. |
+| `NOVA_WORKER_STOP_GRACE_S` | `3` | Seconds a worker gets to finish its current step at shutdown. Cancelling mid-write loses the write and leaks a non-daemon aiosqlite thread. |
+
+Setting `NOVA_TTS_DEVICE=cuda` restores fast speech and the crash with it. That trade-off
+is yours to make; it is documented at the call site in `backend/app.py`.
+
 See `.env.example` for the full, commented list.
 
 ---
@@ -330,7 +356,7 @@ See `.env.example` for the full, commented list.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Liveness + GPU enforcement state (open even with auth on) |
-| `GET /status` | Full status: model, real GPU telemetry (nvidia-smi), subsystems, integrations |
+| `GET /status` | Full status: model, real GPU telemetry (nvidia-smi), subsystems, integrations, `semantic_index` health |
 | `WS /ws/events` | Structured live events (thinking, tools, memory, vision, web, TTS/STT) |
 | `POST /chat`, `POST /chat/stream` | Chat (JSON / SSE stream with optional TTS) |
 | `POST /stt`, `POST /speak` | Whisper transcription / XTTS synthesis |
@@ -349,14 +375,48 @@ See `.env.example` for the full, commented list.
 ## Tests
 
 ```powershell
-.\run_tests.ps1            # all offline suites in tests/
+.\run_tests.ps1            # all 61 suites in tests/
 .\run_tests.ps1 memory     # filtered by name
+.\run_tests.ps1 it_        # just the integration suites
 cd frontend; npm run build # frontend build check
 ```
 
 The offline suite is deterministic and self-verifying (e.g. the config catalog test
 fails if any `NOVA_*` var is used without being cataloged, and migration tests prove your
 database upgrades cleanly).
+
+### Integration tests: the ones that boot a real backend
+
+Unit suites test modules against fakes. That let two bugs reach normal use through a
+fully green run — a routing misroute and a CUDA crash — because *nothing booted the
+thing you actually talk to*.
+
+`tests/harness.py` runs `backend.app`'s own startup for real (memory, tool router,
+RuntimeManager, every worker, the HTTP routes) into a throwaway temp root. The
+`tests/test_it_*.py` suites drive real turns through it.
+
+Exactly three things are substituted, each for a stated reason in the harness docstring:
+**model weights** (a scripted stand-in — loading a 9B per suite would need the GPU
+exclusively and make replies non-deterministic), the **chroma index** (it pulls an
+embedding transformer onto CUDA), and **API keys** (blanked, so no test can reach the
+network with real credentials). Everything else is the real thing.
+
+```powershell
+# Opt-in, spends real money on your cloud key. Requires NOVA_CLOUD_DAILY_TOKEN_CAP.
+$env:NOVA_CLOUD_LIVE=1; .\run_tests.ps1 cloud_live
+```
+
+`test_cloud_live.py` is the only suite that talks to a paid API. It proves the key,
+model and base URL actually work, that `coder`/`planner` really route to the cloud, that
+the context firewall scrubs before egress, and that the daily cap diverts work back to
+local. A full run costs a fraction of a cent.
+
+### A hung suite reports itself
+
+`harness.run()` arms a faulthandler watchdog (`NOVA_IT_WATCHDOG_S`, default 180s) that
+dumps every thread's stack and exits non-zero. A suite that *hangs* stalls the runner
+with nothing to read, which is worse than one that fails — and that watchdog is how a
+leaked aiosqlite thread (which stopped the process from ever exiting) was found.
 
 ---
 
@@ -408,6 +468,14 @@ Nova tells you the truth about what she can't yet do, and so does this README:
 - **Standalone packaging** isn't wired yet (`package.json`'s `dist:win:*` scripts expect a
   PyInstaller build that ships with the always-on phase). Run from source with
   `start_nova.ps1` for now.
+- **Voice is slow, or fast and crashy — pick one.** XTTS shares the GPU with the 9B and
+  the two collide fatally (see *GPU sharing* above). It runs on CPU by default, which is
+  stable but makes a speaking turn noticeably slower than a text one. Running XTTS in its
+  own process is the real fix and isn't built yet.
+- **No audio? Check Windows first.** Nova generating speech and you hearing it are
+  different things. If `/speak` returns a WAV but you hear nothing, the usual cause is
+  the playback device — verify the output you're actually using is enabled and set as
+  default in Windows Sound settings before suspecting Nova.
 
 ---
 

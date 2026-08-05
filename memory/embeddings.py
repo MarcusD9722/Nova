@@ -43,8 +43,16 @@ def _load() -> None:
     from transformers import AutoModel, AutoTokenizer  # type: ignore
 
     model_id = os.getenv("NOVA_EMBED_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
-    requested = (os.getenv("NOVA_EMBED_DEVICE", "auto").strip() or "auto").lower()
-    if requested in {"", "auto"}:
+    # Defaults to CPU, deliberately. This is a 33M-parameter model whose work
+    # happens in the background, so the GPU buys almost nothing — but it is a
+    # THIRD independent CUDA consumer in a process that already runs llama.cpp
+    # and XTTS on the one device, and uncoordinated torch allocations there
+    # abort llama.cpp with an illegal memory access (see core/gpu.py).
+    # Unlike XTTS, this path is synchronous and cannot take the async GPU
+    # semaphore, so keeping it off the device is the honest fix.
+    # NOVA_EMBED_DEVICE=cuda puts it back — reasonable once a second GPU exists.
+    requested = (os.getenv("NOVA_EMBED_DEVICE", "cpu").strip() or "cpu").lower()
+    if requested == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = requested

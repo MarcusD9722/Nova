@@ -691,8 +691,27 @@ def _load_tts_model():
     for _ in range(32):
         try:
             tts = _silent_call(TTS, model_id)
-            requested_device = (os.getenv("NOVA_TTS_DEVICE", "auto").strip() or "auto").lower()
-            if requested_device in {"", "auto"}:
+            # Defaults to CPU, deliberately, and it is a real trade-off.
+            #
+            # On CUDA, XTTS is fast (RTF ~0.44) and ABORTS THE BACKEND. It is a
+            # second uncoordinated CUDA consumer beside llama.cpp, and
+            # synthesizing a sentence while the model generates the next one
+            # kills the process:
+            #   CUDA error: an illegal memory access was encountered
+            #     in ggml_backend_cuda_synchronize (ggml-cuda.cu:3235)
+            # Reproduced twice in ten minutes of ordinary speaking turns; with
+            # XTTS on CPU, ten speaking turns ran clean.
+            #
+            # It cannot simply be serialized on the GPU semaphore: sentence
+            # streaming overlaps synthesis with generation BY DESIGN, and the
+            # SSE handler drains clips mid-stream, so taking the permit here
+            # deadlocks (measured: 195s hang, then access violations on every
+            # later turn). The correct fix is to run XTTS in its own process,
+            # the pattern tools/imagegen/ already uses for GPU isolation.
+            #
+            # NOVA_TTS_DEVICE=cuda restores the fast path, with that crash.
+            requested_device = (os.getenv("NOVA_TTS_DEVICE", "cpu").strip() or "cpu").lower()
+            if requested_device == "auto":
                 target_device = "cuda"
             else:
                 target_device = requested_device
@@ -935,6 +954,17 @@ async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply") -> byte
         return _wav_bytes_from_f32(wav, sr)
 
     started = perf_counter()
+    # NOTE: acquiring core.gpu.GPU_SEM here DEADLOCKS. The reply stream holds
+    # that permit for the whole generation (`async with chat_model.semaphore`
+    # wraps the token loop) while the SSE handler drains TTS clips MID-stream,
+    # so the synthesis it is waiting on can never get the permit. Observed:
+    # a 195s hang, then `access violation reading 0x18` on every later turn.
+    #
+    # Sentence-streamed TTS is *designed* to overlap generation, so it cannot
+    # simply be serialized against it. The real fix is process isolation, the
+    # pattern tools/imagegen/ already uses for exactly this reason. Until then
+    # XTTS runs on CPU by default (see NOVA_TTS_DEVICE) — slower, but it does
+    # not abort llama.cpp. See core/gpu.py for the full evidence.
     audio = await asyncio.to_thread(_run)
     if _should_cache_tts_phrase(text, reason):
         STATE.tts_phrase_cache[cache_key] = audio
@@ -1019,7 +1049,7 @@ async def _stt_transcribe(upload: UploadFile) -> SttResponse:
         in_path = Path(td) / f"in{suffix}"
         out_path = Path(td) / "out.wav"
         data = await upload.read()
-        in_path.write_bytes(data)
+        await asyncio.to_thread(in_path.write_bytes, data)
 
         cmd = [
             ffmpeg,
@@ -1035,7 +1065,15 @@ async def _stt_transcribe(upload: UploadFile) -> SttResponse:
             str(out_path),
         ]
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            # ffmpeg ran DIRECTLY on the event loop here, for up to 60s. While a
+            # voice clip decoded, nothing else in Nova could make progress —
+            # no chat, no token streaming, no WS events, no workers. The decode
+            # itself is fine; doing it on the loop was not.
+            await asyncio.to_thread(
+                lambda: subprocess.run(
+                    cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60
+                )
+            )
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"ffmpeg_decode_failed: {e}") from e
 
@@ -1188,7 +1226,7 @@ async def _shutdown() -> None:
         except Exception:
             pass
     if STATE.tts_voice_cache_dir is not None:
-        shutil.rmtree(STATE.tts_voice_cache_dir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, STATE.tts_voice_cache_dir, ignore_errors=True)
 
 
 @app.get("/health")
@@ -1265,6 +1303,11 @@ async def status() -> dict:
             "model": os.getenv("NOVA_STT_MODEL_SIZE", "base"),
         },
         "integrations": _plugin_config_status(),
+        # Chroma writes are best-effort so a broken index can never break
+        # memory — which also meant a degraded index was invisible after one
+        # log line. `degraded: true` here says recall is impaired even though
+        # every fact was still saved to SQLite.
+        "semantic_index": (STATE.memory.semantic_index_health() if STATE.memory is not None else {}),
         "tools": tools,
         "models": (STATE.runtime.models.describe() if STATE.runtime is not None else {}),
         # Which roles are remote vs local, plus cloud state (never the API key).
@@ -1615,7 +1658,10 @@ async def file_upload(files: list[UploadFile] = File(...)) -> dict:
         data = await f.read()
         stored_name = f"{uuid4().hex}_{name}"
         out = upload_dir / stored_name
-        out.write_bytes(data)
+        # Upload size is caller-controlled and unbounded, so this write does
+        # not belong on the event loop — a large attachment would stall chat,
+        # streaming and every worker for its duration.
+        await asyncio.to_thread(out.write_bytes, data)
         stored.append(
             {
                 "name": name,

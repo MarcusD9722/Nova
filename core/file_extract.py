@@ -29,7 +29,12 @@ def read_limited_bytes(path: Path, max_bytes: int = MAX_BYTES) -> tuple[bytes, b
 
 
 def decode_text_bytes(data: bytes) -> str | None:
-    for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be"):
+    # utf-8-sig FIRST: it strips a BOM when present and is otherwise identical
+    # to utf-8. Ordered the other way round, plain utf-8 matched first and left
+    # the BOM in place, so every BOM'd file (the Windows default for a lot of
+    # editors) carried an invisible ﻿ into chat attachments, indexed
+    # document chunks, and the embeddings built from them.
+    for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be"):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:

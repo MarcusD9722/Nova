@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from core.logging_setup import get_logger
 from core.policy.autonomy_planner import AutonomyPlannerLLM
 from core.tool_router import ToolCall, ToolRouter
+from core.workers.lifecycle import log_worker_error, stop_worker
 from memory.unifier import MemoryUnifier
 
 
@@ -42,21 +43,22 @@ class AutonomySupervisorWorker:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except Exception:
-                pass
+        await stop_worker(self._task, name="autonomy-supervisor")
 
     async def _run(self) -> None:
         await self._memory.initialize()
         while not self._stop.is_set():
+            claimed_id: str | None = None
             try:
                 task = await self._memory.claim_next_task()
                 if not task:
                     await asyncio.sleep(self._tick)
                     continue
+                # Remember what we hold: claim_next_task marks it running, so
+                # anything that throws below would otherwise leave it running
+                # FOREVER — never finished, never retried, and invisible until
+                # the next boot clears stale background work.
+                claimed_id = str(task.get("task_id"))
 
                 # Pace backlog processing: without this, a queue of stale tasks
                 # drains at full speed — one GPU LLM call per task, back to back.
@@ -130,5 +132,15 @@ class AutonomySupervisorWorker:
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
-                logger.exception("autonomy_loop_error", error=str(e))
+                log_worker_error(logger, "autonomy_loop_error", e, task_id=claimed_id or "-")
+                # Release the claim honestly so the task shows as failed rather
+                # than sitting in 'running' for the rest of the session.
+                if claimed_id:
+                    try:
+                        await self._memory.mark_task_done(
+                            task_id=claimed_id,
+                            result={"status": "failed", "error": str(e)[:300]},
+                        )
+                    except Exception as e2:  # noqa: BLE001
+                        log_worker_error(logger, "autonomy_task_release_failed", e2, task_id=claimed_id)
                 await asyncio.sleep(self._tick)

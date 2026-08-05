@@ -144,14 +144,22 @@ class ChromaMemoryBackend:
         )
 
     async def upsert_text(self, doc_id: str, text: str, metadata: dict[str, Any] | None = None) -> None:
-        meta = metadata or {}
+        # chromadb REJECTS an empty metadata dict ("Expected metadata to be a
+        # non-empty dict"), so the signature's own `metadata=None` default used
+        # to raise. It must be passed as None instead. Every current caller
+        # happens to supply metadata, so this was latent — but the signature
+        # advertises the broken call, which is exactly how it becomes live.
+        doc_id = str(doc_id).strip()
+        if not doc_id:
+            return  # a blank id would create an unaddressable phantom row
+        metas = [metadata] if metadata else None
         async with self._lock:
             await asyncio.to_thread(self._ensure)
             await asyncio.to_thread(
                 self._collection.upsert,
-                ids=[str(doc_id)],
+                ids=[doc_id],
                 documents=[str(text)],
-                metadatas=[meta],
+                metadatas=metas,
             )
 
     async def query(self, q: str, limit: int = 10) -> list[dict[str, Any]]:

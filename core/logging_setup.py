@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -87,12 +88,35 @@ def _startup_bullets_processor(_: Any, __: str, event_dict: dict[str, Any]) -> d
     return event_dict
 
 
+def _force_utf8_console() -> None:
+    """Make the console incapable of killing the process on a log line.
+
+    Windows consoles default to cp1252. structlog's ConsoleRenderer and its
+    rich traceback draw box characters (│ ┌ ─ →), so `print()` raises
+    UnicodeEncodeError — and it raises INSIDE whatever except block was doing
+    the logging. Measured consequence: `logger.exception("memory_ingest_failed")`
+    threw out of MemoryIngestWorker._run and killed the task, so one ordinary
+    ingest error stopped ALL long-term memory writes for the rest of the
+    session, silently.
+
+    errors="replace" over errors="strict": a mangled character in a log line is
+    always preferable to losing a background worker.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — a console we can't reconfigure is not fatal
+            pass
+
+
 def setup_logging(level: str = "INFO") -> None:
     """Configure Nova logging.
 
     Defaults to a clean, human-friendly console format. Set NOVA_LOG_FORMAT=json
     to revert to structured JSON logs (useful for log aggregation).
     """
+    _force_utf8_console()
     level = (level or "INFO").upper()
     py_level = getattr(logging, level, logging.INFO)
 

@@ -53,6 +53,32 @@ MEMORY_RECORD_RE = re.compile(r"^\s*(FACT|PERSON|EVENT|FILE)\s+\S", re.MULTILINE
 
 _REDACTED_USER = "[user]"
 _REDACTED_PERSON = "[person]"
+_REDACTED_ADDRESS = "[address]"
+_REDACTED_EMAIL = "[email]"
+_REDACTED_PHONE = "[phone]"
+
+# Contact PII that survives the block-level drop because it can appear inside
+# an otherwise task-shaped message. Verified live: a sentence like "Marcus
+# lives at 9139 Coronal Rings with Leslie" had the NAMES redacted and the
+# STREET ADDRESS sent to the provider intact.
+#
+# These are REDACTIONS, not refusals, on purpose. Refusing would silently
+# disable cloud coding whenever a prompt happened to contain an address, which
+# is a worse failure than sending a placeholder. A model can still write the
+# code around "[address]".
+#
+# Redaction also does not depend on the identity cache, which name redaction
+# does — that cache is only populated by a chat turn's grounding build, so
+# background ProjectBuilder calls can reach the provider with it empty.
+_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Z][A-Za-z'\-]+\s+){0,4}"
+    r"(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd|Court|Ct|"
+    r"Circle|Cir|Way|Trail|Trl|Place|Pl|Parkway|Pkwy|Terrace|Ter|Highway|Hwy|"
+    r"Rings|Ridge|Run|Bend|Crossing|Loop|Square|Sq)\b\.?",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}(?!\d)")
 
 
 @dataclass
@@ -104,6 +130,15 @@ def _redact_names(text: str, user_name: str | None, known_names: list[str] | Non
                        key=lambda s: len(s), reverse=True):
         pattern = re.compile(rf"\b{re.escape(name.strip())}\b", re.IGNORECASE)
         out, n = pattern.subn(_REDACTED_PERSON, out)
+        count += n
+
+    # Contact PII, independent of whether the identity cache was populated.
+    for pattern, placeholder in (
+        (_EMAIL_RE, _REDACTED_EMAIL),      # before phone: an email can contain digits
+        (_ADDRESS_RE, _REDACTED_ADDRESS),
+        (_PHONE_RE, _REDACTED_PHONE),
+    ):
+        out, n = pattern.subn(placeholder, out)
         count += n
     return out, count
 
