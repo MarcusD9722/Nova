@@ -9,7 +9,7 @@ from core.logging_setup import get_logger
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
 from core.conversation_state import ConversationStateStore
-from core.workers.lifecycle import stop_worker
+from core.workers.lifecycle import log_worker_error, stop_worker
 from memory.unifier import MemoryUnifier
 
 
@@ -51,11 +51,27 @@ class MemoryIngestWorker:
         logger.info("memory_ingest_worker_started")
 
     async def stop(self) -> None:
+        # Drain what is already queued BEFORE signalling stop. These are the
+        # most recent things Marcus said; the loop exits at the top once
+        # _stop is set, so anything still queued would be discarded and never
+        # reach long-term memory — invisibly, since the turn itself succeeded.
+        await self._drain_queue_for_shutdown()
         self._stop.set()
         # Graceful first: this worker writes turns to SQLite, and cancelling it
         # mid-transaction both loses the write and leaks aiosqlite's non-daemon
         # connection thread (see core/workers/lifecycle.py).
         await stop_worker(self._task, name="memory-ingest")
+
+    async def _drain_queue_for_shutdown(self, *, budget_s: float = 10.0) -> None:
+        """Wait (briefly) for the in-flight backlog to be ingested."""
+        if self._q.empty() or self._task is None or self._task.done():
+            return
+        try:
+            await asyncio.wait_for(self._q.join(), timeout=budget_s)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("memory_ingest_drain_incomplete", pending=self._q.qsize())
+        except Exception as e:  # noqa: BLE001
+            log_worker_error(logger, "memory_ingest_drain_failed", e)
 
     async def _run(self) -> None:
         await self._memory.initialize()
@@ -71,7 +87,7 @@ class MemoryIngestWorker:
             try:
                 await self._handle_ingest(ev)
             except Exception as e:  # noqa: BLE001
-                logger.exception("memory_ingest_failed", error=str(e))
+                log_worker_error(logger, "memory_ingest_failed", e)
             finally:
                 self._q.task_done()
 
