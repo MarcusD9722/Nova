@@ -10,7 +10,7 @@ from uuid import UUID
 from core.logging_setup import get_logger
 from core.policy._json_extract import extract_first_json_object
 from core.tool_router import ToolCall, ToolRouter
-from core.workers.lifecycle import stop_worker
+from core.workers.lifecycle import log_worker_error, stop_worker
 from core.llm_runtime import LLMRuntime
 from memory.unifier import MemoryUnifier
 
@@ -149,6 +149,7 @@ Return JSON only.
     async def _run_loop(self) -> None:
         await self._memory.initialize()
         while not self._stop.is_set():
+            claimed_id: str | None = None
             try:
                 task = await self._memory.claim_next_goal_task()
                 if not task:
@@ -156,6 +157,12 @@ Return JSON only.
                     continue
 
                 task_id = str(task["task_id"])
+                # claim_next_goal_task marks it running. Anything raising below
+                # (an unknown decision type, a tool name the model left blank,
+                # schema drift) used to fall through to the outer handler,
+                # which logged and slept but never released the claim — the
+                # goal stalled forever with nothing reporting it.
+                claimed_id = task_id
                 goal_id = str(task["goal_id"])
                 project_name = str(task["project_name"])
                 tool_name = str(task["tool_name"])
@@ -224,12 +231,25 @@ Return JSON only.
 
                     raise ValueError(f"Unknown decision type: {t}")
 
-                # Execute a real tool call
+                # Execute a real tool call.
+                #
+                # ToolRouter.execute() NEVER raises — it catches everything and
+                # returns ToolResult(ok=False). This used to be wrapped in a
+                # try/except, which made the entire retry-with-backoff branch
+                # DEAD CODE: max_retries never applied, bump_goal_task_attempt
+                # was never called, and a tool that failed was recorded as
+                # status "done". The goal's own history then read "DONE
+                # <tool>", so the next __decide__ step was told the step had
+                # succeeded. Failure is signalled by `ok`, so that is what is
+                # checked. The except is kept for genuinely unexpected errors.
                 call = ToolCall(name=tool_name, args=args)
                 try:
                     result = await self._router.execute(call, timeout_s=self._cfg.task_timeout_s, retries=1)
-                except Exception as e:
-                    # retry w/ backoff
+                    failure = None if result.ok else (result.error or "tool reported failure")
+                except Exception as e:  # noqa: BLE001 — router contract says this shouldn't happen
+                    result, failure = None, str(e)
+
+                if failure is not None:
                     attempts += 1
                     if attempts <= self._cfg.max_retries:
                         backoff = timedelta(seconds=min(60, 2 ** attempts))
@@ -237,21 +257,30 @@ Return JSON only.
                             task_id=task_id,
                             attempts=attempts,
                             run_after_iso=self._iso(self._now() + backoff),
-                            error=str(e),
+                            error=failure,
                         )
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {e}")
+                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {failure}")
                     else:
-                        await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=str(e))
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="error", message=f"{tool_name} failed: {e}")
+                        await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=failure)
+                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="error", message=f"{tool_name} failed: {failure}")
                     continue
 
                 # Mark tool task done
-                await self._memory.complete_goal_task(task_id=task_id, status="done", result={"ok": result.ok, "data": result.result}, error=result.error or "")
-                await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="tool", message=f"{tool_name} completed" if result.ok else f"{tool_name} error: {result.error}")
+                await self._memory.complete_goal_task(task_id=task_id, status="done", result={"ok": True, "data": result.result}, error="")
+                await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="tool", message=f"{tool_name} completed")
             except Exception as e:
                 # Schema drift during upgrades can cause sqlite OperationalError spam; back off harder.
                 msg = str(e)
-                logger.exception("agent_supervisor_loop_error", error=msg)
+                # log_worker_error, not logger.exception: on a cp1252 console
+                # structlog's traceback renderer raised UnicodeEncodeError from
+                # inside this very handler and killed the supervisor outright.
+                log_worker_error(logger, "agent_supervisor_loop_error", e, task_id=claimed_id or "-")
+                if claimed_id:
+                    try:
+                        await self._memory.complete_goal_task(
+                            task_id=claimed_id, status="failed", result={}, error=msg[:300])
+                    except Exception as e2:  # noqa: BLE001
+                        log_worker_error(logger, "agent_task_release_failed", e2, task_id=claimed_id)
                 if "no such column" in msg and "sqlite" in msg.lower():
                     await asyncio.sleep(max(5.0, self._cfg.tick_seconds * 5))
                 else:
