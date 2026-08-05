@@ -691,8 +691,27 @@ def _load_tts_model():
     for _ in range(32):
         try:
             tts = _silent_call(TTS, model_id)
-            requested_device = (os.getenv("NOVA_TTS_DEVICE", "auto").strip() or "auto").lower()
-            if requested_device in {"", "auto"}:
+            # Defaults to CPU, deliberately, and it is a real trade-off.
+            #
+            # On CUDA, XTTS is fast (RTF ~0.44) and ABORTS THE BACKEND. It is a
+            # second uncoordinated CUDA consumer beside llama.cpp, and
+            # synthesizing a sentence while the model generates the next one
+            # kills the process:
+            #   CUDA error: an illegal memory access was encountered
+            #     in ggml_backend_cuda_synchronize (ggml-cuda.cu:3235)
+            # Reproduced twice in ten minutes of ordinary speaking turns; with
+            # XTTS on CPU, ten speaking turns ran clean.
+            #
+            # It cannot simply be serialized on the GPU semaphore: sentence
+            # streaming overlaps synthesis with generation BY DESIGN, and the
+            # SSE handler drains clips mid-stream, so taking the permit here
+            # deadlocks (measured: 195s hang, then access violations on every
+            # later turn). The correct fix is to run XTTS in its own process,
+            # the pattern tools/imagegen/ already uses for GPU isolation.
+            #
+            # NOVA_TTS_DEVICE=cuda restores the fast path, with that crash.
+            requested_device = (os.getenv("NOVA_TTS_DEVICE", "cpu").strip() or "cpu").lower()
+            if requested_device == "auto":
                 target_device = "cuda"
             else:
                 target_device = requested_device
@@ -935,6 +954,17 @@ async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply") -> byte
         return _wav_bytes_from_f32(wav, sr)
 
     started = perf_counter()
+    # NOTE: acquiring core.gpu.GPU_SEM here DEADLOCKS. The reply stream holds
+    # that permit for the whole generation (`async with chat_model.semaphore`
+    # wraps the token loop) while the SSE handler drains TTS clips MID-stream,
+    # so the synthesis it is waiting on can never get the permit. Observed:
+    # a 195s hang, then `access violation reading 0x18` on every later turn.
+    #
+    # Sentence-streamed TTS is *designed* to overlap generation, so it cannot
+    # simply be serialized against it. The real fix is process isolation, the
+    # pattern tools/imagegen/ already uses for exactly this reason. Until then
+    # XTTS runs on CPU by default (see NOVA_TTS_DEVICE) — slower, but it does
+    # not abort llama.cpp. See core/gpu.py for the full evidence.
     audio = await asyncio.to_thread(_run)
     if _should_cache_tts_phrase(text, reason):
         STATE.tts_phrase_cache[cache_key] = audio

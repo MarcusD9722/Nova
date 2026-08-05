@@ -9,6 +9,7 @@ from core.logging_setup import get_logger
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
 from core.conversation_state import ConversationStateStore
+from core.turn_gate import GATE
 from core.workers.lifecycle import log_worker_error, stop_worker
 from memory.unifier import MemoryUnifier
 
@@ -111,8 +112,16 @@ class MemoryIngestWorker:
         if assistant_text:
             await self._memory.ingest_turn(ev.conversation_id, "assistant", assistant_text)
 
-        # LLM-powered extraction (explicit-only)
+        # LLM-powered extraction (explicit-only).
+        #
+        # Yield to any live turn first. This call and the reply Marcus is
+        # waiting on contend for the SAME 1-permit GPU semaphore, and the
+        # semaphore is fair rather than prioritized — so a turn arriving while
+        # this runs simply waits behind it. Measured: 3.2s and 6.1s for turns
+        # with no background work, 41.2s for one that collided with extraction
+        # plus the summarizer.
         if user_text:
+            await GATE.wait_for_idle(what="memory_extract")
             out = await self._extractor.extract(user_text=user_text)
             for f in out.facts:
                 if not f.persist:
@@ -145,6 +154,11 @@ class MemoryIngestWorker:
             try:
                 transcript = await self._state.recent_chat_text(hint.conversation_id)
                 if transcript:
+                    # Same yield as extraction: summarization is the single
+                    # most expensive background call (a whole transcript) and
+                    # fires every 8 turns, which is exactly the periodic
+                    # "why was THAT one so slow?" spike.
+                    await GATE.wait_for_idle(what="summarize")
                     s = await self._summarizer.summarize(transcript=transcript)
                     if s.summary.strip():
                         # Rolling "right now" summary (singleton, overwrites).

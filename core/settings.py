@@ -89,7 +89,7 @@ CATALOG: dict[str, Setting] = dict(
         # ── Voice ───────────────────────────────────────────────────────────
         _s("NOVA_VOICE_DIR", "path", "voices", "Reference-voice wav directory."),
         _s("NOVA_DEFAULT_VOICE", "str", "", "Default reference voice filename."),
-        _s("NOVA_TTS_DEVICE", "str", "auto", "XTTS device (cuda|auto)."),
+        _s("NOVA_TTS_DEVICE", "str", "cpu", "XTTS device (cpu|cuda|auto). Defaults to CPU: on CUDA, XTTS is a second uncoordinated consumer beside llama.cpp and synthesizing while the model generates aborts the backend with an illegal memory access. Slower, but it does not crash. Proper fix is process isolation (see backend/app.py::_load_tts_engine)."),
         _s("NOVA_TTS_PREWARM", "bool", "0", "Load + warm XTTS at startup."),
         _s("NOVA_TTS_WARMUP_TEXT", "str", "Hello there. I am ready to help.", "Prewarm utterance."),
         _s("NOVA_TTS_SPEED", "float", "1.0", "Base TTS speed multiplier."),
@@ -100,7 +100,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_STT_MODEL_SIZE", "str", "base", "faster-whisper model size."),
         # ── Memory ──────────────────────────────────────────────────────────
         _s("NOVA_EMBED_MODEL", "str", "BAAI/bge-small-en-v1.5", "Embedding model for semantic memory."),
-        _s("NOVA_EMBED_DEVICE", "str", "auto", "Embedding device (cuda|cpu|auto)."),
+        _s("NOVA_EMBED_DEVICE", "str", "cpu", "Embedding device (cuda|cpu|auto). Defaults to CPU: bge-small is tiny and runs in the background, but on GPU it is a third uncoordinated CUDA consumer alongside llama.cpp and XTTS, which aborts llama.cpp with an illegal memory access (see core/gpu.py)."),
         _s("NOVA_SEMANTIC_CACHE", "bool", "1", "Reuse a recent answer when a question means the same thing (embedding similarity). Never caches tool-backed or time-sensitive turns; any memory write invalidates it (U5)."),
         _s("NOVA_SEMANTIC_CACHE_THRESHOLD", "float", "0.95", "Cosine similarity required for a semantic cache hit."),
         _s("NOVA_SEMANTIC_CACHE_TTL_S", "float", "3600", "How long a cached answer stays valid, in seconds."),
@@ -126,6 +126,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_AGENT_MAX_STEPS", "int", "6", "Max tool steps per chat turn."),
         _s("NOVA_SELF_IMPROVE_INTERVAL_S", "float", "1800", "Self-improve cycle interval."),
         _s("NOVA_WORKER_STOP_GRACE_S", "float", "3", "Seconds a background worker gets to finish its current step at shutdown before it is cancelled. Cancelling mid-write loses the write and leaks aiosqlite's non-daemon connection thread (see core/workers/lifecycle.py)."),
+        _s("NOVA_BACKGROUND_YIELD_MAX_S", "float", "45", "How long background GPU work (memory extraction, summarization) waits for a live chat turn to finish before proceeding anyway. They share one 1-permit GPU semaphore, so without this a reply queues behind them (measured: 3-6s turns vs 41s when they collide). The cap stops a long conversation from starving memory ingest entirely."),
         _s("NOVA_RESEARCH", "bool", "0", "Enable the autonomous research worker (periodic web search→summarize→cite into the world model). OFF by default: makes network calls (#9)."),
         _s("NOVA_RESEARCH_INTERVAL_S", "float", "3600", "Autonomous research cycle interval (seconds)."),
         _s("NOVA_RESUME_BACKGROUND_TASKS", "bool", "0", "Resume queued autonomy tasks on boot."),

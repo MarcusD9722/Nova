@@ -22,7 +22,9 @@ from core.policy.summarizer import SummarizerLLM
 from core.policy.storyteller import StorytellerLLM, is_story_request, story_system_prompt
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
-from core.intent import is_question
+from core.intent import is_question, is_purely_conversational
+from core.gpu import GPU_SEM
+from core.turn_gate import GATE
 from core.capabilities.navigation import Navigation, extract_directions
 from core.project_builder import (
     ProjectBuilder,
@@ -197,7 +199,11 @@ class RuntimeManager:
         self._llm = llm
         self._router = router
 
-        self._llm_sem = asyncio.Semaphore(1)
+        # THE process-wide GPU semaphore (core/gpu.py), not a private one:
+        # XTTS and the embedding model take the same permit, because all three
+        # share one physical device and running them concurrently aborts
+        # llama.cpp with an illegal memory access.
+        self._llm_sem = GPU_SEM
 
         # Capabilities (U10). Self-contained things Nova can DO, each owning
         # its own patterns, state and replies. RuntimeManager stays the
@@ -943,7 +949,23 @@ class RuntimeManager:
     # default chat agent's step budget.
     _TOOL_LOOP_MAX = int(os.getenv("NOVA_AGENT_MAX_STEPS", "6").strip() or "6")
 
-    async def chat_turn_stream(
+    async def chat_turn_stream(self, **kwargs):
+        """Async generator for streamed chat.
+
+        Yields dicts:
+          {"type": "token", "text": str}          — response text delta
+          {"type": "done", "full_text": str, "tool_calls": [...]}
+        Deterministic pre-passes yield their full reply as a single token.
+
+        Wrapped so the whole turn is marked in-flight on the shared TurnGate:
+        background memory work then waits rather than holding the one GPU
+        semaphore while Marcus is watching a blank screen.
+        """
+        async with GATE.turn():
+            async for event in self._chat_turn_stream(**kwargs):
+                yield event
+
+    async def _chat_turn_stream(
         self,
         *,
         user_text: str,
@@ -952,13 +974,6 @@ class RuntimeManager:
         project_name: str = "temp",
         current_location: dict[str, Any] | None = None,
     ):
-        """Async generator for streamed chat.
-
-        Yields dicts:
-          {"type": "token", "text": str}          — response text delta
-          {"type": "done", "full_text": str, "tool_calls": [...]}
-        Deterministic pre-passes yield their full reply as a single token.
-        """
         await self._memory.initialize()
         clean_user = (user_text or "").strip()
 
@@ -1123,9 +1138,20 @@ class RuntimeManager:
             BUS.publish("agent.stage", {"stage": "executor"})
 
         # ── Agent loop: reason → act → observe (core/orchestrator/agent.py) ──
-        tool_results = await self._tool_loop.run(
-            agent=loop_agent, user_text=clean_user, grounding=grounding
-        )
+        # Skipped entirely for unambiguously social messages. The loop's first
+        # act is a 900-token *thinking* generation asking "do I need a tool?",
+        # and for "good morning" the answer can only be no — so that call was
+        # pure latency on the most common kind of turn. is_purely_conversational
+        # is an allowlist and vetoes itself on any tool-ish word, so anything
+        # it doesn't positively recognise still gets the full loop.
+        # Deep mode always runs it: it was explicitly asked for.
+        if not deep_mode and is_purely_conversational(clean_user):
+            tool_results = []
+            logger.debug("tool_loop_skipped_conversational", chars=len(clean_user))
+        else:
+            tool_results = await self._tool_loop.run(
+                agent=loop_agent, user_text=clean_user, grounding=grounding
+            )
 
         # ── Streamed final response ─────────────────────────────────────────
         tools_context = ""

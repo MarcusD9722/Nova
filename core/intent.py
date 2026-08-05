@@ -16,7 +16,7 @@ a literal "?" for WH-questions.
 
 import re
 
-__all__ = ["is_question", "strip_preamble"]
+__all__ = ["is_question", "strip_preamble", "is_purely_conversational"]
 
 # Conversational lead-ins that hide a sentence's real shape. Applied repeatedly
 # so "So, Nova, I meant what..." reduces to "what...".
@@ -61,6 +61,103 @@ def strip_preamble(text: str) -> str:
             break
         t = new
     return t or (text or "").strip()
+
+
+# ── "Could any tool possibly help with this?" ───────────────────────────────
+# Every chat turn spends a full 900-token *thinking* generation on the agent
+# loop's "do I need a tool?" decision — including for "good morning", where the
+# answer can only be no. On one 9B that is several seconds of the 30-60s Marcus
+# was waiting.
+#
+# The direction of risk matters here. Wrongly skipping the decider would cost
+# Nova a capability silently (she just wouldn't reach for a tool); wrongly
+# running it only costs the time we already spend. So this is an ALLOWLIST of
+# shapes that are unambiguously social, and anything unrecognised keeps the
+# full tool loop. It is meant to stay narrow.
+
+_CONVERSATIONAL_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:hi|hey|hello|yo|sup|howdy|morning|afternoon|evening)\b"
+    r"|good\s+(?:morning|afternoon|evening|night)\b"
+    r"|(?:good\s?)?night\b|goodbye\b|bye\b|see\s+(?:you|ya)\b|talk\s+(?:to\s+you\s+)?later\b"
+    r"|thanks?\b|thank\s+you\b|ty\b|appreciate\s+(?:it|that)\b"
+    r"|(?:ok|okay|kk|cool|nice|sweet|awesome|great|perfect|sounds\s+good|"
+    r"got\s+it|gotcha|sure|yeah|yep|yup|nope|nah|alright|fine)\b"
+    r"|(?:lol|lmao|haha+|hehe)\b"
+    r"|how\s+(?:are|r)\s+(?:you|u)\b|how'?s\s+it\s+going\b|how\s+have\s+you\s+been\b"
+    r"|what'?s\s+up\b|wassup\b"
+    r"|i'?m\s+(?:good|fine|ok|okay|tired|exhausted|beat|happy|sad|hungry|back|home)\b"
+    r"|(?:long|rough|good|great|tough)\s+day\b"
+    r"|love\s+(?:you|ya)\b|miss\s+(?:you|ya)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Any hint that live data, a file, a person's record, or an action is involved
+# vetoes the fast path even if the message opens conversationally
+# ("hey, what's the weather" must still reach the tool loop).
+_TOOL_SIGNAL_RE = re.compile(
+    r"\b(?:weather|temperature|forecast|rain|snow|time|date|today|tomorrow|tonight|"
+    r"remind|reminder|calendar|schedule|meeting|appointment|email|mail|inbox|"
+    r"search|google|look\s+up|find|lookup|news|price|stock|score|"
+    r"map|maps|directions?|route|navigate|drive|nearest|closest|address|"
+    r"project|build|code|program|script|app|game|file|folder|document|read|write|"
+    r"remember|recall|forget|memory|note|goal|task|todo|"
+    r"discord|message|send|post|play|open|run|execute|install|download|"
+    r"image|picture|photo|screen|camera|generate|draw|"
+    # Trouble words: "I'm tired of this bug in main.py, can you look at it"
+    # opens exactly like smalltalk and is unmistakably work.
+    r"bug|fix|broken|crash|error|failing|debug|look\s+at|check\s+on|"
+    r"who|what|where|when|why|how\s+(?:do|much|many|far|long)|which"
+    r")\b",
+    re.IGNORECASE,
+)
+
+#: A filename is always about work, whatever the sentence around it looks like.
+_FILENAME_RE = re.compile(
+    r"\b[\w\-]+\.(?:py|js|jsx|ts|tsx|json|md|txt|html|css|yaml|yml|sh|ps1|toml|ini|csv|log)\b",
+    re.IGNORECASE,
+)
+
+#: Whole-message social phrases that happen to contain a veto word. "what's
+#: up" is a greeting, not a question about anything. Anchored to the ENTIRE
+#: message, so "what's up with the printer" is untouched and still gets tools.
+_SOCIAL_OVERRIDE_RE = re.compile(
+    r"^(?:"
+    r"what'?s\s+up|whats\s+up|what\s+is\s+up|what'?s\s+new|what'?s\s+good|"
+    r"how\s+are\s+(?:you|ya|u)(?:\s+doing)?|how'?s\s+it\s+going|how\s+have\s+you\s+been|"
+    r"how\s+was\s+your\s+day|what\s+are\s+you\s+up\s+to"
+    r")[\s.,!?]*$",
+    re.IGNORECASE,
+)
+
+#: Longer than this and it is not the kind of throwaway social line this
+#: fast path is for, whatever it opens with.
+_MAX_CONVERSATIONAL_WORDS = 12
+
+
+def is_purely_conversational(text: str) -> bool:
+    """True only when NO registered tool could plausibly help.
+
+    Conservative by construction: returns False for anything it does not
+    positively recognise, so the caller keeps its normal tool-using path.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _SOCIAL_OVERRIDE_RE.match(raw):
+        return True
+
+    core = strip_preamble(raw)
+    if len(core.split()) > _MAX_CONVERSATIONAL_WORDS:
+        return False
+    # Veto on the RAW message, not just the stripped core — a tool word in the
+    # preamble counts.
+    if _TOOL_SIGNAL_RE.search(raw) or _FILENAME_RE.search(raw):
+        return False
+    # Match either form: strip_preamble removes "hey"/"so"/"ok", which are
+    # themselves the greeting in "hey there, I was thinking about you".
+    return bool(_CONVERSATIONAL_RE.match(raw) or _CONVERSATIONAL_RE.match(core))
 
 
 def is_question(text: str) -> bool:
