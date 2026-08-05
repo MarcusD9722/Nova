@@ -4,8 +4,19 @@ from __future__ import annotations
 
 Fed by the self-improvement worker (which subscribes to the event bus), this is
 what lets Nova notice a recurring problem in her own operation and file a fix
-proposal for Marcus. Kept small, bounded, and free of secrets (only event
-payloads, which are already clipped by the bus).
+proposal for Marcus. Kept small, bounded, and scrubbed of secrets.
+
+That last part used to be assumed rather than done: the docstring claimed
+payloads were "free of secrets (only event payloads, already clipped by the
+bus)", but clipping is not redaction. A real entry on this machine read
+
+    Client error '404 Not Found' for url
+    'https://api.openweathermap.org/data/2.5/weather?q=...&appid=52e5e1...'
+
+— the live OpenWeather key, in plaintext. It matters beyond the file itself,
+because the self-improve loop feeds recurring error text to an LLM to diagnose
+it, and roles can be routed to a remote provider. `_redact_secrets` now runs on
+every message and context value before anything is stored.
 """
 
 import asyncio
@@ -26,6 +37,29 @@ _ERROR_HINTS = ("error", "failed", "failure", "exception", "traceback")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Credentials as they actually appear in error text: query-string parameters
+# (the OpenWeather/Maps shape), JSON-ish key/value pairs, and Authorization
+# headers. Kept deliberately broad on the NAME and total on the VALUE.
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(api[_-]?key|appid|app_id|access[_-]?token|auth[_-]?token|"
+               r"token|secret|password|passwd|pwd|client[_-]?secret)"
+               r"(\s*[=:]\s*|=)([^&\s'\"},]+)"),
+    re.compile(r"(?i)\b(bearer|bot)\s+([A-Za-z0-9._\-]{12,})"),
+    re.compile(r"\b(sk-[A-Za-z0-9._\-]{8,})"),          # OpenAI-style keys
+    re.compile(r"\b(AIza[A-Za-z0-9._\-]{20,})"),        # Google API keys
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credentials out of error text before it is stored or shown."""
+    out = str(text or "")
+    out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", out)
+    out = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)} [REDACTED]", out)
+    for pattern in _SECRET_PATTERNS[2:]:
+        out = pattern.sub("[REDACTED]", out)
+    return out
 
 
 def is_error_event(event_type: str, data: dict[str, Any] | None = None) -> bool:
@@ -99,12 +133,15 @@ class ErrorLog:
     # ── api ──────────────────────────────────────────────────────────────────
 
     async def record(self, component: str, message: str, context: dict[str, Any] | None = None) -> None:
+        # Redact BEFORE clipping and before the signature is computed, so a
+        # rotated key can't produce a different signature for the same fault.
+        safe_message = _redact_secrets(message)[:1000]
         entry = {
             "ts": _now_iso(),
             "component": str(component or "")[:80],
-            "message": str(message or "")[:1000],
-            "signature": self.signature(component, message),
-            "context": {k: str(v)[:200] for k, v in (context or {}).items()},
+            "message": safe_message,
+            "signature": self.signature(component, safe_message),
+            "context": {k: _redact_secrets(str(v))[:200] for k, v in (context or {}).items()},
         }
         async with self._lock:
             self._entries.append(entry)

@@ -1756,30 +1756,38 @@ class RuntimeManager:
             if loc:
                 await self._memory.add_fact(entity="user", attribute="location", value=loc, confidence=0.75)
 
-        # Spouse
+        # ── Family names ────────────────────────────────────────────────────
+        # The [A-Z] guards below are LOAD-BEARING: capitalization is the only
+        # thing separating a NAME from the rest of the sentence. These were
+        # matched with re.IGNORECASE, which silently disabled them — every
+        # letter satisfied [A-Z] and the trailing (?:\s+[A-Z]...)* swallowed
+        # the whole tail.
+        #
+        # Verified live: "my mom is named Tara and my favorite color is blue"
+        # stored  mother = "named Tara and my favorite color is blue".
+        # Nova then repeats that back as her mother's name.
+        #
+        # Case-insensitivity now applies ONLY to the lead-in via a scoped
+        # (?i:...) group, so the capture stays case-SENSITIVE.
+        _NAME = r"([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)"
+        _LEAD_IN = r"(?:name\s+is|is\s+named|is|=|named)"   # longest first
+
         m_sp = re.search(
-            r"\bmy\s+(wife|husband|spouse)\b(?:\s+name\s+is|\s+is|\s+named)?\s+([A-Z][A-Za-z0-9'\-_]{1,40})\b",
+            rf"(?i:\bmy\s+(?:wife|husband|spouse)\b(?:\s+name\s+is|\s+is|\s+named)?)\s+"
+            rf"([A-Z][A-Za-z0-9'\-_]{{1,40}})\b",
             msg,
-            flags=re.IGNORECASE,
         )
         if m_sp:
-            spouse_name = m_sp.group(2).strip()
+            spouse_name = m_sp.group(1).strip()
             if spouse_name:
                 await self._memory.add_fact(entity="user", attribute="spouse", value=spouse_name, confidence=0.85)
 
-        # Parents
         parent_patterns = [
-            (r"\bmy\s+mom\s+(?:is|=|named)\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "mother"),
-            (r"\bmy\s+mother\s+(?:is|=|named)\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "mother"),
-            (r"\bmy\s+dad\s+(?:is|=|named)\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "father"),
-            (r"\bmy\s+father\s+(?:is|=|named)\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "father"),
-            (r"\bmy\s+mom['’]s\s+name\s+is\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "mother"),
-            (r"\bmy\s+mother['’]s\s+name\s+is\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "mother"),
-            (r"\bmy\s+dad['’]s\s+name\s+is\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "father"),
-            (r"\bmy\s+father['’]s\s+name\s+is\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)", "father"),
+            (rf"(?i:\bmy\s+(?:mom|mother)(?:['’]s)?\s+{_LEAD_IN})\s+{_NAME}", "mother"),
+            (rf"(?i:\bmy\s+(?:dad|father)(?:['’]s)?\s+{_LEAD_IN})\s+{_NAME}", "father"),
         ]
         for pat, attr in parent_patterns:
-            mm = re.search(pat, msg, flags=re.IGNORECASE)
+            mm = re.search(pat, msg)
             if mm:
                 name = mm.group(1).strip()
                 if name:
@@ -1814,8 +1822,9 @@ class RuntimeManager:
                 for n in self._split_name_list(tail)[:10]:
                     await self._memory.add_fact(entity="user", attribute=attr, value=n, confidence=conf)
 
-        # Pets
-        m_pet = re.search(r"\bmy\s+(dog|cat|pet)\b(?:\s+(?:is|named))\s+([A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+)*)\b", msg, flags=re.IGNORECASE)
+        # Pets — same load-bearing [A-Z] guard as the family patterns above.
+        m_pet = re.search(
+            rf"(?i:\bmy\s+(dog|cat|pet)\b\s+(?:is\s+named|is|named))\s+{_NAME}\b", msg)
         if m_pet:
             species = m_pet.group(1).strip().lower()
             name = m_pet.group(2).strip()

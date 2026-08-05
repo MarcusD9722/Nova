@@ -96,6 +96,33 @@ async def main() -> None:
         r = await nova.http.post("/chat", json={"message": "   "})
         check(r.status_code == 422, f"blank message -> 422 (got {r.status_code})")
 
+        check.section("Quick-fact extraction captures a NAME, not the sentence")
+        # Found by a real boot check, not by a test. The [A-Z] guards in these
+        # patterns are the only thing separating a name from the rest of the
+        # sentence, and re.IGNORECASE silently disabled them: every letter
+        # satisfied [A-Z] and the trailing (?:\s+[A-Z]...)* swallowed the tail.
+        # Live result: mother = "named Tara and my favorite color is blue".
+        rt = nova.runtime
+        await rt._extract_quick_facts("my mom is named Tara and my favorite color is blue")
+        mother = await nova.memory.get_latest_fact(entity="user", attribute="mother")
+        check(mother is not None and mother.value == "Tara",
+              f"a trailing clause is not absorbed into the name ({mother and mother.value!r})")
+
+        await rt._extract_quick_facts("my dad's name is Ron")
+        father = await nova.memory.get_latest_fact(entity="user", attribute="father")
+        check(father is not None and father.value == "Ron", f"possessive phrasing works ({father and father.value!r})")
+
+        await rt._extract_quick_facts("my mother's name is Tara Jane")
+        mother = await nova.memory.get_latest_fact(entity="user", attribute="mother")
+        check(mother.value == "Tara Jane", f"a genuine two-word name is kept whole ({mother.value!r})")
+
+        # Ordinary chatter must not be mistaken for a name at all.
+        before = (await nova.memory.get_latest_fact(entity="user", attribute="mother")).value
+        for chatter in ("my mom is really tired today", "my mom is going to the store"):
+            await rt._extract_quick_facts(chatter)
+        after = (await nova.memory.get_latest_fact(entity="user", attribute="mother")).value
+        check(after == before, f"chatter about a parent stores nothing ({after!r})")
+
         check.section("A broken memory capture is LOUD, not silent")
         # Regression: the four capture pre-passes each sat in `except: pass`.
         # A capture that started raising would stop recording facts, lessons
