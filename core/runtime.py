@@ -17,7 +17,6 @@ from core.events import MemoryIngestEvent, SummarizeHintEvent
 from core.logging_setup import get_logger
 from core.planner import Planner
 from core.policy.autonomy_planner import AutonomyPlannerLLM
-from core.policy.chat_decider import ChatDecider
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
 from core.policy.storyteller import StorytellerLLM, is_story_request, story_system_prompt
@@ -42,7 +41,6 @@ from core.orchestrator.model_router import ModelHandle, ModelRouter, parse_role_
 from core.cloud_runtime import CloudRuntime, cloud_enabled
 from core.understanding import Understanding
 from core.expression import Expression
-from core.response_composer import ResponseComposer
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
 from core.llm_runtime import LLMRuntime
@@ -280,15 +278,21 @@ class RuntimeManager:
         except Exception:
             pass
 
-        self._decider = ChatDecider(llm, llm_semaphore=self._llm_sem, understanding=self._understanding)
+        # NOTE: ChatDecider and ResponseComposer used to be constructed here.
+        # Phase P4 unified /chat and /chat/stream onto one pipeline and stopped
+        # calling both of them; the attributes were assigned and never read
+        # again, so every boot built two unused LLM policy objects. Removing
+        # them also drops the last reference to FollowUpGeneratorLLM (its only
+        # caller was ChatDecider), leaving core/policy/chat_decider.py,
+        # core/policy/followup_generator.py and core/response_composer.py —
+        # ~590 lines — completely unreachable. They are left on disk (working
+        # and now under test) rather than deleted unilaterally; delete them
+        # when you're sure deep-mode composition won't want them back.
         self._extractor = MemoryExtractorLLM(llm, llm_semaphore=self._llm_sem)
         self._summarizer = SummarizerLLM(llm, llm_semaphore=self._llm_sem)
         self._storyteller = StorytellerLLM(llm, llm_semaphore=self._llm_sem)
         self._autonomy_planner = AutonomyPlannerLLM(llm, llm_semaphore=self._llm_sem)
         self._planner = Planner()
-
-        # Composer
-        self._composer = ResponseComposer(state_store=self._state_store, llm=llm, llm_semaphore=self._llm_sem)
 
         # Queues
         self._memory_ingest_q: asyncio.Queue[MemoryIngestEvent] = asyncio.Queue(maxsize=200)
