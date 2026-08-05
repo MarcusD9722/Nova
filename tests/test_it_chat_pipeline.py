@@ -96,6 +96,40 @@ async def main() -> None:
         r = await nova.http.post("/chat", json={"message": "   "})
         check(r.status_code == 422, f"blank message -> 422 (got {r.status_code})")
 
+        check.section("A broken memory capture is LOUD, not silent")
+        # Regression: the four capture pre-passes each sat in `except: pass`.
+        # A capture that started raising would stop recording facts, lessons
+        # and mood forever with no signal — which is exactly how a NameError
+        # in _capture_mood survived an entire development round. The turn must
+        # still succeed (capture is best-effort) AND the failure must surface.
+        # Asserted at the logger call, not via a log handler: the harness pins
+        # NOVA_LOG_LEVEL=ERROR and the codebase logs through structlog, so a
+        # stdlib handler would see nothing even when the code is correct.
+        import core.runtime as _rt_mod
+
+        warnings: list[tuple] = []
+        real_warning = _rt_mod.logger.warning
+        _rt_mod.logger.warning = lambda *a, **kw: warnings.append((a, kw))
+
+        rt = nova.runtime
+        original = rt._capture_mood
+
+        async def _boom(_text):
+            raise RuntimeError("simulated capture failure")
+
+        rt._capture_mood = _boom
+        try:
+            res = await nova.say("the kids built a fort today", conversation_id=uuid4())
+            check(res.assistant_text.strip() != "", "the turn still succeeds when a capture breaks")
+            reported = [w for w in warnings if "memory_capture_failed" in str(w)]
+            check(bool(reported), f"the broken capture is reported, not swallowed ({len(warnings)} warning(s))")
+            check(any("mood" in str(w) for w in reported), "the report names WHICH capture failed")
+            check(any("simulated capture failure" in str(w) for w in reported),
+                  "the report carries the real error text")
+        finally:
+            rt._capture_mood = original
+            _rt_mod.logger.warning = real_warning
+
         check.section("Shutdown stops EVERY worker")
         # Two regressions live here, both invisible without a real boot:
         #

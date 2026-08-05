@@ -976,8 +976,11 @@ class RuntimeManager:
                         policy_memory_facts=[],
                     )
                 )
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Dropping the ingest event means this turn never reaches
+                # long-term memory. Best-effort by design, but silence here
+                # looked identical to a successful save.
+                logger.warning("memory_ingest_enqueue_failed", error=str(e)[:200])
 
         # ── Deterministic pre-passes (instant, no LLM) ──────────────────────
         project_reply = await self._project_prepass(clean_user)
@@ -987,22 +990,24 @@ class RuntimeManager:
             yield {"type": "done", "full_text": project_reply, "tool_calls": []}
             return
 
-        try:
-            await self._extract_quick_facts(clean_user)
-        except Exception:
-            pass
-        try:
-            await self._capture_lessons(clean_user)
-        except Exception:
-            pass
-        try:
-            await self._capture_mood(clean_user)
-        except Exception:
-            pass
-        try:
-            await self._capture_wellbeing()
-        except Exception:
-            pass
+        # Memory capture must never break a turn, so these stay best-effort —
+        # but they used to swallow the exception ENTIRELY. A capture that
+        # starts raising (schema drift, a bad regex, a missing import) would
+        # silently stop recording facts, lessons and mood forever, with no
+        # signal anywhere. That is not hypothetical: a `BUS.publish` NameError
+        # in _capture_mood sat broken for a whole development round precisely
+        # because these blocks hid it. Control flow is unchanged; the failure
+        # is now visible.
+        for label, capture in (
+            ("quick_facts", self._extract_quick_facts(clean_user)),
+            ("lessons", self._capture_lessons(clean_user)),
+            ("mood", self._capture_mood(clean_user)),
+            ("wellbeing", self._capture_wellbeing()),
+        ):
+            try:
+                await capture
+            except Exception as e:  # noqa: BLE001
+                logger.warning("memory_capture_failed", stage=label, error=str(e)[:200])
 
         direct = await self._direct_live_reply(clean_user, current_location=current_location)
         if direct is not None:

@@ -35,9 +35,27 @@ class MemoryPurgeResponse(BaseModel):
     ids: list[str]
 
 
-def _require_admin_token(token: str | None) -> None:
+def _require_admin_token(token: str | None, *, destructive: bool = True) -> None:
+    """Gate an admin action on NOVA_ADMIN_TOKEN.
+
+    This used to FAIL OPEN: with no token configured it returned silently, so
+    an unauthenticated POST /memory/purge with dry_run=false deleted facts and
+    answered 200. NOVA_ADMIN_TOKEN is not set on this machine and
+    NOVA_API_TOKEN is usually unset too, so the only thing standing between
+    the port and a real delete was that dry_run defaults to true.
+
+    Destructive calls now fail CLOSED — an unconfigured guard is treated as
+    "not permitted", not "no guard". Read-only variants (a dry run, which only
+    reports what WOULD be removed) stay open so the data is still inspectable.
+    """
     expected = os.getenv("NOVA_ADMIN_TOKEN", "").strip()
     if not expected:
+        if destructive:
+            raise HTTPException(
+                status_code=403,
+                detail="Destructive memory operations require NOVA_ADMIN_TOKEN to be set in .env "
+                       "and passed as ?admin_token=... . Use dry_run=true to preview without it.",
+            )
         return
     if (token or "").strip() != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -75,7 +93,7 @@ async def memory_purge(req: MemoryPurgeRequest, admin_token: str | None = Query(
 
     If env NOVA_ADMIN_TOKEN is set, caller must provide ?admin_token=... .
     """
-    _require_admin_token(admin_token)
+    _require_admin_token(admin_token, destructive=not req.dry_run)
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Memory not initialized")
     result = await STATE.memory.purge_facts(

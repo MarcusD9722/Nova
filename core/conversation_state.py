@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -65,6 +66,15 @@ class ConversationStateStore:
         self._cache = cache
         self._max_turns = int(max_turns)
         self._followup_window = int(followup_window)
+        # record_turn is read-modify-write. Unguarded, two overlapping turns on
+        # the same conversation both read the same state and the second write
+        # wins — the first turn vanishes from "Recent messages:" with no error
+        # anywhere. Measured: 10 concurrent record_turn calls kept 1. Only one
+        # production path writes today (chat_turn_stream._finish), but /chat and
+        # /chat/stream are separate endpoints, so a double-send or an overlapping
+        # voice+text turn reaches it. One lock is enough — writes are rare and
+        # sub-millisecond, so contention is irrelevant.
+        self._write_lock = asyncio.Lock()
 
     def _key(self, conversation_id: UUID) -> str:
         return f"conv_state:{conversation_id}"
@@ -90,19 +100,20 @@ class ConversationStateStore:
         follow_up_question: str | None,
         mode: str | None,
     ) -> None:
-        st = await self.load(conversation_id)
+        async with self._write_lock:
+            st = await self.load(conversation_id)
 
-        st.last_user_messages.append((user_message or "").strip())
-        st.last_assistant_replies.append((assistant_reply or "").strip())
-        if follow_up_question:
-            st.last_follow_up_questions.append((follow_up_question or "").strip())
-        st.last_mode = mode
+            st.last_user_messages.append((user_message or "").strip())
+            st.last_assistant_replies.append((assistant_reply or "").strip())
+            if follow_up_question:
+                st.last_follow_up_questions.append((follow_up_question or "").strip())
+            st.last_mode = mode
 
-        st.last_user_messages = st.last_user_messages[-self._max_turns :]
-        st.last_assistant_replies = st.last_assistant_replies[-self._max_turns :]
-        st.last_follow_up_questions = st.last_follow_up_questions[-max(self._max_turns, self._followup_window) :]
+            st.last_user_messages = st.last_user_messages[-self._max_turns :]
+            st.last_assistant_replies = st.last_assistant_replies[-self._max_turns :]
+            st.last_follow_up_questions = st.last_follow_up_questions[-max(self._max_turns, self._followup_window) :]
 
-        await self._cache.set(self._key(conversation_id), json.loads(st.to_json()), ttl_s=7 * 24 * 3600)
+            await self._cache.set(self._key(conversation_id), json.loads(st.to_json()), ttl_s=7 * 24 * 3600)
 
     async def recent_chat_text(self, conversation_id: UUID) -> str:
         st = await self.load(conversation_id)
