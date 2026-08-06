@@ -5,6 +5,7 @@ import contextlib
 from datetime import datetime, timezone
 
 from core.events import MemoryIngestEvent, SummarizeHintEvent
+from core.mood import emotional_salience
 from core.logging_setup import get_logger
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
@@ -122,13 +123,27 @@ class MemoryIngestWorker:
         # plus the summarizer.
         if user_text:
             await GATE.wait_for_idle(what="memory_extract")
+            # How charged was the moment this was learned in? Emotion is the
+            # clearest natural signal for what should outlast what, and it was
+            # already being computed per turn and discarded. A fact picked up
+            # while Marcus was excited or upset now decays far more slowly than
+            # one mentioned in passing. 0.0 for ordinary messages, which is
+            # most of them — and that's the point.
+            moment = emotional_salience(user_text)
             out = await self._extractor.extract(user_text=user_text)
             for f in out.facts:
                 if not f.persist:
                     continue
                 if f.confidence < 0.55:
                     continue
-                await self._memory.add_fact(entity=f.entity, attribute=f.attribute, value=f.value, confidence=float(f.confidence))
+                await self._memory.add_fact(
+                    entity=f.entity, attribute=f.attribute, value=f.value,
+                    confidence=float(f.confidence),
+                    # None lets the unifier's default stand for unremarkable
+                    # moments, so identity facts keep their own high floor
+                    # instead of being dragged down by a flat 0.0.
+                    salience=(moment if moment > 0 else None),
+                )
 
         # also persist policy-provided facts (already validated) if any
         for mf in (ev.policy_memory_facts or []):

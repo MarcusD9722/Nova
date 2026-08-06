@@ -139,7 +139,17 @@ async def main():
                 # every column added after v1 to faithfully simulate a real v1 DB —
                 # otherwise replaying v2/v3 would collide with a column already present.
                 cols = [r[1] for r in await (await db.execute("PRAGMA table_info(facts)")).fetchall()]
-                for post_v1_col in ("last_reinforced_at", "source", "evidence", "verification_status", "last_confirmed_at"):
+                # DERIVED from the migration list, not hardcoded: every future
+                # "ALTER TABLE facts ADD COLUMN" is picked up automatically.
+                # Hardcoding it meant this test broke the moment v5 landed,
+                # which is noise — the migration itself was fine.
+                post_v1_cols = [
+                    sql.split("ADD COLUMN")[1].split()[0].strip().strip(";")
+                    for _v, _desc, sqls in SQLiteMemoryBackend._MIGRATIONS[1:]
+                    for sql in sqls
+                    if "ALTER TABLE facts" in sql and "ADD COLUMN" in sql
+                ]
+                for post_v1_col in post_v1_cols:
                     if post_v1_col in cols:
                         await db.execute(f"ALTER TABLE facts DROP COLUMN {post_v1_col}")
                 await db.commit()
@@ -153,6 +163,8 @@ async def main():
             check("edges" in tables, "migration created edges table (v2)")
             check("last_reinforced_at" in cols, "migration added facts.last_reinforced_at (v2)")
             check("verification_status" in cols, "migration added facts provenance columns (v3)")
+            check("access_count" in cols and "salience" in cols,
+                  "migration added retrieval-reinforcement + salience columns (v5)")
 
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)

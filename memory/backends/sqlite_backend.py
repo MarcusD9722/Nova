@@ -60,7 +60,10 @@ class SQLiteMemoryBackend:
                         source TEXT,
                         evidence TEXT,
                         verification_status TEXT,
-                        last_confirmed_at TEXT
+                        last_confirmed_at TEXT,
+                        access_count INTEGER NOT NULL DEFAULT 0,
+                        last_accessed_at TEXT,
+                        salience REAL NOT NULL DEFAULT 0.0
                     );
                     """
                 )
@@ -454,6 +457,50 @@ class SQLiteMemoryBackend:
                 "CREATE INDEX IF NOT EXISTS idx_thoughts_kind_status ON thoughts(kind, status, updated_at);",
             ],
         ),
+        (
+            5,
+            "Human-like memory: retrieval reinforcement (access_count/last_accessed_at) + encoding salience",
+            [
+                # Retrieval strengthens memory — the testing effect. Until now
+                # only a duplicate WRITE reinforced a fact; recalling one did
+                # nothing, so a fact Marcus refers to daily was no more durable
+                # than one he never mentions again.
+                "ALTER TABLE facts ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE facts ADD COLUMN last_accessed_at TEXT;",
+                # How much this mattered when it was formed (emotion, surprise,
+                # how directly it was stated). Salient memories decay slower —
+                # the reason you remember where you were for the big moments.
+                "ALTER TABLE facts ADD COLUMN salience REAL NOT NULL DEFAULT 0.0;",
+                "CREATE INDEX IF NOT EXISTS idx_facts_accessed ON facts(last_accessed_at);",
+            ],
+        ),
+        (
+            6,
+            "Backfill salience for facts written before v5 (mirrors unifier._default_salience)",
+            [
+                # Without this, every memory formed before today sits at
+                # salience 0.0 and decays faster than an identical one learned
+                # tomorrow — an arbitrary cliff at the upgrade date. This
+                # applies the same deterministic default the unifier uses for
+                # new writes, so old memories are ranked on what they ARE
+                # rather than on when the feature happened to land.
+                #
+                # Only touches rows still at the 0.0 default, so it is safe to
+                # run against a database that already has real salience values.
+                """UPDATE facts SET salience = CASE
+                       WHEN entity = 'user' AND attribute IN
+                            ('name','location','spouse','child','children_type',
+                             'mother','father','sibling','birthday','anniversary') THEN 1.0
+                       WHEN entity = 'lesson'        THEN 0.9
+                       WHEN entity = 'people'        THEN 0.7
+                       WHEN entity LIKE 'person:%'   THEN 0.7
+                       WHEN entity LIKE 'project:%'  THEN 0.5
+                       WHEN entity = 'note'          THEN 0.2
+                       ELSE MAX(0.0, MIN(1.0, COALESCE(confidence, 0.0))) * 0.5
+                   END
+                   WHERE salience IS NULL OR salience = 0.0;""",
+            ],
+        ),
     ]
 
     async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
@@ -744,13 +791,14 @@ class SQLiteMemoryBackend:
         evidence: str | None = None,
         verification_status: str | None = None,
         last_confirmed_at: str | None = None,
+        salience: float = 0.0,
     ) -> None:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO facts(id, entity, attribute, value, confidence, created_at, "
-                "source, evidence, verification_status, last_confirmed_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "source, evidence, verification_status, last_confirmed_at, salience) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(fact_id),
                     entity,
@@ -762,7 +810,33 @@ class SQLiteMemoryBackend:
                     evidence,
                     verification_status,
                     last_confirmed_at,
+                    max(0.0, min(1.0, float(salience))),
                 ),
+            )
+            await db.commit()
+
+    async def touch_facts_accessed(self, fact_ids: list[str]) -> None:
+        """Record that these facts were RETRIEVED — the testing effect.
+
+        Recalling a memory is what makes it durable in humans, far more than
+        re-reading it. Until this existed, only a duplicate write reinforced a
+        fact, so memory was shaped by how often something was RESTATED rather
+        than by how often it actually mattered.
+
+        Deliberately does NOT touch confidence: being reminded of something is
+        not evidence that it is more true, only that it is more used. Decay
+        ranking reads access_count/last_accessed_at (see unifier).
+        """
+        ids = [str(i) for i in (fact_ids or []) if str(i).strip()]
+        if not ids:
+            return
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.executemany(
+                "UPDATE facts SET access_count = COALESCE(access_count, 0) + 1, "
+                "last_accessed_at = ? WHERE id = ?",
+                [(now, i) for i in ids],
             )
             await db.commit()
 
@@ -878,7 +952,8 @@ class SQLiteMemoryBackend:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT id, entity, attribute, value, confidence, created_at, last_reinforced_at, "
-                "source, evidence, verification_status, last_confirmed_at FROM facts "
+                "source, evidence, verification_status, last_confirmed_at, "
+                "access_count, last_accessed_at, salience FROM facts "
                 "WHERE entity LIKE ? OR attribute LIKE ? OR value LIKE ? ORDER BY created_at DESC LIMIT ?",
                 (like, like, like, int(limit)),
             ) as cur:

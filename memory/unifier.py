@@ -50,14 +50,82 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _staleness_factor(created_at: Any, last_reinforced_at: Any, half_life_days: float = 90.0) -> float:
-    """Recency multiplier in [0.85, 1.0] (Phase 1.3). Uses the NEWER of
-    created/reinforced timestamps, so a re-mentioned memory stays fresh.
-    Deliberately gentle: decay re-ranks, it never buries or deletes."""
+#: Entities whose facts never decay. Being old doesn't make your name less
+#: true, and sinking identity facts would falsely trip the CH1 low-confidence
+#: hedge. Prefix match, so "project:flappy-bird" is covered by "project:".
+_UNDECAYED_ENTITY_PREFIXES = ("user", "lesson", "project:", "projects", "session")
+
+
+def _is_undecayed(entity: Any) -> bool:
+    e = str(entity or "").strip().lower()
+    return any(e == p or e.startswith(p) for p in _UNDECAYED_ENTITY_PREFIXES)
+
+
+#: Things a person does not forget: who their family are, where they live,
+#: what they've asked you to do differently. Given maximum encoding strength
+#: so decay can never reach them even if they're never mentioned again.
+_CORE_IDENTITY_ATTRS = {
+    "name", "location", "spouse", "child", "children_type", "mother", "father",
+    "sibling", "birthday", "anniversary",
+}
+
+
+def _default_salience(entity: str, attribute: str, confidence: float) -> float:
+    """Encoding strength when the caller doesn't specify one.
+
+    Deterministic and cheap — no LLM on the write path, same reasoning as
+    core/mood.py. Callers that know more (the runtime knows the emotional tone
+    of the message that produced the fact) should pass `salience` explicitly.
+    """
+    e = str(entity or "").strip().lower()
+    a = str(attribute or "").strip().lower()
+    if e == "user" and a in _CORE_IDENTITY_ATTRS:
+        return 1.0
+    if e == "lesson":                      # explicit "do it this way" corrections
+        return 0.9
+    if e.startswith("person:") or e == "people":
+        return 0.7
+    if e.startswith("project:"):
+        return 0.5
+    if e == "note":                        # free-form asides — the most forgettable
+        return 0.2
+    # Otherwise let stated confidence stand in for how firmly it was asserted.
+    return max(0.0, min(1.0, float(confidence or 0.0))) * 0.5
+
+
+def _staleness_factor(
+    created_at: Any,
+    last_reinforced_at: Any,
+    half_life_days: float = 90.0,
+    *,
+    salience: float = 0.0,
+    access_count: int = 0,
+    last_accessed_at: Any = None,
+) -> float:
+    """Recency multiplier in [0.85, 1.0] (Phase 1.3, extended).
+
+    Uses the NEWEST of created / reinforced / **accessed**, so recalling a
+    memory keeps it fresh — the testing effect. Before this, only re-stating
+    something refreshed it; using it did nothing.
+
+    Two things slow decay, both taken from how human memory actually behaves:
+
+    * **salience** — how much this mattered when it was formed (emotion,
+      surprise, how directly it was said). Up to 3x the half-life. This is why
+      you remember where you were for the big moments and not for last
+      Tuesday's lunch.
+    * **access_count** — how often it has been recalled since, with diminishing
+      returns (log). The tenth recall should matter less than the second.
+
+    Still deliberately gentle: decay RE-RANKS, it never buries or deletes. The
+    0.85 floor keeps a decayed fact at 0.95*0.85 = 0.8075, just above the CH1
+    high-confidence threshold of 0.80, so age alone can never make Nova hedge
+    about something she actually knows.
+    """
     import math
 
     newest = None
-    for raw in (last_reinforced_at, created_at):
+    for raw in (last_accessed_at, last_reinforced_at, created_at):
         if not raw:
             continue
         try:
@@ -70,8 +138,13 @@ def _staleness_factor(created_at: Any, last_reinforced_at: Any, half_life_days: 
             newest = dt
     if newest is None:
         return 1.0
+
+    sal = max(0.0, min(1.0, float(salience or 0.0)))
+    uses = max(0, int(access_count or 0))
+    effective_half_life = half_life_days * (1.0 + 2.0 * sal) * (1.0 + 0.5 * math.log1p(uses))
+
     age_days = max(0.0, (_now() - newest).total_seconds() / 86400.0)
-    return 0.85 + 0.15 * math.exp(-age_days / half_life_days)
+    return 0.85 + 0.15 * math.exp(-age_days / max(1.0, effective_half_life))
 
 
 class MemoryUnifier:
@@ -94,6 +167,8 @@ class MemoryUnifier:
         # write), but the failures themselves must stay countable — otherwise
         # semantic recall degrades permanently after one buried log line and
         # nothing ever says so again. semantic_index_health() surfaces this.
+        # Per-fact cooldown for retrieval reinforcement (see _reinforce_recalled).
+        self._recall_seen: dict[str, datetime] = {}
         self._chroma_degraded_logged = False
         self._chroma_failures = 0
         self._chroma_writes = 0
@@ -1109,7 +1184,12 @@ class MemoryUnifier:
         source: str | None = None,
         evidence: str | None = None,
         verification_status: str | None = None,
+        salience: float | None = None,
     ) -> UUID:
+        """`salience` (0..1) is how much this mattered at the moment it was
+        formed — emotional weight, surprise, how directly it was stated. It
+        slows decay rather than boosting rank, which is why you remember where
+        you were for the big moments. None = derive a sensible default."""
 
         # ---- write guard: prevent storing non-name tokens as relationship values ----
         deny_by_attr = {
@@ -1193,6 +1273,8 @@ class MemoryUnifier:
                     evidence=prov_evidence,
                     verification_status=prov_status,
                     last_confirmed_at=prov_confirmed,
+                    salience=(_default_salience(entity, attribute, confidence)
+                              if salience is None else max(0.0, min(1.0, float(salience)))),
                 ),
                 self._json.append_audit(
                     {
@@ -2254,16 +2336,21 @@ class MemoryUnifier:
                 )
 
         # Facts (highest priority for identity and stable attributes).
-        # Phase 1.3: free-form notes decay gently with staleness (floor 0.85×,
-        # never deleted); a re-mention refreshes them via last_reinforced_at.
-        # Identity facts (user.*), lessons, and project state stay undecayed —
-        # being old doesn't make your name less true, and sinking them would
-        # falsely trip the low-confidence hedge (CH1).
+        # Decay is gentle (floor 0.85x, never deleted) and now applies to every
+        # entity EXCEPT identity/lessons/projects — which is what the comment
+        # here always claimed, though the code only ever decayed "note".
+        # Salience and recall count slow the decay; see _staleness_factor.
         for row in fact_rows:
             text = f"FACT {row['entity']} {row['attribute']} = {row['value']}"
             base = 0.95
-            if str(row.get("entity") or "").strip().lower() == "note":
-                base *= _staleness_factor(row.get("created_at"), row.get("last_reinforced_at"))
+            if not _is_undecayed(row.get("entity")):
+                base *= _staleness_factor(
+                    row.get("created_at"),
+                    row.get("last_reinforced_at"),
+                    salience=row.get("salience") or 0.0,
+                    access_count=row.get("access_count") or 0,
+                    last_accessed_at=row.get("last_accessed_at"),
+                )
             fact_prov = {"backend": "sqlite", "table": "facts"}
             # #19: carry the trust label into recall so consumers (and the CH1
             # hedge) can tell a settled fact from an assumption. Only attach when
@@ -2366,6 +2453,8 @@ class MemoryUnifier:
 
         ranked = sorted(merged.values(), key=lambda x: x.score, reverse=True)[: int(limit)]
 
+        await self._reinforce_recalled(ranked)
+
         await self._diskcache.set(cache_key, [r.model_dump() for r in ranked], ttl_s=120)
         # NOTE: previously every search() appended its full result set to
         # snapshots.jsonl — the fastest-growing file in the system, with no code
@@ -2373,6 +2462,50 @@ class MemoryUnifier:
 
         return ranked
 
+    #: A recalled fact is only reinforced if it actually surfaced strongly.
+    #: search() returns up to `limit` hits whether or not they were any good;
+    #: reinforcing all of them would strengthen everything equally and destroy
+    #: the very signal this is meant to create.
+    _RECALL_REINFORCE_MIN_SCORE = 0.75
+    #: Don't let one conversation about the same subject inflate a fact's
+    #: recall count dozens of times. Human consolidation works on repeated
+    #: retrieval over TIME, not within a single sitting (the spacing effect).
+    _RECALL_REINFORCE_COOLDOWN_S = 600.0
+
+    async def _reinforce_recalled(self, ranked: list[MemoryHit]) -> None:
+        """Strengthen facts that were genuinely recalled — the testing effect.
+
+        Best-effort and fire-and-forget: this must never slow or break a turn.
+        It records USE (access_count / last_accessed_at), deliberately not
+        confidence — being reminded of something isn't evidence it's truer.
+        """
+        now = _now()
+        due: list[str] = []
+        for hit in ranked:
+            if hit.kind != "fact" or hit.score < self._RECALL_REINFORCE_MIN_SCORE:
+                continue
+            last = self._recall_seen.get(hit.id)
+            if last is not None and (now - last).total_seconds() < self._RECALL_REINFORCE_COOLDOWN_S:
+                continue
+            self._recall_seen[hit.id] = now
+            due.append(hit.id)
+        if not due:
+            return
+        try:
+            await self._sqlite.touch_facts_accessed(due)
+            # Deliberately does NOT bump _search_gen. Reinforcement shifts a
+            # decay multiplier by a fraction of a percent; busting the search
+            # cache for that on every single turn costs far more than the
+            # slightly fresher ordering is worth. Decay is a slow signal and
+            # can wait for the 120s TTL.
+        except Exception as e:  # noqa: BLE001
+            logger.debug("recall_reinforce_failed", error=str(e)[:200])
+
+        # Bound the in-process cooldown map so a long session can't grow it
+        # without limit.
+        if len(self._recall_seen) > 2000:
+            cutoff = now - timedelta(seconds=self._RECALL_REINFORCE_COOLDOWN_S)
+            self._recall_seen = {k: v for k, v in self._recall_seen.items() if v > cutoff}
 
     # ---------------- ChatGPT-like autonomy task queue (new contract) ----------------
 
