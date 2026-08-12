@@ -38,6 +38,24 @@ IGNORE_TURN_KINDS = {"turn", "turn_user", "turn_assistant"}
 # and preferences — are stored as facts under this entity and applied to future
 # replies. Kept separate from ordinary facts so they can be listed/injected as a
 # group. See core/runtime.py (capture + injection) and the reflection pass.
+#: Words too common to indicate two statements are about the same thing.
+_STOP_WORDS = frozenset(
+    "a an the and or but if then than that this these those is are was were be been being am "
+    "do does did have has had i me my mine you your yours he him his she her it its we us our "
+    "they them their to of in on at for with from by about as into over under again very just "
+    "not no so too can could would should will shall may might must now new old more most some "
+    "any all one two really quite much many lot".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    """Substantive words in a fact, for cheap same-subject detection."""
+    return {
+        w for w in re.findall(r"[a-z]{3,}", (text or "").lower())
+        if w not in _STOP_WORDS
+    }
+
+
 LESSON_ENTITY = "lesson"
 #: Generalizations Nova inferred across many episodes ("you work late on
 #: Thursdays"). Kept in its own entity so an inference can never be confused
@@ -1611,6 +1629,61 @@ class MemoryUnifier:
     async def get_latest_fact(self, entity: str, attribute: str) -> FactRecord | None:
         hits = await self.get_facts(entity=entity, attribute=attribute, limit=1, newest_first=True)
         return hits[0] if hits else None
+
+    # ── Write-time contradiction reconciliation ──────────────────────────
+    # Singleton attributes already supersede, so a changed favourite food
+    # replaces cleanly. The case that leaks is free-form: "I love running"
+    # and, months later, "I hate running" both land as entity=note with
+    # different attributes, so nothing keys them together and both sit there
+    # as equally true. Recall then surfaces whichever scores higher.
+    #
+    # Narrowing is DETERMINISTIC (shared content words) and only the judgement
+    # is left to the model — the same deterministic/probabilistic split the
+    # rest of the codebase uses. Most writes find no candidate and cost nothing.
+
+    async def find_conflict_candidates(
+        self, *, entity: str, value: str, exclude_id: str | None = None, limit: int = 4
+    ) -> list[FactRecord]:
+        """Existing facts about the same subject that a new one might contradict."""
+        await self.initialize()
+        new_words = _content_words(value)
+        if not new_words:
+            return []
+        rows = await self.get_facts(entity=entity, limit=120, newest_first=True)
+        scored: list[tuple[float, FactRecord]] = []
+        for r in rows:
+            if exclude_id and str(r.id) == str(exclude_id):
+                continue
+            words = _content_words(r.value)
+            if not words:
+                continue
+            overlap = len(new_words & words) / max(1, min(len(new_words), len(words)))
+            # Enough shared substance to be about the same thing, but not an
+            # exact restatement (those are handled by duplicate detection).
+            if overlap >= 0.5:
+                scored.append((overlap, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored[:limit]]
+
+    async def supersede_facts(self, *, old_ids: list[str], reason: str = "superseded") -> int:
+        """Retire facts a newer one has replaced, keeping the audit trail."""
+        ids = [str(i) for i in (old_ids or []) if str(i).strip()]
+        if not ids:
+            return 0
+        await self.initialize()
+        try:
+            removed = await self._sqlite.delete_facts_by_ids(ids)
+            self._search_gen += 1
+            if self._chroma is not None:
+                try:
+                    await self._chroma.delete_ids(ids)
+                except Exception:
+                    pass
+            await self._json.append_audit({"op": "supersede", "ids": ids, "reason": reason})
+            return removed
+        except Exception as e:  # noqa: BLE001
+            logger.debug("supersede_failed", error=str(e)[:160])
+            return 0
 
     async def correct_fact(self, entity: str, attribute: str, new_value: str,
                            *, old_value: str | None = None) -> dict[str, Any]:
