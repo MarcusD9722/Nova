@@ -151,7 +151,22 @@ class MemoryUnifier:
     # Attributes that hold exactly ONE current value: a new write supersedes
     # (deletes) older rows instead of accumulating contradictory facts that
     # search would then surface side by side ("mother = Tara" AND "= Sara").
-    _SINGLETON_USER_ATTRS = {"name", "location", "spouse", "mother", "father", "children_type"}
+    # Single-valued: a NEW value replaces the old one instead of stacking.
+    # Widening the extractor's attribute set (contracts.MemoryFact) without
+    # widening this would mean "my favourite food is sushi" and, six months
+    # later, "my favourite food is ramen" both sit in memory as equally
+    # current — the exact contradiction-stacking problem.
+    #
+    # Multi-valued attributes are deliberately absent: child, sibling, cousin,
+    # friend, pet, likes, dislikes, hobby, interest, allergy, trip,
+    # important_date and goal can all legitimately have several answers.
+    _SINGLETON_USER_ATTRS = {
+        "name", "location", "spouse", "mother", "father", "children_type",
+        "job", "employer", "work_days", "work_hours", "hometown", "vehicle",
+        "favorite_food", "favorite_drink", "favorite_place", "favorite_music",
+        "favorite_show", "favorite_color", "birthday", "anniversary",
+        "dietary_restriction", "routine", "appearance",
+    }
     _SINGLETON_PROJECT_ATTRS = {"status", "summary", "brief", "next_steps", "last_worked"}
 
     def __init__(self, memory_dir: Path, *, enable_chroma: bool = True):

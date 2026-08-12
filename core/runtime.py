@@ -85,6 +85,61 @@ _WEATHER_CITY_RE = re.compile(
 _WEATHER_CITY_LEAD_RE = re.compile(
     r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+weather\b',
 )
+# Words that never appear inside a person's name, used to reject the sentence
+# fragments the `(.+)$` list patterns hand over. Every entry here was chosen
+# from something that actually landed in Marcus's memory as a child's name, or
+# is an unambiguous non-name token (month, street suffix).
+_NOT_A_NAME = {
+    # articles / connectives / fillers
+    "a", "an", "the", "of", "for", "with", "to", "that", "this", "these", "those",
+    # prepositions: "pick up my kids at 5 o'clock" donated "at 5 o'clock"
+    "at", "in", "on", "by", "from", "up", "out", "off", "over", "under",
+    "after", "before", "into", "near", "around", "through", "during", "until",
+    "oclock", "am", "pm", "today", "tomorrow", "tonight", "yesterday",
+    "my", "your", "his", "her", "their", "our", "its", "and", "or", "but",
+    "is", "was", "are", "were", "be", "been", "am", "do", "does", "did",
+    "it", "them", "us", "me", "you", "we", "they", "he", "she",
+    "who", "what", "when", "where", "how", "why", "which",
+    "please", "just", "some", "any", "all", "one", "two", "three", "four",
+    "very", "really", "about", "again", "now", "then", "here", "there",
+    # verbs/nouns seen in real false positives
+    "named", "name", "called", "call", "tell", "told", "story", "stories",
+    "time", "bed", "dinosaur", "make", "made", "made", "get", "got", "go",
+    "want", "wants", "like", "likes", "need", "needs", "say", "said",
+    # months and street suffixes — "July St" was stored as a child
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "ln", "lane",
+    "blvd", "boulevard", "ct", "court", "way", "rings", "circle", "cir",
+}
+
+# Durable-profile attributes surfaced in grounding, most-useful first — the
+# list is walked in this order and truncated, so put what matters early.
+_PROFILE_ATTRS = (
+    "job", "employer", "work_days", "work_hours", "routine",
+    "hobby", "interest", "likes", "dislikes",
+    "favorite_food", "favorite_drink", "favorite_place",
+    "allergy", "dietary_restriction",
+    "birthday", "anniversary", "important_date", "trip",
+    "hometown", "vehicle", "goal",
+)
+#: Hard cap on profile values in the prompt. Grounding runs on EVERY turn, so
+#: this trades completeness for context budget; the rest stays searchable.
+_PROFILE_MAX_ITEMS = 14
+
+#: Human-readable labels for the rendered grounding line.
+_PROFILE_LABELS = {
+    "work_days": "works", "work_hours": "work hours", "favorite_food": "favourite food",
+    "favorite_drink": "favourite drink", "favorite_place": "favourite place",
+    "dietary_restriction": "diet", "important_date": "important date",
+}
+
+
+def _capitalize_name(word: str) -> str:
+    """Capitalize a name word, respecting internal separators."""
+    return re.sub(r"[A-Za-z]+", lambda m: m.group(0)[:1].upper() + m.group(0)[1:].lower(), word)
+
+
 _NAME_QUERY_RE = re.compile(
     r"\b(?:do\s+you\s+know\s+my\s+name|what\s+is\s+my\s+name|who\s+am\s+i)\b",
     re.IGNORECASE,
@@ -1531,6 +1586,31 @@ class RuntimeManager:
             except Exception:
                 return None
 
+        # Durable profile: preferences, routine and milestones.
+        #
+        # The extractor can now type these (contracts.MemoryFact), but grounding
+        # only ever loaded FAMILY, so a captured "favourite food" would sit in
+        # SQLite and only ever come back if a search happened to surface it.
+        # Knowing someone means knowing what they like without being asked, so
+        # a bounded slice rides along every turn.
+        #
+        # Bounded on purpose: the whole point of the salience/access work is
+        # that some memories matter more, so take the ones that have actually
+        # been used or were learned in a charged moment, and cap the list.
+        async def _load_profile() -> dict[str, list[str]] | None:
+            try:
+                out: dict[str, list[str]] = {}
+                for attr in _PROFILE_ATTRS:
+                    rows = await self._memory.get_facts(entity="user", attribute=attr, limit=4)
+                    vals = self._dedup_vals([r.value for r in rows])
+                    if vals:
+                        out[attr] = vals[:3]
+                    if sum(len(v) for v in out.values()) >= _PROFILE_MAX_ITEMS:
+                        break
+                return out or None
+            except Exception:
+                return None
+
         # Recent mood trend (M1) — a coarse, honestly-labeled signal so replies
         # can be a little warmer/more attentive when it's been a rough
         # stretch, without claiming deep insight into how Marcus feels.
@@ -1562,9 +1642,12 @@ class RuntimeManager:
             except Exception:
                 return None
 
-        relations, focus_ctx, mood_trend, upcoming_dates, drift_line = await asyncio.gather(
+        relations, focus_ctx, mood_trend, upcoming_dates, drift_line, profile = await asyncio.gather(
             _load_family(), _load_focus(), _load_mood(), _load_upcoming_dates(), _load_drift(),
+            _load_profile(),
         )
+        if profile:
+            context["known_profile"] = profile
 
         if relations:
             context["known_family"].update(relations["family"])
@@ -1689,6 +1772,15 @@ class RuntimeManager:
         if fam_bits:
             parts.append("known family: " + "; ".join(fam_bits))
 
+        profile = context.get("known_profile") or {}
+        if profile:
+            bits = [
+                f"{_PROFILE_LABELS.get(attr, attr.replace('_', ' '))} {', '.join(vals)}"
+                for attr, vals in profile.items() if vals
+            ]
+            if bits:
+                parts.append("about him: " + "; ".join(bits))
+
         people = context.get("known_people") or {}
         if people.get("friends"):
             parts.append("friends: " + ", ".join(people["friends"]))
@@ -1776,6 +1868,21 @@ class RuntimeManager:
         return ", ".join(items[:-1]) + ", and " + items[-1]
 
     @staticmethod
+    def _looks_like_person_name(raw: str) -> bool:
+        """Could this fragment plausibly be somebody's name?
+
+        Deliberately strict: these lists feed the grounding context that goes
+        into EVERY turn, so a false positive is read by the model forever,
+        while a false negative just means Marcus says the name again.
+        """
+        words = [w for w in re.split(r"\s+", (raw or "").strip()) if w]
+        if not (1 <= len(words) <= 3) or len(" ".join(words)) > 40:
+            return False
+        if any(w.lower() in _NOT_A_NAME for w in words):
+            return False
+        return all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", w) for w in words)
+
+    @staticmethod
     def _split_name_list(text: str) -> list[str]:
         if not text:
             return []
@@ -1789,7 +1896,20 @@ class RuntimeManager:
             p = re.sub(r"[^A-Za-z\-\'\s]", "", p).strip()
             if len(p) < 2:
                 continue
-            out.append(" ".join([w.capitalize() for w in p.split() if w]))
+            # The list patterns feeding this capture `(.+)$` — everything to the
+            # end of the line — so a sentence that merely CONTAINS "my kids"
+            # donates its whole tail. Worse, .capitalize() below then
+            # manufactures the very capitalization that would have exposed it.
+            # Live result: user.child held "A Bed Time Story About A Dinosaur
+            # Named Rex", "July St" and "Called" alongside Mateo and Liam, and
+            # all five went into the grounding context on every single turn.
+            if not RuntimeManager._looks_like_person_name(p):
+                logger.debug("name_list_rejected", candidate=p[:60])
+                continue
+            # Capitalize each segment, not just the first letter of the word:
+            # str.capitalize() lowercases the remainder, turning O'Brien into
+            # O'brien and Mary-Jane into Mary-jane in every reply that uses it.
+            out.append(" ".join(_capitalize_name(w) for w in p.split() if w))
         seen: set[str] = set()
         ded: list[str] = []
         for n in out:

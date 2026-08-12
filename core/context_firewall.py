@@ -29,7 +29,7 @@ from typing import Any
 # Keys of the grounding context dict (core/runtime.py::_build_grounding_context).
 # Their presence means a personal-context blob is in the text.
 PERSONAL_JSON_KEYS = frozenset({
-    "known_user", "known_family", "known_people", "current_focus", "recent_mood",
+    "known_user", "known_family", "known_people", "known_profile", "current_focus", "recent_mood",
     "relationship_reminders", "interest_drift", "wellbeing_trend", "catchup_summary",
     "executive_recommendations", "operating_state",
 })
@@ -38,6 +38,7 @@ PERSONAL_JSON_KEYS = frozenset({
 PERSONAL_PHRASES = (
     "the user's name is",
     "known family:",
+    "about him:",
     "you are currently working with the user on the",
     "existing projects:",
     "let that inform your warmth",

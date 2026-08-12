@@ -27,7 +27,15 @@ _ATTRIBUTE_ALIASES = {"mom": "mother", "dad": "father"}
 
 class MemoryFact(_StrictModel):
     entity: str
+    # The allowed set was family/identity only, so the extractor was
+    # STRUCTURALLY unable to remember a favourite food, a hobby, or which days
+    # Marcus works — those facts were parsed and then dropped on the floor.
+    #
+    # Everything added below is a durable property of a person, not a passing
+    # state. "I'm tired today" must not become a stored fact; "I work Mon-Thu"
+    # should. Keep that test in mind before extending this list again.
     attribute: Literal[
+        # ── identity & family (original set) ──
         "name",
         "location",
         "spouse",
@@ -41,6 +49,35 @@ class MemoryFact(_StrictModel):
         "friend",
         "mom",
         "dad",
+        # ── preferences: the "things I like" gap ──
+        "likes",
+        "dislikes",
+        "favorite_food",
+        "favorite_drink",
+        "favorite_place",
+        "favorite_music",
+        "favorite_show",
+        "favorite_color",
+        "hobby",
+        "interest",
+        "allergy",
+        "dietary_restriction",
+        # ── work & routine: the "days I work / schedule" gap ──
+        "job",
+        "employer",
+        "work_days",
+        "work_hours",
+        "routine",
+        "goal",
+        # ── milestones: the "important dates / trips" gap ──
+        "birthday",
+        "anniversary",
+        "important_date",
+        "trip",
+        # ── people detail: the "physical traits" gap ──
+        "appearance",
+        "vehicle",
+        "hometown",
     ]
     value: str
     confidence: float = Field(ge=0.0, le=1.0)

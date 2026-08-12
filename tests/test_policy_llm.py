@@ -96,7 +96,10 @@ async def test_memory_extractor() -> None:
     # ── BUG 1: one unsupported attribute discards EVERY fact in the batch ──
     mixed = ('{"facts": ['
              '{"entity":"user","attribute":"spouse","value":"Leslie","confidence":0.9,"persist":true},'
-             '{"entity":"user","attribute":"favorite_color","value":"blue","confidence":0.9,"persist":true},'
+             # Deliberately a PASSING STATE, not a durable property — the line
+             # the widened attribute set is drawn at. ("favorite_color" used to
+             # be the example here and is now legitimately supported.)
+             '{"entity":"user","attribute":"feeling_right_now","value":"tired","confidence":0.9,"persist":true},'
              '{"entity":"user","attribute":"child","value":"Mateo","confidence":0.9,"persist":true}'
              ']}')
     m, sem = llm_returning(mixed)
