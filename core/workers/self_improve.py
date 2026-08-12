@@ -258,6 +258,16 @@ class SelfImproveWorker:
         except Exception as e:  # noqa: BLE001
             logger.debug("lesson_consolidation_failed", error=str(e)[:160])
 
+        # 3a) Episodic -> semantic consolidation. Runs occasionally, not every
+        # cycle: it reads a month of episodes, and a pattern across days does
+        # not appear in the half hour since the last pass.
+        self._reflect_cycles = getattr(self, "_reflect_cycles", 0) + 1
+        if self._reflect_cycles % self._CONSOLIDATE_EVERY == 1:
+            try:
+                await self._consolidate_episodes()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("episode_consolidation_failed", error=str(e)[:160])
+
         # 3b) Knowledge-graph association discovery (Phase 4 / #8) — infer
         # low-confidence links between nodes that share several neighbors.
         # Deterministic, no LLM call; bounded work per cycle.
@@ -427,6 +437,84 @@ class SelfImproveWorker:
                 await self._memory.record_interest_focus(focus)
             except Exception:
                 pass
+
+    # How many reflection cycles between consolidation passes. Reflection runs
+    # every ~30 min; a pattern across days doesn't change in half an hour, and
+    # this reads a month of episodes rather than the last 30 turns.
+    _CONSOLIDATE_EVERY = 8
+
+    async def _consolidate_episodes(self) -> None:
+        """Form generalizations about Marcus from many separate days.
+
+        This is the one pass that writes beliefs Nova INFERRED rather than
+        facts he stated, so the guard rails matter more than the yield:
+        stored as INFERRED (so replies hedge), every claim carries the dates
+        that support it, and a claim without dates is thrown away.
+        """
+        try:
+            episodes = await self._memory.episodes_for_consolidation(days=30, max_turns=400)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("consolidation_episodes_failed", error=str(e)[:160])
+            return
+        # Below this there is no pattern to find, only noise to hallucinate from.
+        if len(episodes) < 4:
+            logger.debug("consolidation_skipped_too_few_days", days=len(episodes))
+            return
+
+        rendered = "\n".join(
+            f"[{e['date']} · {e['weekday']}] " + " | ".join(e["messages"][:10])
+            for e in episodes
+        )[:6000]
+        known_dates = {e["date"] for e in episodes}
+
+        prompt = (
+            "You are Nova, looking back over several days of what Marcus said to you, to notice "
+            "PATTERNS you could not see in any single conversation.\n\n"
+            "A good observation is a durable regularity about his life or working habits — when he "
+            "works, what he returns to, what tends to go with what. It must be visible on at least "
+            "TWO different days.\n\n"
+            "Do NOT output:\n"
+            "- anything he stated outright (that is already remembered)\n"
+            "- one-off events, or a restatement of a single day\n"
+            "- guesses about his feelings, health, relationships or motives\n"
+            "- anything you cannot point at specific dates for\n\n"
+            f"Days:\n{rendered}\n\n"
+            'Reply ONLY with JSON: {"observations": [{"topic": "short-slug", "text": "one sentence in '
+            'second person, e.g. \'You usually work late on Thursdays\'", "dates": ["YYYY-MM-DD", ...]}]}\n'
+            "0-3 observations. Return an empty array if nothing is genuinely recurring — that is the "
+            "expected answer most of the time."
+        )
+        async with self._sem:
+            raw = await self._llm.chat(
+                [{"role": "user", "content": prompt}], max_tokens=600, temperature=0.2, thinking=True
+            )
+        obj = extract_first_json_object(raw or "") or {}
+        observations = obj.get("observations") if isinstance(obj, dict) else None
+        if not isinstance(observations, list):
+            return
+
+        stored = 0
+        for ob in observations[:3]:
+            if not isinstance(ob, dict):
+                continue
+            # Only dates that really appear in the material — a model citing a
+            # day it was never shown is exactly the fabrication this guards.
+            dates = [str(d).strip() for d in (ob.get("dates") or []) if str(d).strip() in known_dates]
+            if len(dates) < 2:
+                logger.debug("consolidation_rejected_unsupported", topic=str(ob.get("topic"))[:40],
+                             cited=len(ob.get("dates") or []), verified=len(dates))
+                continue
+            try:
+                if await self._memory.add_insight(
+                    str(ob.get("text") or ""), topic=str(ob.get("topic") or ""), evidence_dates=dates,
+                ):
+                    stored += 1
+                    BUS.publish("autonomy.insight", {"insight": clip(str(ob.get("text")), 160),
+                                                     "days": len(dates)})
+            except Exception:
+                continue
+        if stored:
+            logger.info("episodes_consolidated", insights=stored, days=len(episodes))
 
     async def _recent_transcript(self) -> str:
         try:

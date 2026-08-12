@@ -24,7 +24,7 @@ from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.backends.json_backend import JsonAuditBackend
 from memory.backends.sqlite_backend import SQLiteMemoryBackend
 from memory.graph import Edge, GraphStore, build_timeline, extract_turn_edges, fact_edge, person_relation_edge
-from memory.provenance import classify_default, normalize_status, observed_at_write
+from memory.provenance import INFERRED, classify_default, normalize_status, observed_at_write
 from memory.schemas import FactRecord, MemoryHit
 from memory.thoughts import ThoughtStore
 from memory.world_model import WorldModel
@@ -39,6 +39,10 @@ IGNORE_TURN_KINDS = {"turn", "turn_user", "turn_assistant"}
 # replies. Kept separate from ordinary facts so they can be listed/injected as a
 # group. See core/runtime.py (capture + injection) and the reflection pass.
 LESSON_ENTITY = "lesson"
+#: Generalizations Nova inferred across many episodes ("you work late on
+#: Thursdays"). Kept in its own entity so an inference can never be confused
+#: with something Marcus actually said — see add_insight.
+INSIGHT_ENTITY = "insight"
 
 
 def _lesson_topic_slug(topic: str) -> str:
@@ -251,6 +255,12 @@ class MemoryUnifier:
         attr = (attribute or "").strip().lower()
         if ent == "user":
             return attr in self._SINGLETON_USER_ATTRS
+        if ent == INSIGHT_ENTITY:
+            # One belief per topic. Re-deriving "he works late on Thursdays"
+            # every reflection cycle must REPLACE the old one (refreshing its
+            # evidence dates), not stack another copy — and if the routine
+            # changes, the new belief must win outright.
+            return True
         if ent == "projects":
             return attr == "last_active"
         if ent.startswith("project:"):
@@ -2116,6 +2126,84 @@ class MemoryUnifier:
 
         results.sort(key=lambda r: r["score"], reverse=True)
         return results[:limit]
+
+    # ── Episodic → semantic consolidation ────────────────────────────────
+    # Everything above stores what Marcus SAID. This is the first mechanism
+    # that stores what Nova NOTICED across many separate occasions — "he works
+    # late on Thursdays" is in no single turn, only in the shape of dozens.
+    #
+    # Three rules keep it honest, and none of them are optional:
+    #   * stored as INFERRED, so the existing hedging treats it as an
+    #     assumption and Nova says "I think" rather than stating it as fact;
+    #   * every insight carries the DATES that support it, so she can answer
+    #     "why do you think that?" — without anchors, consolidation collapses
+    #     diverse experience into confident mush;
+    #   * one insight per topic, superseded on re-derivation, so a changed
+    #     routine replaces the old belief instead of stacking beside it.
+
+    async def episodes_for_consolidation(
+        self, *, days: int = 30, max_turns: int = 400
+    ) -> list[dict[str, Any]]:
+        """Recent user turns grouped by calendar day, oldest day first.
+
+        Only Marcus's own turns: generalizing over Nova's replies would let
+        her learn from her own output, which drifts.
+        """
+        await self.initialize()
+        rows = await self._sqlite.recent_turns(conversation_id=None, limit=int(max_turns))
+        cutoff = _now() - timedelta(days=int(days))
+        by_day: dict[str, list[str]] = {}
+        for r in rows:
+            if str(r.get("role") or "") != "user":
+                continue
+            raw = str(r.get("created_at") or "")
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if dt < cutoff:
+                continue
+            text = " ".join(str(r.get("content") or "").split())
+            if len(text) < 12:
+                continue
+            by_day.setdefault(dt.strftime("%Y-%m-%d"), []).append(text[:300])
+        return [
+            {"date": day, "weekday": datetime.fromisoformat(day).strftime("%A"), "messages": msgs[:20]}
+            for day, msgs in sorted(by_day.items())
+        ]
+
+    async def add_insight(
+        self, text: str, *, topic: str, evidence_dates: list[str], confidence: float = 0.55
+    ) -> bool:
+        """Store a generalization Nova inferred. Refused without evidence."""
+        text = " ".join(str(text or "").split())
+        topic = re.sub(r"[^a-z0-9]+", "-", str(topic or "").strip().lower()).strip("-")[:40]
+        dates = [d for d in (evidence_dates or []) if str(d).strip()][:12]
+        # An unsupported generalization is exactly the failure mode this is
+        # meant to avoid, so it is refused rather than stored unanchored.
+        if not text or not topic or len(text) < 12 or len(text) > 400 or not dates:
+            return False
+        await self.add_fact(
+            entity=INSIGHT_ENTITY,
+            attribute=topic,
+            value=text,
+            confidence=max(0.0, min(0.8, float(confidence))),
+            source="reflection:consolidation",
+            evidence="observed on " + ", ".join(dates),
+            verification_status=INFERRED,
+        )
+        return True
+
+    async def get_insights(self, limit: int = 12) -> list[dict[str, Any]]:
+        """Insights newest-first, each with the evidence that supports it."""
+        rows = await self.get_facts(entity=INSIGHT_ENTITY, limit=int(limit), newest_first=True)
+        return [
+            {"topic": r.attribute, "text": r.value, "evidence": r.evidence or "",
+             "confidence": r.confidence}
+            for r in rows
+        ]
 
     async def recent_turns_text(self, limit: int = 30) -> str:
         """Recent conversation turns (across conversations) as a transcript —

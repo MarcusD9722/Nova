@@ -1611,6 +1611,18 @@ class RuntimeManager:
             except Exception:
                 return None
 
+        # Patterns Nova noticed across many days (episodic -> semantic
+        # consolidation). These are INFERENCES, not things Marcus said, and
+        # they are labeled as such in the rendered line so a reply hedges
+        # instead of asserting. Each one has dates behind it, so "why do you
+        # think that?" is answerable from memory.synthesize / recall.
+        async def _load_insights() -> list[str] | None:
+            try:
+                rows = await self._memory.get_insights(limit=3)
+                return [r["text"] for r in rows if r.get("text")] or None
+            except Exception:
+                return None
+
         # Recent mood trend (M1) — a coarse, honestly-labeled signal so replies
         # can be a little warmer/more attentive when it's been a rough
         # stretch, without claiming deep insight into how Marcus feels.
@@ -1642,12 +1654,14 @@ class RuntimeManager:
             except Exception:
                 return None
 
-        relations, focus_ctx, mood_trend, upcoming_dates, drift_line, profile = await asyncio.gather(
+        relations, focus_ctx, mood_trend, upcoming_dates, drift_line, profile, insights = await asyncio.gather(
             _load_family(), _load_focus(), _load_mood(), _load_upcoming_dates(), _load_drift(),
-            _load_profile(),
+            _load_profile(), _load_insights(),
         )
         if profile:
             context["known_profile"] = profile
+        if insights:
+            context["noticed_patterns"] = insights
 
         if relations:
             context["known_family"].update(relations["family"])
@@ -1780,6 +1794,17 @@ class RuntimeManager:
             ]
             if bits:
                 parts.append("about him: " + "; ".join(bits))
+
+        noticed = context.get("noticed_patterns") or []
+        if noticed:
+            # Explicitly framed as a guess. These are inferred from patterns,
+            # never stated by Marcus, and a confident assertion of one he
+            # disagrees with is worse than not mentioning it at all.
+            parts.append(
+                "patterns you think you've noticed (your own guesses from past "
+                "conversations, NOT things he told you — mention only if relevant, "
+                "and say you may be wrong): " + "; ".join(noticed)
+            )
 
         people = context.get("known_people") or {}
         if people.get("friends"):
