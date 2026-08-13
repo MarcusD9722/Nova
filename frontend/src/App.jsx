@@ -15,7 +15,8 @@ import useFocusSession from "./hooks/useFocusSession";
 import useNovaBusEffects from "./hooks/useNovaBusEffects";
 
 import { useWakeNova } from "./voice/useWakeNova";
-import { acquireMicStreamHandle, playAudioUrl, prefetchAudioBlob, recordVoiceActivityFromStreamToBlob, recordVoiceActivityToBlob, stopActiveAudio, transcribeBlob, unlockAudioContext } from "./voice/recorder";
+import { acquireMicStreamHandle, duckPlayback, playAudioUrl, prefetchAudioBlob, recordVoiceActivityFromStreamToBlob, recordVoiceActivityToBlob, restorePlayback, stopActiveAudio, transcribeBlob, unlockAudioContext } from "./voice/recorder";
+import { CouplingEstimator, newAttempt, summarize, watchForSpeechOverPlayback } from "./voice/bargeIn";
 
 import SettingsSheet from "./overlays/SettingsSheet";
 import CameraSheet from "./overlays/CameraSheet";
@@ -499,37 +500,143 @@ export default function App() {
     }
   };
 
+  // ===== Barge-in telemetry (live acceptance harness) =====
+  const bargeAttemptsRef = useRef([]);
+  const couplingRef = useRef(new CouplingEstimator());
+
+  const harnessOn = () => {
+    try { return window.localStorage.getItem("nova.bargeInHarness") === "1"; }
+    catch { return false; }
+  };
+
+  useEffect(() => {
+    window.novaBargeIn = {
+      report() {
+        const s = summarize(bargeAttemptsRef.current);
+        const text = [
+          "=== Nova barge-in acceptance run ===",
+          `attempts recorded        : ${s.total}`,
+          `successful interrupts    : ${s.successes}`,
+          `missed interrupts        : ${s.missed}`,
+          `FALSE self-interrupts    : ${s.falseSelfInterrupts}`,
+          `echoes correctly rejected: ${s.echoesCorrectlyRejected}`,
+          `mixed speech salvaged    : ${s.mixedSalvaged}`,
+          `stale audio leaks        : ${s.staleAudioLeaks}`,
+          `median stop latency      : ${s.medianStopMs ?? "n/a"} ms`,
+          `P90 stop latency         : ${s.p90StopMs ?? "n/a"} ms`,
+          `median interrupt->reply  : ${s.medianReplyMs ?? "n/a"} ms`,
+          `median measured coupling : ${s.medianCoupling ?? "n/a"}`,
+        ].join("\n");
+        console.log(text);
+        try {
+          navigator.clipboard?.writeText(
+            text + "\n\n" + JSON.stringify(bargeAttemptsRef.current, null, 2));
+        } catch {}
+        return s;
+      },
+      attempts: () => bargeAttemptsRef.current,
+      coupling: () => couplingRef.current.value(),
+      reset() {
+        bargeAttemptsRef.current = [];
+        couplingRef.current.reset();
+        console.log("[barge-in] harness reset");
+      },
+    };
+    if (harnessOn()) {
+      console.log("[barge-in] harness armed — 20 attempts. "
+        + "Run window.novaBargeIn.report() when done.");
+    }
+    return () => { try { delete window.novaBargeIn; } catch {} };
+  }, []);
+
   const watchForBargeIn = async (replyDone, myToken) => {
     let replyFinished = false;
     const settle = () => { replyFinished = true; };
     replyDone.then(settle, settle);
 
-    // Keep listening while the reply is still streaming OR still being spoken.
-    while (voiceSessionRef.current && sessionCtlRef.current.token === myToken) {
-      if (replyFinished && !ttsPlayingRef.current) return null;
+    const attempt = newAttempt(bargeAttemptsRef.current.length + 1);
+    attempt.playbackStartedAt = performance.now();
 
-      let heard = "";
-      try {
-        // Short windows so an interruption is acted on quickly rather than
-        // after a long trailing silence.
-        const blob = await captureCommandBlob({ debugTag: "bargein", maxMs: 4000 });
-        heard = await transcribeBlob(blob, apiUrl("/stt"));
-      } catch {
-        heard = "";
-      }
-      if (!heard?.trim()) continue;
-
-      // The backend decides whether this was Marcus or Nova's own voice coming
-      // back through the speakers. Only a genuine interruption cancels; pure
-      // echo leaves her talking. It can also salvage the real words out of a
-      // transcript that starts as echo and ends as a question.
-      const verdict = await interruptActiveTurn(heard);
-      if (verdict?.interrupted) {
-        return (verdict.text || heard).trim();
-      }
-      // Echo, or nothing to cancel — keep listening.
+    // ── Stage 1: acoustic gate ──────────────────────────────────────────────
+    // Fires on levels alone, so it only DUCKS Nova. Nothing is cancelled until
+    // the backend has classified the transcript — that asymmetry is what makes
+    // a fast, fallible detector acceptable here.
+    let stopWatch = () => {};
+    const analyser = micKeepaliveRef.current?.analyser || null;
+    if (analyser) {
+      stopWatch = watchForSpeechOverPlayback(analyser, (ev) => {
+        attempt.speechDetectedAt = ev.at;
+        attempt.micLevel = ev.micLevel;
+        attempt.ttsRms = ev.ttsRms;
+        attempt.coupling = ev.coupling;
+        if (duckPlayback(0.05)) attempt.playbackDuckedAt = performance.now();
+      }, {}, couplingRef.current);
     }
-    return null;
+
+    const finish = (outcome) => {
+      stopWatch();
+      attempt.outcome = outcome;
+      if (harnessOn()) {
+        bargeAttemptsRef.current.push(attempt);
+        console.log(`[barge-in] attempt ${attempt.attempt}: ${outcome}`, attempt);
+      }
+    };
+
+    try {
+      while (voiceSessionRef.current && sessionCtlRef.current.token === myToken) {
+        if (replyFinished && !ttsPlayingRef.current) {
+          // Nova finished uninterrupted. If the gate ducked her anyway, that is
+          // a false self-interrupt and is recorded as one rather than passing
+          // silently as a clean run.
+          restorePlayback();
+          finish(attempt.playbackDuckedAt ? "false-self-interrupt" : "missed");
+          return null;
+        }
+
+        let heard = "";
+        try {
+          const blob = await captureCommandBlob({ debugTag: "bargein", maxMs: 4000 });
+          heard = await transcribeBlob(blob, apiUrl("/stt"));
+        } catch {
+          heard = "";
+        }
+        if (!heard?.trim()) {
+          // A duck with no intelligible speech behind it was a false trigger.
+          // Give Nova her volume back rather than leaving her quiet.
+          if (attempt.playbackDuckedAt) restorePlayback();
+          continue;
+        }
+
+        attempt.transcriptAt = performance.now();
+        attempt.transcript = heard;
+
+        // ── Stage 2: the backend decides ECHO / USER / MIXED ────────────────
+        const verdict = await interruptActiveTurn(heard);
+        attempt.classification = verdict?.classification ?? null;
+        attempt.turnCancelled = verdict?.interrupted ?? null;
+
+        if (verdict?.interrupted) {
+          attempt.salvagedText = verdict.text || heard;
+          stopActiveAudio();          // confirmed — now it is safe to be final
+          finish("success");
+          return String(attempt.salvagedText).trim();
+        }
+
+        // Pure echo. Nova was ducked on suspicion and is owed her volume back.
+        restorePlayback();
+        if (attempt.playbackDuckedAt) {
+          finish("echo-rejected");
+          return null;
+        }
+      }
+      restorePlayback();
+      finish(attempt.playbackDuckedAt ? "false-self-interrupt" : "missed");
+      return null;
+    } catch (e) {
+      restorePlayback();
+      finish("missed");
+      throw e;
+    }
   };
 
   const waitForResponseToFinish = async ({ maxMs = 45_000 } = {}) => {

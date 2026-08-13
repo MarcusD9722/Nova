@@ -1,24 +1,23 @@
 # P0 live barge-in acceptance run
 
-> ## ⚠ NOT YET RUNNABLE
+> ## ✅ READY TO RUN
 >
-> This document describes the acceptance run. **The harness it describes is not
-> finished yet.** Built and build-verified so far:
+> Wired and verified offline: the stage-1 acoustic gate, duck/restore, backend
+> ECHO/USER/MIXED verification, turn cancellation, and `window.novaBargeIn`.
+> Frontend builds clean; `npm run test:voice` passes.
 >
-> * `frontend/src/voice/bargeIn.ts` — the stage-1 acoustic gate
->   (`watchForSpeechOverPlayback`, `frameIsSpeechLike`), the telemetry types,
->   and the summary maths (`summarize`, `stopLatencyMs`, `replyLatencyMs`).
+> **A bug was fixed before this run existed, and it matters for what you are
+> about to tune.** The gate originally compared raw mic RMS against
+> `getTtsOutputLevel()`, which is a *display* signal for avatar lip sync (raw
+> RMS × 3.4, clamped to 1.0). Above output RMS 0.294 it saturates, making the
+> threshold 1.6 — unreachable, since mic RMS is ≤ 1 by definition. **Barge-in
+> was mathematically impossible exactly when Nova was loudest.** Tuning it live
+> would have chased a broken denominator forever.
 >
-> Still to do before you can run this:
->
-> * call `watchForSpeechOverPlayback` from the voice session loop in
->   `frontend/src/App.jsx`, wired to attenuate playback and hand off to the
->   existing `interruptActiveTurn()`
-> * restore volume when the backend returns ECHO
-> * expose `window.novaBargeIn` (`report()` / `reset()`)
->
-> **Do not attempt the run below yet — `window.novaBargeIn` does not exist.**
-> I will say explicitly when it is ready.
+> It now uses raw output RMS and a **measured** acoustic-coupling estimate
+> rather than a guessed constant, because how much of Nova the mic hears depends
+> on speaker volume, mic distance and the room — the very things this run
+> sweeps.
 
 **Status: UNVALIDATED LIVE.** Full-duplex barge-in stays OFF by default until
 this run passes. Nothing below can be simulated — it needs your voice, your
@@ -137,13 +136,16 @@ measurements:
 | P90 stop latency | ≤ 700 ms | |
 | Echo correctly rejected | attempt 20 not treated as a fresh question | |
 
-**If false self-interrupts > 0**, the acoustic gate is too eager. Raise
-`overTtsRatio` in `frontend/src/voice/bargeIn.ts` (1.6 → 2.0) and re-run. That is
-the single most likely adjustment, and it is why the value is a named constant
-with a comment rather than a magic number.
+**If false self-interrupts > 0**, the gate is too eager. Raise `excessMargin` in
+`frontend/src/voice/bargeIn.ts` (2.0 → 2.6) and re-run.
 
-**If interrupts are missed**, lower `overTtsRatio` (1.6 → 1.3) or `sustainMs`
-(180 → 120). Lower both only one at a time — they trade against each other.
+**If interrupts are missed**, lower `excessMargin` (2.0 → 1.6) or `sustainMs`
+(180 → 120). Change one at a time — they trade against each other.
+
+Check `window.novaBargeIn.coupling()` during a run. It should settle to a
+plausible number for your room (roughly 0.1–0.9). If it stays `null`, the gate
+never gathered enough clean frames and is running on `fallbackCoupling` — tell
+me, because that is a different problem from a badly-tuned margin.
 
 ---
 
