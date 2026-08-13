@@ -75,7 +75,76 @@ function routeThroughAnalyser(audio: HTMLAudioElement): void {
   }
 }
 
-/** Current RMS level (0..1) of Nova's speech output. 0 when not speaking. */
+/**
+ * RAW RMS (0..1) of Nova's speech output — no display scaling, no clamp.
+ *
+ * getTtsOutputLevel() below multiplies by 3.4 and clamps to 1.0 because the
+ * avatar's mouth needs a lively 0..1 display signal. That makes it useless as
+ * an acoustic reference, and using it as one is an outright bug rather than a
+ * mis-tuning:
+ *
+ *   moderate speech (rms ~0.15) -> 0.51, so a naive `mic > level * ratio`
+ *   test demands a mic RMS no human voice produces;
+ *   loud speech (rms >= 0.294)  -> SATURATES at 1.0, so the comparison can
+ *   never be satisfied at all, because mic RMS is <= 1 by definition.
+ *
+ * Barge-in would therefore have been impossible exactly when Nova is loudest.
+ * Echo/coupling logic must use this function; lip sync keeps the scaled one.
+ */
+export function getTtsOutputRms(): number {
+  try {
+    if (!_outAnalyser || !_outData || !_activeAudio || _activeAudio.paused) return 0;
+    _outAnalyser.getByteTimeDomainData(_outData);
+    let sum = 0;
+    for (let i = 0; i < _outData.length; i += 1) {
+      const v = (_outData[i] - 128) / 128;
+      sum += v * v;
+    }
+    return Math.sqrt(sum / _outData.length);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Duck Nova's playback without destroying the turn.
+ *
+ * Barge-in's fast stage acts on levels alone and is allowed to be wrong, so it
+ * must be reversible: attenuate here, and restore if the backend comes back
+ * ECHO. stopActiveAudio() is the irreversible version and is only correct once
+ * a real interruption has been confirmed.
+ */
+let _preDuckVolume: number | null = null;
+
+export function duckPlayback(gain = 0.05): boolean {
+  const audio = _activeAudio;
+  if (!audio) return false;
+  try {
+    if (_preDuckVolume === null) _preDuckVolume = audio.volume;
+    audio.volume = Math.max(0, Math.min(1, gain));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function restorePlayback(): void {
+  const audio = _activeAudio;
+  if (_preDuckVolume === null) return;
+  try {
+    if (audio) audio.volume = _preDuckVolume;
+  } catch {
+    // Nothing to restore to if the clip already ended.
+  }
+  _preDuckVolume = null;
+}
+
+export function isDucked(): boolean {
+  return _preDuckVolume !== null;
+}
+
+/** Display level (0..1) for avatar lip sync. Scaled and clamped — NOT an
+ *  acoustic reference; use getTtsOutputRms() for that. */
 export function getTtsOutputLevel(): number {
   try {
     if (!_outAnalyser || !_outData || !_activeAudio || _activeAudio.paused) return 0;
@@ -270,8 +339,46 @@ let _sharedMicRefs = 0;
 
 export type MicStreamHandle = {
   stream: MediaStream;
+  /**
+   * Live analyser over the shared microphone.
+   *
+   * Barge-in's acoustic gate has to read mic level WHILE no recording is in
+   * progress, which the per-recording analysers inside recordVoiceActivity*
+   * cannot provide — they only exist for the duration of a capture. Shared and
+   * lazily created so repeated handles do not stack AudioContexts.
+   */
+  analyser: AnalyserNode | null;
   release: () => void;
 };
+
+// Shared INPUT analyser. Distinct from the output analyser above, which taps
+// Nova's playback for lip sync.
+let _inCtx: AudioContext | null = null;
+let _inAnalyser: AnalyserNode | null = null;
+let _inSourceFor: MediaStream | null = null;
+
+function ensureInputAnalyser(stream: MediaStream): AnalyserNode | null {
+  try {
+    if (_inAnalyser && _inSourceFor === stream) return _inAnalyser;
+    if (!_inCtx) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      _inCtx = new Ctx();
+    }
+    if (_inCtx.state === "suspended") _inCtx.resume().catch(() => {});
+    const analyser = _inCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.3;
+    // Deliberately NOT connected to destination: monitoring the microphone
+    // through the speakers would create the exact feedback loop barge-in
+    // exists to reason about.
+    _inCtx.createMediaStreamSource(stream).connect(analyser);
+    _inAnalyser = analyser;
+    _inSourceFor = stream;
+    return analyser;
+  } catch {
+    return null;
+  }
+}
 
 export async function acquireMicStreamHandle(opts: VoiceDebugOptions = {}): Promise<MicStreamHandle> {
   const tag = opts.debugTag;
@@ -282,6 +389,7 @@ export async function acquireMicStreamHandle(opts: VoiceDebugOptions = {}): Prom
     vlog(tag, "reusing mic stream", { refs: _sharedMicRefs });
     return {
       stream: _sharedMicStream,
+      analyser: ensureInputAnalyser(_sharedMicStream),
       release: () => releaseMicStreamHandle({ debugTag: tag, _fromRef: myRef }),
     };
   }
@@ -293,6 +401,7 @@ export async function acquireMicStreamHandle(opts: VoiceDebugOptions = {}): Prom
     vlog(tag, "mic stream acquired", { refs: _sharedMicRefs, tracks: stream.getAudioTracks().length });
     return {
       stream,
+      analyser: ensureInputAnalyser(stream),
       release: () => releaseMicStreamHandle({ debugTag: tag, _fromRef: myRef }),
     };
   } catch (e: any) {
@@ -314,6 +423,8 @@ function releaseMicStreamHandle({ debugTag, _fromRef }: { debugTag?: string; _fr
     _sharedMicStream.getTracks().forEach((t) => t.stop());
   } catch {}
   _sharedMicStream = null;
+  _inAnalyser = null;
+  _inSourceFor = null;
   vlog(debugTag, "mic stream released");
 }
 

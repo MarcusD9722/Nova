@@ -3,45 +3,57 @@
  *
  * Barge-in is two-stage on purpose, because the two requirements conflict:
  *
- *   Stage 1 (this file)  must be FAST. Nova has to stop talking within a
- *                        couple of hundred milliseconds or the interruption
- *                        feels broken. It has no transcript, only levels.
+ *   Stage 1 (this file)  must be FAST. Nova has to duck within a couple of
+ *                        hundred milliseconds or the interruption feels
+ *                        broken. It has no transcript, only levels.
  *
  *   Stage 2 (backend)    must be ACCURATE. core/voice/echo.py runs STT and
  *                        decides ECHO / USER / MIXED, and only it can salvage
  *                        the real words out of a transcript that begins as
  *                        Nova's own voice.
  *
- * So this gate is allowed to be wrong, and is designed around being wrong:
- * it ATTENUATES playback rather than cancelling the turn. If stage 2 comes
- * back ECHO, the volume is restored and Nova carries on. Nothing is destroyed
- * on the strength of a level reading alone.
+ * So this gate is allowed to be wrong, and is designed around being wrong: it
+ * DUCKS playback rather than cancelling the turn. If stage 2 returns ECHO the
+ * volume is restored and Nova carries on. Nothing is destroyed on the strength
+ * of a level reading alone.
  *
- * The hard problem is that the microphone hears Nova. Two signals separate her
- * voice from his:
+ * ── Why a fixed mic-to-TTS ratio cannot work ────────────────────────────────
  *
- *   1. Nova's own output level, from getTtsOutputLevel(). When the mic rises
- *      in step with her speech it is almost certainly echo; when it rises while
- *      she is quiet, it is not.
- *   2. Sustained duration. A door, a keyboard, a cough is a spike. Speech holds
- *      energy across many frames.
+ * The first version compared mic RMS against `getTtsOutputLevel() * 1.6`. That
+ * was broken twice over: getTtsOutputLevel() is a *display* signal (raw RMS
+ * x3.4, clamped to 1.0) for avatar lip sync, so the threshold was ~5.4x the
+ * true output RMS, and above rms 0.294 it saturated at 1.0 — making the
+ * comparison unsatisfiable, since mic RMS is <= 1 by definition. Barge-in was
+ * impossible exactly when Nova was loudest.
  *
- * Neither alone is enough. A loud speaker near the mic defeats (1); a long
- * stretch of Nova's own speech defeats (2). Requiring both is what keeps Nova
- * from interrupting herself.
+ * But simply swapping in the raw RMS still leaves a constant to guess, and no
+ * constant is correct: how much of Nova's output the microphone hears depends
+ * on speaker volume, mic distance and the room. Those are precisely the
+ * variables the live acceptance run sweeps. A value tuned at one volume is
+ * wrong at another.
+ *
+ * So the coupling is MEASURED instead. While Nova speaks and nothing else is
+ * happening, mic/tts settles at whatever this room's echo path actually is.
+ * The gate fires when the mic materially exceeds what that measured coupling
+ * predicts — i.e. when there is energy Nova's own voice cannot explain.
  */
 
-import { getTtsOutputLevel, isTtsPlaying } from "./recorder";
+import { getTtsOutputRms, isTtsPlaying } from "./recorder";
 
 export type BargeInConfig = {
   /** Mic RMS below this is never speech, whatever else is true. */
   floor: number;
   /**
-   * How far above Nova's own output the mic must sit before her voice stops
-   * explaining the reading. 1.0 = "as loud as her"; higher = more conservative.
+   * How far above the PREDICTED echo level the mic must sit. Multiplies a
+   * measured coupling estimate, not a raw output level, so it stays meaningful
+   * across speaker volumes and mic distances.
    */
-  overTtsRatio: number;
-  /** Mic level that counts as speech when Nova is silent. */
+  excessMargin: number;
+  /** Coupling assumed before enough has been measured. Deliberately generous. */
+  fallbackCoupling: number;
+  /** Ignore TTS frames quieter than this when estimating coupling. */
+  minTtsForEstimate: number;
+  /** Mic level that counts as speech when Nova is silent between clips. */
   quietThreshold: number;
   /** Consecutive speech-like frames required before firing. */
   sustainMs: number;
@@ -53,10 +65,12 @@ export type BargeInConfig = {
 
 export const DEFAULT_BARGE_IN: BargeInConfig = {
   floor: 0.02,
-  // Measured starting point, not a tuned constant. The live acceptance run
-  // (tests/live_barge_in_harness) is what sets this honestly: too low and Nova
-  // interrupts herself, too high and Marcus has to shout.
-  overTtsRatio: 1.6,
+  // Starting points, not tuned constants. The live acceptance run is what sets
+  // these honestly: too low and Nova interrupts herself, too high and Marcus
+  // has to shout.
+  excessMargin: 2.0,
+  fallbackCoupling: 0.5,
+  minTtsForEstimate: 0.03,
   quietThreshold: 0.025,
   sustainMs: 180,
   graceMs: 250,
@@ -64,61 +78,114 @@ export const DEFAULT_BARGE_IN: BargeInConfig = {
 };
 
 /**
- * The whole stage-1 decision for a single frame, as a pure function.
+ * Running estimate of how much of Nova's output this microphone hears.
  *
- * Split out so it can be tested without a browser, an analyser or a
- * microphone — the timing wrapper around it genuinely needs all three, but the
- * judgement it encodes is what decides whether Nova interrupts herself, and
- * that must be verifiable offline.
+ * Median rather than mean: while Marcus talks over her the ratio spikes, and a
+ * mean would quietly absorb those spikes into the baseline and desensitise the
+ * gate — the failure mode being that the more he interrupts, the less it
+ * listens. A median ignores a minority of contaminated frames.
  */
-export function frameIsSpeechLike(
-  mic: number,
-  tts: number,
-  cfg: BargeInConfig,
-): { speechLike: boolean; reason: BargeInEvent["reason"] } {
-  if (mic < cfg.floor) return { speechLike: false, reason: "tts-quiet" };
-  if (tts > 0.01) {
-    // Nova is audible: the mic must clearly exceed what her own voice explains.
-    return { speechLike: mic > tts * cfg.overTtsRatio, reason: "over-tts" };
+export class CouplingEstimator {
+  private ratios: number[] = [];
+  private cached: number | null = null;
+  constructor(private readonly capacity = 150) {}
+
+  observe(mic: number, tts: number, minTts: number): void {
+    if (tts < minTts) return;
+    this.ratios.push(mic / tts);
+    if (this.ratios.length > this.capacity) this.ratios.shift();
+    this.cached = null;
   }
-  // Nova is between clips: ordinary speech detection applies.
-  return { speechLike: mic >= cfg.quietThreshold, reason: "tts-quiet" };
+
+  /** null until there is enough evidence to be worth trusting. */
+  value(): number | null {
+    if (this.ratios.length < 20) return null;
+    if (this.cached !== null) return this.cached;
+    const s = [...this.ratios].sort((a, b) => a - b);
+    this.cached = s[Math.floor(s.length / 2)];
+    return this.cached;
+  }
+
+  get samples(): number {
+    return this.ratios.length;
+  }
+
+  reset(): void {
+    this.ratios = [];
+    this.cached = null;
+  }
 }
 
 export type BargeInEvent = {
   at: number;
   micLevel: number;
-  ttsLevel: number;
+  ttsRms: number;
+  coupling: number;
+  predictedEcho: number;
   sustainedMs: number;
-  reason: "over-tts" | "tts-quiet";
+  reason: "over-echo" | "tts-quiet";
 };
+
+/**
+ * The whole stage-1 decision for one frame, as a pure function.
+ *
+ * Split out precisely so the judgement that decides whether Nova interrupts
+ * herself can be verified without a browser, an analyser or a microphone.
+ */
+export function frameIsSpeechLike(
+  mic: number,
+  ttsRms: number,
+  cfg: BargeInConfig,
+  coupling: number | null,
+): { speechLike: boolean; reason: BargeInEvent["reason"]; predictedEcho: number } {
+  if (mic < cfg.floor) {
+    return { speechLike: false, reason: "tts-quiet", predictedEcho: 0 };
+  }
+  if (ttsRms > 0.01) {
+    // Nova is audible. Predict how loud her echo should be in this room, and
+    // require the mic to exceed it by a margin.
+    const c = coupling ?? cfg.fallbackCoupling;
+    const predicted = ttsRms * c;
+    return {
+      speechLike: mic > predicted * cfg.excessMargin,
+      reason: "over-echo",
+      predictedEcho: predicted,
+    };
+  }
+  // Between clips: ordinary speech detection applies.
+  return {
+    speechLike: mic >= cfg.quietThreshold,
+    reason: "tts-quiet",
+    predictedEcho: 0,
+  };
+}
 
 /**
  * Watches a live analyser and calls `onCandidate` the first time it believes
  * Marcus has started talking over Nova.
  *
- * Returns a stop() function. Deliberately does NOT touch playback, cancel a
- * turn, or call the backend — the caller owns those decisions, so this stays
- * testable and cannot half-perform an interruption.
+ * Returns stop(). Deliberately does NOT touch playback, cancel a turn or call
+ * the backend — the caller owns those decisions, so this stays testable and
+ * cannot half-perform an interruption.
  */
 export function watchForSpeechOverPlayback(
   analyser: AnalyserNode,
   onCandidate: (ev: BargeInEvent) => void,
   cfg: Partial<BargeInConfig> = {},
+  estimator: CouplingEstimator = new CouplingEstimator(),
 ): () => void {
   const c = { ...DEFAULT_BARGE_IN, ...cfg };
   const data = new Uint8Array(analyser.fftSize);
   const startedAt = performance.now();
   let sustainedFrom: number | null = null;
   let fired = false;
-  let timer: number | null = null;
 
   const tick = () => {
     if (fired) return;
     const now = performance.now();
 
-    // Only meaningful while Nova is actually speaking; otherwise the normal
-    // VAD owns the microphone and this would double-trigger.
+    // Only meaningful while Nova is actually speaking; otherwise the normal VAD
+    // owns the microphone and this would double-trigger.
     if (!isTtsPlaying()) {
       sustainedFrom = null;
       return;
@@ -132,9 +199,16 @@ export function watchForSpeechOverPlayback(
       sum += v * v;
     }
     const mic = Math.sqrt(sum / data.length);
-    const tts = getTtsOutputLevel();
+    const ttsRms = getTtsOutputRms();
 
-    const { speechLike, reason } = frameIsSpeechLike(mic, tts, c);
+    const coupling = estimator.value();
+    const { speechLike, reason, predictedEcho } =
+      frameIsSpeechLike(mic, ttsRms, c, coupling);
+
+    // Only learn the room from frames that look like Nova alone. Feeding
+    // candidate-interruption frames back in would teach the estimator that
+    // Marcus's voice is normal echo.
+    if (!speechLike) estimator.observe(mic, ttsRms, c.minTtsForEstimate);
 
     if (!speechLike) {
       sustainedFrom = null;
@@ -144,29 +218,30 @@ export function watchForSpeechOverPlayback(
     const sustained = now - sustainedFrom;
     if (sustained >= c.sustainMs) {
       fired = true;
-      onCandidate({ at: now, micLevel: mic, ttsLevel: tts, sustainedMs: sustained, reason });
+      onCandidate({
+        at: now, micLevel: mic, ttsRms,
+        coupling: coupling ?? c.fallbackCoupling,
+        predictedEcho, sustainedMs: sustained, reason,
+      });
     }
   };
 
-  timer = window.setInterval(tick, c.frameMs);
-  return () => {
-    if (timer !== null) window.clearInterval(timer);
-    timer = null;
-  };
+  const timer = window.setInterval(tick, c.frameMs);
+  return () => window.clearInterval(timer);
 }
 
+// ── Telemetry ───────────────────────────────────────────────────────────────
+
 /**
- * Barge-in telemetry for one attempt.
- *
- * Every field is a real observation or null — nothing is inferred, so the live
- * acceptance run cannot accidentally report a latency it never measured.
+ * One barge-in attempt. Every field is a real observation or null — nothing is
+ * inferred, so the acceptance run cannot report a latency it never measured.
  */
 export type BargeInAttempt = {
   attempt: number;
   novaSentence: string | null;
   playbackStartedAt: number | null;
   speechDetectedAt: number | null;
-  playbackStoppedAt: number | null;
+  playbackDuckedAt: number | null;
   transcriptAt: number | null;
   transcript: string | null;
   classification: string | null;
@@ -174,30 +249,25 @@ export type BargeInAttempt = {
   turnCancelled: boolean | null;
   staleAudioLeaked: boolean;
   newFirstAudioAt: number | null;
+  coupling: number | null;
+  micLevel: number | null;
+  ttsRms: number | null;
   outcome: "success" | "missed" | "false-self-interrupt" | "echo-rejected" | "pending";
 };
 
 export function newAttempt(n: number): BargeInAttempt {
   return {
-    attempt: n,
-    novaSentence: null,
-    playbackStartedAt: null,
-    speechDetectedAt: null,
-    playbackStoppedAt: null,
-    transcriptAt: null,
-    transcript: null,
-    classification: null,
-    salvagedText: null,
-    turnCancelled: null,
-    staleAudioLeaked: false,
-    newFirstAudioAt: null,
+    attempt: n, novaSentence: null, playbackStartedAt: null, speechDetectedAt: null,
+    playbackDuckedAt: null, transcriptAt: null, transcript: null, classification: null,
+    salvagedText: null, turnCancelled: null, staleAudioLeaked: false,
+    newFirstAudioAt: null, coupling: null, micLevel: null, ttsRms: null,
     outcome: "pending",
   };
 }
 
 export function stopLatencyMs(a: BargeInAttempt): number | null {
-  if (a.speechDetectedAt === null || a.playbackStoppedAt === null) return null;
-  return a.playbackStoppedAt - a.speechDetectedAt;
+  if (a.speechDetectedAt === null || a.playbackDuckedAt === null) return null;
+  return a.playbackDuckedAt - a.speechDetectedAt;
 }
 
 export function replyLatencyMs(a: BargeInAttempt): number | null {
@@ -205,11 +275,10 @@ export function replyLatencyMs(a: BargeInAttempt): number | null {
   return a.newFirstAudioAt - a.transcriptAt;
 }
 
-function percentile(vals: number[], p: number): number | null {
+export function percentile(vals: number[], p: number): number | null {
   if (!vals.length) return null;
   const s = [...vals].sort((x, y) => x - y);
-  const k = Math.min(s.length - 1, Math.round((p / 100) * (s.length - 1)));
-  return s[k];
+  return s[Math.min(s.length - 1, Math.round((p / 100) * (s.length - 1)))];
 }
 
 /** Summary for the live acceptance run, so Marcus never computes a timing. */
@@ -217,6 +286,7 @@ export function summarize(attempts: BargeInAttempt[]) {
   const done = attempts.filter((a) => a.outcome !== "pending");
   const stops = done.map(stopLatencyMs).filter((x): x is number => x !== null);
   const replies = done.map(replyLatencyMs).filter((x): x is number => x !== null);
+  const couplings = done.map((a) => a.coupling).filter((x): x is number => x !== null);
   return {
     total: done.length,
     successes: done.filter((a) => a.outcome === "success").length,
@@ -228,5 +298,6 @@ export function summarize(attempts: BargeInAttempt[]) {
     medianStopMs: percentile(stops, 50),
     p90StopMs: percentile(stops, 90),
     medianReplyMs: percentile(replies, 50),
+    medianCoupling: percentile(couplings, 50),
   };
 }
