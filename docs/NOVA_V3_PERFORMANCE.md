@@ -1,5 +1,128 @@
 # Nova V3 — Performance
 
+---
+
+# P2 — Formal benchmark baseline
+
+`tests/bench_nova_v3.py`, ten scenarios, real model + real memory + real
+selector + real isolated XTTS. Memory runs in a temp directory so a benchmark
+never pollutes Marcus's own.
+
+```bash
+venv/Scripts/python.exe tests/bench_nova_v3.py
+```
+
+## The headline finding, and it is uncomfortable
+
+| Metric | mean | median | P90 |
+|---|---:|---:|---:|
+| recall gate + memory | 84 ms | 80 ms | 123 ms |
+| tool selection | 42 ms | 32 ms | 48 ms |
+| artifact resolution | **0 ms** | 0 ms | 0 ms |
+| **TTFT** | **11,703 ms** | **12,127 ms** | **18,215 ms** |
+| first speakable chunk | 11,878 ms | 12,414 ms | 18,258 ms |
+| XTTS first chunk | 2,661 ms | — | — |
+| total turn | 12,529 ms | 14,359 ms | 18,695 ms |
+
+**Everything V2 and V3 P1 optimised is noise.** Memory retrieval, the recall
+gate, tool selection and artifact resolution together account for ~126 ms of a
+turn whose median is 14.4 seconds. The ~130 ms P1 bought is real, and it is
+about 1% of the problem.
+
+The dominant term is **hidden reasoning before the first visible token**, and its
+variance is extreme:
+
+| Scenario | TTFT |
+|---|---:|
+| reasoning | **114 ms** |
+| project recall | 128 ms |
+| greeting | 332 ms |
+| followup | 8,874 ms |
+| long_tts | 9,615 ms |
+| freshness | 14,640 ms |
+| ordinal | 14,945 ms |
+| memory | 17,005 ms |
+| multitool | 18,215 ms |
+| tool | **33,164 ms** |
+
+**114 ms to 33 seconds on the same model with the same settings.** Note the
+ordering is not intuitive — the scenario literally named "complex reasoning"
+was the *fastest*, and "what's the weather tomorrow?" was the slowest. Prompt
+content, not question difficulty, is driving think length.
+
+33 seconds to first word is not a conversational assistant. This is now the
+single most important open problem in Nova, and it is far larger than anything
+addressed in V2 or V3 so far.
+
+## Per-scenario detail
+
+```
+scenario    gate     mem    sel tools    ttft   chunk    tts1    total  chars
+greeting    skip       0      0     2      332     366       —      498     70
+memory      R        123      4    10    17005   17248       —    17375     60
+tool        R         62      0     4    33164   33404       —    33547    102
+followup    R         69    214    10     8874    8919       —     9384     79
+multitool   R         91      0     4    18215   18258       —    18695    128
+ordinal     skip       0     32    10    14945   15176       —    15453    132
+reasoning   R        122     32     9      114     302       —      968    369
+project     R        196     46    10      128     282       —      650    134
+freshness   R         62     45     9    14640   14891       —    15141    119
+long_tts    R        112     48     8     9615    9938    2661    13577    485
+```
+
+| | |
+|---|---|
+| Tools exposed per turn | **7.6 of 20** registered |
+| Recall-gate skips | 2/10 (greeting, ordinal) |
+| LLM calls per turn | 1.0 |
+| Empty replies | **0/10** |
+| Wasted generations | 1 |
+| Errors | 0 |
+| VRAM at end | 8.86 GB |
+| RSS at end | 7,985 MB |
+
+The subsystems built in V2 behave exactly as designed — the gate skips the
+greeting and the ordinal reference, artifact resolution is genuinely free
+(sub-millisecond), and the selector shows 7.6 tools instead of 20. They are
+just not where the time goes.
+
+## A harness bug, recorded because the wrong numbers looked plausible
+
+The first run reported **3/10 empty replies and 8 wasted generations** — which
+reads exactly like the empty-generation regression returning. It was not. The
+benchmark defaulted scenarios to `max_tokens=512`; production uses 1536, and
+`core/runtime.py` documents that a small budget with thinking enabled lets the
+hidden block overflow and strip to nothing.
+
+Raising it to 1536 gave 0/10 empty and 1 wasted generation. Same mistake made
+earlier in `live_voice_validation.py`; the fix is now commented in both so the
+next harness does not repeat it a third time.
+
+## Not measured — needs a microphone and a live browser
+
+Omitted rather than estimated:
+
+* VAD / speech-onset latency
+* endpoint (trailing-silence) latency in a real room
+* frontend audio finalisation and upload transport
+* backend → frontend TTS delivery, playback start
+* **end of user speech → first audible word** (the headline metric)
+* barge-in stop latency — **P0: IMPLEMENTED, LIVE ACCEPTANCE PENDING**
+
+## What this changes about V3 priorities
+
+The remaining V3 phases (MCP, artifacts, speaker ID, CAD, gestures, devices,
+productization) all add capability. **None of them touch the 12-second median.**
+On the evidence above, bounding or suppressing hidden reasoning for
+conversational turns is worth more to the experience than any of them, and it
+should be raised in priority rather than left until after P9.
+
+That is a recommendation, not a unilateral reordering — the phase order was set
+deliberately and this is one benchmark run.
+
+---
+
+
 Every number here came from a run on Marcus's RTX 5080. Reproduce with:
 
 ```bash
