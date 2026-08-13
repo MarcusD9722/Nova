@@ -18,7 +18,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import wave
 import warnings
 import xml.etree.ElementTree as ET
 import zipfile
@@ -43,6 +42,9 @@ from core.llm_runtime import GPUEnforcementError, LLMRuntime
 from core.logging_setup import get_logger, setup_logging
 from core.runtime import RuntimeManager
 from core.tooling import build_tool_router
+from core.voice.chunker import SpeechChunker
+from core.voice.echo import EchoFilter
+from core.voice.speech_text import has_speakable_content, to_spoken
 from memory.unifier import MemoryUnifier
 from core.brain import Brain
 from plugins.registry import PluginConfigError
@@ -388,14 +390,6 @@ app.include_router(_r_web_maps.router)
 from backend.state import STATE, _TTS_CACHE_MAX  # Phase 0.6: shared state lives in backend/state.py
 
 
-def _xtts_gpu_required_message() -> str:
-    return (
-        "XTTS requires CUDA GPU execution and refuses CPU fallback. "
-        "Install a CUDA-enabled PyTorch/TorchAudio stack, keep NOVA_TTS_DEVICE=cuda, "
-        "and verify torch.cuda.is_available() is true."
-    )
-
-
 def _require_model_present() -> None:
     cfg = STATE.config
     llm = STATE.llm
@@ -465,63 +459,6 @@ def _voice_needs_ffmpeg(voice_path: Path) -> bool:
     return voice_path.suffix.lower() in {".mp3", ".m4a", ".ogg", ".webm"}
 
 
-def _patch_torchaudio_load_for_soundfile() -> None:
-    """Work around TorchAudio 2.9's hard dependency on torchcodec.
-
-    Coqui TTS calls `torchaudio.load(...)` to read reference audio. In torchaudio
-    2.9, `torchaudio.load` routes through torchcodec unconditionally, which can
-    fail to load native DLLs on Windows.
-
-    We monkeypatch `torchaudio.load` to use `soundfile` (already in our deps) so
-    WAV reference audio works without torchcodec.
-
-    NOTE: This is a pragmatic compatibility shim; it only aims to support the
-    subset of `torchaudio.load` behavior used by Coqui.
-    """
-
-    try:
-        import io
-
-        import numpy as np
-        import soundfile as sf  # type: ignore
-        import torch  # type: ignore
-        import torchaudio  # type: ignore
-    except Exception:
-        return
-
-    if getattr(torchaudio, "__nova_soundfile_load_patched__", False):
-        return
-
-    def _load_with_soundfile(
-        uri,
-        frame_offset: int = 0,
-        num_frames: int = -1,
-        normalize: bool = True,
-        channels_first: bool = True,
-        format: str | None = None,
-        buffer_size: int = 4096,
-        backend: str | None = None,
-    ):
-        # Support path-like and file-like (bytes) objects.
-        if hasattr(uri, "read"):
-            raw = uri.read()
-            data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
-        else:
-            data, sr = sf.read(uri, dtype="float32", always_2d=True)
-
-        if frame_offset:
-            data = data[int(frame_offset) :]
-        if num_frames is not None and int(num_frames) > 0:
-            data = data[: int(num_frames)]
-
-        # data: (frames, channels)
-        tensor = torch.from_numpy(np.ascontiguousarray(data.T if channels_first else data))
-        return tensor, int(sr)
-
-    torchaudio.load = _load_with_soundfile  # type: ignore[assignment]
-    torchaudio.__nova_soundfile_load_patched__ = True
-
-
 def _list_voice_files(voice_dir: Path) -> list[Path]:
     exts = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
     try:
@@ -579,13 +516,6 @@ def _resolve_voice_path(cfg: "RuntimeConfig", requested: str | None) -> Path:
 
 
 
-def _silent_call(fn, *args, **kwargs):
-    sink = io.StringIO()
-    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-        return fn(*args, **kwargs)
-
-
-
 def _silent_warn_call(fn, *args, **kwargs):
     sink = io.StringIO()
     with warnings.catch_warnings():
@@ -593,169 +523,101 @@ def _silent_warn_call(fn, *args, **kwargs):
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             return fn(*args, **kwargs)
 
-def _wav_bytes_from_f32(samples, sample_rate: int) -> bytes:
-    # samples expected float32 in [-1, 1]
-    import numpy as np
-
-    arr = np.asarray(samples, dtype=np.float32)
-    arr = np.clip(arr, -1.0, 1.0)
-    pcm = (arr * 32767.0).astype(np.int16)
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(int(sample_rate))
-        wf.writeframes(pcm.tobytes())
-    return buf.getvalue()
-
-
-def _ensure_xtts_downloadable() -> None:
-    """Guard against XTTS first-download failure modes.
-
-    Coqui TTS gates XTTS v2 behind an interactive license prompt. Under
-    uvicorn (no usable stdin, output silenced) that prompt blocks forever, so
-    Nova would type but never speak, with no visible error. Additionally, an
-    aborted download leaves an empty cache dir that makes ModelManager skip
-    the download and then fail on missing files.
-    """
-    try:
-        from TTS.utils.generic_utils import get_user_data_dir  # type: ignore
-
-        cache_dir = Path(get_user_data_dir("tts")) / "tts_models--multilingual--multi-dataset--xtts_v2"
-    except Exception:
-        return
-
-    complete = (cache_dir / "config.json").exists() and (cache_dir / "model.pth").exists()
-    if complete:
-        return
-
-    # Remove a partial/empty cache dir so a fresh download actually happens.
-    if cache_dir.exists():
-        shutil.rmtree(cache_dir, ignore_errors=True)
-
-    if os.getenv("COQUI_TOS_AGREED", "").strip() != "1":
-        raise RuntimeError(
-            "XTTS v2 is not downloaded yet, and downloading it requires accepting the Coqui CPML "
-            "license (non-commercial). Set COQUI_TOS_AGREED=1 in .env, restart Nova, and the model "
-            "(~1.9 GB) will download on first use. License: https://coqui.ai/cpml"
-        )
-
-    # Coqui's own downloader routes through coqui.gateway.scarf.sh, whose TLS
-    # chain is broken (Coqui shut down). Fetch the model straight from
-    # HuggingFace instead, into the exact cache layout TTS expects.
-    _bullet("Downloading XTTS v2 from HuggingFace (~1.9 GB, one-time)...")
-    BUS.publish("tts.loading", {"reason": "downloading_model"})
-    try:
-        from huggingface_hub import hf_hub_download  # type: ignore
-
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        for filename in ("config.json", "vocab.json", "hash.md5", "speakers_xtts.pth", "model.pth"):
-            hf_hub_download(repo_id="coqui/XTTS-v2", filename=filename, local_dir=str(cache_dir))
-        # Marker TTS writes after an interactive TOS agreement; keeps its
-        # downloader from ever re-prompting.
-        (cache_dir / "tos_agreed.txt").write_text("I have read, understood and agreed to the Terms and Conditions.\n", encoding="utf-8")
-        _bullet("XTTS v2 download complete")
-    except Exception as e:  # noqa: BLE001
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        raise RuntimeError(
-            f"XTTS v2 download from HuggingFace failed: {e}. "
-            "Check your internet connection and try again."
-        ) from e
-
-
 def _load_tts_model():
-    # PyTorch 2.6+ defaults to safer "weights_only" loading, which can
-    # break Coqui checkpoints unless required classes are allowlisted.
-    # We iteratively allowlist only TTS.* classes that torch reports as
-    # "Unsupported global".
-    import importlib
-    import re
+    """Legacy in-process XTTS load (NOVA_TTS_ISOLATED=0 only).
 
-    import torch  # type: ignore
+    Kept for debugging the model itself without the process boundary in the
+    way. It is NOT the normal path: in-process CUDA XTTS beside llama.cpp is
+    what produced the illegal-memory-access aborts documented in core/gpu.py,
+    so this path is only safe on CPU. Device policy is shared with the isolated
+    worker so the two can never disagree about what "auto" means.
+    """
+    from services.xtts_engine import load_engine, resolve_device
 
-    warnings.filterwarnings(
-        "ignore",
-        message=r"pkg_resources is deprecated as an API\..*",
-        category=UserWarning,
-        module=r"jieba\._compat",
-    )
+    device, reason = resolve_device()
+    if device != "cpu":
+        _bullet(f"WARNING: in-process XTTS on {device} shares a CUDA context with llama.cpp "
+                "and can abort the backend. Set NOVA_TTS_ISOLATED=1 (the default).")
+    tts, sample_rate = load_engine(device, progress=_bullet)
+    STATE.tts_sample_rate = sample_rate
+    STATE.tts_device_reason = reason
+    return tts, device
 
-    _patch_torchaudio_load_for_soundfile()
-    from TTS.api import TTS  # type: ignore
 
-    model_id = "tts_models/multilingual/multi-dataset/xtts_v2"
-    _ensure_xtts_downloadable()
-    allowlisted: set[str] = set()
+def _tts_isolated_enabled() -> bool:
+    return os.getenv("NOVA_TTS_ISOLATED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
-    for _ in range(32):
-        try:
-            tts = _silent_call(TTS, model_id)
-            # Defaults to CPU, deliberately, and it is a real trade-off.
-            #
-            # On CUDA, XTTS is fast (RTF ~0.44) and ABORTS THE BACKEND. It is a
-            # second uncoordinated CUDA consumer beside llama.cpp, and
-            # synthesizing a sentence while the model generates the next one
-            # kills the process:
-            #   CUDA error: an illegal memory access was encountered
-            #     in ggml_backend_cuda_synchronize (ggml-cuda.cu:3235)
-            # Reproduced twice in ten minutes of ordinary speaking turns; with
-            # XTTS on CPU, ten speaking turns ran clean.
-            #
-            # It cannot simply be serialized on the GPU semaphore: sentence
-            # streaming overlaps synthesis with generation BY DESIGN, and the
-            # SSE handler drains clips mid-stream, so taking the permit here
-            # deadlocks (measured: 195s hang, then access violations on every
-            # later turn). The correct fix is to run XTTS in its own process,
-            # the pattern tools/imagegen/ already uses for GPU isolation.
-            #
-            # NOVA_TTS_DEVICE=cuda restores the fast path, with that crash.
-            requested_device = (os.getenv("NOVA_TTS_DEVICE", "cpu").strip() or "cpu").lower()
-            if requested_device == "auto":
-                target_device = "cuda"
-            else:
-                target_device = requested_device
 
-            if target_device.startswith("cuda") and not torch.cuda.is_available():
-                raise RuntimeError(_xtts_gpu_required_message())
+def _tts_engine():
+    """The isolated XTTS client, created on first use.
 
-            if target_device != "cpu":
-                try:
-                    tts = tts.to(target_device)
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"{_xtts_gpu_required_message()} Device move failed for {target_device}: {e}"
-                    ) from e
-            else:
-                raise RuntimeError(_xtts_gpu_required_message())
+    Creating it is cheap and starts nothing — the child process spawns on the
+    first `ensure_started()`. That keeps `import backend.app` free of any CUDA
+    or model side effects, which the test suite depends on.
+    """
+    if STATE.tts_engine is None:
+        from services.tts_client import IsolatedTtsEngine
 
-            return tts, target_device
-        except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            m = re.search(r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)", msg)
-            if not m:
-                raise
+        def _emit(event: str, payload: dict) -> None:
+            BUS.publish(event, payload)
+            if event == "tts.loading" and payload.get("message"):
+                _bullet(str(payload["message"]))
+            elif event == "tts.worker_died":
+                _bullet("XTTS worker died — voice degraded, text chat unaffected")
+            elif event == "tts.worker_restarting":
+                _bullet(f"Restarting XTTS worker (attempt {payload.get('attempt')})")
 
-            dotted = m.group(1).strip()
-            if not dotted.startswith("TTS."):
-                raise
-            if dotted in allowlisted:
-                raise
+        STATE.tts_engine = IsolatedTtsEngine(
+            cfg={
+                "device": os.getenv("NOVA_TTS_DEVICE", "auto"),
+                "allow_cpu_fallback": os.getenv("NOVA_TTS_ALLOW_CPU_FALLBACK", "0").strip().lower()
+                in {"1", "true", "yes", "on"},
+            },
+            max_backlog=int(os.getenv("NOVA_TTS_MAX_BACKLOG", "32").strip() or "32"),
+            max_restarts=int(os.getenv("NOVA_TTS_MAX_RESTARTS", "3").strip() or "3"),
+            on_event=_emit,
+        )
+    return STATE.tts_engine
 
-            mod_name, attr = dotted.rsplit(".", 1)
-            obj = getattr(importlib.import_module(mod_name), attr)
 
-            try:
-                torch.serialization.add_safe_globals([(obj, dotted)])  # type: ignore[attr-defined]
-            except Exception:
-                raise
-
-            allowlisted.add(dotted)
-
-    raise RuntimeError("tts_model_load_failed: exceeded allowlist attempts")
+def tts_status() -> dict[str, Any]:
+    """What the voice subsystem is ACTUALLY doing right now. Never inferred."""
+    if _tts_isolated_enabled():
+        engine = STATE.tts_engine
+        if engine is None:
+            return {
+                "mode": "isolated",
+                "state": "stopped",
+                "configured_device": os.getenv("NOVA_TTS_DEVICE", "auto"),
+                "actual_device": None,
+                "detail": "worker not started yet (starts on first speech)",
+            }
+        return {"mode": "isolated", **engine.status()}
+    return {
+        "mode": "in_process",
+        "state": "ready" if STATE.tts is not None else "stopped",
+        "configured_device": os.getenv("NOVA_TTS_DEVICE", "auto"),
+        "actual_device": STATE.tts_device,
+        "device_reason": STATE.tts_device_reason,
+        "detail": "NOVA_TTS_ISOLATED=0: legacy in-process loader, CPU-safe only",
+    }
 
 
 async def _ensure_tts_loaded(reason: str = "request") -> Any:
+    if _tts_isolated_enabled():
+        engine = _tts_engine()
+        if engine.state != "ready":
+            _bullet(f"Starting XTTS worker... ({reason})")
+            BUS.publish("tts.loading", {"reason": reason})
+        if not await engine.ensure_started():
+            raise RuntimeError(engine.last_error or "XTTS worker unavailable")
+        if STATE.tts_device != engine.device:
+            STATE.tts_device = engine.device
+            STATE.tts_device_reason = engine.device_reason
+            STATE.tts_sample_rate = engine.sample_rate
+            _bullet(f"XTTS ready on {engine.device} (isolated process, pid {engine.pid})")
+        return engine
+
     if STATE.tts is not None:
         return STATE.tts
 
@@ -925,7 +787,23 @@ async def _mood_speed_multiplier() -> float:
         return 1.0
 
 
-async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply") -> bytes:
+async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply",
+                     turn_id: str = "") -> bytes:
+    """Synthesise one utterance.
+
+    Deliberately does NOT take core.gpu.GPU_SEM. That was tried and deadlocks:
+    the reply stream holds the permit for the whole generation (`async with
+    chat_model.semaphore` wraps the token loop) while the SSE handler drains
+    TTS clips mid-stream, so the synthesis it waits on can never get the permit
+    (measured: a 195 s hang, then access violations on every later turn).
+    Sentence-streamed TTS overlaps generation *by design* and so cannot be
+    serialised against it.
+
+    The resolution is not a permit but a process: XTTS runs in its own child
+    process with its own CUDA context (services/tts_worker.py), so it shares the
+    card with llama.cpp without sharing the context that made them corrupt each
+    other. See core/gpu.py for the original evidence.
+    """
     text = _normalize_tts_text(text)
     if not text:
         raise RuntimeError("tts_text_empty")
@@ -938,7 +816,7 @@ async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply") -> byte
         if cached is not None:
             return cached
 
-    await _ensure_tts_loaded(reason)
+    engine = await _ensure_tts_loaded(reason)
     speaker_wav = await _speaker_wav_for_voice(voice_path)
 
     try:
@@ -948,24 +826,22 @@ async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply") -> byte
     # Layer the mood hint on the configured base, clamped to a natural range.
     tts_speed = max(0.8, min(1.25, tts_speed * mood_mult))
 
-    def _run() -> bytes:
-        wav = _silent_call(STATE.tts.tts, text=text, speaker_wav=speaker_wav, language="en", speed=tts_speed)
-        sr = int(getattr(STATE.tts.synthesizer, "output_sample_rate", 24000))
-        return _wav_bytes_from_f32(wav, sr)
+    if _tts_isolated_enabled():
+        audio = await engine.synthesize(
+            text, speaker_wav=speaker_wav, turn_id=turn_id, language="en", speed=tts_speed
+        )
+    else:
+        def _run() -> bytes:
+            from services.xtts_engine import synthesize
 
-    started = perf_counter()
-    # NOTE: acquiring core.gpu.GPU_SEM here DEADLOCKS. The reply stream holds
-    # that permit for the whole generation (`async with chat_model.semaphore`
-    # wraps the token loop) while the SSE handler drains TTS clips MID-stream,
-    # so the synthesis it is waiting on can never get the permit. Observed:
-    # a 195s hang, then `access violation reading 0x18` on every later turn.
-    #
-    # Sentence-streamed TTS is *designed* to overlap generation, so it cannot
-    # simply be serialized against it. The real fix is process isolation, the
-    # pattern tools/imagegen/ already uses for exactly this reason. Until then
-    # XTTS runs on CPU by default (see NOVA_TTS_DEVICE) — slower, but it does
-    # not abort llama.cpp. See core/gpu.py for the full evidence.
-    audio = await asyncio.to_thread(_run)
+            sr = STATE.tts_sample_rate or int(
+                getattr(STATE.tts.synthesizer, "output_sample_rate", 24000)
+            )
+            return synthesize(STATE.tts, sr, text=text, speaker_wav=speaker_wav,
+                              language="en", speed=tts_speed)
+
+        audio = await asyncio.to_thread(_run)
+
     if _should_cache_tts_phrase(text, reason):
         STATE.tts_phrase_cache[cache_key] = audio
     return audio
@@ -1220,6 +1096,14 @@ async def _shutdown() -> None:
             pass
         except Exception:
             pass
+    if STATE.tts_engine is not None:
+        # Must happen before the loop closes: the worker is a real child
+        # process, and leaving it running orphans a CUDA context holding VRAM.
+        try:
+            await STATE.tts_engine.stop()
+        except Exception:
+            pass
+        STATE.tts_engine = None
     if STATE.brain is not None:
         try:
             await STATE.brain.stop()
@@ -1239,8 +1123,7 @@ async def health() -> dict:
         "version": cfg.version,
         "gpu": llm.gpu_status.__dict__,
         "tts": {
-            "loaded": STATE.tts is not None,
-            "device": STATE.tts_device,
+            **tts_status(),
             "voice_dir": str(cfg.voice_dir),
             "default_voice": os.getenv("NOVA_DEFAULT_VOICE", "").strip() or None,
         },
@@ -1296,7 +1179,7 @@ async def status() -> dict:
         },
         "gpu": gpu.to_dict(),
         "vision": llm.vision_status,
-        "tts": {"loaded": STATE.tts is not None, "device": STATE.tts_device},
+        "tts": tts_status(),
         "stt": {
             "loaded": STATE.stt is not None,
             "engine": STATE.stt[0] if STATE.stt is not None else None,
@@ -1444,26 +1327,18 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
 
         return f"event: {event}\ndata: {_json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
-    def _split_sentences(buffer: str, force: bool = False) -> tuple[list[str], str]:
-        """Split complete sentences off the front of the stream buffer."""
-        if force:
-            return ([buffer.strip()] if buffer.strip() else []), ""
-        parts = re.split(r"(?<=[.!?])\s+", buffer)
-        if len(parts) <= 1:
-            # No boundary yet; force a cut on very long run-ons so speech keeps up.
-            if len(buffer) > 260:
-                cut = buffer.rfind(" ", 60, 260)
-                if cut > 0:
-                    return [buffer[:cut].strip()], buffer[cut + 1 :]
-            return [], buffer
-        complete = [p.strip() for p in parts[:-1] if p.strip()]
-        return complete, parts[-1]
-
     async def gen():
         conv_id = req.conversation_id or uuid4()
         speak = bool(req.speak)
 
-        yield _sse("meta", {"conversation_id": str(conv_id)})
+        # Turn identity: everything asynchronous below carries this id, and a
+        # barge-in on /voice/interrupt cancels it. Starting a turn also
+        # supersedes whatever was live in this conversation, so an abandoned
+        # previous turn stops producing audio immediately.
+        turn = STATE.turns.start(str(conv_id))
+        turn_id = turn.turn_id
+
+        yield _sse("meta", {"conversation_id": str(conv_id), "turn_id": turn_id})
 
         # ── Sentence-streamed TTS worker (runs alongside token streaming) ────
         sentence_q: asyncio.Queue[str | None] = asyncio.Queue()
@@ -1483,9 +1358,17 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                 sentence = await sentence_q.get()
                 if sentence is None:
                     break
+                if STATE.turns.is_cancelled(turn_id):
+                    # Barge-in landed while this sentence was queued. Drop the
+                    # rest of the turn rather than synthesising audio nobody
+                    # will be allowed to hear.
+                    continue
                 try:
-                    BUS.publish("tts.generate_start", {"chars": len(sentence)})
-                    audio = await _tts_bytes(sentence, voice_path=voice_path)
+                    BUS.publish("tts.generate_start", {"chars": len(sentence), "turn_id": turn_id})
+                    audio = await _tts_bytes(sentence, voice_path=voice_path, turn_id=turn_id)
+                    if STATE.turns.is_cancelled(turn_id):
+                        continue
+                    STATE.turns.record_spoken(turn_id, sentence)
                     BUS.publish("tts.generate_done", {"bytes": len(audio)})
                     audio_id = str(UUID(bytes=os.urandom(16)))
                     STATE.tts_cache[audio_id] = audio
@@ -1495,7 +1378,12 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                     # each clip once, right after it's produced.
                     while len(STATE.tts_cache) > _TTS_CACHE_MAX:
                         STATE.tts_cache.pop(next(iter(STATE.tts_cache)), None)
-                    await audio_q.put({"audio_url": f"/tts/{audio_id}"})
+                    await audio_q.put({"audio_url": f"/tts/{audio_id}", "turn_id": turn_id,
+                                       "text": sentence})
+                except asyncio.CancelledError:
+                    # The isolated engine cancels a synthesis whose turn was
+                    # interrupted. That is a normal barge-in, not an error.
+                    continue
                 except Exception as e:  # noqa: BLE001
                     logger.debug("tts_sentence_failed", error=str(e))
                     await audio_q.put({"error": str(e)})
@@ -1506,8 +1394,17 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
         # ── Token stream (real streaming via the function-calling pipeline) ──
         tool_calls_result: list[dict] = []
         full_text = ""
-        sent_buffer = ""
         sent_any_token = False
+        # Speech chunker V2: abbreviation/decimal/URL aware, and willing to cut
+        # at a clause boundary so the first audio starts sooner (core/voice).
+        chunker = SpeechChunker()
+
+        async def queue_for_speech(chunks: list[str]) -> None:
+            """Convert display text to spoken text, then queue it."""
+            for raw in chunks:
+                spoken = to_spoken(raw)
+                if spoken and has_speakable_content(spoken):
+                    await sentence_q.put(spoken)
 
         async def source():
             BUS.publish("chat.user_message", {"chars": len(user_text)})
@@ -1533,10 +1430,7 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                     yield _sse("message", {"content": token})
 
                     if speak:
-                        sent_buffer += token
-                        complete, sent_buffer = _split_sentences(sent_buffer)
-                        for s in complete:
-                            await sentence_q.put(s)
+                        await queue_for_speech(chunker.feed(token))
                         # Forward any finished audio without blocking the tokens.
                         while True:
                             try:
@@ -1545,6 +1439,8 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                                 break
                             if item is None:
                                 break
+                            if STATE.turns.is_cancelled(turn_id):
+                                continue
                             yield _sse("tts_error" if "error" in item else "tts", item)
 
                 elif ev.get("type") == "done":
@@ -1561,7 +1457,7 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                 sent_any_token = True
                 yield _sse("message", {"content": apology})
                 if speak:
-                    await sentence_q.put(apology)
+                    await queue_for_speech([apology])
 
         # The pipeline can legitimately finish with no visible tokens (e.g. a
         # reasoning model whose entire generation got spent on hidden
@@ -1571,20 +1467,23 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
             full_text = apology
             yield _sse("message", {"content": apology})
             if speak:
-                await sentence_q.put(apology)
+                await queue_for_speech([apology])
 
         BUS.publish("chat.assistant_done", {"chars": len(full_text), "tools_used": len(tool_calls_result)})
 
         # ── Flush remaining speech and drain the audio queue in order ───────
         if speak and worker is not None:
-            tail, _ = _split_sentences(sent_buffer, force=True)
-            for s in tail:
-                await sentence_q.put(s)
+            await queue_for_speech(chunker.flush())
             await sentence_q.put(None)
             while True:
                 item = await audio_q.get()
                 if item is None:
                     break
+                if STATE.turns.is_cancelled(turn_id):
+                    # A late clip from a turn the user already interrupted. This
+                    # is the leak that would otherwise let turn 105 speak over
+                    # turn 106; drop it rather than emit it.
+                    continue
                 yield _sse("tts_error" if "error" in item else "tts", item)
             await worker
 
@@ -1597,7 +1496,8 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                 if data_url:
                     yield _sse("action", {"type": "image_generated", "image_url": data_url, "prompt": tc["result"].get("prompt", "")})
 
-        yield _sse("done", {})
+        STATE.turns.finish(turn_id)
+        yield _sse("done", {"turn_id": turn_id})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -1618,6 +1518,69 @@ async def tts(req: TtsRequest) -> Response:
     except Exception as e:  # noqa: BLE001
         logger.error("tts_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class InterruptRequest(BaseModel):
+    conversation_id: str | None = None
+    turn_id: str | None = None
+    #: Optional STT transcript of what the user said over Nova. Used to decide
+    #: whether this was a genuine interruption or the microphone hearing Nova.
+    transcript: str | None = None
+    reason: str = "user_interrupt"
+
+
+@app.post("/voice/interrupt")
+async def voice_interrupt(req: InterruptRequest) -> dict:
+    """Barge-in. Stop speaking now, and say what survived of the user's words.
+
+    The frontend calls this the moment it detects speech over playback. It is
+    deliberately cheap and synchronous — the whole value is in how fast the
+    audio stops.
+
+    When a transcript is supplied it is run through echo suppression first, so
+    Nova's own voice coming back through the speakers cannot trigger a
+    "cancellation" of the very sentence it is currently saying. A genuine
+    interruption cancels; pure echo does not.
+    """
+    turns = STATE.turns
+    verdict = None
+
+    if req.transcript:
+        verdict = EchoFilter(turns).check(req.transcript, conversation_id=req.conversation_id)
+        if not verdict.is_user_speech:
+            # Nova heard herself. Keep talking.
+            BUS.publish("voice.echo_rejected", {"matched": verdict.matched_tokens,
+                                                "of": verdict.total_tokens})
+            return {
+                "interrupted": False,
+                "classification": verdict.kind,
+                "reason": verdict.reason,
+                "text": "",
+            }
+
+    if req.turn_id:
+        cancelled = req.turn_id if turns.cancel(req.turn_id, reason=req.reason) else None
+    elif req.conversation_id:
+        cancelled = turns.cancel_active(req.conversation_id, reason=req.reason)
+    else:
+        raise HTTPException(status_code=422, detail="Provide conversation_id or turn_id")
+
+    dropped = 0
+    if cancelled and STATE.tts_engine is not None:
+        # Stop synthesis that has not started, and guarantee that anything
+        # already in flight can never be delivered.
+        dropped = STATE.tts_engine.cancel_turn(cancelled)
+
+    if cancelled:
+        BUS.publish("voice.interrupted", {"turn_id": cancelled, "dropped": dropped})
+
+    return {
+        "interrupted": bool(cancelled),
+        "turn_id": cancelled,
+        "dropped_clips": dropped,
+        "classification": (verdict.kind if verdict else "user"),
+        "text": (verdict.text if verdict else (req.transcript or "")),
+    }
 
 
 @app.get("/tts/{audio_id}")

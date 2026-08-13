@@ -183,6 +183,11 @@ export default function App() {
   // ===== Chat state =====
   const [messages, setMessages] = useState([]);
   const [conversationId, setConversationId] = useState(null);
+  // Mirrored into a ref: the voice session loop is a single long-lived async
+  // function, so reading the state variable there would pin whatever value it
+  // had when the loop started.
+  const conversationIdRef = useRef(null);
+  useEffect(() => { conversationIdRef.current = conversationId; }, [conversationId]);
 
   // Persist conversation ID across app restarts
   const CONV_STORAGE_KEY = "nova.conversation_id";
@@ -475,6 +480,58 @@ export default function App() {
     domPressRef.current = { active: false, target: null, startX: 0, startY: 0, moved: false, pressedAt: 0 };
   };
 
+  // ===== True barge-in (brief §13) =====
+  //
+  // OFF by default, deliberately. The server side is complete and tested
+  // (turn cancellation + echo suppression), but this half cannot be validated
+  // without a live microphone talking over live playback — and getting it wrong
+  // degrades a voice loop that currently works. Enable to try it:
+  //
+  //     localStorage.setItem("nova.bargeIn", "1")   // then reload
+  //
+  // What changes when it is on: the microphone stays open while Nova speaks,
+  // instead of the loop waiting for her to finish before listening again.
+  const bargeInEnabled = () => {
+    try {
+      return window.localStorage.getItem("nova.bargeIn") === "1";
+    } catch {
+      return false;
+    }
+  };
+
+  const watchForBargeIn = async (replyDone, myToken) => {
+    let replyFinished = false;
+    const settle = () => { replyFinished = true; };
+    replyDone.then(settle, settle);
+
+    // Keep listening while the reply is still streaming OR still being spoken.
+    while (voiceSessionRef.current && sessionCtlRef.current.token === myToken) {
+      if (replyFinished && !ttsPlayingRef.current) return null;
+
+      let heard = "";
+      try {
+        // Short windows so an interruption is acted on quickly rather than
+        // after a long trailing silence.
+        const blob = await captureCommandBlob({ debugTag: "bargein", maxMs: 4000 });
+        heard = await transcribeBlob(blob, apiUrl("/stt"));
+      } catch {
+        heard = "";
+      }
+      if (!heard?.trim()) continue;
+
+      // The backend decides whether this was Marcus or Nova's own voice coming
+      // back through the speakers. Only a genuine interruption cancels; pure
+      // echo leaves her talking. It can also salvage the real words out of a
+      // transcript that starts as echo and ends as a question.
+      const verdict = await interruptActiveTurn(heard);
+      if (verdict?.interrupted) {
+        return (verdict.text || heard).trim();
+      }
+      // Echo, or nothing to cancel — keep listening.
+    }
+    return null;
+  };
+
   const waitForResponseToFinish = async ({ maxMs = 45_000 } = {}) => {
     const t0 = Date.now();
     while (Date.now() - t0 < maxMs) {
@@ -554,7 +611,11 @@ export default function App() {
           lastHeardAt = Date.now();
 
           if (isInterruptPhrase(text)) {
-            clearTtsQueue();
+            // Cancel on the server too, so the sentences Nova had queued for
+            // this reply are never synthesised. The transcript goes with it:
+            // the backend runs echo suppression first, so Nova hearing her own
+            // voice through the speakers cannot cancel her own turn.
+            await interruptActiveTurn(text);
             setVoiceStatus("idle");
             continue;
           }
@@ -572,11 +633,32 @@ export default function App() {
 
           // Send as normal chat message
           setVoiceStatus("speaking");
-          await sendMessage(text);
-          if (!ttsPlayingRef.current) setVoiceStatus("idle");
-          setPhase("RESPONDING", { reason: "session_sent" });
-          await waitForResponseToFinish();
-          setPhase("CAPTURING_COMMAND", { reason: "session_next" });
+          if (bargeInEnabled()) {
+            // True barge-in: keep the microphone open WHILE Nova speaks, so
+            // talking over her interrupts without needing a stop phrase.
+            // Everything heard here goes through the backend's echo suppression
+            // first, because the mic is picking up Nova's own voice through the
+            // speakers at the same time.
+            const replyDone = sendMessage(text);
+            setPhase("RESPONDING", { reason: "session_sent" });
+            const interruption = await watchForBargeIn(replyDone, myToken);
+            if (interruption) {
+              // Treat the salvaged words as the next thing Marcus said and
+              // answer them immediately, rather than dropping back to a
+              // listening pause he would have to talk into again.
+              lastHeardAt = Date.now();
+              setVoiceStatus("speaking");
+              await sendMessage(interruption);
+              await waitForResponseToFinish();
+            }
+            setPhase("CAPTURING_COMMAND", { reason: "session_next" });
+          } else {
+            await sendMessage(text);
+            if (!ttsPlayingRef.current) setVoiceStatus("idle");
+            setPhase("RESPONDING", { reason: "session_sent" });
+            await waitForResponseToFinish();
+            setPhase("CAPTURING_COMMAND", { reason: "session_next" });
+          }
         } catch (e) {
           console.warn(e);
           setVoiceStatus("error");
@@ -796,6 +878,40 @@ export default function App() {
     endTtsPlayback();
   };
 
+  // Server-side turn id for the reply currently streaming (from the SSE `meta`
+  // event). Needed to cancel a turn on the BACKEND, not just locally.
+  const activeTurnIdRef = useRef(null);
+
+  // Stopping playback locally is only half an interruption: without telling the
+  // server, it keeps synthesising every remaining sentence of the abandoned
+  // reply and keeps emitting `tts` events for it. This cancels the turn at the
+  // source, so queued sentences are never synthesised and any clip already in
+  // flight is discarded instead of played over the next answer.
+  const interruptActiveTurn = async (transcript = "") => {
+    const turnId = activeTurnIdRef.current;
+    clearTtsQueue();
+    if (!turnId && !conversationIdRef.current) return null;
+    activeTurnIdRef.current = null;
+    try {
+      const res = await fetch(apiUrl("/voice/interrupt"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(turnId ? { turn_id: turnId } : {}),
+          ...(conversationIdRef.current ? { conversation_id: conversationIdRef.current } : {}),
+          ...(transcript ? { transcript } : {}),
+          reason: "user_interrupt",
+        }),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      // A failed interrupt must never break the session loop — playback is
+      // already stopped locally, which is the part the user can hear.
+      return null;
+    }
+  };
+
   const pumpTtsQueue = () => {
     if (ttsBusyRef.current) return;
     const next = ttsQueueRef.current.shift();
@@ -987,6 +1103,9 @@ export default function App() {
                 if (currentEvent === "meta") {
                   const cid = piece?.conversation_id;
                   if (cid) setConversationId(String(cid));
+                  // Server-side turn identity. Cancelling by id is what stops
+                  // synthesis of sentences that have not been spoken yet.
+                  if (piece?.turn_id) activeTurnIdRef.current = String(piece.turn_id);
                   continue;
                 }
                 if (currentEvent === "tts") {
@@ -1050,6 +1169,7 @@ export default function App() {
             if (currentEvent === "meta") {
               const cid = piece?.conversation_id;
               if (cid) setConversationId(String(cid));
+              if (piece?.turn_id) activeTurnIdRef.current = String(piece.turn_id);
             }
             if (currentEvent === "tts") {
               const aurl = piece?.audio_url;

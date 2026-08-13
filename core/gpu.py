@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-"""One GPU, one consumer at a time.
+"""One GPU, one consumer at a time — within this process.
 
-Nova runs three independent CUDA consumers inside a single process:
+Nova used to run three independent CUDA consumers inside a single process:
 
   * llama.cpp (the 9B, via llama-cpp-python)
-  * XTTS      (torch, voice synthesis)
+  * XTTS      (torch, voice synthesis)      <- NO LONGER IN THIS PROCESS
   * bge-small (torch, memory embeddings)
+
+XTTS moved out in the JARVIS V2 round. It now runs in a child process with its
+own CUDA context (services/tts_worker.py), because it was the one consumer that
+could not take this semaphore: sentence-streamed TTS overlaps synthesis with
+generation BY DESIGN, and the reply stream holds the permit for the whole
+generation, so waiting for it here deadlocked (measured: a 195 s hang, then
+access violations on every later turn). Same card, separate context, driver
+time-slicing.
+
+The evidence below is why that was necessary, and is kept verbatim.
 
 Nothing coordinated them. llama.cpp's calls were serialized against each other
 by RuntimeManager's semaphore, but the torch models allocated and ran on the
@@ -33,12 +43,17 @@ in d1f407e ("re-serialize on the GPU before touching the local model"),
 extended to every consumer instead of just llama.cpp.
 
 It is a plain 1-permit semaphore, not a lock, so it composes with the existing
-ModelHandle plumbing unchanged. Anything that touches the GPU takes it.
+ModelHandle plumbing unchanged. Anything that touches the GPU IN THIS PROCESS
+takes it.
+
+Out-of-process consumers (the XTTS worker; tools/imagegen) neither take nor need
+this permit — they are isolated by having their own CUDA context, which is a
+stronger guarantee than serialisation and is why they were moved out.
 """
 
 import asyncio
 
-#: THE GPU semaphore. One permit, process-wide, for every CUDA consumer.
-#: Import this rather than constructing a new one — a second semaphore
+#: THE GPU semaphore. One permit, process-wide, for every in-process CUDA
+#: consumer. Import this rather than constructing a new one — a second semaphore
 #: guarding the same device provides no protection at all.
 GPU_SEM = asyncio.Semaphore(1)

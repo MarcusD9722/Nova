@@ -91,6 +91,31 @@ def embedding_available() -> bool:
             return False
 
 
+def embedding_loaded() -> bool:
+    """True only if the model is ALREADY in memory. Never triggers a load.
+
+    `embedding_available()` loads on first call, which takes seconds. Callers on
+    a latency-critical path (the tool selector runs before every turn's first
+    token) need to ask "can I have embeddings *right now*" without paying for
+    the load, and degrade gracefully when the answer is no.
+    """
+    return _model is not None
+
+
+def warm_in_background() -> None:
+    """Kick off the model load off the hot path. Safe to call repeatedly."""
+    if _model is not None or _load_failed is not None:
+        return
+
+    def _warm() -> None:
+        try:
+            embedding_available()
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_warm, name="nova-embed-warm", daemon=True).start()
+
+
 def load_error() -> str | None:
     return _load_failed
 

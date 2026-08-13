@@ -31,6 +31,16 @@ class _State:
     stt = None
     tts_cache: dict[str, bytes] = {}  # bounded to _TTS_CACHE_MAX most-recent clips
     tts_device: str | None = None
+    tts_device_reason: str | None = None
+    tts_sample_rate: int | None = None
+    # The isolated XTTS worker client (services/tts_client.IsolatedTtsEngine).
+    # None until first use; it owns its own process and CUDA context, which is
+    # what makes GPU voice safe beside llama.cpp. See services/tts_worker.py.
+    tts_engine = None
+    # Turn identity for the voice pipeline (core/voice/turn.py). Created eagerly
+    # because barge-in must be able to cancel a turn before anything else has
+    # touched the voice subsystem.
+    turns = None
     tts_load_task: asyncio.Task | None = None
     tts_prewarm_task: asyncio.Task | None = None
     tts_voice_cache: dict[str, str] = {}
@@ -44,3 +54,7 @@ class _State:
 _TTS_CACHE_MAX = int(os.getenv("NOVA_TTS_CACHE_MAX", "64").strip() or "64")
 
 STATE = _State()
+
+from core.voice.turn import TurnRegistry  # noqa: E402  (after _State, avoids a cycle)
+
+STATE.turns = TurnRegistry()
