@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from core.agent_supervisor import AgentSupervisor, SupervisorConfig
 from core.conversation_state import ConversationStateStore
@@ -38,6 +38,10 @@ from core.project_builder import (
     STATUS_WORDS_RE,
 )
 from core.orchestrator.agent import Agent, ToolLoopExecutor
+from core.tools.selector import ToolSelector
+from memory.artifacts import ArtifactStore, capture_tool_result, describe_for_prompt
+from memory.recall_gate import GateDecision, should_recall
+from memory.working_context import WorkingContextStore
 from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
 from core.orchestrator.model_router import ModelHandle, ModelRouter, parse_role_map
 from core.cloud_runtime import CloudRuntime, cloud_enabled
@@ -61,6 +65,11 @@ from memory.unifier import MemoryUnifier
 
 
 logger = get_logger(__name__)
+
+#: How long a result set counts as "on screen" for prompt purposes. Past this,
+#: it is still addressable ("what was that drive we liked?") but stops being
+#: injected into every turn's context.
+_ARTIFACT_PROMPT_WINDOW_S = float(os.getenv("NOVA_ARTIFACT_WINDOW_S", "900").strip() or "900")
 
 
 def _now() -> datetime:
@@ -306,7 +315,24 @@ class RuntimeManager:
         self._models = ModelRouter(handles, default="primary", role_map=role_map)
         # Orchestrator (Phase 2.1): the reason→act→observe loop runs here. The
         # default chat agent reproduces the previous inline loop exactly.
-        self._tool_loop = ToolLoopExecutor(models=self._models, tool_router=router)
+        # Tool preselection (JV2): the loop used to embed all 49+ tool
+        # descriptions in every decide() prompt, up to step_budget times a turn.
+        # The selector narrows that to a handful of plausible candidates and
+        # fails open to the full list if it cannot rank them.
+        self._tool_selector = ToolSelector() if os.getenv(
+            "NOVA_TOOL_SELECTOR", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"} else None
+        self._tool_loop = ToolLoopExecutor(
+            models=self._models, tool_router=router, selector=self._tool_selector
+        )
+        # Live-turn context (JV2). Working context is what is happening now;
+        # artifacts are the concrete things turns produced. Both are hot, bounded
+        # and in-memory — SQLite remains the authoritative store.
+        self._working = WorkingContextStore()
+        self._artifacts = ArtifactStore()
+        self._recall_gate_enabled = os.getenv(
+            "NOVA_RECALL_GATE", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self._chat_agent = Agent(name="chat", step_budget=self._TOOL_LOOP_MAX)
         # Deep mode (Phase 2.3): Planner + Critic bookends around the loop,
         # opt-in only (is_deep_request), so normal chat stays one-pass fast.
@@ -1038,8 +1064,18 @@ class RuntimeManager:
     ):
         await self._memory.initialize()
         clean_user = (user_text or "").strip()
+        # Identity for everything this turn produces. The backend keeps its own
+        # richer turn registry for the voice (core/voice/turn.py); this one just
+        # has to be unique so artifacts are attributable to the turn that made
+        # them rather than smeared across the whole conversation.
+        turn_uid = uuid4().hex
 
         async def _finish(reply: str, tool_calls: list[dict[str, Any]], mode: str = "chat") -> None:
+            # Working context sees every reply, including the ones that return
+            # early (project pre-pass, direct live reply, story mode) — otherwise
+            # the recall gate would judge "what did you just say" against a
+            # conversation it only half remembers.
+            self._working.get(str(conversation_id)).record_assistant(reply)
             await self._state_store.record_turn(
                 conversation_id=conversation_id,
                 user_message=clean_user,
@@ -1155,7 +1191,39 @@ class RuntimeManager:
             yield {"type": "done", "full_text": story_reply, "tool_calls": []}
             return
 
-        mem_hits = await self._memory.search(q=clean_user, conversation_id=conversation_id, limit=8)
+        # ── Working context, artifacts, and the recall gate ──────────────────
+        # The gate decides whether this turn needs a broad semantic search at
+        # all. It fails OPEN: anything it does not positively recognise still
+        # searches, because a wrong skip loses something Nova knows while a
+        # wrong recall costs milliseconds. See memory/recall_gate.py.
+        work_ctx = self._working.get(str(conversation_id))
+        work_ctx.record_user(clean_user)
+        active_items = self._artifacts.active_items(str(conversation_id))
+
+        # A positional reference ("the second one") is resolved here,
+        # deterministically, before any retrieval — asking an embedding index
+        # what "the second one" means is a category error.
+        referenced = self._artifacts.resolve(clean_user, str(conversation_id)) if active_items else None
+        if referenced is not None:
+            work_ctx.select(referenced.artifact_id)
+
+        last_trace = work_ctx.last_tool()
+        gate = should_recall(
+            clean_user,
+            recent_text=work_ctx.recent_text(),
+            has_result_set=bool(active_items),
+            item_count=len(active_items),
+            last_tool_summary=(last_trace.summary if last_trace else ""),
+        ) if self._recall_gate_enabled else GateDecision(True, "gate disabled")
+
+        if gate.recall:
+            mem_hits = await self._memory.search(q=clean_user, conversation_id=conversation_id, limit=8)
+        else:
+            mem_hits = []
+            logger.debug("recall_gate_skip", reason=gate.reason, **{
+                k: v for k, v in gate.signals.items() if isinstance(v, (str, int, float))
+            })
+        BUS.publish("memory.recall_gate", {"recall": gate.recall, "reason": gate.reason})
         # Lessons are stored under the "lesson" entity and can surface as search
         # hits too; keep them out of the general memory block so they only appear
         # in the dedicated "lessons" section below.
@@ -1215,12 +1283,53 @@ class RuntimeManager:
                 agent=loop_agent, user_text=clean_user, grounding=grounding
             )
 
+        # ── Capture list-shaped tool results as addressable artifacts ────────
+        # This is what makes "how reliable is the second one?" answerable on the
+        # NEXT turn. Best-effort: a capture failure must never cost the user
+        # their answer, but it is logged rather than swallowed.
+        for r in tool_results:
+            if not r.get("ok"):
+                continue
+            try:
+                art = capture_tool_result(
+                    self._artifacts, conversation_id=str(conversation_id),
+                    turn_id=turn_uid, tool=r["tool"],
+                    args=r.get("args") if isinstance(r.get("args"), dict) else None,
+                    result=r.get("result"),
+                )
+                if art is not None:
+                    work_ctx.set_result_set(art.artifact_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("artifact_capture_failed", tool=r.get("tool"), error=str(e)[:200])
+            work_ctx.record_tool(str(r.get("tool")), r.get("args") if isinstance(r.get("args"), dict) else {},
+                                 summary=str(r.get("result"))[:200], ok=bool(r.get("ok")))
+
         # ── Streamed final response ─────────────────────────────────────────
         tools_context = ""
         if tool_results:
             tools_context = "\nLive tool results (trust these over your own knowledge):\n" + "\n".join(
                 f"- {r['tool']}: {''.join([str(r['result'])[:600]]) if r['ok'] else 'FAILED: ' + str(r['error'])[:200]}"
                 for r in tool_results
+            )
+
+        # What is on screen right now, and what the user just pointed at.
+        #
+        # Deliberately NOT injected on every later turn: a result set from
+        # twenty minutes ago is prompt bloat, and bloat is what the context
+        # budget work exists to avoid. It earns its place only when the user
+        # actually pointed at it, or when it is recent enough to still be "on
+        # screen" in any meaningful sense.
+        artifact_context = ""
+        current_set = self._artifacts.latest_result_set(str(conversation_id))
+        if current_set is not None and (referenced is not None
+                                        or current_set.age_s() <= _ARTIFACT_PROMPT_WINDOW_S):
+            artifact_context = "\nOn screen right now:\n" + describe_for_prompt(
+                current_set, self._artifacts.items_of(current_set.artifact_id)[:8]
+            )
+        if referenced is not None:
+            artifact_context += (
+                f"\nMarcus is referring to item {referenced.item_index}: {referenced.title}"
+                f" — {json.dumps(referenced.payload, default=str)[:400]}"
             )
 
         try:
@@ -1263,9 +1372,25 @@ class RuntimeManager:
             + (f"Earlier in this conversation: {conversation_summary}\n" if conversation_summary else "")
             + (f"Things you remember:\n{stable_mem}\n" if stable_mem else "")
             + (f"Recent messages:\n{recent_chat}\n" if recent_chat else "")
+            + artifact_context
             + tools_context
+            # Say "a reasoning block", never the literal tag. Measured on this
+            # model (tests/bench_empty_generations.py, 30 samples per variant):
+            #
+            #   naming the tag              30% of turns produced NOTHING visible
+            #   tag AND prohibition removed  7%, but replies got slower and shorter
+            #   tag removed, prohibition kept 0%
+            #
+            # With the tag spelled out, the model quotes this very instruction
+            # back to itself inside its reasoning and generation dies mid-block:
+            # every failure had an unclosed <think>, none were empty at the
+            # model, and finish_reason was `stop`, not `length` — so it was never
+            # a budget problem. Dropping the prohibition as well fixes the
+            # failures but stops discouraging the reasoning, so it thinks on
+            # every turn instead. Keep both properties: forbid the block, do not
+            # name it.
             + "\n\nIMPORTANT: Reply with ONLY what you'd actually say to Marcus out loud. Do NOT write "
-            "any analysis, planning, notes, or a reasoning/<think> block — just say your reply directly."
+            "any analysis, planning, notes, or a reasoning block — just say your reply directly."
         )
         messages = [
             {"role": "system", "content": system_prompt},

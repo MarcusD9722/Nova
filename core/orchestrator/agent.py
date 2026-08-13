@@ -11,12 +11,15 @@ mode's Executor stage in 2.3 reuses it).
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.logging_setup import get_logger
 from core.orchestrator.model_router import ModelRouter
 from core.policy._json_extract import extract_first_json_object
 from core.tool_router import ToolCall, ToolRouter
+
+if TYPE_CHECKING:  # selection is optional; never imported at runtime from here
+    from core.tools.selector import ToolSelector
 
 logger = get_logger(__name__)
 
@@ -43,23 +46,40 @@ class Agent:
 class ToolLoopExecutor:
     """Runs an Agent's reason→act→observe loop and returns the observations."""
 
-    def __init__(self, *, models: ModelRouter, tool_router: ToolRouter) -> None:
+    def __init__(self, *, models: ModelRouter, tool_router: ToolRouter,
+                 selector: "ToolSelector | None" = None) -> None:
         self._models = models
         self._router = tool_router
+        #: Optional preselection stage (core/tools/selector.py). Without it the
+        #: agent sees every allowed tool on every step — the pre-V2 behaviour,
+        #: which remains the fallback whenever selection is unavailable.
+        self._selector = selector
+        self.last_selection = None
 
-    def tool_catalog(self, agent: Agent) -> str:
+    def tool_catalog(self, agent: Agent, user_text: str = "") -> str:
         """Public: the tool list an agent would see (for the Planner)."""
-        return self._tool_catalog(agent)
+        return self._tool_catalog(agent, user_text)
 
-    def _tool_catalog(self, agent: Agent) -> str:
-        lines = []
-        for name, desc in self._router.describe_tools().items():
-            if not desc or name in agent.skip_tools:
-                continue
-            if agent.tool_allowlist is not None and name not in agent.tool_allowlist:
-                continue
-            lines.append(f"- {name}: {desc}")
-        return "\n".join(lines)
+    def _allowed(self, agent: Agent) -> dict[str, str]:
+        return {
+            name: desc
+            for name, desc in self._router.describe_tools().items()
+            if desc and name not in agent.skip_tools
+            and (agent.tool_allowlist is None or name in agent.tool_allowlist)
+        }
+
+    def _tool_catalog(self, agent: Agent, user_text: str = "", context: str = "") -> str:
+        allowed = self._allowed(agent)
+
+        # Preselect, so the prompt carries a handful of plausible tools instead
+        # of the whole registry, repeated on every step of the loop.
+        if self._selector is not None and user_text.strip():
+            selection = self._selector.select(user_text, allowed, context=context)
+            self.last_selection = selection
+            if selection.tools:
+                allowed = {name: allowed[name] for name in selection.tools if name in allowed}
+
+        return "\n".join(f"- {name}: {desc}" for name, desc in allowed.items())
 
     async def decide(self, *, agent: Agent, user_text: str, grounding: str,
                      tool_results: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -80,7 +100,7 @@ class ToolLoopExecutor:
             "You are the agent brain for Nova, a local AI assistant. Work the user's "
             "request step by step: decide whether you need ONE more tool call, or "
             "whether you have enough to answer.\n\n"
-            f"Available tools:\n{self._tool_catalog(agent)}\n\n"
+            f"Available tools:\n{self._tool_catalog(agent, user_text, grounding)}\n\n"
             f"Context: {grounding}\n{results_text}\n"
             f"User message: {user_text}\n\n"
             'Reply ONLY with JSON. Next tool call: {"action": "tool", "tool": "<name>", "args": {...}}. '
@@ -159,7 +179,11 @@ class ToolLoopExecutor:
 
             call = ToolCall(name=decision["tool"], args=decision["args"])
             res = await self._router.execute(call, timeout_s=25.0, retries=0)
-            tool_results.append({"tool": call.name, "ok": res.ok, "result": res.result, "error": res.error})
+            # `args` travels with the observation so downstream can record what
+            # was actually asked — artifact provenance needs the query, not just
+            # the answer (memory/artifacts.py::capture_tool_result).
+            tool_results.append({"tool": call.name, "args": call.args, "ok": res.ok,
+                                 "result": res.result, "error": res.error})
             if not res.ok:
                 failure_counts[call.name] = failure_counts.get(call.name, 0) + 1
         return tool_results

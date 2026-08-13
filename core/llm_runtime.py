@@ -242,6 +242,13 @@ class LLMRuntime:
             "last_prompt_tokens": 0,
             "last_reply_tokens": 0,
             "avg_reply_tokens": 0.0,
+            # A generation that produces no VISIBLE output (the reasoning model
+            # spending its whole budget on an unclosed <think>) is silently
+            # retried below. Each retry is a full extra generation, so this is
+            # pure latency the user feels and nothing else reported. Measured at
+            # up to two wasted generations on a single conversational turn.
+            "empty_retries": 0,
+            "empty_exhausted": 0,
         }
 
     @property
@@ -521,11 +528,43 @@ class LLMRuntime:
         # See chat() above: an explicit empty list must disable stop sequences
         # entirely rather than falling back to the defaults.
         stop_seq = default_stop if stop is None else stop
-        messages = _apply_no_think(messages, thinking=thinking)
+        base_messages = list(messages)
+
+        def _attempt_messages(attempt: int) -> tuple[list[dict[str, Any]], int]:
+            """Messages and budget for attempt N.
+
+            Attempts ESCALATE rather than repeat. The previous loop retried
+            identically, so a prompt that reliably made the model spend its whole
+            budget on an unclosed <think> burned three full generations and still
+            returned nothing — measured on this machine, and the reason a plain
+            "Good morning" could take 19.8 s to first token.
+
+            Attempt 0 honours the caller. Attempt 1 forces /no_think, since the
+            hidden reasoning is what failed. Attempt 2 also cuts the budget and
+            asks outright for a direct answer, mirroring the salvage prompt in
+            RuntimeManager that was already known to work.
+            """
+            if attempt == 0:
+                return _apply_no_think(base_messages, thinking=thinking), int(max_tokens)
+            msgs_ = _apply_no_think(base_messages, thinking=False)
+            if attempt == 1:
+                return msgs_, int(max_tokens)
+            return (
+                # Never name the think tag here either. Spelling it out is what
+                # makes this model recite the instruction back inside its
+                # reasoning and produce nothing (30% of turns, measured in
+                # tests/bench_empty_generations.py) — so the original wording of
+                # this salvage prompt could trigger the very failure it exists
+                # to recover from.
+                msgs_ + [{"role": "user", "content": (
+                    "Answer now, directly, in one or two short sentences. No analysis, "
+                    "no reasoning block — just the answer.")}],
+                max(256, int(max_tokens) // 3),
+            )
 
         loop = asyncio.get_running_loop()
 
-        def _produce(q: asyncio.Queue) -> None:
+        def _produce(q: asyncio.Queue, messages: list[dict[str, Any]], max_tokens: int) -> None:
             sink = io.StringIO()
             reply_tokens = 0
             try:
@@ -565,8 +604,11 @@ class LLMRuntime:
         # a fresh attempt from scratch is always safe/invisible when an
         # attempt produces zero visible output.
         for attempt in range(3):
+            attempt_messages, attempt_budget = _attempt_messages(attempt)
             queue: asyncio.Queue[str | None | Exception] = asyncio.Queue(maxsize=512)
-            producer = asyncio.create_task(asyncio.to_thread(_produce, queue))
+            producer = asyncio.create_task(
+                asyncio.to_thread(_produce, queue, attempt_messages, attempt_budget)
+            )
             think_filter = _ThinkStreamFilter()
             produced_any = False
             try:
@@ -586,8 +628,17 @@ class LLMRuntime:
                     yield tail
             finally:
                 await producer
-            if produced_any or attempt == 2:
+            if produced_any:
                 return
+            if attempt == 2:
+                # All three attempts produced nothing visible. The caller gets an
+                # empty stream and will substitute an apology; record it so the
+                # failure is countable rather than invisible.
+                self._usage["empty_exhausted"] = int(self._usage["empty_exhausted"]) + 1
+                logger.warning("llm_chat_stream_empty_exhausted", attempts=3,
+                               max_tokens=int(max_tokens))
+                return
+            self._usage["empty_retries"] = int(self._usage["empty_retries"]) + 1
             logger.debug("llm_chat_stream_empty_retry", attempt=attempt + 1)
 
     async def vision_analyze(
