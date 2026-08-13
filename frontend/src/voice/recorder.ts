@@ -357,7 +357,22 @@ export async function recordVoiceActivityFromStreamToBlob(
   {
     maxMs = 8000,
     minSpeechMs = 250,
-    trailingSilenceMs = 700,
+    // 700 -> 600. Measured in tests/bench_stt_v3.py against seven probe
+    // utterances (short commands, technical vocabulary, model numbers, and a
+    // sentence with a deliberate mid-sentence "um" pause):
+    //
+    //   300ms  cuts the speaker off on 7/7 probes
+    //   450ms  cuts 3-5 of 7, including the mid-sentence pause
+    //   600ms  0 cuts, -4ms dead air after speech ends
+    //   700ms  0 cuts, +96ms dead air   <- was shipped
+    //   900ms  0 cuts, +296ms dead air
+    //
+    // 600 is the lowest CUT-free setting measured and saves ~100ms of dead air
+    // on every single turn. The margin matters though: 450 already cuts, so
+    // there is only ~150ms of headroom, and synthetic speech pauses are
+    // cleaner than a real "um... hang on" pause. If Marcus gets clipped
+    // mid-sentence, put this back to 700 first.
+    trailingSilenceMs = 600,
     speechThreshold = 0.025,
     startTimeoutMs = 3500,
     timesliceMs = 250,

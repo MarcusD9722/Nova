@@ -107,7 +107,9 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_TTS_CACHE_MAX", "int", "64", "Max cached TTS clips."),
         _s("NOVA_FFMPEG_PATH", "path", "", "Explicit ffmpeg path if not on PATH."),
         _s("NOVA_STT_MODEL", "str", "openai/whisper-base", "Transformers STT fallback model."),
-        _s("NOVA_STT_MODEL_SIZE", "str", "base", "faster-whisper model size."),
+        _s("NOVA_STT_MODEL_SIZE", "str", "base", "faster-whisper model size. Measured: base 73ms mean vs small 106ms on this GPU (tests/bench_stt_v3.py)."),
+        _s("NOVA_STT_BIAS", "bool", "1", "Bias the STT decoder toward Marcus's vocabulary (Nova, Qwen, XTTS, llama.cpp, Jellyfin...) via initial_prompt. Unbiased, the model produced 'Lama.cpp', 'QN' and 'XCTs' on synthetic probes."),
+        _s("NOVA_STT_VOCABULARY", "str", "", "Extra comma-separated terms to add to the STT bias prompt (project names, product names, people)."),
         # ── Memory ──────────────────────────────────────────────────────────
         _s("NOVA_EMBED_MODEL", "str", "BAAI/bge-small-en-v1.5", "Embedding model for semantic memory."),
         _s("NOVA_EMBED_DEVICE", "str", "cpu", "Embedding device (cuda|cpu|auto). Defaults to CPU: bge-small is tiny and runs in the background, but on GPU it is a second uncoordinated CUDA consumer inside llama.cpp's process, which aborts it with an illegal memory access (see core/gpu.py). XTTS no longer shares this process — it has its own (services/tts_worker.py) — but the embedding model still does."),

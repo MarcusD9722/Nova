@@ -854,6 +854,26 @@ def _chunk_text(s: str, chunk_size: int = 18) -> list[str]:
     return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
 
 
+#: Terms Whisper has no reason to know, but Marcus says constantly. Fed to the
+#: decoder as an initial prompt rather than corrected afterwards — biasing the
+#: decode is the mechanism that actually exists for this, and a post-hoc
+#: search/replace table would happily "fix" a word he really said.
+_STT_VOCABULARY = (
+    "Nova", "Jellyfin", "StreamNChill", "llama.cpp", "Qwen", "XTTS", "CUDA",
+    "Chroma", "SQLite", "Raspberry Pi", "Orange Pi", "RTX 5080", "RTX 5090",
+    "faster-whisper", "GGUF", "VRAM", "Moonraker", "OctoPrint", "build123d",
+)
+
+
+def _stt_vocabulary_prompt() -> str | None:
+    """Decoder bias prompt. NOVA_STT_VOCABULARY appends comma-separated extras."""
+    extra = [w.strip() for w in os.getenv("NOVA_STT_VOCABULARY", "").split(",") if w.strip()]
+    if os.getenv("NOVA_STT_BIAS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    words = list(_STT_VOCABULARY) + extra
+    return "Vocabulary: " + ", ".join(words) + "."
+
+
 async def _stt_transcribe(upload: UploadFile) -> SttResponse:
     """Transcribe an uploaded audio file using Whisper via transformers.
 
@@ -965,7 +985,35 @@ async def _stt_transcribe(upload: UploadFile) -> SttResponse:
 
             engine, model = STATE.stt
             if engine == "faster":
-                segments, _info = model.transcribe(audio, language="en", beam_size=1, vad_filter=True)
+                # Measured in tests/bench_stt_v3.py on this machine (base model,
+                # CUDA float16, 7 probe utterances):
+                #
+                #   as shipped                          82ms mean
+                #   + condition_on_previous_text=False  58ms
+                #   + without_timestamps=True           50ms
+                #
+                # condition_on_previous_text is for long-form continuity across
+                # chunks; Nova transcribes ONE utterance per request, so it buys
+                # nothing here and is a known hallucination source. Word
+                # timestamps are computed and then discarded — Nova only reads
+                # `.text`. vad_filter is KEPT: dropping it measured fastest of
+                # all (42ms) but it is what trims leading/trailing silence, and
+                # trading real-audio robustness for 8ms is a bad deal.
+                #
+                # initial_prompt biases decoding toward vocabulary Marcus
+                # actually uses. Measured on synthetic speech, the unbiased model
+                # produced "Lama.cpp", "QN" and "XCTs"; biased it produced
+                # "llama.cpp", "Qwen" and "XTTS". This is proper decoder
+                # conditioning, not a post-hoc search/replace table.
+                segments, _info = model.transcribe(
+                    audio,
+                    language="en",
+                    beam_size=1,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                    without_timestamps=True,
+                    initial_prompt=_stt_vocabulary_prompt(),
+                )
                 text = " ".join(seg.text.strip() for seg in segments).strip()
             else:
                 result = _silent_warn_call(model, {"array": audio, "sampling_rate": int(sr)})
