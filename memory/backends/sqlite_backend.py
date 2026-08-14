@@ -9,6 +9,8 @@ from uuid import UUID
 
 import aiosqlite
 
+from memory.episodic_schema import EPISODIC_DDL, EPISODIC_MIGRATION
+
 
 class SQLiteMemoryBackend:
     def __init__(self, db_path: Path):
@@ -380,6 +382,13 @@ class SQLiteMemoryBackend:
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_proposals_pending ON proposals(status, created_at);")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_progress_ack ON progress_events(project_name, acknowledged, created_at);")
 
+                # --- V3 P4: episodic memory (episodes, artifacts, decisions,
+                # cold_evidence). The DDL lives in memory/episodic_schema.py and
+                # is referenced by BOTH this create block and migration 7, so the
+                # fresh-database schema and the upgrade path cannot drift apart.
+                for _sql in EPISODIC_DDL:
+                    await db.execute(_sql)
+
                 await self._apply_migrations(db)
 
                 await db.commit()
@@ -501,6 +510,7 @@ class SQLiteMemoryBackend:
                    WHERE salience IS NULL OR salience = 0.0;""",
             ],
         ),
+        EPISODIC_MIGRATION,
     ]
 
     async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
