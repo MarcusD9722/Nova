@@ -2,7 +2,123 @@
 
 ---
 
-# P2 — Formal benchmark baseline
+# P2.5 — TTFT / hidden reasoning control
+
+## The diagnosis
+
+P2 reported TTFT of 114 ms – 33,164 ms. That number measured
+time-to-first-**visible**-token, which conflates two different things.
+Instrumenting the raw llama.cpp stream separated them:
+
+| | median |
+|---|---:|
+| **model compute TTFT** (first token at all) | **35 ms** |
+| first VISIBLE token | 10,336 ms |
+| **delay attributable to hidden reasoning** | **10,301 ms** |
+
+**Nova's inference was never slow.** ~10 seconds per turn was the model
+generating a `<think>` block that was then discarded. This is a reasoning-policy
+problem; no amount of inference tuning would have touched it.
+
+## What did not work
+
+Five prompt rewordings, measured at production budget:
+
+| variant | simple median | simple P90 | empty |
+|---|---:|---:|---|
+| **P0 current production** | **8,071 ms** | **10,663 ms** | 5/18 |
+| P1 persona only | 13,503 ms | 17,366 ms | 8/18 |
+| P2 spoken-voice framing | 11,297 ms | 15,408 ms | 3/18 |
+| P3 answer-first framing | 12,242 ms | 16,504 ms | 6/18 |
+| P4 spoken + brevity | 9,959 ms | 14,717 ms | 3/18 |
+
+**The shipped prompt was the best of them.** An earlier candidate that looked
+like a 3× win did not reproduce — it was variance at n=18. Prompt wording does
+not control this model's reasoning; the chat template does.
+
+Also rejected: a 384-token budget gave a 79 ms median and **17/18 empty
+replies**. Fast because it fails fast. Exactly the trap of judging on medians.
+
+## What worked
+
+Prefilling the assistant turn with an **already-closed** reasoning block, so the
+model continues from after it instead of opening its own:
+
+| | simple median | simple P90 | worst | empty |
+|---|---:|---:|---:|---|
+| production | 8,169 ms | 10,877 ms | 20,949 ms | 5/18 |
+| **prefill** | **36 ms** | **38 ms** | **39 ms** | **0/18** |
+
+Answers stay real — *"Running two CUDA consumers in one process can cause
+illegal memory access because…"*. Empty replies go to zero because nothing can
+overflow inside a block that was never opened.
+
+## The escalation ladder, and two wrong versions of it
+
+Reasoning is **not** switched off. It moved to where decisions are made: the
+agent loop's `decide()` and deep mode still pass `thinking=True`, so tool
+choice, planning and critique keep full native reasoning. By the time the spoken
+reply is generated, tools have run and their observations are in the prompt.
+
+The fallback took three iterations, each corrected by measurement:
+
+1. **FAST only** → the complex-reasoning scenario returned empty. A hard
+   question opens a second block on top of the prefill and overflows.
+2. **FAST → DEEP immediately** → fixed the empties but put a **19,721 ms P90**
+   back on turns as simple as "Good morning", because the fast-path failure is
+   stochastic and escalating costs 14–20 s.
+3. **FAST → FAST → DEEP (full budget)** → shipped. A second cheap attempt costs
+   ~130 ms and rescues most stochastic failures; only a turn that fails twice
+   pays for reasoning.
+
+The final attempt also had to stop shrinking the budget. It previously escalated
+to `thinking=True` **with** `max_tokens//3` — reasoning enabled at a small
+budget is the exact 512-token overflow combination, and it made the reasoning
+scenario fail all three attempts.
+
+## P2 before / after
+
+Same benchmark, same ten scenarios, same machine.
+
+| metric | before | after | change |
+|---|---:|---:|---|
+| **TTFT median** | 12,127 ms | **130 ms** | **93× faster** |
+| TTFT mean | 11,703 ms | 3,360 ms | 3.5× |
+| **total turn median** | 14,359 ms | **628 ms** | **23× faster** |
+| empty replies | 0/10 | 0/10 | — |
+| recall gate + memory | 84 ms | 86 ms | unchanged |
+| tool selection | 42 ms | 34 ms | unchanged |
+
+**Eight of ten scenarios now answer in under 500 ms** where the median was
+previously over 12 seconds.
+
+## Where it is honestly not fixed
+
+**Aggregate P90 is 14,631 ms**, down only ~20% from 18,215 ms. That number is
+driven entirely by the two scenarios that escalated to DEEP on this run
+(`reasoning` 17.6 s, `long_tts` 14.6 s).
+
+For the `reasoning` case that is arguably correct — a hard question earning real
+thought. For `long_tts` ("explain RAID 1 in four sentences") it is not obviously
+correct, and **which scenarios escalate varies between runs**, because the
+fast-path failure is stochastic. So:
+
+* P90 across *simple* turns is ~455 ms and genuinely fixed.
+* P90 across *all* turns still has a 15-second tail whenever escalation fires.
+* A turn that escalates pays ~130 ms of wasted fast attempts on top.
+
+The pathological delays on simple turns are gone. The tail on escalating turns
+is not, and closing it needs either a complexity classifier before the first
+call, or a bounded reasoning budget that can be cut off — neither attempted
+here, and both should be judged against fresh measurements rather than this
+paragraph.
+
+---
+
+# P2 — Formal benchmark baseline (BEFORE P2.5)
+
+> Preserved as the pre-P2.5 baseline. The current numbers are in the
+> before/after table above.
 
 `tests/bench_nova_v3.py`, ten scenarios, real model + real memory + real
 selector + real isolated XTTS. Memory runs in a temp directory so a benchmark

@@ -1438,18 +1438,31 @@ class RuntimeManager:
             yield {"type": "done", "full_text": reply, "tool_calls": tool_results}
             return
 
-        # This reasoning model ignores the '/no_think' switch and reasons anyway;
-        # forcing it there produces a long unclosed <think> that overflows the
-        # token budget and gets stripped to nothing ("came up empty"). Instead we
-        # pass thinking=True (no '/no_think') and rely on the direct-reply
-        # instruction above to keep the hidden reasoning to a line or two. Proven
-        # far more reliable in practice.
+        # FAST contract for the spoken reply (V3 P2.5).
+        #
+        # This used to pass thinking=True, because '/no_think' made the model
+        # open a reasoning block anyway and overflow into an empty reply. That
+        # reason no longer holds: thinking=False now prefills an already-closed
+        # reasoning block (core/llm_runtime._apply_no_think), which the model
+        # cannot overflow because it never opens one.
+        #
+        # Measured on the six P2.5 cases at production budget:
+        #
+        #   thinking=True   simple median 8,169ms  P90 10,877ms  worst 20,949ms  5/18 empty
+        #   thinking=False     "      "      36ms  P90     38ms  worst     39ms  0/18 empty
+        #
+        # Reasoning is NOT switched off across Nova — it is moved to where
+        # decisions are actually made. The agent loop's decide() and deep mode
+        # both still pass thinking=True, so tool choice, planning and critique
+        # keep full native reasoning. By the time this call runs, the tools have
+        # already run and their observations are in the prompt; the spoken reply
+        # does not need to re-derive them.
         reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
         chat_model = self._models.for_role("chat")
         full: list[str] = []
         async with chat_model.semaphore:
             async for token in chat_model.runtime.chat_stream(
-                messages, max_tokens=reply_budget, temperature=0.4, thinking=True
+                messages, max_tokens=reply_budget, temperature=0.4, thinking=False
             ):
                 full.append(token)
                 yield {"type": "token", "text": token}

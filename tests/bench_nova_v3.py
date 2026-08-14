@@ -293,7 +293,7 @@ async def main():
         tokens: list[str] = []
         try:
             async for tok in llm.chat_stream(messages, max_tokens=sc.max_tokens,
-                                             temperature=0.4, thinking=True):
+                                             temperature=0.4, thinking=False):
                 if r.ttft_ms is None:
                     r.ttft_ms = (time.perf_counter() - t_gen) * 1000
                 tokens.append(tok)

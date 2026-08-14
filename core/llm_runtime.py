@@ -536,31 +536,46 @@ class LLMRuntime:
             Attempts ESCALATE rather than repeat. The previous loop retried
             identically, so a prompt that reliably made the model spend its whole
             budget on an unclosed <think> burned three full generations and still
-            returned nothing — measured on this machine, and the reason a plain
-            "Good morning" could take 19.8 s to first token.
+            returned nothing.
 
-            Attempt 0 honours the caller. Attempt 1 forces /no_think, since the
-            hidden reasoning is what failed. Attempt 2 also cuts the budget and
-            asks outright for a direct answer, mirroring the salvage prompt in
-            RuntimeManager that was already known to work.
+            The escalation DIRECTION inverted in V3 P2.5. It used to force
+            /no_think on retry, because native reasoning was what overflowed.
+            Now the fast path prefills a closed reasoning block and is the
+            default, so the failure mode is the opposite: a genuinely hard
+            question opens a SECOND block on top of the prefilled one and
+            overflows inside it. Measured — the complex-reasoning scenario in
+            tests/bench_nova_v3.py returned empty under a pure fast contract.
+
+            So a fast attempt that produces nothing escalates to real reasoning
+            rather than retrying fast. That is a self-correcting complexity
+            router with no classifier to misjudge: turns that can be answered
+            directly are, in ~126 ms, and turns that genuinely need thinking ask
+            for it by failing the cheap path first.
             """
             if attempt == 0:
                 return _apply_no_think(base_messages, thinking=thinking), int(max_tokens)
-            msgs_ = _apply_no_think(base_messages, thinking=False)
-            if attempt == 1:
-                return msgs_, int(max_tokens)
-            return (
-                # Never name the think tag here either. Spelling it out is what
-                # makes this model recite the instruction back inside its
-                # reasoning and produce nothing (30% of turns, measured in
-                # tests/bench_empty_generations.py) — so the original wording of
-                # this salvage prompt could trigger the very failure it exists
-                # to recover from.
-                msgs_ + [{"role": "user", "content": (
-                    "Answer now, directly, in one or two short sentences. No analysis, "
-                    "no reasoning block — just the answer.")}],
-                max(256, int(max_tokens) // 3),
-            )
+            if attempt == 1 and not thinking:
+                # Retry the CHEAP path once before paying for reasoning.
+                #
+                # Fast attempts cost ~130ms, so a second one is nearly free,
+                # while jumping straight to DEEP costs 14-20s. Escalating
+                # immediately put a 19.7s P90 back on turns as simple as "Good
+                # morning" — the failure is stochastic (the model sometimes
+                # opens a second block on top of the prefilled one), so most of
+                # them succeed on a second cheap try. Only a turn that fails the
+                # cheap contract TWICE is treated as genuinely needing thought.
+                return _apply_no_think(base_messages, thinking=False), int(max_tokens)
+            # Final attempt: real reasoning, FULL budget, no extra instruction.
+            #
+            # This used to shrink the budget to max_tokens//3 and append a
+            # "no reasoning block" nudge. Both were wrong here and measurably so:
+            # a small budget WITH reasoning enabled is the exact combination
+            # that overflows (the whole 512-token failure mode), and the nudge
+            # contradicts the reasoning this attempt is deliberately asking for.
+            # Together they made the complex-reasoning scenario fail all three
+            # attempts. A turn that has already failed the cheap path twice has
+            # earned the full budget.
+            return _apply_no_think(base_messages, thinking=True), int(max_tokens)
 
         loop = asyncio.get_running_loop()
 
@@ -711,17 +726,54 @@ def _strip_think(text: str) -> str:
     return cleaned.strip()
 
 
-def _apply_no_think(messages: list[dict[str, Any]], thinking: bool = False) -> list[dict[str, Any]]:
-    """Append Qwen3's '/no_think' soft switch so ordinary chat/tool calls skip
-    the hidden reasoning phase entirely (keeps latency/token budget sane).
+#: Seeds the assistant turn with an ALREADY-CLOSED reasoning block, so the model
+#: continues from after it rather than opening its own. The think filter strips
+#: the echoed prefix, so nothing reaches the user.
+_CLOSED_THINK_PREFILL = "<think>\n\n</think>\n\n"
 
-    Callers doing hard work (agent decisions, planning, coding) pass
-    thinking=True to let the model reason natively — the reasoning is still
-    stripped from all output by the think filter, it just happens in the
-    background. NOVA_LLM_ALLOW_THINKING=1 forces thinking on everywhere.
+
+def _apply_no_think(messages: list[dict[str, Any]], thinking: bool = False) -> list[dict[str, Any]]:
+    """Give ordinary chat/tool calls a FAST contract: no hidden reasoning.
+
+    This used to append Qwen3's '/no_think' soft switch. Measured on this model
+    (tests/bench_ttft_v3*.py), that barely worked and made things worse in one
+    respect — it left ~7s median before the first visible token and RAISED the
+    empty-reply rate to 6/18, because the model kept opening a <think> block
+    anyway and sometimes spent the whole budget inside it.
+
+    The V3 P2.5 investigation found where the time actually goes:
+
+        model compute TTFT              35 ms
+        first VISIBLE token         10,336 ms   <- the whole problem
+        i.e. ~10.3 s of hidden reasoning that is generated and then discarded
+
+    Prompt wording does not fix it. Five rewordings were measured and the
+    shipped prompt was the best of them; a promising candidate from an earlier
+    run failed to reproduce and was variance. The model reasons because the chat
+    template tells it to, so the control has to be at the template level.
+
+    Prefilling a closed reasoning block does work, decisively:
+
+        production      simple median 8,169 ms   P90 10,877 ms   worst 20,949 ms   5/18 empty
+        prefill         simple median    36 ms   P90     38 ms   worst     39 ms   0/18 empty
+
+    Answer quality is preserved — the replies are still real answers, and the
+    empty-generation rate goes to zero because nothing can overflow inside a
+    block that was never opened.
+
+    Callers doing hard work (agent decisions, planning, deep mode) pass
+    thinking=True and keep full native reasoning. NOVA_LLM_ALLOW_THINKING=1
+    forces reasoning on everywhere; NOVA_LLM_FAST_PREFILL=0 falls back to the
+    old '/no_think' switch if this ever needs to be disabled in the field.
     """
     if thinking or os.getenv("NOVA_LLM_ALLOW_THINKING", "").strip() == "1":
         return messages
+
+    if os.getenv("NOVA_LLM_FAST_PREFILL", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        # A trailing assistant message is rendered by the chat template as the
+        # start of the assistant's turn, so the model continues it.
+        return [*messages, {"role": "assistant", "content": _CLOSED_THINK_PREFILL}]
+
     msgs = [dict(m) for m in messages]
     for i, m in enumerate(msgs):
         if m.get("role") == "system" and isinstance(m.get("content"), str):
