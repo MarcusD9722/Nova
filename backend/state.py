@@ -41,6 +41,11 @@ class _State:
     # because barge-in must be able to cancel a turn before anything else has
     # touched the voice subsystem.
     turns = None
+    # MCP capability layer (core/mcp). None until servers are configured and
+    # discovery finishes; started in the background so a slow server cannot
+    # hold up boot.
+    mcp = None
+    mcp_task = None
     tts_load_task: asyncio.Task | None = None
     tts_prewarm_task: asyncio.Task | None = None
     tts_voice_cache: dict[str, str] = {}

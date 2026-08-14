@@ -1,0 +1,128 @@
+# Nova — architectural decision record
+
+Durable decisions with the evidence behind them, so a future agent (human or
+otherwise) does not undo a good architecture because the reason was not written
+down.
+
+This file is the interim home for what the V3 brief calls **decision memory**.
+When that system is built (P4), these entries should migrate into it with their
+provenance intact rather than being retyped.
+
+Format: what was decided, why, what the alternatives were, what evidence
+supports it, and what would justify revisiting it.
+
+---
+
+## D1 — XTTS runs in an isolated child process
+
+**Decided:** 2026-08-12 (JARVIS V2)
+
+**Decision.** XTTS synthesis runs in a dedicated child process with its own CUDA
+context, not in the backend process.
+
+**Rationale.** In-process CUDA XTTS beside llama.cpp aborts the backend with
+`CUDA error: an illegal memory access was encountered` in
+`ggml_backend_cuda_synchronize`. It cannot be serialised behind `GPU_SEM`
+either: sentence-streamed TTS overlaps generation by design and the reply stream
+holds the permit for the whole generation, so taking it deadlocks (measured:
+195 s hang, then access violations on every later turn).
+
+**Alternatives rejected.** CPU-only XTTS (4× slower, and the config claiming it
+was unreachable); serialising on the GPU semaphore (deadlocks); a second GPU
+(hardware Marcus does not have).
+
+**Evidence.** `tests/live_voice_validation.py` — 10/10 turns, 28 concurrent CUDA
+clips, 0 aborts, +0.05 GB VRAM drift, RTF 0.73. `core/gpu.py` records the
+original failure.
+
+**Revisit if.** A future llama.cpp/torch combination demonstrably shares a CUDA
+context safely, proven by the same ten-turn concurrent test.
+
+---
+
+## D2 — STT stays on CUDA
+
+**Decided:** 2026-08-12 (V3 P1)
+
+**Decision.** faster-whisper keeps `("cuda", "float16")` as its first attempt,
+in the backend process, despite CTranslate2 being a second CUDA runtime there.
+
+**Rationale.** The risk is real in shape but was not borne out. Moving STT to
+CPU on suspicion would be a silent regression with no measurement behind it.
+
+**Evidence.** `tests/bench_cuda_coexist_v3.py` — seven configurations
+(each consumer alone, in pairs, and all three under conversational load): zero
+inference errors, zero aborts, zero XTTS restarts, VRAM flat at 9.04 GB.
+Contention is real but asymmetric (llama.cpp +6%, whisper +185%, XTTS +209%).
+
+**Revisit if.** A CUDA abort is ever observed with STT on GPU. Re-run the matrix
+before changing the device.
+
+---
+
+## D3 — The FAST reasoning contract is a closed-block prefill
+
+**Decided:** 2026-08-13 (V3 P2.5)
+
+**Decision.** Ordinary conversational replies (`thinking=False`) prefill the
+assistant turn with an already-closed reasoning block
+(`<think>\n\n</think>\n\n`) so the model continues from after it. Decision-making
+paths (`decide()`, deep mode) keep native reasoning.
+
+**Rationale.** Model compute TTFT is 35 ms; ~10.3 s per turn was hidden
+reasoning that was generated and then discarded. Prompt wording does not control
+it — five rewordings were measured and the shipped prompt was the best of them.
+The chat template is what opens the block, so the control has to live there.
+
+**Evidence.** `tests/bench_ttft_v3*.py`, `tests/bench_nova_v3.py`:
+first-visible-token 8,169 ms → 36 ms simple median, empty replies 5/18 → 0/18;
+end-to-end TTFT median 12,127 ms → 130 ms.
+
+### ⚠ CONSTRAINT: this is model- and template-specific
+
+`<think>` / `</think>` is **Qwen3-family syntax**, validated only against Nova's
+current `Qwen3.5-9B-Q6_K` and its chat template. It is not a general technique.
+
+Applying it blindly to another model would at best do nothing and at worst
+inject literal `<think>` text into the visible answer, or — given what V2 found
+about naming the tag in prompts — actively trigger the pathology it exists to
+prevent.
+
+**Therefore, before any model swap or productization work:**
+
+* A reasoning contract must be **selected per model / per chat template**, not
+  applied globally. The current behaviour is correct *for the current model* and
+  must be gated on that, not assumed.
+* `NOVA_LLM_FAST_PREFILL=0` already falls back to the older `/no_think` switch,
+  so the escape hatch exists — but a fallback is not model selection.
+* The right eventual shape is a small per-template registry: template identity →
+  how to request "no hidden reasoning" (prefill, a template flag, a sampling
+  parameter, or nothing at all), with a documented default of "do nothing" for
+  unknown templates.
+* Any new model must be re-measured with `tests/bench_ttft_v3c.py` before its
+  contract is trusted. Do not port the number 36 ms across models.
+
+**Alternatives rejected.** Prompt rewording (measured, the shipped prompt was
+best); a short token budget (79 ms median but **17/18 empty** — fast because it
+fails fast); `/no_think` alone (barely helped, raised empties to 6/18).
+
+**Revisit if.** The model or chat template changes — mandatory, not optional.
+
+---
+
+## D4 — MCP is a governed capability source, not a model-side bypass
+
+**Decided:** 2026-08-13 (V3 P3)
+
+**Decision.** MCP servers feed Nova's existing capability registry, ToolSelector,
+permission broker, context firewall and artifact system. MCP tools are ordinary
+`ToolRouter` tools with namespaced identities, not a parallel execution path.
+
+**Rationale.** The value of MCP is the ecosystem, not its execution model.
+Nova's selection, permission and trust machinery is stronger than routing tool
+calls straight from the model, and adopting MCP must not cost that.
+
+**Evidence.** See `docs/NOVA_V3_MCP.md`.
+
+**Revisit if.** The MCP specification adds capabilities that genuinely cannot be
+expressed as a governed Nova tool.

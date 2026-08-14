@@ -729,6 +729,14 @@ def _strip_think(text: str) -> str:
 #: Seeds the assistant turn with an ALREADY-CLOSED reasoning block, so the model
 #: continues from after it rather than opening its own. The think filter strips
 #: the echoed prefix, so nothing reaches the user.
+#:
+#: MODEL-SPECIFIC. `<think>`/`</think>` is Qwen3-family syntax and this is
+#: validated only against Qwen3.5-9B and its chat template. On another model it
+#: would at best do nothing and at worst leak a literal "<think>" into the
+#: spoken answer — or, given what V2 found about naming the tag, trigger the
+#: pathology it exists to prevent. A model swap MUST re-measure with
+#: tests/bench_ttft_v3c.py and select a contract per template rather than
+#: assuming this one. See docs/NOVA_DECISIONS.md D3.
 _CLOSED_THINK_PREFILL = "<think>\n\n</think>\n\n"
 
 

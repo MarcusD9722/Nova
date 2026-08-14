@@ -580,6 +580,17 @@ def _tts_engine():
     return STATE.tts_engine
 
 
+def _load_mcp_configs():
+    """MCP servers from NOVA_MCP_SERVERS. Absent config means no MCP at all."""
+    try:
+        from core.mcp.manager import load_server_configs
+
+        return load_server_configs()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mcp_config_load_failed", error=str(e)[:200])
+        return []
+
+
 def tts_status() -> dict[str, Any]:
     """What the voice subsystem is ACTUALLY doing right now. Never inferred."""
     if _tts_isolated_enabled():
@@ -1102,6 +1113,37 @@ async def _startup() -> None:
     STATE.runtime = runtime
     STATE.brain = brain
     brain.start()
+
+    # ── MCP capability servers (V3 P3) ──────────────────────────────────────
+    # Started in the BACKGROUND: an MCP server is somebody else's process, and
+    # a slow or wedged one must not hold up Nova's boot. Capabilities appear in
+    # the registry when discovery finishes; until then Nova simply has fewer
+    # tools, which every layer already handles.
+    STATE.mcp = None
+    _mcp_configs = _load_mcp_configs()
+    if _mcp_configs:
+        async def _start_mcp() -> None:
+            from core.mcp.manager import McpManager
+
+            mgr = McpManager(
+                permission_broker=runtime.permission_broker,
+                artifact_store=getattr(runtime, "_artifacts", None),
+            )
+            ok = 0
+            for scfg in _mcp_configs:
+                if await mgr.add_server(scfg):
+                    ok += 1
+            if ok:
+                # Registering on the ordinary ToolRouter is what gives MCP calls
+                # Nova's timeout, retry, failure taxonomy and audit for free.
+                n = mgr.register_with_router(runtime.router)
+                _bullet(f"MCP ready: {ok}/{len(_mcp_configs)} servers, {n} capabilities")
+            else:
+                _bullet(f"MCP: no servers connected ({len(_mcp_configs)} configured)")
+            STATE.mcp = mgr
+
+        STATE.mcp_task = asyncio.create_task(_start_mcp())
+
     if (os.getenv("NOVA_TTS_PREWARM", "0").strip() or "0").lower() not in {"0", "false", "no", "off"}:
         # Load + warm XTTS in the background so Nova can speak immediately.
         STATE.tts_prewarm_task = asyncio.create_task(_prewarm_tts())
