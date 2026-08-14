@@ -43,7 +43,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # ── Trust classes ────────────────────────────────────────────────────────────
 TRUST_DIRECT_USER = "DIRECT_USER"
@@ -280,19 +280,40 @@ def resolve_reference(text: str, items: list[Artifact]) -> Artifact | None:
 class ArtifactStore:
     """Hot, bounded, per-conversation artifact memory."""
 
-    def __init__(self, *, max_per_conversation: int = 120) -> None:
+    def __init__(self, *, max_per_conversation: int = 120,
+                 on_artifact: "Callable[[Artifact, list[Artifact]], None] | None" = None) -> None:
         self._by_id: dict[str, Artifact] = {}
         self._by_conversation: dict[str, list[str]] = {}
         self._max = max_per_conversation
+        # HOT -> WARM promotion hook (V3 P4.1). Anything that produces an
+        # artifact — the tool loop, McpManager, a capability — gets considered
+        # for durable memory by virtue of storing one. That is deliberately the
+        # only route: a subsystem writing its own episodes would be a second
+        # persistence path, and the two would disagree within a release.
+        self._on_artifact = on_artifact
+
+    def _notify(self, artifact: Artifact, children: list[Artifact]) -> None:
+        """Announce a COMPLETE unit. Never raises: hot memory is on the turn
+        path and an observer's problem is not the user's problem."""
+        if self._on_artifact is None:
+            return
+        try:
+            self._on_artifact(artifact, children)
+        except Exception:  # noqa: BLE001 — logged by the observer, not here
+            pass
 
     # -- writing --------------------------------------------------------------
 
-    def add(self, artifact: Artifact) -> Artifact:
+    def add(self, artifact: Artifact, *, notify: bool = True) -> Artifact:
         self._by_id[artifact.artifact_id] = artifact
         ids = self._by_conversation.setdefault(artifact.conversation_id, [])
         ids.append(artifact.artifact_id)
         while len(ids) > self._max:
             self._by_id.pop(ids.pop(0), None)
+        # A child is announced with its parent, not on its own — "the second
+        # one" is meaningless without the set it belongs to.
+        if notify and artifact.parent_id is None:
+            self._notify(artifact, [])
         return artifact
 
     def add_result_set(
@@ -320,8 +341,9 @@ class ArtifactStore:
             freshness=freshness,
             provenance={"query": query, "tool": source_tool, "at": time.time()},
         )
-        self.add(parent)
+        self.add(parent, notify=False)
 
+        children: list[Artifact] = []
         for i, raw in enumerate(items, start=1):
             payload = dict(raw)
             child = Artifact(
@@ -338,7 +360,10 @@ class ArtifactStore:
                 freshness=freshness,
                 provenance=dict(parent.provenance),
             )
-            self.add(child)
+            self.add(child, notify=False)
+            children.append(child)
+        # One announcement, once the set is complete and ordered.
+        self._notify(parent, children)
         return parent
 
     # -- reading --------------------------------------------------------------

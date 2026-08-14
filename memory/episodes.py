@@ -62,6 +62,11 @@ EP_CONVERSATION = "conversation"
 #: Payload above this size goes to cold storage instead of the warm row.
 WARM_PAYLOAD_LIMIT = 2000
 
+#: Position of `cold_ref` in the artifact row tuple built by `_artifact_row`.
+#: Named rather than inlined because a column added before it would otherwise
+#: silently start copying the wrong value onto episodes.
+_COLD_REF_COL = 16
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -183,21 +188,58 @@ class EpisodicStore:
 
     # ── episodes ─────────────────────────────────────────────────────────────
 
-    async def record_episode(self, ep: Episode) -> str:
-        async with self._conn() as db:
-            await db.execute(
-                """INSERT OR REPLACE INTO episodes
+    _EPISODE_SQL = """INSERT OR REPLACE INTO episodes
                    (id, kind, summary, entities, conversation_id, project, source_tool,
                     trust, freshness, provenance, outcome, importance, access_count,
                     last_accessed_at, superseded_by, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (ep.id, ep.kind, ep.summary, json.dumps(ep.entities), ep.conversation_id,
-                 ep.project, ep.source_tool, ep.trust, ep.freshness,
-                 json.dumps(ep.provenance, default=str), ep.outcome, ep.importance,
-                 ep.access_count, ep.last_accessed_at, ep.superseded_by, ep.created_at),
-            )
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+    def _episode_row(self, ep: Episode) -> tuple:
+        return (ep.id, ep.kind, ep.summary, json.dumps(ep.entities), ep.conversation_id,
+                ep.project, ep.source_tool, ep.trust, ep.freshness,
+                json.dumps(ep.provenance, default=str), ep.outcome, ep.importance,
+                ep.access_count, ep.last_accessed_at, ep.superseded_by, ep.created_at)
+
+    async def record_episode(self, ep: Episode) -> str:
+        async with self._conn() as db:
+            await db.execute(self._EPISODE_SQL, self._episode_row(ep))
             await db.commit()
         return ep.id
+
+    async def record_happening(self, ep: Episode, parent: Artifact | None = None,
+                               children: Iterable[Artifact] = ()) -> int:
+        """Write one thing that happened — episode and its evidence — atomically.
+
+        The episode and its result set are a single fact about the world, and
+        splitting them across transactions creates a state that is worse than
+        either: an episode whose `provenance.artifact_id` points at rows that a
+        crash prevented from ever existing. Retrieval would then rank it, offer
+        it, and resolve an ordinal against nothing.
+
+        Returns the number of rows written.
+        """
+        rows = []
+        if parent is not None:
+            rows.append(self._artifact_row(parent, episode_id=ep.id))
+            rows.extend(self._artifact_row(c, episode_id=ep.id) for c in children)
+
+        # Carry any cold digest up onto the WARM row. Retrieval decides whether
+        # to hydrate by looking at the episode — it has not loaded the artifacts
+        # at that point, and loading them to find out whether there is anything
+        # worth loading would defeat the tiering. Without this the evidence is
+        # on disk, correctly written, and permanently unreachable: measured on
+        # the real path, cold hydration never fired once.
+        cold_refs = [r[_COLD_REF_COL] for r in rows if r[_COLD_REF_COL]]
+        if cold_refs and not ep.provenance.get("cold_ref"):
+            ep.provenance = {**ep.provenance, "cold_ref": cold_refs[0],
+                             "cold_refs": cold_refs[:8]}
+
+        async with self._conn() as db:
+            await db.execute(self._EPISODE_SQL, self._episode_row(ep))
+            if rows:
+                await db.executemany(self._ARTIFACT_SQL, rows)
+            await db.commit()
+        return 1 + len(rows)
 
     async def get_episode(self, episode_id: str) -> Episode | None:
         async with self._conn() as db:
@@ -281,14 +323,25 @@ class EpisodicStore:
 
     # ── artifacts ────────────────────────────────────────────────────────────
 
-    async def persist_artifact(self, art: Artifact, *, episode_id: str | None = None,
-                               cold_payload: Any = None) -> str:
-        """Persist one artifact. Large evidence goes cold; the row stays small.
+    _ARTIFACT_SQL = """INSERT OR REPLACE INTO artifacts
+                   (id, conversation_id, turn_id, episode_id, parent_id, item_index,
+                    artifact_type, summary, payload, source_tool, trust, freshness,
+                    provenance, importance, access_count, last_accessed_at, cold_ref,
+                    active, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
-        Trust and freshness are written through verbatim. There is deliberately
-        no parameter here that could change them — laundering an untrusted
-        artifact into a trusted one must not be possible by calling this
-        function differently.
+    def _artifact_row(self, art: Artifact, *, episode_id: str | None,
+                      cold_payload: Any = None) -> tuple:
+        """Build one artifact's row, sending heavy evidence cold on the way.
+
+        Separated from the write so a result set can go into a single
+        transaction. Cold storage is plain file IO and deliberately happens
+        outside the database transaction — a blob write must not hold a SQLite
+        lock open.
+
+        Trust and freshness are copied verbatim. There is deliberately no
+        parameter here that could change them: laundering an untrusted artifact
+        into a trusted one must not be possible by calling this differently.
         """
         payload = dict(art.payload or {})
         cold_ref = None
@@ -307,35 +360,42 @@ class EpisodicStore:
             if ref:
                 cold_ref = ref["digest"]
 
+        return (art.artifact_id, art.conversation_id, art.turn_id, episode_id,
+                art.parent_id, art.item_index, art.artifact_type, art.summary,
+                json.dumps(payload, ensure_ascii=False, default=str), art.source_tool,
+                art.trust, art.freshness,
+                json.dumps(art.provenance, default=str), art.importance,
+                art.access_count, art.last_accessed,
+                cold_ref, 1 if art.active else 0,
+                datetime.fromtimestamp(art.created_at, tz=timezone.utc).isoformat())
+
+    async def persist_artifact(self, art: Artifact, *, episode_id: str | None = None,
+                               cold_payload: Any = None) -> str:
+        """Persist one artifact. Large evidence goes cold; the row stays small."""
+        row = self._artifact_row(art, episode_id=episode_id, cold_payload=cold_payload)
         async with self._conn() as db:
-            await db.execute(
-                """INSERT OR REPLACE INTO artifacts
-                   (id, conversation_id, turn_id, episode_id, parent_id, item_index,
-                    artifact_type, summary, payload, source_tool, trust, freshness,
-                    provenance, importance, access_count, last_accessed_at, cold_ref,
-                    active, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (art.artifact_id, art.conversation_id, art.turn_id, episode_id,
-                 art.parent_id, art.item_index, art.artifact_type, art.summary,
-                 json.dumps(payload, ensure_ascii=False, default=str), art.source_tool,
-                 art.trust, art.freshness,
-                 json.dumps(art.provenance, default=str), art.importance,
-                 art.access_count, art.last_accessed,
-                 cold_ref, 1 if art.active else 0,
-                 datetime.fromtimestamp(art.created_at, tz=timezone.utc).isoformat()),
-            )
+            await db.execute(self._ARTIFACT_SQL, row)
             await db.commit()
         return art.artifact_id
 
     async def persist_result_set(self, parent: Artifact, children: Iterable[Artifact],
                                  *, episode_id: str | None = None) -> int:
-        n = 0
-        await self.persist_artifact(parent, episode_id=episode_id)
-        n += 1
-        for child in children:
-            await self.persist_artifact(child, episode_id=episode_id)
-            n += 1
-        return n
+        """A result set is ONE write, not one per item.
+
+        It used to be a loop over `persist_artifact`, which opened a fresh
+        connection and committed separately for every row. Measured on the real
+        promotion path that made a four-item set cost ~147 ms — four connection
+        setups and four fsyncs to store one thing that happened. It is also the
+        wrong transaction boundary: a crash midway through left a result set
+        with some of its items, and a half-persisted ordered set is worse than
+        none, because "the second one" would then quietly mean something else.
+        """
+        rows = [self._artifact_row(parent, episode_id=episode_id)]
+        rows.extend(self._artifact_row(c, episode_id=episode_id) for c in children)
+        async with self._conn() as db:
+            await db.executemany(self._ARTIFACT_SQL, rows)
+            await db.commit()
+        return len(rows)
 
     async def load_artifact(self, artifact_id: str, *, hydrate: bool = False) -> Artifact | None:
         async with self._conn() as db:
