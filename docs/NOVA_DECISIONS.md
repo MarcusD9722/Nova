@@ -187,3 +187,79 @@ zero prompt characters against a 2,001-episode corpus.
 
 **Revisit if.** Users report Nova failing to recall something she demonstrably
 stored — check the gate before touching ranking.
+
+---
+
+## D7 — Durable memory is promoted by ONE hook on the hot artifact store
+
+**Decided:** 2026-08-14 (V3 P4.1)
+
+**Decision.** Anything that produces an artifact is considered for durable
+memory by virtue of producing one. `ArtifactStore` announces each complete unit
+(a standalone artifact, or a result set with its ordered children) to a single
+promotion hook; the runtime decides eligibility with `worth_remembering()` and
+enqueues. No subsystem writes episodes itself.
+
+**Rationale.** The alternative is each producer persisting its own history, and
+the producers do not agree for long. MCP is the proof: `McpManager` already
+stored an artifact carrying server, remote tool, arguments, schema hash and the
+injection flag, so it became durable the day the hook existed — no MCP-specific
+persistence, no second code path to keep in sync, and P3's rule that "MCP uses
+Nova's normal machinery" held without anyone maintaining it. A hook on the hot
+store is also the only place that sees every producer, including ones not
+written yet.
+
+**Alternatives rejected.** Persisting inside the tool loop (misses MCP and
+capabilities, which do not go through it); each subsystem writing its own
+episodes (two paths disagree within a release, and trust/provenance handling
+gets reimplemented per subsystem — the exact way a security invariant erodes).
+
+**Constraint.** The hook is called on the turn path, so it must stay
+synchronous, cheap and non-raising: decide and enqueue, never await, never
+touch the database. Persistence itself is a background worker
+(`EpisodicIngestWorker`) that drains before it stops and drops rather than
+blocks when saturated — an episode may be lost to back-pressure, a reply may
+not.
+
+**Evidence.** `tests/bench_episodic_v41.py`: enqueue 0.035 ms on the turn versus
+41.7 ms to complete the write in the background — three orders of magnitude.
+`tests/test_episodic_integration_v41.py` covers MCP promotion, duplicate
+delivery, shutdown drain and failure isolation.
+
+**Revisit if.** A producer appears that legitimately cannot express itself as an
+artifact. Adding a second persistence path is not the fix; extending the
+artifact vocabulary is.
+
+---
+
+## D8 — Explicit past wording outranks the result set on screen
+
+**Decided:** 2026-08-14 (V3 P4.1)
+
+**Decision.** Ordinal references resolve in a fixed order: wording about the
+present resolves against the HOT set; wording about the past resolves against
+the historical set **even when something is on screen**, and the hot selection
+is then dropped; when neither is clearly meant, Nova asks instead of choosing.
+
+**Rationale.** "The second drive we looked at yesterday" matches the set
+currently on screen too — positionally, by coincidence — so both layers resolve
+it. Presenting both leaves the model a prompt that says "he means the LG
+monitor" and "he means the WD Gold", which is worse than either answer alone.
+The user's tense is the only evidence available about which set they mean, and
+it is unambiguous evidence.
+
+**Alternatives rejected.** Hot always wins (ignores the word "yesterday", which
+is the user telling Nova exactly what they mean); most-recent historical set
+wins on ties (a guess wearing a confident face); asking an LLM to pick (makes a
+deterministic operation probabilistic).
+
+**Constraint.** Ambiguity must survive as ambiguity. Two historical result sets
+within 1.25x of each other resolve to a question, and must never be settled by
+whatever happens to be on screen.
+
+**Evidence.** `tests/test_episodic_integration_v41.py` —
+`test_current_ordinal_precedence`, `test_historical_wording_outranks_hot`,
+`test_ambiguity_is_not_resolved_arbitrarily`.
+
+**Revisit if.** Users report Nova answering about the wrong result set. Check
+which of the three rules fired before changing ranking.

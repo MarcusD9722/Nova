@@ -30,6 +30,34 @@ class AutonomyHintEvent:
 
 
 @dataclass(frozen=True)
+class EpisodicPersistEvent:
+    """One thing that happened, on its way to durable memory (V3 P4.1).
+
+    Carries the LIVE artifact objects rather than their ids. The hot store is
+    bounded and evicts, so an id could be dangling by the time the worker drains
+    the queue — and re-capturing from the tool result would be a second capture
+    path, which is exactly what P4.1 must not create.
+
+    `artifact_id` is the parent's id, generated once at capture. It is the
+    stable identity that makes persistence idempotent: the same logical event
+    observed twice writes the same episode row twice, not two episodes.
+    """
+
+    # A string, not a UUID: this comes off the artifact, which stores the
+    # conversation id as text. Annotating it UUID would be a quiet lie.
+    conversation_id: UUID | str
+    turn_id: str
+    timestamp: datetime
+    artifact: Any                       # memory.artifacts.Artifact (the parent)
+    children: list[Any] = field(default_factory=list)
+    user_text: str = ""
+    reason: str = ""
+    kind: str = "tool_result"
+    project: str | None = None
+    importance: float = 0.5
+
+
+@dataclass(frozen=True)
 class AssistantPostEvent:
     conversation_id: UUID
     timestamp: datetime

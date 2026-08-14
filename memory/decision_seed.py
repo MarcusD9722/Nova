@@ -100,16 +100,21 @@ def seed_decisions() -> list[Decision]:
                       "tests/bench_nova_v3.py: end-to-end TTFT median 12127ms -> 130ms"],
             subsystem="llm",
             source_refs=["core/llm_runtime.py::_apply_no_think", "core/runtime.py"],
-            constraints="MODEL-SPECIFIC AND TEMPLATE-SPECIFIC. '<think>'/'</think>' is "
-                        "Qwen3-family syntax, validated only against Qwen3.5-9B and its "
-                        "chat template. It is NOT a general technique: on another model "
-                        "it would at best do nothing and at worst leak a literal "
-                        "'<think>' into the spoken answer, or trigger the very pathology "
-                        "it prevents. A reasoning contract MUST be selected per model / "
-                        "per chat template, never applied globally. Any model swap must "
-                        "re-measure with tests/bench_ttft_v3c.py before the contract is "
-                        "trusted; do not port the 36ms figure across models. "
-                        "NOVA_LLM_FAST_PREFILL=0 is an escape hatch, not model selection.",
+            # Ordered most-operative first, deliberately. Retrieval clips long
+            # fields, so the two facts that change what a future agent DOES —
+            # it is Qwen-specific, and a model swap must re-measure — have to
+            # survive the clip. The full reasoning stays in
+            # docs/NOVA_DECISIONS.md, which is not budget-constrained.
+            constraints="MODEL-SPECIFIC AND TEMPLATE-SPECIFIC: this is Qwen3-family "
+                        "syntax, validated only against Qwen3.5-9B and its chat template. "
+                        "Any model swap MUST re-measure with tests/bench_ttft_v3c.py "
+                        "before the contract is trusted, and must never port the 36ms "
+                        "figure across models. A reasoning contract is selected per model "
+                        "/ per chat template, never applied globally. Applied blindly "
+                        "elsewhere it would at best do nothing and at worst leak a literal "
+                        "reasoning tag into the spoken answer, or trigger the very "
+                        "pathology it prevents. NOVA_LLM_FAST_PREFILL=0 is an escape "
+                        "hatch, not model selection.",
             decided_at="2026-08-13T00:00:00+00:00",
         ),
         Decision(
@@ -197,6 +202,74 @@ def seed_decisions() -> list[Decision]:
                         "stored, check this gate BEFORE touching ranking — a closed gate "
                         "fails silently and looks like a retrieval-quality problem.",
             decided_at="2026-08-13T00:00:00+00:00",
+        ),
+        Decision(
+            id="D7",
+            title="Durable memory is promoted by ONE hook on the hot artifact store",
+            decision="Anything that produces an artifact is considered for durable memory "
+                     "by virtue of producing one. ArtifactStore announces each complete "
+                     "unit to a single promotion hook; the runtime decides eligibility "
+                     "and enqueues. No subsystem writes episodes itself.",
+            rationale="The alternative is each producer persisting its own history, and "
+                      "producers do not agree for long. MCP is the proof: McpManager "
+                      "already stored an artifact with server, remote tool, arguments, "
+                      "schema hash and injection flag, so it became durable the day the "
+                      "hook existed — no MCP-specific persistence and no second path to "
+                      "keep in sync. A hook on the hot store is also the only place that "
+                      "sees every producer, including ones not written yet.",
+            alternatives=["Persisting inside the tool loop (rejected: misses MCP and "
+                          "capabilities, which do not go through it)",
+                          "Each subsystem writing its own episodes (rejected: two paths "
+                          "disagree within a release, and trust/provenance handling gets "
+                          "reimplemented per subsystem — how a security invariant erodes)"],
+            evidence=["tests/bench_episodic_v41.py: enqueue 0.035ms on the turn vs 41.7ms "
+                      "to complete the write in background — three orders of magnitude",
+                      "tests/test_episodic_integration_v41.py covers MCP promotion, "
+                      "duplicate delivery, shutdown drain and failure isolation"],
+            subsystem="memory",
+            source_refs=["memory/artifacts.py::ArtifactStore._notify",
+                         "core/runtime.py::_on_artifact_captured",
+                         "core/workers/episodic_ingest.py"],
+            constraints="The hook runs ON the turn path: it must stay synchronous, cheap "
+                        "and non-raising — decide and enqueue, never await, never touch "
+                        "the database. Persistence is a background worker that drains "
+                        "BEFORE it stops and drops rather than blocks when saturated. An "
+                        "episode may be lost to back-pressure; a reply may not.",
+            decided_at="2026-08-14T00:00:00+00:00",
+        ),
+        Decision(
+            id="D8",
+            title="Explicit past wording outranks the result set on screen",
+            decision="Ordinals resolve in a fixed order: present-tense wording resolves "
+                     "against the HOT set; past-tense wording resolves against the "
+                     "historical set EVEN when something is on screen, and the hot "
+                     "selection is then dropped; when neither is clearly meant, Nova asks "
+                     "instead of choosing.",
+            rationale="'The second drive we looked at yesterday' matches the set currently "
+                      "on screen too — positionally, by coincidence — so both layers "
+                      "resolve it. Presenting both leaves the model a prompt saying 'he "
+                      "means the LG monitor' AND 'he means the WD Gold', which is worse "
+                      "than either answer alone. The user's tense is the only evidence "
+                      "available about which set they mean, and it is unambiguous.",
+            alternatives=["Hot always wins (rejected: ignores the word 'yesterday', which "
+                          "is the user saying exactly what they mean)",
+                          "Most-recent historical set wins ties (rejected: a guess wearing "
+                          "a confident face)",
+                          "Ask an LLM to pick (rejected: makes a deterministic operation "
+                          "probabilistic)"],
+            evidence=["tests/test_episodic_integration_v41.py::"
+                      "test_current_ordinal_precedence",
+                      "tests/test_episodic_integration_v41.py::"
+                      "test_historical_wording_outranks_hot",
+                      "tests/test_episodic_integration_v41.py::"
+                      "test_ambiguity_is_not_resolved_arbitrarily"],
+            subsystem="memory",
+            source_refs=["core/runtime.py::_episodic_context",
+                         "memory/episodic_recall.py::resolve_historical_reference"],
+            constraints="Ambiguity must survive as ambiguity. Two historical result sets "
+                        "within 1.25x of each other resolve to a QUESTION, and must never "
+                        "be settled by whatever happens to be on screen.",
+            decided_at="2026-08-14T00:00:00+00:00",
         ),
     ]
 
