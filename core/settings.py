@@ -97,6 +97,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_TTS_START_TIMEOUT", "float", "300", "Seconds allowed for the XTTS worker to load (first run may download ~1.9 GB)."),
         _s("NOVA_TTS_MAX_BACKLOG", "int", "32", "Max sentences queued for synthesis before new ones are rejected instead of queued."),
         _s("NOVA_TTS_MAX_RESTARTS", "int", "3", "How many times a crashed XTTS worker is restarted before Nova stops trying and reports degraded."),
+        _s("NOVA_COLD_MAX_BYTES", "int", "8388608", "Largest single piece of cold evidence Nova will store (bytes). A tool producing more than this is refused rather than silently filling the memory directory."),
         _s("NOVA_ARTIFACT_WINDOW_S", "float", "900", "How long a tool result set stays 'on screen' and is injected into the prompt. Older sets remain addressable by reference but stop consuming context every turn."),
         _s("NOVA_RECALL_GATE", "bool", "1", "Skip the broad semantic memory search when working context already answers the turn (memory/recall_gate.py). Fails open: anything it does not positively recognise still searches. Set 0 to always search, as before."),
         _s("NOVA_MCP_SERVERS", "str", "", "MCP servers as a JSON object of server-id -> {command, args, env, cwd, enabled}. Each server's tools become namespaced Nova capabilities (mcp:<server>:<tool>) that go through ToolSelector, permissions, the context firewall and artifacts like any other tool. Empty = MCP off."),

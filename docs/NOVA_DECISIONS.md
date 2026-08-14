@@ -4,9 +4,16 @@ Durable decisions with the evidence behind them, so a future agent (human or
 otherwise) does not undo a good architecture because the reason was not written
 down.
 
-This file is the interim home for what the V3 brief calls **decision memory**.
-When that system is built (P4), these entries should migrate into it with their
-provenance intact rather than being retyped.
+**These decisions are now also stored as data.** `memory/decision_seed.py`
+mirrors this file into the `decisions` table (P4), so Nova can *retrieve* the
+reasoning rather than only display it — "why do unknown MCP capabilities require
+confirmation?" is answerable from memory, with the rationale attached.
+
+The two views are kept deliberately, not redundantly: prose here because it is
+what a person will actually read and review in a diff, structure there because
+retrieval and supersession need fields. Seeding is idempotent and never
+overwrites an edited decision. **When you add a decision here, add it to the
+seed too** — the test suite checks the acceptance questions, not the file.
 
 Format: what was decided, why, what the alternatives were, what evidence
 supports it, and what would justify revisiting it.
@@ -126,3 +133,57 @@ calls straight from the model, and adopting MCP must not cost that.
 
 **Revisit if.** The MCP specification adds capabilities that genuinely cannot be
 expressed as a governed Nova tool.
+
+---
+
+## D5 — Episodic memory lives in Nova's existing SQLite database
+
+**Decided:** 2026-08-13 (V3 P4)
+
+**Decision.** Episodes, artifacts and decisions are tables in the existing
+memory database (schema v7). Only heavy evidence goes to a content-addressed
+filesystem store under `<memory_dir>/cold/`.
+
+**Rationale.** SQLite is already Nova's authoritative structured store, and the
+warm records are small, relational, and want the same transactional guarantees
+as facts. A second database would add another thing to keep consistent, back up
+and migrate, for no measured benefit. Cold evidence is genuinely different: it is
+large, read rarely, never queried by content, and would sit inside every backup
+and VACUUM of a database that is otherwise a couple of megabytes.
+
+**Alternatives rejected.** A dedicated vector/document database for episodes
+(splits the source of truth, no measured benefit); storing evidence blobs in
+SQLite (bloats every backup for data read rarely).
+
+**Evidence.** `tests/bench_episodic_v4.py`: 2,001 episodes = 1.22 MB database; a
+greeting adds 0.01 ms and 0 prompt characters. `tests/test_episodic_memory_v4.py`
+covers persistence, trust, freshness, provenance, corruption and lifecycle.
+
+**Constraint.** A missing or corrupt cold payload must never break memory. Warm
+records are self-sufficient; cold hydration returns None rather than raising, and
+a digest mismatch is refused rather than served.
+
+**Revisit if.** Retrieval quality at 50k+ episodes proves lexical ranking
+insufficient, or write throughput becomes a bottleneck.
+
+---
+
+## D6 — Episodic search fails CLOSED, unlike fact recall
+
+**Decided:** 2026-08-13 (V3 P4)
+
+**Decision.** `needs_episodic_memory()` requires positive evidence that a turn
+references the past. Fact recall (`should_recall`) does the opposite and fails
+open.
+
+**Rationale.** The two gates guard different failure modes. Forgetting a fact
+Nova knows is the worst thing she can do, so that gate errs toward searching.
+Episodic search is a database query for things that *happened*; running it on
+every turn costs latency and buys almost nothing, and the cost lands on exactly
+the conversational turns P2.5 worked to make fast.
+
+**Evidence.** `tests/bench_episodic_v4.py`: a greeting costs 0.01 ms and adds
+zero prompt characters against a 2,001-episode corpus.
+
+**Revisit if.** Users report Nova failing to recall something she demonstrably
+stored — check the gate before touching ranking.
