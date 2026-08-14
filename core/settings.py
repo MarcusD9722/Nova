@@ -85,6 +85,7 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_MAX_TOKENS", "int", "1536", "Default reply token budget."),
         _s("NOVA_MAIN_GPU", "int", "0", "CUDA device index for the LLM."),
         _s("NOVA_LLM_ALLOW_THINKING", "bool", "", "Globally allow reasoning blocks in replies."),
+        _s("NOVA_LLM_FAST_PREFILL", "bool", "1", "FAST reasoning contract: prefill an already-closed reasoning block so ordinary replies skip hidden reasoning entirely. Measured (V3 P2.5): first visible token 8169ms -> 36ms median, empty replies 5/18 -> 0/18. Set 0 to fall back to the old '/no_think' switch, which barely worked on this model."),
         _s("NOVA_VISION_FORCE", "bool", "", "Force-enable vision even if detection is unsure."),
         # ── Voice ───────────────────────────────────────────────────────────
         _s("NOVA_VOICE_DIR", "path", "voices", "Reference-voice wav directory."),
