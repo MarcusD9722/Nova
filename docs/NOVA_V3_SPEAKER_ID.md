@@ -9,6 +9,7 @@ large phase.
 |---|---|
 | **P5 part 1** | the measured backend decision, the identification subsystem, `/stt` integration |
 | **P5.1 (this pass)** | four pre-flight defects in part 1, each reproduced before being fixed |
+| **P5.1a** | two remaining unverified-voice holes, both reproduced first |
 | **P5.1 remaining** | live turn carriage and speaker-aware memory attribution — **not built** |
 
 The scope table at the end says exactly what remains, and nothing here is
@@ -48,11 +49,9 @@ match and left the handle in the cache, so one captured id could assert the same
 identity on every later turn within its 300 s TTL. Redemption now consumes the
 handle: one `/stt` classification backs exactly one chat turn.
 
-An identity *failure* still mints a handle. `unknown`, `ambiguous` and
-`too_short` redeem back as themselves — losing the handle on failure would erase
-the only structured evidence that a turn was an unverified voice turn, and the
-absence of evidence is exactly where an accidental upgrade to "Marcus" would
-come from.
+An identity *failure* still mints a handle — `unknown`, `ambiguous` and
+`too_short` redeem back as themselves. **`unavailable` did not**, which P5.1's
+report described as though it did; that gap is fixed in P5.1a below.
 
 **4. The privacy setting did nothing.** `NOVA_SPEAKER_KEEP_AUDIO` promised
 control over raw recordings that were never written, and the expression guarding
@@ -61,6 +60,77 @@ nothing, in either direction. A privacy setting that does nothing is worse than
 no setting, because someone will rely on it. Removed rather than given a meaning
 it never had. Raw audio is never retained; the derived embeddings are, and a
 test asserts no audio file of any format is written during enrollment.
+
+---
+
+## P5.1a — two remaining ways a voice turn could lose its state
+
+Both reproduced on `d9ecc5a` before anything changed.
+
+### Hole 1: `unavailable` was the one outcome with no handle
+
+`issue_voice_turn` refused `status == unavailable`, so four outcomes carried
+structured evidence that a voice command had happened and a classifier failure
+carried none. Once attribution is wired, **"no speaker metadata" is exactly the
+state that would be read as typed-Marcus** — so the failure case is the one that
+most needs the handle.
+
+The fix is a distinction the code did not previously have. `SpeakerMatch` now
+records whether identification was **attempted**:
+
+| | meaning | handle? |
+|---|---|---|
+| `attempted=False` | the feature is **off**. Legacy Nova. No speaker question is being asked. | no |
+| `attempted=True` | the feature is **on** and Nova tried. Every outcome — including `unavailable` — is a real backend-derived voice-turn result. | yes |
+
+This is what keeps *"we could not tell"* distinguishable from *"nobody asked"*.
+Removing the `unavailable` check alone would have made `NOVA_SPEAKER_ID=0` mint
+handles and quietly turn every legacy voice turn into an unverified guest turn —
+the opposite mistake, and just as wrong.
+
+**Handle semantics, all outcomes:**
+
+| outcome | handle | single-use | expires |
+|---|---|---|---|
+| `known` | yes | yes | yes |
+| `unknown` | yes | yes | yes |
+| `ambiguous` | yes | yes | yes |
+| `too_short` | yes | yes | yes |
+| `unavailable` (attempted) | **yes** | yes | yes |
+| disabled (`attempted=False`) | **no** | — | — |
+
+### Hole 2: an empty transcript was still classified
+
+`/stt` called the speaker path whenever `identify_speaker` was set, with no
+reference to `result.empty`. A buffer can carry enough energy to clear
+`command_quality()` while Whisper returns nothing — so **background noise could
+come back as a `known` speaker for a turn containing no words**.
+
+An empty result now short-circuits the model entirely:
+
+* **zero** embedding calls — asserted by counting them, not by timing
+* status `unavailable`, reason `empty_transcript`
+* no profile, no similarity, never `known`
+* still `attempted=True` with a handle, so the turn keeps its unverified voice
+  state rather than looking like typed input
+
+No second decode, no second upload, no second Whisper call. The guard is about
+the *transcript*, not the audio: the identical buffer treated as a real
+utterance still classifies, exactly once.
+
+`SpeakerInfo` gained `reason` and `attempted` — structured diagnostics that
+distinguish `empty_transcript` from `disabled` from `no embedding`, and expose
+nothing biometric.
+
+### Call counts, asserted
+
+| path | ffmpeg | Whisper | ECAPA |
+|---|---|---|---|
+| voice command | 1 | 1 | 1 |
+| empty transcript | 1 | 1 | **0** |
+| wake chunk | 1 | 1 | **0** |
+| typed chat | 0 | 0 | **0** |
+| speaker disabled | 1 | 1 | **0** (no model load) |
 
 ---
 
@@ -343,8 +413,14 @@ Reported honestly rather than as a completed phase.
 
 * model revision genuinely pinned at load, not just recorded
 * command-audio quality gate — silence can no longer become `known`
-* one-time voice-turn redemption; failures stay unverified voice turns
+* one-time voice-turn redemption
 * the dead `NOVA_SPEAKER_KEEP_AUDIO` setting removed
+
+### Fixed in P5.1a
+
+* every *attempted* outcome preserves a voice-turn handle, `unavailable` included
+* disabled mode stays legacy — it mints nothing and loads no model
+* an empty transcript can never become `known`, and costs zero embedding calls
 
 ### NOT built — do not assume these work
 

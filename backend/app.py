@@ -292,6 +292,11 @@ class SpeakerInfo(BaseModel):
     """Backend-derived speaker metadata (V3 P5). Never contains an embedding."""
 
     status: str = "unavailable"      # known | unknown | ambiguous | too_short | unavailable
+    #: Why there is no identity, when there is none. Actionable and non-biometric:
+    #: "empty_transcript" and "disabled" and "no embedding" are different problems.
+    reason: str | None = None
+    #: Was identification actually attempted? False only when the feature is off.
+    attempted: bool = False
     profile_id: str | None = None
     display_name: str | None = None
     similarity: float | None = None
@@ -922,20 +927,40 @@ def _speaker_service():
     return STATE.speaker
 
 
-async def _identify_speaker(pcm, sample_rate: int) -> "SpeakerInfo":
+async def _identify_speaker(pcm, sample_rate: int, *,
+                            skip_reason: str | None = None) -> "SpeakerInfo":
     """Classify the speaker of an already-decoded utterance.
+
+    `skip_reason` short-circuits the model while still producing a real,
+    attempted voice-turn outcome (V3 P5.1a). It exists for the case where the
+    ASR layer already decided there is no utterance: asking ECAPA who spoke a
+    silence Whisper rejected wastes 40 ms to answer a question nobody asked, and
+    a buffer can carry enough energy to pass `command_quality()` while Whisper
+    returns nothing at all.
 
     Wrapped so that NOTHING here can fail the request. Whisper has already
     succeeded by this point; returning HTTP 500 because an optional biometric
     model misbehaved would turn enrichment into an outage.
     """
-    from core.speaker.backend import MODEL_ID
+    from core.speaker.backend import MODEL_ID, enabled as speaker_enabled
+    from core.speaker.matcher import STATUS_UNAVAILABLE, SpeakerMatch
 
     try:
         svc = _speaker_service()
         if svc is None:
-            return SpeakerInfo(status="unavailable", model_id=MODEL_ID)
-        match = await svc.identify(pcm, sample_rate)
+            return SpeakerInfo(status="unavailable", reason="service unavailable",
+                               model_id=MODEL_ID)
+        if skip_reason is not None:
+            if not speaker_enabled():
+                return SpeakerInfo(status="unavailable", reason="disabled",
+                                   model_id=MODEL_ID)
+            # Attempted, deliberately unresolved. Never `known`, no profile, no
+            # similarity — but still a voice turn, with a handle, so downstream
+            # cannot mistake the absence of identity for typed Marcus.
+            match = SpeakerMatch(status=STATUS_UNAVAILABLE, reason=skip_reason,
+                                 attempted=True)
+        else:
+            match = await svc.identify(pcm, sample_rate)
         info = SpeakerInfo(**match.for_response(model_id=MODEL_ID))
         # A handle is minted for every classified turn, including unknown ones:
         # "an unrecognised voice said this" is itself identity the frontend must
@@ -1117,7 +1142,14 @@ async def _stt_transcribe(upload: UploadFile, *, identify_speaker: bool = False)
         # embedding every one of those would burn CPU forever to identify the
         # speaker of a word Nova is going to discard.
         if identify_speaker:
-            result.speaker = await _identify_speaker(pcm, pcm_sr)
+            # An empty transcript means Whisper found no utterance to send to
+            # chat. Classifying it anyway would let background noise that
+            # happens to clear the energy gate come back as a KNOWN speaker for
+            # a turn that has no words in it. Zero embedding calls, and the turn
+            # still carries its unverified voice state.
+            result.speaker = await _identify_speaker(
+                pcm, pcm_sr,
+                skip_reason="empty_transcript" if result.empty else None)
         return result
 
 @app.on_event("startup")

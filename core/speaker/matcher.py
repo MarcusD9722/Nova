@@ -84,6 +84,20 @@ class SpeakerMatch:
     threshold: float | None = None
     margin: float | None = None
     reason: str = ""
+    #: Was speaker identification actually ATTEMPTED for this turn? (V3 P5.1a)
+    #:
+    #: This is the difference between two things that both look like "no
+    #: identity" and must never be conflated once attribution is wired:
+    #:
+    #:   attempted=False  the feature is OFF. Legacy Nova. There is no speaker
+    #:                    question being asked, and no unverified-voice state.
+    #:   attempted=True   the feature is ON and Nova tried. Whatever came back —
+    #:                    including `unavailable` — is a real backend-derived
+    #:                    outcome for a real voice command.
+    #:
+    #: Absence of metadata must never silently read as "Marcus". `attempted`
+    #: is what keeps "we could not tell" distinguishable from "nobody asked".
+    attempted: bool = False
 
     @property
     def is_known(self) -> bool:
@@ -93,6 +107,11 @@ class SpeakerMatch:
         """The shape /stt returns. Contains no embedding, ever."""
         return {
             "status": self.status,
+            # Structured diagnostics: WHY there is no identity is actionable
+            # ("empty_transcript" vs "disabled" vs "no embedding"), and it
+            # exposes nothing biometric.
+            "reason": self.reason or None,
+            "attempted": self.attempted,
             "profile_id": self.profile_id,
             "display_name": self.display_name,
             "similarity": round(self.similarity, 4) if self.similarity is not None else None,

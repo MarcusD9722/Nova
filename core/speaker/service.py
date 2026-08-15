@@ -86,7 +86,11 @@ class SpeakerService:
     async def identify(self, audio: np.ndarray, sample_rate: int) -> SpeakerMatch:
         """Who is speaking? Never raises; `unavailable` is a valid answer."""
         if not enabled():
-            return SpeakerMatch(status=M.STATUS_UNAVAILABLE, reason="disabled")
+            # attempted=False: the feature is off, so this is legacy Nova and
+            # NOT an unverified voice turn. Nothing downstream should start
+            # treating disabled-mode turns as guests.
+            return SpeakerMatch(status=M.STATUS_UNAVAILABLE, reason="disabled",
+                                attempted=False)
         self.stats["identify_calls"] += 1
         try:
             await self.initialize()
@@ -99,7 +103,7 @@ class SpeakerService:
                 self.stats["too_short" if short else "unavailable"] += 1
                 return SpeakerMatch(
                     status=M.STATUS_TOO_SHORT if short else M.STATUS_UNAVAILABLE,
-                    reason=why)
+                    reason=why, attempted=True)
 
             # The model runs in a thread: it is 40-60 ms of CPU work and the
             # event loop is serving token streams.
@@ -112,18 +116,23 @@ class SpeakerService:
                 if EMBEDDER.available and dur < 1.0:
                     self.stats["too_short"] += 1
                     return SpeakerMatch(status=M.STATUS_TOO_SHORT,
-                                        reason=f"{dur:.2f}s of audio")
+                                        reason=f"{dur:.2f}s of audio", attempted=True)
                 self.stats["unavailable"] += 1
-                return SpeakerMatch(status=M.STATUS_UNAVAILABLE, reason="no embedding")
+                return SpeakerMatch(status=M.STATUS_UNAVAILABLE, reason="no embedding",
+                                    attempted=True)
 
             profiles = await self.registry.matchable()
             result = M.match(emb, profiles)
+            result.attempted = True
             self.stats[result.status] = self.stats.get(result.status, 0) + 1
             return result
         except Exception as e:  # noqa: BLE001
             self.stats["failures"] += 1
             logger.warning("speaker_identify_failed", error=str(e)[:200])
-            return SpeakerMatch(status=M.STATUS_UNAVAILABLE, reason="error")
+            # Still attempted: a crashed classifier is an UNVERIFIED voice turn,
+            # not an absence of one.
+            return SpeakerMatch(status=M.STATUS_UNAVAILABLE, reason="error",
+                                attempted=True)
 
     # ── voice-turn handles (integrity, NOT authentication) ───────────────────
 
@@ -137,8 +146,19 @@ class SpeakerService:
 
         This protects the INTEGRITY of speaker metadata. It is not a session
         token and grants nothing.
+
+        A handle is minted for EVERY attempted outcome — `known`, `unknown`,
+        `ambiguous`, `too_short` and `unavailable` alike (V3 P5.1a). P5.1
+        refused `unavailable`, which meant a classifier failure produced a voice
+        command carrying no structured evidence that it was ever a voice
+        command. Once attribution is wired, "no metadata" is exactly the state
+        that would be mistaken for typed-Marcus, so the failure case is the one
+        that most needs a handle.
+
+        When speaker ID is DISABLED nothing is minted: `attempted=False` means
+        there is no speaker question, and legacy behaviour must stay legacy.
         """
-        if match is None or match.status == M.STATUS_UNAVAILABLE:
+        if match is None or not match.attempted:
             return None
         import uuid
         self._sweep()
