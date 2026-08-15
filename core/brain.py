@@ -98,6 +98,7 @@ class Brain:
         message: str,
         conversation_id: UUID | None = None,
         current_location: dict[str, Any] | None = None,
+        identity: Any = None,
     ) -> ChatResponse:
         conv_id = conversation_id or uuid4()
         clean_message = _sanitize_user_text(message)
@@ -108,6 +109,7 @@ class Brain:
             user_name=None,
             project_name="temp",
             current_location=current_location,
+            identity=identity,
         )
         return ChatResponse(conversation_id=res.conversation_id, assistant_text=res.assistant_text, tool_calls=res.tool_calls)
 
@@ -116,6 +118,7 @@ class Brain:
         message: str,
         conversation_id: UUID | None = None,
         current_location: dict[str, Any] | None = None,
+        identity: Any = None,
     ):
         """Streaming chat: yields {"type": "token"|"done", ...} dicts.
 
@@ -130,5 +133,6 @@ class Brain:
             user_name=None,
             project_name="temp",
             current_location=current_location,
+            identity=identity,
         ):
             yield event

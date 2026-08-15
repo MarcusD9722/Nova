@@ -11,7 +11,7 @@ large phase.
 | **P5.1 (this pass)** | four pre-flight defects in part 1, each reproduced before being fixed |
 | **P5.1a** | two remaining unverified-voice holes, both reproduced first |
 | **P5.1b** | the same invariant when the speaker *service itself* fails |
-| **P5.1 remaining** | live turn carriage and speaker-aware memory attribution — **not built** |
+| **P5.1 main** | live turn carriage, write isolation, read privacy, correction enforcement |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -195,6 +195,74 @@ Nova, not a guest turn.
 
 No additional decode, upload, Whisper call or embedding. The failure paths reach
 the model zero times.
+
+---
+
+## P5.1 main body — identity now changes what Nova does
+
+The failure this exists to prevent, stated plainly:
+
+> A guest says *"my name is Alex"* and Nova rewrites **Marcus's** name.
+
+Until now `entity="user"` meant Marcus, because only Marcus could speak.
+
+### The attribution matrix
+
+| turn | personal-memory entity |
+|---|---|
+| typed | `user` (legacy) |
+| voice, speaker ID **disabled** | `user` (legacy — nobody asked) |
+| voice, known profile with role `owner` | `user` |
+| voice, known **non-owner** | `speaker:<profile_id>` |
+| voice, unknown | **none** |
+| voice, ambiguous | **none** |
+| voice, too_short | **none** |
+| voice, unavailable | **none** |
+| voice, handle missing / invalid / expired / **replayed** | **none** |
+
+`memory_entity` returns `None` for anything Nova could not attribute, and **None
+is never substituted for a default**. Every failure lands on the safe side.
+
+`stored_role` comes from the durable enrolled profile, never the request — a
+client asserting `role=owner`, or a profile merely *named* "Marcus", does not get
+the owner namespace.
+
+### Two boundaries, not one
+
+**WRITE.** `_extract_quick_facts` and the name-replacement helper consult turn
+identity before every write. Name replacement is gated separately because it
+*purges* first: a guest reaching it with the owner entity would have deleted
+Marcus's name outright.
+
+**READ.** Blocking writes alone would be half a boundary — reciting Marcus's
+family, spouse and children to whoever is standing there leaks his profile just
+as thoroughly. Grounding loads his personal context only for a turn that is
+actually his. A known guest gets **their own** stored profile instead; an
+unrecognised speaker gets none. Shared context (date, tools, capabilities) stays
+for everyone, because it is not personal.
+
+### `memory.correct` is enforced in code
+
+The tool defaults to `entity="user"`. A guest saying *"no, my GPU is a 4090"*
+would have superseded his. The model is **not** asked to pick a safe entity — it
+does not know who is in the room, and making a safety boundary probabilistic is
+the mistake. Personal corrections are redirected to the speaker's own namespace,
+and an unverified speaker is refused with a result Nova can explain. Corrections
+about explicitly named third parties are untouched.
+
+### Carriage and concurrency
+
+Identity is scoped in `chat_turn_stream`'s wrapper — one choke point, so every
+early return inside (project prepass, direct replies, storytelling, error paths)
+keeps it. A `ContextVar` rather than an attribute: concurrent turns each keep
+their own view, verified by a test running four speakers in parallel, and the
+`finally` guarantees background work never inherits a stale human.
+
+### Still not authentication
+
+Every speaker — typed, owner, guest, unknown — receives the **identical**
+`PermissionBroker` decision, asserted by test. `evaluate()` takes no identity
+argument. Owner role is a memory-routing label, not authority.
 
 ---
 
