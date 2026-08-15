@@ -192,7 +192,9 @@ stored — check the gate before touching ranking.
 
 ## D7 — Durable memory is promoted by ONE hook on the hot artifact store
 
-**Decided:** 2026-08-14 (V3 P4.1)
+**Decided:** 2026-08-14 (V3 P4.1) — **refined by [D9](#d9) the same day (V3 P4.2).**
+The single-path principle held. The assumption that every promotable event is
+artifact-backed did not, and D9 records why.
 
 **Decision.** Anything that produces an artifact is considered for durable
 memory by virtue of producing one. `ArtifactStore` announces each complete unit
@@ -263,3 +265,51 @@ whatever happens to be on screen.
 
 **Revisit if.** Users report Nova answering about the wrong result set. Check
 which of the three rules fired before changing ranking.
+
+---
+
+## D9 — One promotion POLICY, not one promotion SOURCE
+
+**Decided:** 2026-08-14 (V3 P4.2). Refines [D7](#d7); does not supersede it.
+
+**Decision.** Durable memory is decided in exactly one place
+(`core/episodic_promoter.py`) and written by exactly one thing (the P4.1 queue
+and worker). But the promoter accepts events from several sources, and an event
+is no longer required to be artifact-backed. `EpisodicPersistEvent` now carries
+either a live artifact or a self-describing event with its own stable identity.
+
+**What D7 got right, and what it assumed.** D7's real content is "no subsystem
+writes its own episodes", and that has held: MCP still needs no special case,
+and there is still one writer. What it *assumed* — because every case in front
+of it at the time was artifact-backed — is that hanging promotion off
+`ArtifactStore` was sufficient. It is not. A correction is not an artifact. A
+project milestone is not an artifact. A recurring failure is not an artifact.
+
+**Rationale.** The alternative was to manufacture artifacts for events that have
+none, purely to keep the wording of D7 true. That is fabricating evidence to
+satisfy a data shape: a synthetic "artifact" for a correction would carry a
+trust class, a freshness class and a provenance dict describing a thing that
+never existed. Widening the event is the smaller and more honest change.
+
+**Alternatives rejected.** Fake artifacts for non-artifact events (invents
+evidence); a second promoter per source (two policies drift, and each would
+reimplement trust and provenance handling — exactly how a security invariant
+erodes); passing `worth_remembering()` more booleans computed by a new detector
+(a second correction/failure classifier disagreeing with the one fact memory and
+ErrorLog already run).
+
+**Constraint.** Every source must supply a DETERMINISTIC stable identity —
+artifact id, error signature, entity+attribute, project slug plus the publish
+timestamp. Random ids on a redelivery-sensitive path are prohibited: background
+delivery means every event can arrive twice, and "Marcus chose the WD Gold"
+must not accumulate copies. The promoter still never writes and never calls a
+model.
+
+**Evidence.** `tests/test_episodic_events_v42.py` — 34 interactions produce 7
+episodes; three phrasings of one choice produce one; seven occurrences of one
+failure produce one; redelivery of every event type is idempotent.
+`tests/bench_episodic_v42.py` — every promotion decision is 1.3–10.7 µs, and a
+bus publish costs 6.1 µs with a subscriber versus 4.0 µs without.
+
+**Revisit if.** A source appears that cannot supply a stable identity. The fix is
+to find one in the source, not to relax the requirement.

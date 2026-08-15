@@ -48,13 +48,33 @@ class EpisodicPersistEvent:
     conversation_id: UUID | str
     turn_id: str
     timestamp: datetime
-    artifact: Any                       # memory.artifacts.Artifact (the parent)
+    # Artifact-backed events (P4.1) carry the live objects. Events that are not
+    # artifact-backed — a correction, a project milestone, a recurring failure —
+    # carry None and describe themselves in the fields below. Both shapes go
+    # through the same queue and the same worker (V3 P4.2).
+    artifact: Any = None                # memory.artifacts.Artifact (the parent)
     children: list[Any] = field(default_factory=list)
     user_text: str = ""
     reason: str = ""
     kind: str = "tool_result"
     project: str | None = None
     importance: float = 0.5
+
+    # -- non-artifact events (V3 P4.2) ---------------------------------------
+    #: Stable identity. REQUIRED when `artifact` is None, because there is no
+    #: artifact id to derive one from and a random id would make every
+    #: redelivery a new episode.
+    episode_id: str | None = None
+    summary: str = ""
+    entities: list[str] = field(default_factory=list)
+    trust: str = ""
+    freshness: str = ""
+    source_tool: str | None = None
+    provenance: dict[str, Any] = field(default_factory=dict)
+    outcome: str | None = None
+    #: Episode ids to reinforce alongside this write — how a selection credits
+    #: the result set it came from instead of duplicating it.
+    reinforce: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

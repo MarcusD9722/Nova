@@ -40,10 +40,10 @@ from core.project_builder import (
 from core.orchestrator.agent import Agent, ToolLoopExecutor
 from core.tools.selector import ToolSelector
 from memory.artifacts import ArtifactStore, capture_tool_result, describe_for_prompt
-from memory.episodes import EP_MCP_RESULT, EP_TOOL_RESULT, EpisodicStore
+from memory.episodes import EpisodicStore
 from memory.episodic_recall import (needs_decision_memory, needs_episodic_memory,
                                     resolve_historical_reference, retrieve as episodic_retrieve,
-                                    retrieve_decisions, wants_evidence, worth_remembering)
+                                    retrieve_decisions, wants_evidence, is_selection)
 from memory.recall_gate import GateDecision, should_recall
 from memory.working_context import WorkingContextStore
 from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
@@ -54,6 +54,7 @@ from core.expression import Expression
 from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
 from core.llm_runtime import LLMRuntime
+from core.episodic_promoter import EpisodicPromoter
 from core.workers.autonomy_supervisor import AutonomySupervisorWorker
 from core.workers.episodic_ingest import EpisodicIngestWorker
 from core.workers.memory_ingest import MemoryIngestWorker
@@ -347,6 +348,15 @@ class RuntimeManager:
             "NOVA_EPISODIC_MEMORY", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
         self._episodic_worker: EpisodicIngestWorker | None = None
+        # ONE promotion policy (V3 P4.2). Artifacts, selections, corrections,
+        # project milestones and recurring failures all decide here and all end
+        # at the same queue — see docs/NOVA_DECISIONS.md D7 and D9. The promoter
+        # decides; the worker is still the only thing that writes.
+        self._promoter = EpisodicPromoter(
+            submit=lambda ev: bool(self._episodic_worker
+                                   and self._episodic_worker.submit(ev)),
+            enabled=self._episodic_enabled,
+        )
         # Counters, not log lines. Memory behaviour is hard to diagnose after
         # the fact and easy to make noisy; /status can read these.
         self._episodic_stats: dict[str, int] = {
@@ -904,6 +914,7 @@ class RuntimeManager:
         self._memory_worker.start()
         if self._episodic_enabled and self._episodic_worker is not None:
             self._episodic_worker.start()
+            self._promoter.start()
         # Self-improvement starts regardless: its error CAPTURE is passive/safe,
         # and its active IMPROVE loop is gated by its own live-toggleable flag
         # (initialized from NOVA_AUTONOMY) so /autonomy/stop works without a
@@ -924,9 +935,12 @@ class RuntimeManager:
 
     async def stop(self) -> None:
         await self._memory_worker.stop()
-        # Drains accepted episodes first (see EpisodicIngestWorker.stop) — a
-        # result set Nova acknowledged must not vanish because the process
-        # happened to exit before the worker got to it.
+        # Order matters. The promoter stops DECIDING first, or an event accepted
+        # during shutdown would have nowhere to land; then the worker drains
+        # what was already accepted (see EpisodicIngestWorker.stop) — a result
+        # set Nova acknowledged must not vanish because the process happened to
+        # exit before the worker got to it.
+        await self._promoter.stop()
         if self._episodic_worker is not None:
             await self._episodic_worker.stop()
         await self._self_improve.stop()
@@ -951,32 +965,44 @@ class RuntimeManager:
         if not self._episodic_enabled or self._episodic_worker is None:
             return
         try:
-            tool = artifact.source_tool or ""
             ctx = self._working.peek(artifact.conversation_id)
-            user_text = (ctx.user_turns[-1] if ctx and ctx.user_turns else "")
-
-            promote, why = worth_remembering(
-                user_text=user_text, tool=tool, result_items=len(children),
-            )
-            if not promote:
-                return
-
-            self._episodic_worker.submit(EpisodicPersistEvent(
-                conversation_id=artifact.conversation_id,
-                turn_id=artifact.turn_id,
-                timestamp=datetime.now(timezone.utc),
-                artifact=artifact,
-                children=list(children),
-                user_text=user_text,
-                reason=why,
-                kind=EP_MCP_RESULT if tool.startswith("mcp:") else EP_TOOL_RESULT,
+            self._promoter.note_artifact(
+                artifact, children,
+                user_text=(ctx.user_turns[-1] if ctx and ctx.user_turns else ""),
                 project=(ctx.active_project or None) if ctx else None,
-                # A set the user asked for is worth more than an incidental one.
-                importance=0.6 if children else 0.5,
-            ))
+            )
         except Exception as e:  # noqa: BLE001
             self._episodic_stats["failures"] += 1
             logger.warning("episodic_promotion_failed", error=str(e)[:200])
+
+    def _note_selection(self, referenced, conversation_id, turn_id: str,
+                        user_text: str) -> None:
+        """Marcus chose one of the things on screen (V3 P4.2).
+
+        Both halves of the evidence are already computed by the time this runs:
+        `referenced` is what the hot resolver decided "the second one" means,
+        deterministically, and `is_selection` is what tells a choice apart from
+        a question about the same item. Neither costs a model call.
+        """
+        if not self._episodic_enabled or referenced is None:
+            return
+        if not is_selection(user_text):
+            return
+        try:
+            parent = (self._artifacts.get(referenced.parent_id)
+                      if referenced.parent_id else None)
+            items = (self._artifacts.items_of(referenced.parent_id)
+                     if referenced.parent_id else [])
+            ctx = self._working.peek(str(conversation_id))
+            self._promoter.note_selection(
+                selected=referenced, parent=parent, items=items,
+                conversation_id=str(conversation_id), turn_id=turn_id,
+                user_text=user_text,
+                project=(ctx.active_project or None) if ctx else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._episodic_stats["failures"] += 1
+            logger.warning("episodic_selection_failed", error=str(e)[:200])
 
     async def _episodic_context(self, *, query: str, recent_text: str,
                                 has_result_set: bool, item_count: int,
@@ -1076,7 +1102,8 @@ class RuntimeManager:
         return {"enabled": self._episodic_enabled,
                 "retrieval": dict(self._episodic_stats),
                 "persistence": (self._episodic_worker.status()
-                                if self._episodic_worker is not None else {})}
+                                if self._episodic_worker is not None else {}),
+                "promotion": self._promoter.status()}
 
     async def chat_turn(
         self,
@@ -1389,6 +1416,10 @@ class RuntimeManager:
         referenced = self._artifacts.resolve(clean_user, str(conversation_id)) if active_items else None
         if referenced is not None:
             work_ctx.select(referenced.artifact_id)
+            # If the wording was a CHOICE rather than a question, that outcome
+            # is worth remembering — and this is the only point in the turn
+            # where which item he meant is already known for free (V3 P4.2).
+            self._note_selection(referenced, conversation_id, turn_uid, clean_user)
 
         last_trace = work_ctx.last_tool()
         gate = should_recall(

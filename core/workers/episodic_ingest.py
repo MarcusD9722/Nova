@@ -32,6 +32,7 @@ from typing import Any
 from core.events import EpisodicPersistEvent
 from core.logging_setup import get_logger
 from core.workers.lifecycle import log_worker_error, stop_worker
+from memory.artifacts import FRESH_STATIC, TRUST_INTERNAL
 from memory.decision_seed import ensure_seeded
 from memory.episodes import Episode, EpisodicStore
 
@@ -102,7 +103,7 @@ class EpisodicIngestWorker:
         self._task: asyncio.Task[None] | None = None
         self.stats: dict[str, Any] = {
             "queued": 0, "persisted": 0, "dropped": 0, "failed": 0,
-            "artifacts": 0, "last_error": None,
+            "artifacts": 0, "reinforced": 0, "last_error": None,
         }
 
     # -- lifecycle ------------------------------------------------------------
@@ -192,41 +193,87 @@ class EpisodicIngestWorker:
     async def _persist(self, ev: EpisodicPersistEvent) -> None:
         art = ev.artifact
         children = list(ev.children or [])
-        ep_id = episode_id_for(art.artifact_id)
 
-        # Provenance is carried through structurally, not flattened into prose.
-        # `artifact_id` is what later makes cross-session ordinal resolution
-        # possible: it is the handle back to the ordered children.
-        provenance = dict(art.provenance or {})
-        provenance["artifact_id"] = art.artifact_id
-        provenance["turn_id"] = ev.turn_id
-        if ev.user_text:
-            provenance["asked"] = ev.user_text[:200]
+        if art is not None:
+            # Provenance is carried through structurally, not flattened into
+            # prose. `artifact_id` is what later makes cross-session ordinal
+            # resolution possible: it is the handle back to the ordered children.
+            provenance = dict(art.provenance or {})
+            provenance["artifact_id"] = art.artifact_id
+            provenance["turn_id"] = ev.turn_id
+            if ev.user_text:
+                provenance["asked"] = ev.user_text[:200]
+            provenance.update(ev.provenance or {})
 
-        episode = Episode(
-            id=ep_id,
-            kind=ev.kind,
-            summary=art.summary,
-            entities=_entities_for(art, children),
-            conversation_id=str(ev.conversation_id),
-            project=ev.project,
-            source_tool=art.source_tool or None,
-            # Verbatim. Nothing in this worker may raise a trust class — a web
-            # result is no more trustworthy for having reached a background
-            # queue.
-            trust=art.trust,
-            freshness=art.freshness,
-            provenance=provenance,
-            outcome=ev.reason or None,
-            importance=float(ev.importance),
-            created_at=ev.timestamp.isoformat(),
-        )
+            episode = Episode(
+                # An artifact-backed event derives its id from the artifact
+                # unless the promoter supplied one — a SELECTION is about the
+                # same artifact as the result it came from and must not collide
+                # with it.
+                id=ev.episode_id or episode_id_for(art.artifact_id),
+                kind=ev.kind,
+                summary=ev.summary or art.summary,
+                entities=(list(ev.entities) if ev.entities
+                          else _entities_for(art, children)),
+                conversation_id=str(ev.conversation_id),
+                project=ev.project,
+                source_tool=art.source_tool or None,
+                # Verbatim. Nothing in this worker may raise a trust class — a
+                # web result is no more trustworthy for having reached a
+                # background queue, and a CHOSEN one is no more trustworthy for
+                # having been chosen.
+                trust=art.trust,
+                freshness=art.freshness,
+                provenance=provenance,
+                outcome=ev.outcome or ev.reason or None,
+                importance=float(ev.importance),
+                created_at=ev.timestamp.isoformat(),
+            )
+        else:
+            # A correction, a project milestone, a recurring failure (V3 P4.2).
+            # No artifact exists and none is invented: forcing one would mean
+            # fabricating evidence to satisfy a data shape.
+            if not ev.episode_id or not ev.summary:
+                logger.warning("episodic_event_incomplete", kind=ev.kind)
+                return
+            episode = Episode(
+                id=ev.episode_id,
+                kind=ev.kind,
+                summary=ev.summary,
+                entities=[str(e)[:120] for e in (ev.entities or []) if str(e).strip()],
+                conversation_id=str(ev.conversation_id) or None,
+                project=ev.project,
+                source_tool=ev.source_tool,
+                # These are Nova's own observations of her own state changes,
+                # not text fetched from outside. TRUSTED_INTERNAL_STATE is the
+                # honest class — and it is set here, from the event kind, never
+                # copied up from something untrusted.
+                trust=ev.trust or TRUST_INTERNAL,
+                freshness=ev.freshness or FRESH_STATIC,
+                provenance=dict(ev.provenance or {}),
+                outcome=ev.outcome,
+                importance=float(ev.importance),
+                created_at=ev.timestamp.isoformat(),
+            )
+
         # Episode and evidence in ONE transaction. The ordered children are the
         # point of persisting at all — without them "the second one" has nothing
         # to count — and an episode that survived a crash its result set did not
         # would promise exactly that and fail to deliver it.
         n = await self._store.record_happening(episode, art, children)
         self.stats["artifacts"] += max(0, n - 1)
+
+        # Reinforce what this event was ABOUT, rather than copying it. A
+        # selection credits the result set it came from, so the set rises in
+        # future ranking without a second copy of it existing.
+        if ev.reinforce:
+            try:
+                await self._store.touch_episodes(ev.reinforce)
+                self.stats["reinforced"] += len(ev.reinforce)
+            except Exception as e:  # noqa: BLE001
+                # Reinforcement is bookkeeping; losing it must not fail a write
+                # that already succeeded.
+                logger.debug("episodic_reinforce_failed", error=str(e)[:160])
 
     def status(self) -> dict[str, Any]:
         return {**self.stats, "queue_depth": self._q.qsize(),

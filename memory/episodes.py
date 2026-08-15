@@ -58,6 +58,16 @@ EP_ACTION = "action"
 EP_FAILURE = "failure"
 EP_PREFERENCE = "preference"
 EP_CONVERSATION = "conversation"
+#: V3 P4.2. A SELECTION is what Marcus chose out of something Nova showed him;
+#: a CORRECTION is Nova learning that what she believed was wrong. Both are
+#: events, which is why neither is a fact: "Marcus prefers WD Gold" is a fact,
+#: "Marcus chose the WD Gold from a three-drive comparison on the 14th" is not.
+EP_SELECTION = "selection"
+EP_CORRECTION = "correction"
+
+#: Kinds a cleanup job may never delete by age. Quietly forgetting a choice or
+#: a correction is the same class of failure as forgetting a decision.
+PROTECTED_KINDS = (EP_DECISION, EP_PROJECT, EP_PREFERENCE, EP_SELECTION, EP_CORRECTION)
 
 #: Payload above this size goes to cold storage instead of the warm row.
 WARM_PAYLOAD_LIMIT = 2000
@@ -540,8 +550,7 @@ class EpisodicStore:
 
     async def prune_episodes(self, *, older_than_days: float = 180.0,
                              max_importance: float = 0.3,
-                             keep_kinds: Iterable[str] = (EP_DECISION, EP_PROJECT,
-                                                          EP_PREFERENCE)) -> int:
+                             keep_kinds: Iterable[str] = PROTECTED_KINDS) -> int:
         """Conservative pruning of low-value old episodes.
 
         Deliberately narrow: only unimportant, old, never-revisited episodes of

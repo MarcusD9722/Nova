@@ -234,7 +234,10 @@ def seed_decisions() -> list[Decision]:
                         "and non-raising — decide and enqueue, never await, never touch "
                         "the database. Persistence is a background worker that drains "
                         "BEFORE it stops and drops rather than blocks when saturated. An "
-                        "episode may be lost to back-pressure; a reply may not.",
+                        "episode may be lost to back-pressure; a reply may not. "
+                        "REFINED BY D9 (P4.2): the single-path principle held, but the "
+                        "assumption that every promotable event is artifact-backed did "
+                        "not. Read D9 before changing promotion.",
             decided_at="2026-08-14T00:00:00+00:00",
         ),
         Decision(
@@ -269,6 +272,51 @@ def seed_decisions() -> list[Decision]:
             constraints="Ambiguity must survive as ambiguity. Two historical result sets "
                         "within 1.25x of each other resolve to a QUESTION, and must never "
                         "be settled by whatever happens to be on screen.",
+            decided_at="2026-08-14T00:00:00+00:00",
+        ),
+        Decision(
+            id="D9",
+            title="One promotion POLICY, not one promotion SOURCE",
+            decision="Durable memory is decided in exactly one place "
+                     "(core/episodic_promoter.py) and written by exactly one thing (the "
+                     "P4.1 queue and worker) — but events may come from several sources "
+                     "and are no longer required to be artifact-backed. "
+                     "EpisodicPersistEvent carries either a live artifact or a "
+                     "self-describing event with its own stable identity.",
+            rationale="D7's real content — no subsystem writes its own episodes — held. "
+                      "What it ASSUMED, because every case in front of it was "
+                      "artifact-backed, is that hanging promotion off ArtifactStore was "
+                      "sufficient. It is not: a correction is not an artifact, a project "
+                      "milestone is not an artifact, a recurring failure is not an "
+                      "artifact. The alternative was manufacturing artifacts for events "
+                      "that have none purely to keep D7's wording true, which means "
+                      "fabricating evidence to fit a data shape — a synthetic artifact "
+                      "would carry a trust class, a freshness class and provenance "
+                      "describing something that never existed.",
+            alternatives=["Fake artifacts for non-artifact events (rejected: invents "
+                          "evidence)",
+                          "A second promoter per source (rejected: two policies drift, "
+                          "and each reimplements trust and provenance handling — how a "
+                          "security invariant erodes)",
+                          "Passing worth_remembering() more booleans from a new detector "
+                          "(rejected: a second correction/failure classifier disagreeing "
+                          "with the one fact memory and ErrorLog already run)"],
+            evidence=["tests/test_episodic_events_v42.py: 34 interactions -> 7 episodes; "
+                      "three phrasings of one choice -> one; seven occurrences of one "
+                      "failure -> one; redelivery of every event type is idempotent",
+                      "tests/bench_episodic_v42.py: promotion decisions 1.3-10.7us; a bus "
+                      "publish costs 6.1us with a subscriber vs 4.0us without"],
+            subsystem="memory",
+            source_refs=["core/episodic_promoter.py", "core/events.py",
+                         "core/workers/episodic_ingest.py"],
+            supersedes=None,
+            constraints="Every source MUST supply a deterministic stable identity — "
+                        "artifact id, error signature, entity+attribute, or project slug "
+                        "plus publish timestamp. Random ids are prohibited on this path: "
+                        "background delivery means every event can arrive twice, and "
+                        "'Marcus chose the WD Gold' must not accumulate copies. The "
+                        "promoter never writes and never calls a model. Refines D7 "
+                        "rather than superseding it.",
             decided_at="2026-08-14T00:00:00+00:00",
         ),
     ]
