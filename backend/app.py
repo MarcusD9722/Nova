@@ -27,7 +27,8 @@ import re
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -287,11 +288,28 @@ class SpeakRequest(BaseModel):
     voice: str = "nova.wav"
 
 
+class SpeakerInfo(BaseModel):
+    """Backend-derived speaker metadata (V3 P5). Never contains an embedding."""
+
+    status: str = "unavailable"      # known | unknown | ambiguous | too_short | unavailable
+    profile_id: str | None = None
+    display_name: str | None = None
+    similarity: float | None = None
+    second_best_similarity: float | None = None
+    threshold: float | None = None
+    model_id: str | None = None
+    #: Short-lived handle the client quotes back on /chat so identity stays
+    #: backend-derived. Not a session token and grants nothing.
+    voice_turn_id: str | None = None
+
+
 class SttResponse(BaseModel):
     text: str
     duration_ms: int
     sample_rate: int
     empty: bool = False
+    #: OPTIONAL and additive: callers that only read `.text` are unaffected.
+    speaker: SpeakerInfo | None = None
 
 
 class ChatStreamRequest(BaseModel):
@@ -885,7 +903,53 @@ def _stt_vocabulary_prompt() -> str | None:
     return "Vocabulary: " + ", ".join(words) + "."
 
 
-async def _stt_transcribe(upload: UploadFile) -> SttResponse:
+def _speaker_service():
+    """Lazily create the process-wide speaker service (V3 P5).
+
+    Held on STATE beside the other optional subsystems. Creating it is cheap —
+    the 89 MB model is loaded lazily on first use, so a Nova that never enables
+    speaker ID never pays for it.
+    """
+    if getattr(STATE, "speaker", None) is None:
+        try:
+            from core.speaker.service import SpeakerService
+            cfg = STATE.config
+            db = (cfg.memory_dir if cfg else Path("memory_data")) / "sqlite" / "nova.sqlite3"
+            STATE.speaker = SpeakerService(db)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("speaker_service_unavailable", error=str(e)[:200])
+            return None
+    return STATE.speaker
+
+
+async def _identify_speaker(pcm, sample_rate: int) -> "SpeakerInfo":
+    """Classify the speaker of an already-decoded utterance.
+
+    Wrapped so that NOTHING here can fail the request. Whisper has already
+    succeeded by this point; returning HTTP 500 because an optional biometric
+    model misbehaved would turn enrichment into an outage.
+    """
+    from core.speaker.backend import MODEL_ID
+
+    try:
+        svc = _speaker_service()
+        if svc is None:
+            return SpeakerInfo(status="unavailable", model_id=MODEL_ID)
+        match = await svc.identify(pcm, sample_rate)
+        info = SpeakerInfo(**match.for_response(model_id=MODEL_ID))
+        # A handle is minted for every classified turn, including unknown ones:
+        # "an unrecognised voice said this" is itself identity the frontend must
+        # not be able to forge or upgrade.
+        info.voice_turn_id = svc.issue_voice_turn(match)
+        BUS.publish("speaker.identified", {"status": info.status,
+                                           "name": info.display_name})
+        return info
+    except Exception as e:  # noqa: BLE001
+        logger.warning("speaker_identify_error", error=str(e)[:200])
+        return SpeakerInfo(status="unavailable", model_id=MODEL_ID)
+
+
+async def _stt_transcribe(upload: UploadFile, *, identify_speaker: bool = False) -> SttResponse:
     """Transcribe an uploaded audio file using Whisper via transformers.
 
     Returns richer metadata so the frontend can reason about empty/short captures.
@@ -1038,11 +1102,22 @@ async def _stt_transcribe(upload: UploadFile) -> SttResponse:
                 duration_ms=duration_ms,
                 sample_rate=int(sr),
                 empty=not bool(text),
-            )
+            ), audio, int(sr)
 
         BUS.publish("stt.transcribing", {})
-        result = await asyncio.to_thread(_run_asr)
+        # The decoded mono float32 PCM comes back with the transcript so speaker
+        # embedding can reuse it. ffmpeg runs ONCE per request: a second decode
+        # (or a second upload) for speaker ID would double the most expensive
+        # part of this path to recompute bytes we already have.
+        result, pcm, pcm_sr = await asyncio.to_thread(_run_asr)
         BUS.publish("stt.transcript_final", {"chars": len(result.text), "empty": result.empty})
+
+        # Speaker identification is OPT-IN per request. The fallback wake loop
+        # calls /stt continuously on short chunks while waiting for "Hey Nova";
+        # embedding every one of those would burn CPU forever to identify the
+        # speaker of a word Nova is going to discard.
+        if identify_speaker:
+            result.speaker = await _identify_speaker(pcm, pcm_sr)
         return result
 
 @app.on_event("startup")
@@ -1688,9 +1763,14 @@ async def speak(req: SpeakRequest) -> Response:
 
 
 @app.post("/stt", response_model=SttResponse)
-async def stt(file: UploadFile = File(...)) -> SttResponse:
+async def stt(file: UploadFile = File(...),
+              speaker: bool = Form(False)) -> SttResponse:
+    """Transcribe. `speaker=true` additionally identifies who spoke (V3 P5).
+
+    Default OFF so the continuous wake loop stays free.
+    """
     try:
-        return await _stt_transcribe(file)
+        return await _stt_transcribe(file, identify_speaker=bool(speaker))
     except Exception as e:  # noqa: BLE001
         logger.error("stt_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e)) from e
