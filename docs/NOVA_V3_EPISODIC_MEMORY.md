@@ -1,19 +1,38 @@
-# Nova V3 P4 / P4.1 — Persistent episodic memory
+# Nova V3 P4 / P4.1 / P4.2 — Persistent episodic memory
 
 Nova can now remember **what happened**, durably, without flooding the prompt
 with history.
 
-This document covers two phases, and the distinction matters:
+This document covers three phases, and the distinctions matter:
 
 | | |
 |---|---|
 | **P4** | The substrate: schema, stores, retrieval, consolidation rules. Complete, tested — and **not connected to a real conversation.** |
-| **P4.1** | Production integration. A live turn now creates durable memory, and a later live turn retrieves it. |
+| **P4.1** | Artifact-backed history went live. A tool result created durable memory; a later turn retrieved it. |
+| **P4.2** | The remaining promotion semantics. Selections, corrections, failures and project milestones were **defined in P4 and unreachable in production** until this phase. |
 
-P4 shipped with that gap stated openly as its first known limitation. Everything
-in P4 could pass while a real conversation created nothing at all, because
-nothing in `core/runtime.py` called any of it. §"Production integration" below is
-the part that closed it.
+P4 shipped with its gap stated openly as its first known limitation.
+**P4.1 did not** — and that is the more useful thing to record, because it is the
+kind of gap that looks like completion:
+
+`worth_remembering()` has taken five signals since P4 — `is_correction`,
+`is_decision`, `is_failure`, `user_selected`, plus the tool/result-set case. The
+live hook P4.1 wired called it with three arguments (`user_text`, `tool`,
+`result_items`) and let the other four default to `False`. Every one of them was
+reachable only from unit tests calling the function directly. Nothing in the
+codebase was broken, nothing failed, and the phase reported honestly on
+everything it *claimed* — the claim was simply narrower than the machinery
+implied, and nobody had written down which was which.
+
+| Promotion type | Live before P4.2? |
+|---|---|
+| tool result sets | **yes** (P4.1) |
+| MCP results | **yes** (P4.1) |
+| user selections | no — flag existed, never set |
+| corrections | no — flag existed, never set |
+| failures | no — flag existed, never set |
+| project milestones | no — no signal path at all |
+| architectural decisions | partly — seeded into the `decisions` table, never as episodes |
 
 ---
 
@@ -454,10 +473,187 @@ Every path degrades rather than failing the turn, tested end to end:
 
 Fact memory and hot artifact behaviour are unaffected in every case.
 
+---
+
+# Event promotion (P4.2)
+
+## The rule: route evidence, do not invent it
+
+The tempting fix was to pass the four missing booleans. That would have required
+Nova to *decide* whether a turn was a correction — a second detector, disagreeing
+with the first one within a release.
+
+Every signal already existed, computed by something with better evidence:
+
+| Signal | Who already knew | Evidence used |
+|---|---|---|
+| **selection** | `ArtifactStore.resolve()` on the turn path | the resolved artifact, plus wording that expresses a choice |
+| **correction** | `MemoryUnifier` / `MemoryIngestWorker` | `memory.corrected` (with was/now), `memory.superseded` |
+| **failure** | `ErrorLog` + `ToolRouter` | normalised signature; transients already swallowed by retry |
+| **project** | `ProjectBuilder` | `project.started` / `completed` / `error` |
+
+`core/episodic_promoter.py` routes those into the **existing** P4.1 queue and
+worker. It decides; it never writes. There is still exactly one thing in the
+process that writes episodes.
+
+## Selection: the highest-value case
+
+Nova shows three drives. Marcus says *"let's go with the second one."*
+
+Both halves of the evidence are already in hand: the hot resolver has determined
+that means the WD Gold, deterministically, and `is_selection()` distinguishes a
+choice from a question about the same item. **No model is asked to rediscover
+either.** *"What about the second one?"* resolves the same artifact and is not a
+selection.
+
+The result set is **not copied**. The selection is its own small episode holding
+the chosen artifact — with its ordinal position, parent link, trust and freshness
+intact — and the original result-set episode is *reinforced* through P4's access
+mechanism. So these stay different questions with different answers:
+
+* *"What drives did we look at?"* → the three-drive set
+* *"What drive did I end up choosing?"* → the WD Gold
+
+Identity is the selected artifact id, so *"let's go with the second one"*,
+*"yeah, I like that one"* and *"I'll take the WD Gold"* are **one** decision.
+
+## Failure: one occurrence, or a pattern?
+
+Measured and decided rather than assumed. Two thresholds, for two different kinds
+of evidence:
+
+* **`project.error` promotes immediately.** A failed build is user-visible,
+  project-scoped, and the thing Marcus asks about next time.
+* **Generic errors promote on the 3rd occurrence of the same signature.**
+  `ToolRouter` already retries once and only publishes `tool.error` after every
+  attempt failed, so a single event already means "failed for real". That is
+  still not a durable life event — a flaky endpoint would fill memory with
+  identical rows. Three of the *same normalised signature* is a pattern.
+
+Identity is the signature, so the fourth and fiftieth occurrence update one
+episode rather than adding forty-seven. `ErrorLog.signature` is reused rather
+than reimplemented: if episodic memory and the self-improvement loop disagreed
+about what "the same error" means, they would tell Marcus different stories about
+one fault.
+
+Never promoted: `tool.not_configured` (a state, not a defect), `permission.*`
+(a refusal working correctly), `autonomy.*` / `dev.*` (Nova talking to herself).
+
+## Project: milestones, not ticks
+
+`project.started`, `project.completed` and `project.error` are events.
+`project.progress` fires many times per build — writing files, repairing, running
+checks — and is never promoted. A real build in the test suite produces exactly
+**two** episodes.
+
+## Corrections are events, facts are state
+
+```
+FACT      Marcus's GPU is an RTX 5080.                     (fact memory owns this)
+EPISODE   On the 14th Marcus corrected his GPU: 3080 -> 5080.
+```
+
+Fact memory keeps doing exactly what it did. The episode adds the thing a fact
+cannot say about itself — that the belief *changed*, and when. Re-stating an
+unchanged value supersedes a row without anything having been wrong, and is
+rejected.
+
+## Explicit decisions — where they went, and why
+
+Deliberately **not** a second architecture-decision system.
+
+* Artifact-backed choices ("let's buy the WD Gold") are **selections**. That is
+  the concrete form the decision takes, with the evidence attached.
+* Project-level decisions arrive as **project events**.
+* The `decisions` table stays reserved for architectural records with rationale,
+  alternatives, constraints and supersession — fields a conversational choice
+  does not have and would only be given empty.
+* Free-prose decisions with no artifact and no state transition ("keep this
+  feature local-only") are **not promoted.** There is no deterministic evidence
+  that a decision was made, and inventing one means an LLM classifier on the
+  ingest path. That belongs off the critical path and must fail toward *not*
+  promoting — see known limitations.
+
+## Importance policy
+
+One scale, in one place (`memory/episodic_recall.py::IMPORTANCE`), anchored on
+what P4/P4.1 already used:
+
+| | |
+|---|---:|
+| tool / MCP result | 0.5 |
+| result set with items | 0.6 |
+| project event | 0.7 |
+| failure | 0.7 |
+| selection | 0.8 |
+| correction | 0.85 |
+| decision | 0.9 |
+
+The **ordering** is the claim, not the exact numbers: what Marcus decided
+outranks what he chose, which outranks what happened to a project, which
+outranks something Nova fetched. Pruning deletes at ≤ 0.3, so none of these are
+ever pruning candidates — the values drive ranking, not survival. `PROTECTED_KINDS`
+additionally shields selections and corrections from age-based cleanup, for the
+same reason decisions were already shielded.
+
+## Noise
+
+The measurement that matters for a memory system is what it *refuses*.
+
+A synthetic session of **34 interactions** — 20 greetings, 5 routine questions,
+3 searches, a selection, a correction, and a failure repeated three times —
+produced **7 durable episodes**: 4 result sets, 1 selection, 1 correction,
+1 failure.
+
+Worth noting precisely: the 25 trivial turns were not "rejected", they never
+reached the promoter at all. A greeting produces no artifact and no error event,
+so nothing is ever asked about it. The rejection counter saw 2 — the first two
+occurrences of the failure signature, below threshold.
+
+## Latency
+
+Promotion decisions, measured (`tests/bench_episodic_v42.py`):
+
+| Event type | median | P90 |
+|---|---:|---:|
+| artifact | 3.8 µs | 4.5 µs |
+| selection | 5.8 µs | 6.0 µs |
+| correction | 8.0 µs | 8.6 µs |
+| project | 7.9 µs | 8.3 µs |
+| failure | 10.7 µs | 11.2 µs |
+| `project.progress` (rejected) | 1.3 µs | 1.4 µs |
+
+The failure path is slowest because it normalises the message into an
+`ErrorLog` signature — which is the work that stops a flaky endpoint writing
+fifty near-identical episodes.
+
+Three of the five paths are not on the turn at all: they arrive on the event bus,
+which publishers fire and forget. A publish costs **6.1 µs with a subscribed
+promoter versus 4.0 µs without** — one more bounded queue. Nothing in
+`ProjectBuilder` or `MemoryUnifier` waits for a promotion.
+
+**The fast path is unchanged:** "Good morning" still does zero episodic database
+queries, zero episode writes, and adds zero prompt characters — re-measured
+through P4.1's own benchmark after this work, at 72.9 µs and 0 queries against
+the 2,002-episode corpus.
+
+**On variance:** the retrieval numbers in the P4.1 table above move by 30–50%
+between runs on this machine (historical recall has measured 21–48 ms across
+runs of identical code). Treat the *orders of magnitude* as the result —
+microseconds to decide, tens of milliseconds to retrieve, zero of either on the
+fast path — not the third significant figure.
+
 ## Known limitations
 
-*P4's first two limitations — not wired into the turn path, ordinals only
-mechanically proven — were closed by P4.1 and are recorded above. What remains:*
+*P4's first two limitations were closed by P4.1; P4.1's unstated one — four of
+the five promotion signals never reached production — was closed by P4.2. What
+remains:*
+
+0. **Free-prose decisions are not promoted.** "Keep this feature local-only"
+   leaves no artifact and no state transition, so there is no deterministic
+   evidence a decision was made. Adding an LLM classifier is the obvious
+   extension and the obvious hazard: it belongs off the critical path and must
+   fail toward NOT promoting, or a model outage quietly fills memory with noise.
 
 1. **Retrieval ranking is lexical.** Entity overlap plus stemming, no
    embeddings. Adequate at 2k episodes (47 ms worst case); unmeasured at 50k.

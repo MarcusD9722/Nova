@@ -32,7 +32,9 @@ from typing import Any
 
 from memory.artifacts import (UNTRUSTED_TRUST_CLASSES, parse_reference,
                               resolve_reference)
-from memory.episodes import Episode, EpisodicStore
+from memory.episodes import (EP_CORRECTION, EP_DECISION, EP_FAILURE, EP_MCP_RESULT,
+                             EP_PROJECT, EP_SELECTION, EP_TOOL_RESULT, Episode,
+                             EpisodicStore)
 from memory.recall_gate import _stem, should_recall
 
 #: Language that points at the PAST specifically — not merely at something Nova
@@ -45,10 +47,16 @@ from memory.recall_gate import _stem, should_recall
 #: explicit past auxiliary are still unambiguously historical.
 _HISTORICAL = re.compile(
     r"\b(yesterday|last (week|month|year|time|night|session)|earlier|before|previously|"
-    # "did we" / "had we" only. "DO we have a spare drive?" is a question about
-    # the present and must not open a database query.
-    r"(did|had) we\b|"
-    r"we (look(ed)?|were looking|discuss(ed)?|decide[dr]?|tr(y|ied)|saw|see|found|talked)\b|"
+    # Past-tense auxiliaries only. "DO we have a spare drive?" is a question
+    # about the present and must not open a database query. First person is
+    # included because the outcomes P4.2 records are things MARCUS did — "what
+    # did I end up choosing", "when did I tell you" — and those never mention
+    # "we" at all.
+    r"(did|had) (we|i|you)\b|"
+    r"i (told|said|chose|picked|mentioned|asked|decided)\b|"
+    r"end(ed)? up\b|ever (fix|get|try|manage)\b|"
+    r"we (look(ed)?|were looking|discuss(ed)?|decide[dr]?|tr(y|ied)|saw|see|found|talked|"
+    r"chose|picked|went with|settled on|worked on)\b|"
     r"that (one|drive|file|result|thing|project) (we|you|i)|"
     r"the other day|back (then|when)|remind me what|what did (we|you|i)|"
     r"where did we (leave|get to)|did we ever|had we)\b",
@@ -421,6 +429,65 @@ _EPISODIC_TOOLS = {
     "project.start_build", "project.improve", "image.generate", "gmail.list",
     "calendar.list", "memory.correct", "self.propose_change",
 }
+
+
+#: Language that expresses a CHOICE rather than a question. "What about the
+#: second one?" points at an item; "let's go with the second one" picks it, and
+#: only the second is an outcome worth remembering.
+#:
+#: Deliberately narrow, and deliberately only half the evidence: a selection is
+#: promoted only when this matches AND hot artifact resolution has already
+#: determined, deterministically, which item was meant. Language alone would
+#: promote "I like how that looks"; a resolved artifact alone would promote
+#: every follow-up question about it.
+_SELECTION_INTENT = re.compile(
+    r"\b(i'?ll (take|go with|use|get|buy|grab|order)|"
+    r"let'?s (go with|use|take|get|buy|try|order)|"
+    r"we'?ll (go with|use|take|get)|"
+    r"i'?m going with|going with|gonna (go with|get|use)|"
+    r"i (like|want|prefer|choose|pick|chose|picked)\b|"
+    r"that'?s the one|decided on|settled on|sold on|"
+    r"put me down for)\b",
+    re.IGNORECASE,
+)
+
+
+def is_selection(text: str) -> bool:
+    """Does this utterance express choosing something?
+
+    Half of the selection signal. The other half is a deterministically
+    resolved artifact — see core/episodic_promoter.py.
+    """
+    return bool(_SELECTION_INTENT.search(text or ""))
+
+
+# ── Importance policy (V3 P4.2) ──────────────────────────────────────────────
+#
+# One scale, stated in one place, so "how important is a correction" is not
+# answered differently by three call sites. Anchored on what P4/P4.1 already
+# used — an ordinary tool result at 0.5, a result set with items at 0.6 — and
+# extended upward for things Marcus did rather than things Nova fetched.
+#
+# The ordering is the claim, not the exact numbers: what he decided outranks
+# what he chose, which outranks what happened to a project, which outranks a
+# search result. `prune_episodes` deletes at <= 0.3, so nothing here is ever
+# a pruning candidate; the values drive RANKING, not survival.
+IMPORTANCE = {
+    EP_TOOL_RESULT: 0.5,
+    EP_MCP_RESULT: 0.5,
+    "result_set": 0.6,      # a tool result that produced ordered items
+    EP_PROJECT: 0.7,
+    EP_FAILURE: 0.7,
+    EP_SELECTION: 0.8,
+    EP_CORRECTION: 0.85,
+    EP_DECISION: 0.9,
+}
+
+
+def importance_for(kind: str, *, has_items: bool = False) -> float:
+    if has_items and kind in (EP_TOOL_RESULT, EP_MCP_RESULT):
+        return IMPORTANCE["result_set"]
+    return IMPORTANCE.get(kind, 0.5)
 
 
 def worth_remembering(*, user_text: str = "", tool: str = "",
