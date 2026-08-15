@@ -34,3 +34,10 @@ truststore==0.10.4
 TTS==0.22.0
 typer==0.21.1
 uvicorn[standard]==0.34.0
+
+# Local speaker identification (V3 P5). ECAPA-TDNN speaker embeddings.
+# Checked with `pip install --dry-run` before adopting: adds only
+# hyperpyyaml/ruamel.yaml/sentencepiece and leaves torch, torchaudio and
+# numpy untouched. A candidate needing a torch downgrade would have been
+# rejected for that alone. Runs on CPU by default (see docs/NOVA_V3_SPEAKER_ID.md).
+speechbrain==1.1.0

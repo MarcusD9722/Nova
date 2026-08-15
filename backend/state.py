@@ -53,6 +53,9 @@ class _State:
     tts_voice_cache_dir: Path | None = None
     tts_phrase_cache: dict[str, bytes] = {}
     dev_mode = None  # lazily created DevMode instance (see core/dev_mode.py)
+    # Local speaker identification (V3 P5). None until the first request that
+    # opts in; the embedding model itself loads lazily inside the service.
+    speaker = None
 
 
 # Max number of recent TTS clips to retain in memory (see tts_worker eviction).
