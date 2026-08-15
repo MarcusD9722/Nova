@@ -944,12 +944,38 @@ async def _identify_speaker(pcm, sample_rate: int, *,
     """
     from core.speaker.backend import MODEL_ID, enabled as speaker_enabled
     from core.speaker.matcher import STATUS_UNAVAILABLE, SpeakerMatch
+    from core.speaker.voice_turns import VOICE_TURNS
+
+    def _unverified(reason: str) -> "SpeakerInfo":
+        """An ENABLED subsystem failure is still a voice turn (V3 P5.1b).
+
+        The distinction this protects is the whole point of `attempted`:
+
+            disabled     nobody asked. Legacy Nova, typed semantics.
+            unavailable  the question WAS asked and could not be answered.
+                         Unverified voice; personal memory must not be written.
+
+        Before P5.1b both produced `attempted=False` and no handle, so a
+        subsystem that failed erased the evidence it was ever supposed to run —
+        and "no speaker metadata" is exactly what would later read as
+        typed-Marcus. A failure must never be able to launder itself into an
+        identity by disappearing.
+
+        The handle comes from the process-wide registry rather than the service,
+        so it exists even when the service does not.
+        """
+        if not speaker_enabled():
+            return SpeakerInfo(status="unavailable", reason="disabled",
+                               attempted=False, model_id=MODEL_ID)
+        match = SpeakerMatch(status=STATUS_UNAVAILABLE, reason=reason, attempted=True)
+        return SpeakerInfo(status=STATUS_UNAVAILABLE, reason=reason, attempted=True,
+                           model_id=MODEL_ID,
+                           voice_turn_id=VOICE_TURNS.issue(match))
 
     try:
         svc = _speaker_service()
         if svc is None:
-            return SpeakerInfo(status="unavailable", reason="service unavailable",
-                               model_id=MODEL_ID)
+            return _unverified("service unavailable")
         if skip_reason is not None:
             if not speaker_enabled():
                 return SpeakerInfo(status="unavailable", reason="disabled",
@@ -971,7 +997,15 @@ async def _identify_speaker(pcm, sample_rate: int, *,
         return info
     except Exception as e:  # noqa: BLE001
         logger.warning("speaker_identify_error", error=str(e)[:200])
-        return SpeakerInfo(status="unavailable", model_id=MODEL_ID)
+        # Same rule for an unexpected fault anywhere above: enabled and failed
+        # is an unverified voice turn, never an absence of one. `_unverified`
+        # is itself defensive — if even minting a handle fails, the status and
+        # `attempted` flag still go out correctly.
+        try:
+            return _unverified("identify error")
+        except Exception:  # noqa: BLE001
+            return SpeakerInfo(status="unavailable", reason="identify error",
+                               attempted=speaker_enabled(), model_id=MODEL_ID)
 
 
 async def _stt_transcribe(upload: UploadFile, *, identify_speaker: bool = False) -> SttResponse:

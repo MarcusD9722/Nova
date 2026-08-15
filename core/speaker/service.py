@@ -39,22 +39,10 @@ from core.speaker.backend import (EMBEDDER, MODEL_ID, MODEL_REVISION,
                                   command_quality, enabled)
 from core.speaker.matcher import SpeakerMatch, check_sample
 from core.speaker.registry import SpeakerProfile, SpeakerRegistry, new_profile_id
+from core.speaker.voice_turns import (VOICE_TURN_MAX, VOICE_TURN_TTL_S,
+                                      VOICE_TURNS)
 
 logger = get_logger(__name__)
-
-#: How long a classified voice turn can be redeemed for its identity.
-#: Short on purpose: this is an integrity handle, not a session.
-VOICE_TURN_TTL_S = 300.0
-#: Bounded so a burst of voice turns cannot grow memory without limit.
-VOICE_TURN_MAX = 256
-
-
-@dataclass
-class VoiceTurn:
-    turn_id: str
-    match: SpeakerMatch
-    created_at: float
-
 
 class SpeakerService:
     """Identify, enrol, and hand out short-lived voice-turn handles."""
@@ -63,7 +51,6 @@ class SpeakerService:
         self.registry = SpeakerRegistry(db_path)
         self._ready = False
         self._lock = asyncio.Lock()
-        self._turns: "dict[str, VoiceTurn]" = {}
         self.stats: dict[str, int] = {
             "identify_calls": 0, "known": 0, "unknown": 0, "ambiguous": 0,
             "too_short": 0, "unavailable": 0, "enrolments": 0, "failures": 0,
@@ -137,64 +124,31 @@ class SpeakerService:
     # ── voice-turn handles (integrity, NOT authentication) ───────────────────
 
     def issue_voice_turn(self, match: SpeakerMatch) -> str | None:
-        """Mint a short-lived id the frontend can quote back on /chat.
+        """Mint a short-lived handle the frontend can quote back on /chat.
 
-        The browser must not be able to say `"speaker": "Marcus"` and be
-        believed — identity is derived on the backend, so it stays on the
-        backend. The client only ever carries an opaque handle, which expires
-        and is bounded.
+        Delegates to the process-wide `VOICE_TURNS` registry (V3 P5.1b). The
+        cache deliberately does NOT live here: it has no dependency on the
+        model, the database or the registry, and keeping it inside this class
+        meant a service that failed to construct took the evidence of the voice
+        turn down with it.
 
-        This protects the INTEGRITY of speaker metadata. It is not a session
-        token and grants nothing.
+        A handle is minted for every ATTEMPTED outcome — `known`, `unknown`,
+        `ambiguous`, `too_short` and `unavailable` alike. When speaker ID is
+        DISABLED nothing is minted: `attempted=False` means there is no speaker
+        question, and legacy behaviour must stay legacy.
 
-        A handle is minted for EVERY attempted outcome — `known`, `unknown`,
-        `ambiguous`, `too_short` and `unavailable` alike (V3 P5.1a). P5.1
-        refused `unavailable`, which meant a classifier failure produced a voice
-        command carrying no structured evidence that it was ever a voice
-        command. Once attribution is wired, "no metadata" is exactly the state
-        that would be mistaken for typed-Marcus, so the failure case is the one
-        that most needs a handle.
-
-        When speaker ID is DISABLED nothing is minted: `attempted=False` means
-        there is no speaker question, and legacy behaviour must stay legacy.
+        Integrity only. Not a session token; grants nothing.
         """
-        if match is None or not match.attempted:
-            return None
-        import uuid
-        self._sweep()
-        turn_id = f"vt-{uuid.uuid4().hex[:16]}"
-        self._turns[turn_id] = VoiceTurn(turn_id, match, time.monotonic())
-        while len(self._turns) > VOICE_TURN_MAX:
-            oldest = min(self._turns.values(), key=lambda t: t.created_at)
-            self._turns.pop(oldest.turn_id, None)
-        return turn_id
+        return VOICE_TURNS.issue(match)
 
     def redeem_voice_turn(self, turn_id: str | None) -> SpeakerMatch | None:
-        """Resolve a handle back to backend-derived identity — ONCE.
+        """Resolve a handle back to backend-derived identity — ONCE."""
+        return VOICE_TURNS.redeem(turn_id)
 
-        Redemption consumes the handle (V3 P5.1). One /stt classification backs
-        exactly one chat turn: a handle that could be replayed would let a
-        captured id keep asserting "Marcus" across later turns he never spoke,
-        which is precisely the forgery this mechanism exists to prevent.
-
-        Still not authentication. It grants nothing; it only keeps speaker
-        metadata backend-derived.
-        """
-        if not turn_id:
-            return None
-        self._sweep()
-        entry = self._turns.pop(str(turn_id), None)   # pop: single use
-        if entry is None:
-            return None
-        if time.monotonic() - entry.created_at > VOICE_TURN_TTL_S:
-            return None
-        return entry.match
-
-    def _sweep(self) -> None:
-        now = time.monotonic()
-        for tid in [t for t, e in self._turns.items()
-                    if now - e.created_at > VOICE_TURN_TTL_S]:
-            self._turns.pop(tid, None)
+    @property
+    def _turns(self) -> dict:
+        """The shared registry's records, for diagnostics and tests."""
+        return VOICE_TURNS._turns
 
     # ── enrollment ───────────────────────────────────────────────────────────
 
@@ -288,6 +242,6 @@ class SpeakerService:
             "margin": M.margin(),
             "threshold_calibrated": False,   # until the live harness has run
             "raw_audio_retained": False,
-            "voice_turns_cached": len(self._turns),
+            "voice_turns_cached": len(VOICE_TURNS),
             "matches": dict(self.stats),
         }
