@@ -357,8 +357,10 @@ async def test_voice_turn_integrity():
 
     with tempfile.TemporaryDirectory(prefix="nova-p5-vt-") as td:
         svc = SpeakerService(Path(td) / "nova.sqlite3")
+        # attempted=True is what `identify()` sets on every enabled outcome;
+        # a hand-made match without it represents a turn nobody classified.
         m = SpeakerMatch(status="known", profile_id="p-1", display_name="Marcus",
-                         similarity=0.88)
+                         similarity=0.88, attempted=True)
         tid = svc.issue_voice_turn(m)
         check(bool(tid), "a classified turn gets a handle")
 
@@ -382,12 +384,16 @@ async def test_voice_turn_integrity():
 
         for i in range(VOICE_TURN_MAX + 40):
             svc.issue_voice_turn(SpeakerMatch(status="known", profile_id=f"p{i}",
-                                              display_name=f"n{i}"))
+                                              display_name=f"n{i}", attempted=True))
         check(len(svc._turns) <= VOICE_TURN_MAX,
               f"the cache stays bounded ({len(svc._turns)} <= {VOICE_TURN_MAX})")
 
+        # Since P5.1a the discriminator is `attempted`, not the status: an
+        # attempted `unavailable` DOES get a handle (see
+        # tests/test_speaker_unverified_v51a.py). What mints nothing is a turn
+        # where identification was never attempted at all — i.e. disabled mode.
         check(svc.issue_voice_turn(SpeakerMatch(status="unavailable")) is None,
-              "an unclassified turn mints no handle")
+              "a turn nobody classified mints no handle")
 
 
 # ── 6. it is not authentication ──────────────────────────────────────────────

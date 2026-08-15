@@ -169,7 +169,7 @@ async def test_voice_turn_is_single_use():
     with tempfile.TemporaryDirectory(prefix="nova-p51-vt-") as td:
         svc = SpeakerService(Path(td) / "nova.sqlite3")
         m = SpeakerMatch(status="known", profile_id="p1", display_name="Marcus",
-                         similarity=0.9)
+                         similarity=0.9, attempted=True)
         tid = svc.issue_voice_turn(m)
 
         first = svc.redeem_voice_turn(tid)
@@ -193,7 +193,7 @@ async def test_voice_turn_is_single_use():
 
         for i in range(VOICE_TURN_MAX + 50):
             svc.issue_voice_turn(SpeakerMatch(status="known", profile_id=f"p{i}",
-                                              display_name=f"n{i}"))
+                                              display_name=f"n{i}", attempted=True))
         check(len(svc._turns) <= VOICE_TURN_MAX,
               f"the cache stays bounded ({len(svc._turns)})")
 
@@ -206,8 +206,11 @@ async def test_failed_identity_stays_a_voice_turn():
     with tempfile.TemporaryDirectory(prefix="nova-p51-fail-") as td:
         svc = SpeakerService(Path(td) / "nova.sqlite3")
 
-        for status in ("unknown", "ambiguous", "too_short"):
-            tid = svc.issue_voice_turn(SpeakerMatch(status=status))
+        # `unavailable` is included since P5.1a: it was the one outcome P5.1
+        # refused a handle to, which is exactly the case that would later read
+        # as typed-Marcus.
+        for status in ("unknown", "ambiguous", "too_short", "unavailable"):
+            tid = svc.issue_voice_turn(SpeakerMatch(status=status, attempted=True))
             check(bool(tid), f"a '{status}' outcome still mints a handle")
             got = svc.redeem_voice_turn(tid)
             check(got is not None and got.status == status,
