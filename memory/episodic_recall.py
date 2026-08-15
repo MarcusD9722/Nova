@@ -151,6 +151,28 @@ def needs_decision_memory(query: str) -> bool:
     return bool(q) and bool(_WHY.search(q))
 
 
+#: Questions about a decision that was REPLACED, rather than the current one.
+#: Superseded episodes are excluded from ordinary retrieval so a changed choice
+#: cannot compete with the choice that replaced it — this is the narrow case
+#: where the old one is exactly what was asked for.
+_WANTS_SUPERSEDED = re.compile(
+    r"\b(originally|initially|at first|first choice|to begin with|"
+    r"before (i|we|he) chang|chang(ed|ing) (my|his|her|their) mind|"
+    r"used to (want|pick|choose|like)|previous(ly)? (choice|chose|pick)|"
+    r"old choice|instead of|before that|first pick)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_superseded(query: str) -> bool:
+    """Should retrieval look at decisions that have since been replaced?
+
+    Default is no, and that default is what makes "what did I end up choosing"
+    unambiguous: only the live choice is a candidate.
+    """
+    return bool(_WANTS_SUPERSEDED.search(query or ""))
+
+
 def wants_evidence(query: str) -> bool:
     """Should retrieval hydrate COLD evidence for this turn?
 
@@ -214,13 +236,15 @@ class EpisodicResult:
 async def retrieve(store: EpisodicStore, query: str, *, limit: int = 3,
                    candidate_pool: int = 60, project: str | None = None,
                    char_budget: int = DEFAULT_CHAR_BUDGET,
-                   hydrate: bool = False) -> EpisodicResult:
+                   hydrate: bool = False,
+                   include_superseded: bool = False) -> EpisodicResult:
     """Stages 3-6. Assumes stage 2 already said yes."""
     terms = _tokens(query)
     # Relevance-first candidates. Falling back to recency only when the query
     # has no usable terms — never as the primary source, or old-but-relevant
     # episodes become unreachable the moment newer ones exist.
-    candidates = await store.search_episodes(terms, limit=candidate_pool, project=project)
+    candidates = await store.search_episodes(terms, limit=candidate_pool, project=project,
+                                             include_superseded=include_superseded)
     if not candidates and not terms:
         candidates = await store.recent_episodes(limit=candidate_pool, project=project)
 
@@ -288,6 +312,11 @@ def describe_episode(ep: Episode) -> str:
             parts.append("  " + "; ".join(s[:80] for s in shown))
     if ep.outcome:
         parts.append(f"  outcome: {ep.outcome}")
+    # A replaced decision must never read like the current one. It only reaches
+    # a prompt when the question explicitly asked about the earlier choice, and
+    # it says so where the model cannot miss it.
+    if ep.superseded_by:
+        parts.append("  [SUPERSEDED — he changed this later; not the current choice]")
     return "\n".join(parts)
 
 

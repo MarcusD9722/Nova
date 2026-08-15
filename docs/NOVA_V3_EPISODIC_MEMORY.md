@@ -1,15 +1,16 @@
-# Nova V3 P4 / P4.1 / P4.2 — Persistent episodic memory
+# Nova V3 P4 / P4.1 / P4.2 / P4.2.1 — Persistent episodic memory
 
 Nova can now remember **what happened**, durably, without flooding the prompt
 with history.
 
-This document covers three phases, and the distinctions matter:
+This document covers four phases, and the distinctions matter:
 
 | | |
 |---|---|
 | **P4** | The substrate: schema, stores, retrieval, consolidation rules. Complete, tested — and **not connected to a real conversation.** |
 | **P4.1** | Artifact-backed history went live. A tool result created durable memory; a later turn retrieved it. |
 | **P4.2** | The remaining promotion semantics. Selections, corrections, failures and project milestones were **defined in P4 and unreachable in production** until this phase. |
+| **P4.2.1** | Two edge cases P4.2 opened, both confirmed by measurement before being fixed: events lost at shutdown, and two simultaneously current answers to "what did I choose?". |
 
 P4 shipped with its gap stated openly as its first known limitation.
 **P4.1 did not** — and that is the more useful thing to record, because it is the
@@ -628,9 +629,12 @@ The failure path is slowest because it normalises the message into an
 fifty near-identical episodes.
 
 Three of the five paths are not on the turn at all: they arrive on the event bus,
-which publishers fire and forget. A publish costs **6.1 µs with a subscribed
-promoter versus 4.0 µs without** — one more bounded queue. Nothing in
-`ProjectBuilder` or `MemoryUnifier` waits for a promotion.
+which publishers fire and forget. A publish costs single-digit microseconds with
+or without a subscribed promoter — across runs the two have measured 6.1 vs 4.0 µs
+and 8.3 vs 10.7 µs, i.e. **the promoter's cost sits below this measurement's noise
+floor**, which is the honest statement rather than a specific delta. It is one
+more bounded queue on a fire-and-forget publish; nothing in `ProjectBuilder` or
+`MemoryUnifier` waits for a promotion.
 
 **The fast path is unchanged:** "Good morning" still does zero episodic database
 queries, zero episode writes, and adds zero prompt characters — re-measured
@@ -643,11 +647,133 @@ runs of identical code). Treat the *orders of magnitude* as the result —
 microseconds to decide, tens of milliseconds to retrieve, zero of either on the
 fast path — not the third significant figure.
 
+---
+
+# Durability and changed choices (P4.2.1)
+
+Two suspected defects. **Both reproduced.** Neither was fixed before it was
+measured.
+
+## 1. Shutdown lost queued events — confirmed
+
+P4.2 added a second asynchronous stage, and P4.1's drain only ever covered the
+first one:
+
+```
+producers → BUS → promoter queue → persistence queue → worker → SQLite
+                  └─ P4.2, undrained ─┘   └── P4.1 drained this ──┘
+```
+
+`EpisodicPromoter.stop()` set its stop flag *before* draining, and `_run` checks
+that flag at the top of its loop. **Measured on the shipped code: 12 events
+queued, 1 processed.** The persistence worker could then faithfully drain
+everything it received while eleven events had already been discarded one stage
+earlier — the worst shape of data loss, because every counter downstream looks
+healthy.
+
+At system level it usually survived anyway. `runtime.stop()` happened to call
+`_memory_worker.stop()` first, which awaits long enough that the promoter task
+drained by coincidence. That is not a durability guarantee, and it did not hold
+at all for the five producers that stopped *after* the promoter.
+
+**The producer trace is what made the ordering wrong, not just fragile.**
+`MemoryIngestWorker` publishes `memory.superseded` *during its own drain* — the
+moment it concludes a belief was contradicted. So the correction most likely to
+occur during a shutdown was arriving at a promoter that was next in line to be
+stopped.
+
+### Final shutdown ordering
+
+```
+1. producers        memory-ingest, self-improve, reminder, research,
+                    autonomy, agent-supervisor
+2. promoter         unsubscribe → drain → stop
+3. persistence      drain → stop
+```
+
+Each stage stops only once everything feeding it has finished. `stop()` itself:
+
+1. **unsubscribe first** — a drain that races new arrivals has no defined end;
+2. **drain synchronously** — `on_bus_event` does no I/O, so the consumer task
+   cannot interleave and there is no race to reason about;
+3. **then stop the consumer.**
+
+### Why not `queue.join()`
+
+`join()` requires `task_done()` accounting to be exactly right on *every* path —
+promoted, rejected, malformed, raised. Getting it wrong once hangs shutdown
+forever, which is a worse failure than the one being fixed. Draining directly
+needs no accounting to be correct and cannot deadlock: it takes what is there
+and stops. `task_done()` is still called correctly so a future `join()` is not
+poisoned, but nothing depends on it.
+
+The drain is bounded by **count (5,000) and wall clock (5 s)**. On timeout it
+increments `undrained`, logs the pending count, and proceeds — it never claims
+to have finished.
+
+## 2. Changing your mind left two current answers — confirmed
+
+Selection identity is the chosen artifact, which is what makes *"the second
+one" / "yeah, that one" / "I'll take the WD Gold"* one decision. It also meant
+that choosing the WD Gold and then the Seagate from the **same comparison**
+produced two episodes with `superseded_by IS NULL` — **measured: 2 active** —
+so "what did I choose?" had two equally current answers.
+
+### The model
+
+| Case | Result |
+|---|---|
+| same item, said again | one episode, still active *(unchanged from P4.2)* |
+| **different item, same result set** | **the earlier choice is superseded by the later one** |
+| different result sets | both stay active — a drive and a monitor are two live decisions |
+| switching back | the original becomes current again; still two episodes total |
+
+Scope is `parent_id`, the result set. Anything wider and choosing a monitor
+would silently retire your choice of drive.
+
+**The first choice is marked, never deleted.** `superseded_by` points at what
+replaced it, which is what makes *"what did I originally pick, before I changed
+my mind?"* answerable at all. Normal retrieval already filters
+`superseded_by IS NULL`, so the replaced choice stops competing without
+vanishing; `wants_superseded()` is the narrow opt-in that lets an explicitly
+historical question see it, and such an episode renders with a
+`[SUPERSEDED — he changed this later]` marker so it cannot read as current.
+
+No new table. `superseded_by` already existed on `episodes` and already had
+exactly these semantics for decisions.
+
+## Cost
+
+Nothing moved onto the turn. Supersession runs in the worker, only for events
+that carry a scope — ordinary turns never reach the line. Shutdown drain is
+shutdown-only. Re-measured after the change: **"Good morning" still performs
+zero episodic database calls, zero episode writes, and adds zero historical
+prompt characters.**
+
+## A bug this found in my own work
+
+The first attempt to thread `include_superseded` through `retrieve()` never
+reached disk — an edit script asserted and exited before writing. The result was
+a `TypeError` on every historical turn, which `_episodic_context`'s
+catch-everything handler converted into "no historical context" and a bumped
+`failures` counter. The isolation worked exactly as designed; it also meant a
+hard programming error presented as merely unhelpful retrieval. That is the
+trade the broad `except` buys, and the `failures` counter is the only thing that
+makes it visible — which is why it is a counter and not a log line.
+
 ## Known limitations
 
 *P4's first two limitations were closed by P4.1; P4.1's unstated one — four of
 the five promotion signals never reached production — was closed by P4.2. What
 remains:*
+
+0. **Partial product names do not resolve to an artifact.** "Let's use the
+   Seagate" selects nothing, because hot name-matching requires the full title
+   ("Seagate Exos X28") as a substring. Found while reproducing the changed-choice
+   case. It is pre-existing V2 behaviour in `resolve_reference`, shared with
+   ordinal resolution everywhere, so widening it is not a narrow episodic fix —
+   it belongs to whoever next revisits hot reference resolution, with its own
+   regression tests for the false positives loosening would allow.
 
 0. **Free-prose decisions are not promoted.** "Keep this feature local-only"
    leaves no artifact and no state transition, so there is no deterministic

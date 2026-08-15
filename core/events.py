@@ -75,6 +75,10 @@ class EpisodicPersistEvent:
     #: Episode ids to reinforce alongside this write — how a selection credits
     #: the result set it came from instead of duplicating it.
     reinforce: list[str] = field(default_factory=list)
+    #: Result-set id whose EARLIER decisions this one replaces (V3 P4.2.1).
+    #: Set only for selections. Scoped to the choice context, so an unrelated
+    #: comparison's live choice is untouched.
+    supersede_scope: str | None = None
 
 
 @dataclass(frozen=True)
