@@ -10,6 +10,7 @@ large phase.
 | **P5 part 1** | the measured backend decision, the identification subsystem, `/stt` integration |
 | **P5.1 (this pass)** | four pre-flight defects in part 1, each reproduced before being fixed |
 | **P5.1a** | two remaining unverified-voice holes, both reproduced first |
+| **P5.1b** | the same invariant when the speaker *service itself* fails |
 | **P5.1 remaining** | live turn carriage and speaker-aware memory attribution — **not built** |
 
 The scope table at the end says exactly what remains, and nothing here is
@@ -131,6 +132,69 @@ nothing biometric.
 | wake chunk | 1 | 1 | **0** |
 | typed chat | 0 | 0 | **0** |
 | speaker disabled | 1 | 1 | **0** (no model load) |
+
+---
+
+## P5.1b — when the subsystem itself fails
+
+P5.1a made every *classification* outcome preserve its voice-turn state. It did
+not cover the case where there is nothing to classify with. Reproduced on
+`335d31a`, feature **enabled**, real command:
+
+| situation | status | attempted | handle |
+|---|---|---|---|
+| `SpeakerService` cannot be constructed | `unavailable` | **False** | none |
+| unexpected exception in the helper | `unavailable` | **False** | none |
+| `NOVA_SPEAKER_ID=0` (disabled) | `unavailable` | False | none |
+
+The first two were byte-for-byte the third in every field a consumer would read.
+Only the `reason` string differed — and no attribution logic should ever have to
+parse prose to decide whether personal memory may be written.
+
+### The final semantics
+
+```
+disabled      nobody asked a speaker question.  Legacy Nova, typed semantics.
+unavailable   the question WAS asked and could not be answered.
+              Unverified voice — personal memory must not be written to Marcus.
+```
+
+`attempted` is the discriminator, and it is a boolean rather than a string
+comparison. **A subsystem that fails must not be able to erase the evidence that
+it was supposed to run**, because "no speaker metadata" is exactly what would
+later read as typed-Marcus. Failures fail closed, toward *unverified*, never
+toward an identity.
+
+### Architecture: one cache, moved — not a second one
+
+The handle cache lived inside `SpeakerService`, so it died with it. It has no
+dependency on ECAPA, on SQLite, or on the registry — it is a dict of small
+metadata records, and its placement was the whole bug.
+
+`core/speaker/voice_turns.py` now owns it, process-wide, and `SpeakerService`
+delegates. That is the same single cache in a place where it survives its
+consumer, rather than a fallback cache with parallel semantics to keep in sync.
+`core/voice/turn.py`'s `TurnRegistry` was deliberately not reused: it governs
+live execution turns, cancellation and barge-in, with a different lifetime, and
+coupling barge-in cancellation to speaker metadata would be a worse trade.
+
+Every handle keeps its contract: opaque, backend-derived, single-use, expiring,
+bounded, metadata-only, never authorisation.
+
+### Behaviour now
+
+| situation | status | attempted | handle |
+|---|---|---|---|
+| service cannot be constructed | `unavailable` | **True** | **yes** |
+| unexpected exception | `unavailable` | **True** | **yes** |
+| disabled | `unavailable` | False | no |
+| disabled **and** service missing | `unavailable` | False | no |
+
+The last row matters: a service failure while the feature is off is still legacy
+Nova, not a guest turn.
+
+No additional decode, upload, Whisper call or embedding. The failure paths reach
+the model zero times.
 
 ---
 
@@ -421,6 +485,13 @@ Reported honestly rather than as a completed phase.
 * every *attempted* outcome preserves a voice-turn handle, `unavailable` included
 * disabled mode stays legacy — it mints nothing and loads no model
 * an empty transcript can never become `known`, and costs zero embedding calls
+
+### Fixed in P5.1b
+
+* a `SpeakerService` that cannot be constructed still yields an unverified
+  *voice* turn, not a disabled-looking one
+* the same for any unexpected fault in the `/stt` speaker helper
+* the handle cache moved out of `SpeakerService` so it outlives it
 
 ### NOT built — do not assume these work
 

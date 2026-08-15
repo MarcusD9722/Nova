@@ -285,7 +285,10 @@ async def test_speaker_failure_cannot_break_stt():
     finally:
         B.EMBEDDER.embed = real
 
-    # A completely absent service must degrade the same way.
+    # A completely absent service must degrade the same way — and, since
+    # P5.1b, must still preserve the unverified VOICE state. Asserting only
+    # `status == unavailable` was too weak: disabled mode reports exactly that
+    # too, so the check passed while the invariant was broken.
     from backend.state import STATE
     prev = getattr(STATE, "speaker", None)
     STATE.speaker = None
@@ -296,6 +299,13 @@ async def test_speaker_failure_cannot_break_stt():
             info = await app._identify_speaker(speech(3.0), SR)
             check(info.status == "unavailable",
                   "a missing service degrades instead of raising")
+            check(info.attempted is True,
+                  "and remains an ATTEMPTED voice turn — an enabled subsystem "
+                  "failure must not collapse into disabled semantics")
+            check(bool(info.voice_turn_id),
+                  "keeping an opaque handle, so it cannot later read as typed")
+            check(info.display_name is None and info.profile_id is None,
+                  "and inventing no identity from the failure")
         finally:
             app._speaker_service = real_svc
     finally:
