@@ -3,10 +3,64 @@
 Nova can tell who is speaking, locally, without shipping a voice anywhere.
 
 **This document describes what is built and what is not.** P5 as specified is a
-large phase; this pass delivers the measured backend decision, the
-identification subsystem, and its `/stt` integration. The scope table at the end
-says exactly what remains, and nothing here is reported as finished when it is
-not.
+large phase.
+
+| | |
+|---|---|
+| **P5 part 1** | the measured backend decision, the identification subsystem, `/stt` integration |
+| **P5.1 (this pass)** | four pre-flight defects in part 1, each reproduced before being fixed |
+| **P5.1 remaining** | live turn carriage and speaker-aware memory attribution — **not built** |
+
+The scope table at the end says exactly what remains, and nothing here is
+reported as finished when it is not.
+
+---
+
+## P5.1 — four defects part 1 shipped
+
+Each was verified against the code before anything changed. All four reproduced.
+
+**1. The model revision was metadata-only.** Part 1 stamped
+`0f99f2d0…` into every profile and used it to decide compatibility, while
+`from_hparams` was called with no revision at all — so Nova loaded whatever HEAD
+happened to be and asserted a commit she had never requested. Had upstream
+republished the weights, she would have compared new embeddings against old
+centroids, confidently, forever. Now pinned through SpeechBrain's supported
+`fetch_config=FetchConfig(revision=…)`, using the *same constant* profiles are
+stamped with, and `status()` reports `revision_pinned` as an observation of a
+real load rather than a claim.
+
+**2. Ordinary identification had no quality gate.** Enrollment rejected silence,
+clipping and fragments; `identify()` rejected nothing but length, so a
+long-enough stretch of near-silence was embedded and scored against profiles
+like any other audio. An empty room could return a match.
+
+`command_quality()` now gates before the model — and deliberately at a *lower*
+bar than enrollment. Enrollment can demand 1.5 s of clean speech because it
+happens once and can ask for a retake; a real command is often "stop" or "yes",
+and rejecting those to guard against silence would break normal use to fix a
+problem only silence causes. Measured: 1.1 s / 1.5 s / 3.0 s commands accepted,
+a 0.4 s fragment `too_short`, digital and near-silence refused, quiet-but-real
+speech accepted.
+
+**3. Voice-turn redemption was replayable.** `redeem_voice_turn` returned the
+match and left the handle in the cache, so one captured id could assert the same
+identity on every later turn within its 300 s TTL. Redemption now consumes the
+handle: one `/stt` classification backs exactly one chat turn.
+
+An identity *failure* still mints a handle. `unknown`, `ambiguous` and
+`too_short` redeem back as themselves — losing the handle on failure would erase
+the only structured evidence that a turn was an unverified voice turn, and the
+absence of evidence is exactly where an accidental upgrade to "Marcus" would
+come from.
+
+**4. The privacy setting did nothing.** `NOVA_SPEAKER_KEEP_AUDIO` promised
+control over raw recordings that were never written, and the expression guarding
+the derived embeddings read `keep_audio() or True` — so the flag changed
+nothing, in either direction. A privacy setting that does nothing is worse than
+no setting, because someone will rely on it. Removed rather than given a meaning
+it never had. Raw audio is never retained; the derived embeddings are, and a
+test asserts no audio file of any format is written during enrollment.
 
 ---
 
@@ -285,6 +339,13 @@ Reported honestly rather than as a completed phase.
 * 11 test groups (`tests/test_speaker_id_v5.py`), all passing
 * `tests/live_speaker_id_harness.md`
 
+### Fixed in P5.1
+
+* model revision genuinely pinned at load, not just recorded
+* command-audio quality gate — silence can no longer become `known`
+* one-time voice-turn redemption; failures stay unverified voice turns
+* the dead `NOVA_SPEAKER_KEEP_AUDIO` setting removed
+
 ### NOT built — do not assume these work
 
 * **Enrollment HTTP endpoints and frontend UX.** The service can enrol; nothing
@@ -305,6 +366,12 @@ Until the memory-attribution work lands, P5 should be treated as *identification
 without consequence*: Nova can tell who is speaking, and does not yet act on it.
 That ordering is safe — it cannot mis-attribute what it never uses — but it is
 not the finished phase.
+
+**P5.1's main body is still outstanding.** The pre-flight defects are fixed and
+the substrate is now trustworthy enough to build on, but `RuntimeManager` still
+receives no speaker context, so the attribution matrix, `memory.correct`
+protection, speaker-scoped grounding and episodic attribution remain unbuilt.
+A guest's utterances are still handled exactly as Marcus's.
 
 ## Live validation
 

@@ -35,10 +35,10 @@ import numpy as np
 
 from core.logging_setup import get_logger
 from core.speaker import matcher as M
-from core.speaker.backend import EMBEDDER, MODEL_ID, MODEL_REVISION, enabled
+from core.speaker.backend import (EMBEDDER, MODEL_ID, MODEL_REVISION,
+                                  command_quality, enabled)
 from core.speaker.matcher import SpeakerMatch, check_sample
-from core.speaker.registry import (SpeakerProfile, SpeakerRegistry, keep_audio,
-                                   new_profile_id)
+from core.speaker.registry import SpeakerProfile, SpeakerRegistry, new_profile_id
 
 logger = get_logger(__name__)
 
@@ -90,6 +90,17 @@ class SpeakerService:
         self.stats["identify_calls"] += 1
         try:
             await self.initialize()
+
+            # Quality gate BEFORE the model (V3 P5.1). Silence has an embedding
+            # too, and it will score against something.
+            ok, why = command_quality(audio, sample_rate)
+            if not ok:
+                short = "too short" in why
+                self.stats["too_short" if short else "unavailable"] += 1
+                return SpeakerMatch(
+                    status=M.STATUS_TOO_SHORT if short else M.STATUS_UNAVAILABLE,
+                    reason=why)
+
             # The model runs in a thread: it is 40-60 ms of CPU work and the
             # event loop is serving token streams.
             emb = await asyncio.to_thread(EMBEDDER.embed, audio, sample_rate)
@@ -139,15 +150,23 @@ class SpeakerService:
         return turn_id
 
     def redeem_voice_turn(self, turn_id: str | None) -> SpeakerMatch | None:
-        """Resolve a handle back to backend-derived identity, or None."""
+        """Resolve a handle back to backend-derived identity — ONCE.
+
+        Redemption consumes the handle (V3 P5.1). One /stt classification backs
+        exactly one chat turn: a handle that could be replayed would let a
+        captured id keep asserting "Marcus" across later turns he never spoke,
+        which is precisely the forgery this mechanism exists to prevent.
+
+        Still not authentication. It grants nothing; it only keeps speaker
+        metadata backend-derived.
+        """
         if not turn_id:
             return None
         self._sweep()
-        entry = self._turns.get(str(turn_id))
+        entry = self._turns.pop(str(turn_id), None)   # pop: single use
         if entry is None:
             return None
         if time.monotonic() - entry.created_at > VOICE_TURN_TTL_S:
-            self._turns.pop(entry.turn_id, None)
             return None
         return entry.match
 
@@ -200,9 +219,10 @@ class SpeakerService:
             model_id=MODEL_ID, model_revision=MODEL_REVISION,
             embedding_dim=int(built.centroid.size),
             centroid=built.centroid,
-            # The raw AUDIO is never stored; these are the derived vectors, kept
-            # so a future recalibration need not ask for six new recordings.
-            samples=built.kept if keep_audio() or True else [],
+            # The raw AUDIO is never stored, under any setting. These are the
+            # derived embeddings, kept so a future recalibration need not ask
+            # for six new recordings.
+            samples=built.kept,
             sample_count=len(built.kept), consistency=built.consistency,
         )
         try:
@@ -247,7 +267,7 @@ class SpeakerService:
             "threshold": M.threshold(),
             "margin": M.margin(),
             "threshold_calibrated": False,   # until the live harness has run
-            "keep_audio": keep_audio(),
+            "raw_audio_retained": False,
             "voice_turns_cached": len(self._turns),
             "matches": dict(self.stats),
         }

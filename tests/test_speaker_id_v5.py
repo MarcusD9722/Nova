@@ -370,12 +370,15 @@ async def test_voice_turn_integrity():
               "an invented handle resolves to nothing")
         check(svc.redeem_voice_turn(None) is None, "and so does no handle at all")
 
-        # Expiry: the handle is not a session.
-        entry = svc._turns[tid]
+        # Expiry: the handle is not a session. A FRESH handle is needed here —
+        # redemption is single-use since P5.1, so the one above is already
+        # consumed. `test_speaker_preflight_v51.py` asserts that directly.
+        tid2 = svc.issue_voice_turn(m)
+        entry = svc._turns[tid2]
         import time as _t
-        svc._turns[tid] = type(entry)(entry.turn_id, entry.match,
-                                      _t.monotonic() - 10_000)
-        check(svc.redeem_voice_turn(tid) is None, "an expired handle is refused")
+        svc._turns[tid2] = type(entry)(entry.turn_id, entry.match,
+                                       _t.monotonic() - 10_000)
+        check(svc.redeem_voice_turn(tid2) is None, "an expired handle is refused")
 
         for i in range(VOICE_TURN_MAX + 40):
             svc.issue_voice_turn(SpeakerMatch(status="known", profile_id=f"p{i}",

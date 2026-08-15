@@ -65,6 +65,18 @@ TARGET_SR = 16000
 #: guessing from a syllable.
 MIN_SPEECH_S = 1.0
 
+#: Runtime command-audio quality (V3 P5.1). Enrollment already rejects silence,
+#: clipping and fragments; ORDINARY identification had no equivalent gate, so a
+#: long-enough stretch of near-silence would be embedded and could score against
+#: a profile. An empty room must never come back `known`.
+#:
+#: These bars are deliberately LOWER than enrollment's. Enrollment can demand
+#: 1.5s of clean speech because it happens once and can ask for a retake; a real
+#: command is often "stop", "yes", "louder" — rejecting those would break normal
+#: use to fix a problem that only silence causes.
+CMD_MIN_RMS = 0.004          # about half the enrollment floor
+CMD_MAX_CLIP_FRACTION = 0.05  # a command may peak harder than a read prompt
+
 #: Above this we truncate. Longer audio does not improve the embedding enough
 #: to justify the latency, which grows roughly linearly (85 ms at 8 s on CPU).
 MAX_SPEECH_S = 10.0
@@ -88,6 +100,9 @@ class SpeakerEmbedder:
         self._load_error: str | None = None
         self._load_ms: float | None = None
         self._device = device_preference()
+        #: True once a load has actually gone through the pinned-revision path.
+        #: Reported in status() so "pinned" is an observation, not a claim.
+        self._pinned = False
         self.calls = 0
         self.failures = 0
         self._latencies: list[float] = []
@@ -118,15 +133,29 @@ class SpeakerEmbedder:
                     pass
 
                 from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
+                from speechbrain.utils.fetching import FetchConfig  # type: ignore
 
                 savedir = os.getenv("NOVA_SPEAKER_MODEL_DIR", "").strip() or None
                 if not savedir:
                     from pathlib import Path
                     savedir = str(Path(os.getenv("NOVA_REPO_ROOT", ".")) / "model" / "speaker" / "ecapa")
+                # PIN THE REVISION FOR REAL (V3 P5.1).
+                #
+                # P5 part 1 persisted MODEL_REVISION into every profile and used
+                # it to decide compatibility — while loading whatever HEAD of the
+                # repo happened to be. So the metadata was an assertion nobody
+                # checked: upstream could have republished the weights and Nova
+                # would have kept comparing new embeddings against old centroids,
+                # confidently, with a revision string that was simply untrue.
+                #
+                # `fetch_config` is SpeechBrain's supported mechanism. Every file
+                # in the model now comes from this exact commit.
                 self._model = EncoderClassifier.from_hparams(
                     source=MODEL_ID, savedir=savedir,
                     run_opts={"device": self._device},
+                    fetch_config=FetchConfig(revision=MODEL_REVISION),
                 )
+                self._pinned = True
                 self._load_ms = (time.perf_counter() - t0) * 1000
                 logger.info("speaker_model_loaded", model=MODEL_ID, device=self._device,
                             ms=round(self._load_ms))
@@ -192,6 +221,7 @@ class SpeakerEmbedder:
             "embedding_dim": EMBEDDING_DIM,
             "device": self._device,
             "loaded": self._model is not None,
+            "revision_pinned": self._pinned,
             "load_failed": self._load_failed,
             "load_error": self._load_error,
             "load_ms": round(self._load_ms) if self._load_ms else None,
@@ -200,6 +230,35 @@ class SpeakerEmbedder:
             "embed_ms_median": round(lat[len(lat) // 2], 1) if lat else None,
             "embed_ms_last": round(self._latencies[-1], 1) if self._latencies else None,
         }
+
+
+def command_quality(audio: np.ndarray, sample_rate: int) -> tuple[bool, str]:
+    """Is this command audio worth identifying a speaker from? (V3 P5.1)
+
+    Separate from enrollment's `check_sample`, and deliberately more permissive:
+    a command is often one word, and rejecting "stop" to guard against silence
+    would break normal use to fix a problem only silence causes.
+
+    What it does catch is the case P5 part 1 missed entirely — a long-enough
+    stretch of near-silence or a malformed buffer being embedded and scored
+    against a profile. An empty room must never come back `known`.
+    """
+    x = np.asarray(audio, dtype=np.float32)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    if x.size == 0:
+        return False, "empty audio"
+    if not np.isfinite(x).all():
+        return False, "malformed audio (non-finite samples)"
+    dur = x.size / max(int(sample_rate), 1)
+    if dur < MIN_SPEECH_S:
+        return False, f"too short ({dur:.2f}s)"
+    rms = float(np.sqrt(np.mean(np.square(x))))
+    if rms < CMD_MIN_RMS:
+        return False, f"near-silence (rms {rms:.5f})"
+    if float(np.mean(np.abs(x) >= 0.999)) > CMD_MAX_CLIP_FRACTION:
+        return False, "heavily clipped"
+    return True, "ok"
 
 
 def _prepare(audio: np.ndarray, sample_rate: int) -> np.ndarray | None:

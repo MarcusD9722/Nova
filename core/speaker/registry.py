@@ -8,10 +8,16 @@ be another thing to keep consistent, back up and migrate for no measured gain.
 
 WHAT IS NOT STORED
 ------------------
-Raw enrollment audio. By default the samples are used to compute embeddings and
-then discarded — a voice recording is among the most personal things Nova could
-hold, and P5 does not need it after enrollment. `NOVA_SPEAKER_KEEP_AUDIO=1`
-exists for someone deliberately building a calibration set, and is off.
+Raw enrollment audio. Samples are embedded and discarded — a voice recording is
+among the most personal things Nova could hold, and P5 does not need it after
+enrollment. There is no setting to change this.
+
+P5 part 1 shipped a `NOVA_SPEAKER_KEEP_AUDIO` flag whose name promised control
+over raw recordings it did not have: no raw audio was ever written, and the
+expression guarding the derived embeddings read `keep_audio() or True`, so the
+flag changed nothing at all. A privacy setting that does nothing is worse than
+no setting, because someone will rely on it. It was removed in P5.1 rather than
+given a meaning it never had.
 
 Deleting a profile removes its embeddings. That is the whole point of a delete.
 
@@ -64,10 +70,6 @@ SPEAKER_DDL: list[str] = [
 def _now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
-
-
-def keep_audio() -> bool:
-    return os.getenv("NOVA_SPEAKER_KEEP_AUDIO", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
