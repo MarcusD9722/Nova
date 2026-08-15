@@ -275,6 +275,15 @@ class ChatRequest(BaseModel):
     conversation_id: UUID | None = None
     current_location: ClientLocation | None = None
     attachments: list[UploadedAttachment] = Field(default_factory=list)
+    # V3 P5.1. OPAQUE handle from /stt — the ONLY speaker-related thing a client
+    # may send. There is deliberately no speaker_name, profile_id or role field:
+    # a browser that could assert "Marcus" would defeat the whole namespace
+    # separation, so identity is resolved backend-side from this handle alone.
+    voice_turn_id: str | None = None
+    #: Transport hint that this came from the microphone. It cannot grant
+    #: identity — it only lets the backend tell "voice whose handle failed"
+    #: (unverified) apart from "typed" (legacy owner).
+    input_source: str | None = None
 
 
 
@@ -324,6 +333,9 @@ class ChatStreamRequest(BaseModel):
     conversation_id: UUID | None = None
     current_location: ClientLocation | None = None
     attachments: list[UploadedAttachment] = Field(default_factory=list)
+    #: See ChatRequest — opaque handle only, plus a transport hint.
+    voice_turn_id: str | None = None
+    input_source: str | None = None
     speak: bool = False
     voice: str = "nova.wav"
 
@@ -1454,6 +1466,52 @@ async def ws_events(ws: WebSocket) -> None:
 
 
 
+async def _resolve_turn_identity(voice_turn_id: str | None,
+                                 input_source: str | None) -> "TurnIdentity":
+    """Turn a client's opaque handle into backend-derived identity (V3 P5.1).
+
+    Every failure resolves to an UNVERIFIED voice turn, never to typed/Marcus.
+    Missing, invented, expired and already-redeemed handles are the same
+    outcome, deliberately: a client cannot improve its identity by supplying a
+    worse handle.
+
+    The three states that must stay distinguishable:
+
+        typed                     legacy owner semantics
+        voice, speaker ID off     legacy owner semantics (nobody asked)
+        voice, identity failed    UNVERIFIED — no personal-memory write
+
+    The last one is never inferred from absence. `input_source="voice"` is a
+    transport hint that grants nothing; it only prevents a failed voice turn
+    from being mistaken for a typed one.
+    """
+    from core.speaker.backend import enabled as speaker_enabled
+    from core.turn_identity import SOURCE_VOICE, TurnIdentity
+    from core.speaker.voice_turns import VOICE_TURNS
+
+    is_voice = (input_source or "").strip().lower() == SOURCE_VOICE or bool(voice_turn_id)
+    if not is_voice:
+        return TurnIdentity.typed()
+    if not speaker_enabled():
+        # Legacy Nova: voice, but no speaker question was ever asked.
+        return TurnIdentity.voice_legacy()
+
+    match = VOICE_TURNS.redeem(voice_turn_id)
+    if match is None:
+        return TurnIdentity.voice_unverified(
+            "no handle" if not voice_turn_id else "handle invalid, expired or already used")
+
+    # `stored_role` comes from the durable profile, never from the request.
+    profile = None
+    try:
+        svc = _speaker_service()
+        if svc is not None and getattr(match, "profile_id", None):
+            profile = await svc.registry.get(match.profile_id)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("speaker_profile_lookup_failed", error=str(e)[:160])
+    return TurnIdentity.from_match(match, profile=profile)
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest) -> dict:
     if STATE.brain is None:
@@ -1472,6 +1530,7 @@ async def chat(req: ChatRequest) -> dict:
                 user_text,
                 conversation_id=req.conversation_id,
                 current_location=req.current_location.model_dump() if req.current_location is not None else None,
+                identity=await _resolve_turn_identity(req.voice_turn_id, req.input_source),
             )
         finally:
             BUS.publish("chat.thinking_end", {})
@@ -1552,6 +1611,11 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
     user_text = _compose_chat_message(STATE.config, req.msg or req.message, req.attachments)
     if not user_text:
         raise HTTPException(status_code=422, detail="Missing 'msg', 'message', or 'attachments'")
+
+    # Redeem ONCE, here, before the generator — not inside it. The handle is
+    # single-use, so resolving it per-yield or on a retried stream would burn
+    # it and silently downgrade a recognised speaker to unverified (V3 P5.1).
+    turn_identity = await _resolve_turn_identity(req.voice_turn_id, req.input_source)
 
     def _sse(event: str, payload: dict) -> bytes:
         import json as _json
@@ -1645,6 +1709,7 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                     user_text,
                     conversation_id=conv_id,
                     current_location=req.current_location.model_dump() if req.current_location is not None else None,
+                    identity=turn_identity,
                 ):
                     yield ev
             finally:

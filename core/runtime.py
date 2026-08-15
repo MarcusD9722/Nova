@@ -56,6 +56,8 @@ from core.screen_broker import ScreenCaptureBroker
 from core.tool_router import ToolCall, ToolRouter
 from core.llm_runtime import LLMRuntime
 from core.episodic_promoter import EpisodicPromoter
+from core.turn_identity import (OWNER_ENTITY, TurnIdentity, active_turn,
+                                current_identity)
 from core.workers.autonomy_supervisor import AutonomySupervisorWorker
 from core.workers.episodic_ingest import EpisodicIngestWorker
 from core.workers.memory_ingest import MemoryIngestWorker
@@ -1139,6 +1141,7 @@ class RuntimeManager:
         user_name: str | None = None,
         project_name: str = "temp",
         current_location: dict[str, Any] | None = None,
+        identity: TurnIdentity | None = None,
     ) -> ChatTurnResult:
         # ONE production pipeline. /chat (non-streaming) and /chat/stream now
         # share the exact same pre-passes, grounding, prompt, and tool loop —
@@ -1153,6 +1156,7 @@ class RuntimeManager:
             user_name=user_name,
             project_name=project_name,
             current_location=current_location,
+            identity=identity,
         ):
             etype = ev.get("type")
             if etype == "token":
@@ -1285,9 +1289,20 @@ class RuntimeManager:
         background memory work then waits rather than holding the one GPU
         semaphore while Marcus is watching a blank screen.
         """
-        async with GATE.turn():
-            async for event in self._chat_turn_stream(**kwargs):
-                yield event
+        # Scope the speaker identity around the WHOLE turn, here, at the single
+        # choke point (V3 P5.1). Doing it inside `_chat_turn_stream` would miss
+        # its early returns — project prepass, direct replies, storytelling,
+        # error paths — and an early return that lost the identity would fall
+        # back to `user`, which is exactly the mis-attribution this prevents.
+        #
+        # A ContextVar rather than an attribute: concurrent turns each keep
+        # their own view, and the `finally` inside `active_turn` guarantees a
+        # background worker never inherits a stale human.
+        identity = kwargs.pop("identity", None)
+        with active_turn(identity):
+            async with GATE.turn():
+                async for event in self._chat_turn_stream(**kwargs):
+                    yield event
 
     async def _chat_turn_stream(
         self,
@@ -1910,7 +1925,26 @@ class RuntimeManager:
             "available_tools": [],
         }
 
-        if (user_name or "").strip():
+        # READ privacy (V3 P5.1). Blocking a guest's WRITES is only half the
+        # boundary: if Nova still recites Marcus's family, mood and personal
+        # profile to whoever happens to be standing there, his private memory
+        # has leaked just as thoroughly.
+        #
+        # Shared/global context (date, tools, capabilities) stays for everyone —
+        # it is not personal. Marcus's own profile is loaded only for a turn
+        # that is actually his.
+        #
+        # This is personalisation hygiene using a probabilistic voice match, NOT
+        # authentication. It is not a defence against someone determined to
+        # impersonate him.
+        ident = current_identity()
+        personal_ok = ident.is_owner
+        if not personal_ok:
+            context["speaker"] = (ident.display_name if ident.is_known_other
+                                  else "unrecognised speaker")
+            context["personal_profile_withheld"] = True
+
+        if personal_ok and (user_name or "").strip():
             context["known_user"]["name"] = (user_name or "").strip()
 
         # ── Independent read-only signals, fetched CONCURRENTLY (U1) ─────────
@@ -1926,6 +1960,9 @@ class RuntimeManager:
         # are order-dependent.
 
         async def _load_family() -> dict[str, Any] | None:
+            # Marcus's family is his. A guest gets none of it.
+            if not personal_ok:
+                return None
             try:
                 mother, father, spouse, children, siblings, cousins, friends, pets = await asyncio.gather(
                     self._memory.get_latest_fact(entity="user", attribute="mother"),
@@ -2001,7 +2038,29 @@ class RuntimeManager:
         # Bounded on purpose: the whole point of the salience/access work is
         # that some memories matter more, so take the ones that have actually
         # been used or were learned in a charged moment, and cap the list.
+        async def _load_speaker_profile() -> dict[str, list[str]] | None:
+            """The CURRENT speaker's own stored profile, if they have one.
+
+            A known guest is still a person Nova can personalise for — just in
+            their own namespace, never out of Marcus's.
+            """
+            target = ident.memory_entity
+            if target is None or target == OWNER_ENTITY:
+                return None
+            try:
+                rows = await self._memory.get_facts(entity=target, limit=25)
+            except Exception:
+                return None
+            out: dict[str, list[str]] = {}
+            for r in rows or []:
+                out.setdefault(str(r.attribute), []).append(str(r.value))
+            return out or None
+
         async def _load_profile() -> dict[str, list[str]] | None:
+            if not personal_ok:
+                # A known non-owner reads their OWN namespace instead; an
+                # unrecognised speaker reads nothing personal at all.
+                return await _load_speaker_profile()
             try:
                 out: dict[str, list[str]] = {}
                 for attr in _PROFILE_ATTRS:
@@ -2356,16 +2415,48 @@ class RuntimeManager:
         return f"{n}|{s}" if s else n
 
     async def _replace_user_name_fact(self, name: str) -> None:
+        """Replace the speaker's own name — theirs, not necessarily Marcus's.
+
+        This PURGES before writing, which is why it is gated separately rather
+        than trusting the caller: a guest saying "my name is Alex" reaching this
+        with the owner entity would delete Marcus's name outright (V3 P5.1).
+        """
         clean_name = (name or "").strip()
         if not clean_name:
             return
+        target = current_identity().memory_entity
+        if target is None:
+            logger.debug("name_write_suppressed_unverified_speaker")
+            return
         try:
-            await self._memory.purge_facts(entity="user", attribute="name", dry_run=False)
+            await self._memory.purge_facts(entity=target, attribute="name", dry_run=False)
         except Exception:
             pass
-        await self._memory.add_fact(entity="user", attribute="name", value=clean_name, confidence=0.98)
+        await self._memory.add_fact(entity=target, attribute="name", value=clean_name,
+                                    confidence=0.98)
 
     async def _extract_quick_facts(self, message: str) -> None:
+        """Deterministic personal-fact capture — now identity-aware (V3 P5.1).
+
+        Every write below used to target `entity="user"`, which meant Marcus,
+        because until P5 only Marcus could speak. A guest saying "my name is
+        Alex" or "I live in Berlin" would have rewritten his profile.
+
+        Two rules, both fail-closed:
+          * an unverified voice turn writes NOTHING here;
+          * a known non-owner writes to their OWN namespace.
+        `memory_entity` returns None for anything Nova could not attribute, and
+        None is never substituted for a default.
+        """
+        ident = current_identity()
+        target = ident.memory_entity
+        if target is None:
+            # unknown / ambiguous / too_short / unavailable / bad handle.
+            # The utterance still reaches conversation history; it just does not
+            # become somebody's personal fact.
+            logger.debug("quick_facts_suppressed", status=ident.speaker_status)
+            return
+
         msg = (message or "").strip()
         if not msg:
             return
@@ -2379,7 +2470,7 @@ class RuntimeManager:
         if m_loc:
             loc = m_loc.group(1).strip(" .!?\t\n")
             if loc:
-                await self._memory.add_fact(entity="user", attribute="location", value=loc, confidence=0.75)
+                await self._memory.add_fact(entity=target, attribute="location", value=loc, confidence=0.75)
 
         # ── Family names ────────────────────────────────────────────────────
         # The [A-Z] guards below are LOAD-BEARING: capitalization is the only
@@ -2405,7 +2496,7 @@ class RuntimeManager:
         if m_sp:
             spouse_name = m_sp.group(1).strip()
             if spouse_name:
-                await self._memory.add_fact(entity="user", attribute="spouse", value=spouse_name, confidence=0.85)
+                await self._memory.add_fact(entity=target, attribute="spouse", value=spouse_name, confidence=0.85)
 
         parent_patterns = [
             (rf"(?i:\bmy\s+(?:mom|mother)(?:['’]s)?\s+{_LEAD_IN})\s+{_NAME}", "mother"),
@@ -2416,7 +2507,7 @@ class RuntimeManager:
             if mm:
                 name = mm.group(1).strip()
                 if name:
-                    await self._memory.add_fact(entity="user", attribute=attr, value=name, confidence=0.9)
+                    await self._memory.add_fact(entity=target, attribute=attr, value=name, confidence=0.9)
 
         # Children list
         m_kids = re.search(
@@ -2428,11 +2519,11 @@ class RuntimeManager:
             rel = m_kids.group(1).lower()
             tail = re.sub(r"[.?!]+$", "", m_kids.group(2).strip()).strip()
             for n in self._split_name_list(tail)[:6]:
-                await self._memory.add_fact(entity="user", attribute="child", value=n, confidence=0.8)
+                await self._memory.add_fact(entity=target, attribute="child", value=n, confidence=0.8)
             if rel in {"sons", "son"}:
-                await self._memory.add_fact(entity="user", attribute="children_type", value="sons", confidence=0.7)
+                await self._memory.add_fact(entity=target, attribute="children_type", value="sons", confidence=0.7)
             elif rel in {"daughters", "daughter"}:
-                await self._memory.add_fact(entity="user", attribute="children_type", value="daughters", confidence=0.7)
+                await self._memory.add_fact(entity=target, attribute="children_type", value="daughters", confidence=0.7)
 
         # Siblings / cousins / friends lists (simple)
         list_patterns = [
@@ -2445,7 +2536,7 @@ class RuntimeManager:
             if mm:
                 tail = re.sub(r"[.?!]+$", "", mm.group(1).strip()).strip()
                 for n in self._split_name_list(tail)[:10]:
-                    await self._memory.add_fact(entity="user", attribute=attr, value=n, confidence=conf)
+                    await self._memory.add_fact(entity=target, attribute=attr, value=n, confidence=conf)
 
         # Pets — same load-bearing [A-Z] guard as the family patterns above.
         m_pet = re.search(
@@ -2454,7 +2545,7 @@ class RuntimeManager:
             species = m_pet.group(1).strip().lower()
             name = m_pet.group(2).strip()
             if name:
-                await self._memory.add_fact(entity="user", attribute="pet", value=self._pet_value(name, species), confidence=0.85)
+                await self._memory.add_fact(entity=target, attribute="pet", value=self._pet_value(name, species), confidence=0.85)
 
     # Directive/preference/correction phrasings that mean "learn this and apply it
     # going forward". Kept deliberately explicit so ordinary chatter isn't captured.

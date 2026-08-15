@@ -83,7 +83,31 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         return {"ok": True, "saved": fact[:400], "topic": topic}
 
     async def _memory_correct(args: dict[str, Any]) -> dict[str, Any]:
+        """Correct a remembered fact — scoped to whoever is actually speaking.
+
+        The default entity is `user`, which means Marcus. Once a guest can
+        speak, "no, my favourite colour is red" would supersede HIS fact, and
+        the model cannot be relied on to pick a safe entity — it does not know
+        who is in the room, and asking it to would make a safety boundary
+        probabilistic. So it is enforced here, from turn identity (V3 P5.1).
+
+        Personal corrections only. An explicit correction about a NAMED third
+        party or a non-personal entity is left alone: the point is to stop a
+        guest rewriting Marcus, not to stop guests using memory at all.
+        """
+        from core.turn_identity import OWNER_ENTITY, current_identity
+
         entity = str(args.get("entity") or "user").strip()
+        ident = current_identity()
+        if entity.strip().lower() in {"user", "me", "myself", ""}:
+            target = ident.memory_entity
+            if target is None:
+                # Unverified voice: refuse rather than write somewhere wrong.
+                # Returning a clear non-persisting result lets Nova say so.
+                return {"ok": False, "error": "unverified_speaker",
+                        "detail": ("I can't update a personal fact when I'm not "
+                                   "sure who I'm speaking with.")}
+            entity = target
         attribute = str(args.get("attribute") or args.get("topic") or "").strip()
         new_value = str(args.get("value") or args.get("new_value") or args.get("correction") or "").strip()
         old_value = str(args.get("old_value") or "").strip() or None
