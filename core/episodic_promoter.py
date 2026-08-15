@@ -42,7 +42,9 @@ date the belief changed.
 
 import asyncio
 import hashlib
+import time
 from collections import OrderedDict
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -109,7 +111,7 @@ class EpisodicPromoter:
         self._queue: "asyncio.Queue[Any] | None" = None
         self.stats: dict[str, int] = {
             "artifact": 0, "selection": 0, "correction": 0, "failure": 0,
-            "project": 0, "rejected": 0, "errors": 0,
+            "project": 0, "rejected": 0, "errors": 0, "undrained": 0,
         }
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -125,11 +127,78 @@ class EpisodicPromoter:
         logger.info("episodic_promoter_started")
 
     async def stop(self) -> None:
+        """Drain before stopping. P4.2 shipped this the wrong way round.
+
+        The original set the stop flag first, and `_run` checks it at the TOP of
+        the loop — so everything still queued was discarded. Measured: 12 events
+        queued, 1 processed. At system level it usually survived anyway, because
+        the worker that stops earlier in the sequence yields for long enough that
+        the promoter drains by coincidence. Surviving by coincidence is not a
+        durability guarantee, and it does not hold for events published by the
+        producers that stop AFTER this one.
+
+        The order below is the fix, and each step exists for a reason:
+        """
+        q = self._queue
+        # 1. Unsubscribe FIRST, so the queue stops growing while we drain it.
+        #    A drain that races new arrivals has no defined end.
+        if q is not None:
+            BUS.unsubscribe(q)
+        # 2. Drain what was already accepted. Synchronous — `on_bus_event` does
+        #    no I/O — which means the consumer task cannot interleave and there
+        #    is no race to reason about.
+        if q is not None:
+            self._drain_remaining(q)
+        # 3. Only now stop the consumer.
         self._stop.set()
-        if self._queue is not None:
-            BUS.unsubscribe(self._queue)
-            self._queue = None
         await stop_worker(self._task, name="episodic-promoter")
+        self._queue = None
+
+    def _drain_remaining(self, q: "asyncio.Queue[Any]", *,
+                         max_events: int = 5000, budget_s: float = 5.0) -> int:
+        """Process everything still queued, bounded, reporting what it could not.
+
+        Deliberately NOT `queue.join()`. join() waits on `task_done()` accounting
+        that must be exactly right on every path — including rejected and
+        malformed events — and gets it wrong exactly once to hang shutdown
+        forever. Draining here needs no accounting to be correct and cannot
+        deadlock: it takes what is there and stops.
+        """
+        drained = 0
+        deadline = time.monotonic() + budget_s
+        while drained < max_events:
+            try:
+                event = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            except Exception:  # noqa: BLE001
+                break
+            try:
+                self.on_bus_event(getattr(event, "type", ""),
+                                  getattr(event, "data", {}) or {},
+                                  getattr(event, "ts", ""))
+                drained += 1
+            except Exception as e:  # noqa: BLE001
+                self.stats["errors"] += 1
+                log_worker_error(logger, "episodic_promoter_drain_failed", e)
+            finally:
+                # Keep the accounting honest even though nothing joins on it —
+                # a queue left with unfinished tasks is a trap for whoever adds
+                # a join() later.
+                with suppress(ValueError):
+                    q.task_done()
+            if time.monotonic() > deadline:
+                break
+
+        pending = q.qsize()
+        if pending:
+            # Never claim a drain finished when it did not.
+            self.stats["undrained"] += pending
+            logger.warning("episodic_promoter_drain_incomplete",
+                           drained=drained, pending=pending)
+        elif drained:
+            logger.info("episodic_promoter_drained", events=drained)
+        return drained
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -148,6 +217,9 @@ class EpisodicPromoter:
             except Exception as e:  # noqa: BLE001
                 self.stats["errors"] += 1
                 log_worker_error(logger, "episodic_promoter_failed", e)
+            finally:
+                with suppress(ValueError):
+                    self._queue.task_done()
 
     # ── artifact-backed events (the P4.1 path, unchanged in behaviour) ───────
 
@@ -235,6 +307,10 @@ class EpisodicPromoter:
             outcome=f"chose {title}",
             # Credit the result set rather than duplicating it.
             reinforce=[f"ep-{selected.parent_id}"] if selected.parent_id else [],
+            # Changing your mind within one comparison replaces the earlier
+            # choice. Scoped to THIS result set: a live choice from an unrelated
+            # comparison must not be retired by it.
+            supersede_scope=selected.parent_id or None,
         )):
             self.stats["selection"] += 1
 

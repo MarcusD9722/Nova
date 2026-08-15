@@ -305,6 +305,21 @@ delivery means every event can arrive twice, and "Marcus chose the WD Gold"
 must not accumulate copies. The promoter still never writes and never calls a
 model.
 
+**Lifecycle constraint (added 2026-08-14, V3 P4.2.1).** This is a two-queue
+pipeline, and shutdown order is therefore a correctness property, not tidiness:
+
+```
+producers → BUS → promoter queue → persistence queue → SQLite
+```
+
+Every stage stops only after everything feeding it has stopped, and drains what
+it already accepted before it stops. Concretely: all six producers, then the
+promoter, then the persistence worker. Shipping it the other way round lost 11
+of 12 queued events, and `MemoryIngestWorker` publishes `memory.superseded`
+*during its own drain* — so the likeliest correction in a shutdown was the one
+most at risk. Do not reorder these calls without re-running
+`tests/test_episodic_durability_v421.py`.
+
 **Evidence.** `tests/test_episodic_events_v42.py` — 34 interactions produce 7
 episodes; three phrasings of one choice produce one; seven occurrences of one
 failure produce one; redelivery of every event type is idempotent.
@@ -313,3 +328,52 @@ bus publish costs 6.1 µs with a subscriber versus 4.0 µs without.
 
 **Revisit if.** A source appears that cannot supply a stable identity. The fix is
 to find one in the source, not to relax the requirement.
+
+---
+
+## D10 — A changed choice supersedes within its result set, and the old one is kept
+
+**Decided:** 2026-08-14 (V3 P4.2.1)
+
+**Decision.** Selection episodes are identified by the chosen artifact, so
+saying the same choice again is one decision. Choosing a *different* item from
+the **same result set** marks the earlier selection `superseded_by` the newer
+one. Selections from different result sets never affect each other. The
+superseded episode is marked, never deleted.
+
+**Rationale.** Identity-by-artifact is what makes "the second one" / "yeah, that
+one" / "I'll take the WD Gold" a single decision, and it is right. It also meant
+that changing your mind produced two episodes with `superseded_by IS NULL` —
+measured: 2 — so "what did I choose?" had two equally current answers with
+nothing to rank between them.
+
+Scope is `parent_id` because that is the choice context. Anything wider —
+supersession by artifact type, or globally by kind — would have a monitor
+comparison silently retire your choice of drive, which is not a thing the user
+did.
+
+Keeping the old episode is what makes "what did I originally pick, before I
+changed my mind?" answerable at all. Normal retrieval already filters
+`superseded_by IS NULL`, so a replaced choice stops competing without
+disappearing, and a narrow gate (`wants_superseded`) lets an explicitly
+historical question see it — rendered with a SUPERSEDED marker so it cannot read
+as current.
+
+**Alternatives rejected.** Deleting the previous selection (destroys the history
+that makes the question answerable, and a choice is exactly the thing worth
+keeping); global supersession by kind (unrelated decisions retire each other);
+leaving both active and ranking by recency (a guess presented as an answer —
+the same failure D8 rejected for ordinals).
+
+**Evidence.** `tests/test_episodic_durability_v421.py` — changed choice leaves
+one active and one marked; switching back restores the first without creating a
+third; a drive and a monitor stay independently current; repeating one choice
+still yields one active episode.
+
+**Constraint.** No new table. `superseded_by` already existed on `episodes` with
+exactly these semantics for decisions; reusing it is the point. Supersession runs
+in the persistence worker, only for events carrying a scope — ordinary turns
+never reach it.
+
+**Revisit if.** Users report Nova naming a choice they had already changed. Check
+the scope (`parent_id`) before touching retrieval ranking.

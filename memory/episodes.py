@@ -275,7 +275,8 @@ class EpisodicStore:
         return [Episode.from_row(r) for r in rows]
 
     async def search_episodes(self, terms: Iterable[str], *, limit: int = 60,
-                              project: str | None = None) -> list["Episode"]:
+                              project: str | None = None,
+                              include_superseded: bool = False) -> list["Episode"]:
         """Candidates drawn by RELEVANCE, not recency.
 
         The obvious implementation — take the N most recent episodes and rank
@@ -296,7 +297,11 @@ class EpisodicStore:
         params: list[Any] = []
         for w in words:
             params.extend([f"%{w}%", f"%{w}%"])
-        sql = (f"SELECT * FROM episodes WHERE superseded_by IS NULL AND ({clauses})")
+        # Replaced decisions are excluded by default: a choice that was changed
+        # must not compete with the one that changed it. `include_superseded`
+        # is the narrow opt-in for "what did I originally pick?".
+        scope = "1=1" if include_superseded else "superseded_by IS NULL"
+        sql = (f"SELECT * FROM episodes WHERE {scope} AND ({clauses})")
         if project:
             sql += " AND project = ?"
             params.append(project)
@@ -306,6 +311,32 @@ class EpisodicStore:
             async with db.execute(sql, params) as cur:
                 rows = await cur.fetchall()
         return [Episode.from_row(r) for r in rows]
+
+    async def supersede_selections(self, *, parent_id: str,
+                                   keep_episode_id: str) -> int:
+        """Changing your mind replaces the earlier choice; it does not erase it.
+
+        Scope is the RESULT SET (`parent_id`), not the artifact type. Choosing a
+        drive and choosing a monitor are two live decisions; choosing a drive and
+        then a different drive from the SAME comparison is one decision that
+        changed. Anything wider would have the monitor silently retire the drive.
+
+        The old episode is marked, never deleted — `superseded_by` is what makes
+        "what did I originally pick, before I changed my mind?" answerable at
+        all. Normal retrieval already filters `superseded_by IS NULL`, so the
+        replaced choice stops competing with the current one without vanishing.
+        """
+        if not parent_id or not keep_episode_id:
+            return 0
+        async with self._conn() as db:
+            cur = await db.execute(
+                """UPDATE episodes SET superseded_by = ?
+                   WHERE kind = ? AND id != ? AND superseded_by IS NULL
+                     AND provenance LIKE ?""",
+                (keep_episode_id, EP_SELECTION, keep_episode_id,
+                 f'%"parent_id": "{parent_id}"%'))
+            await db.commit()
+            return cur.rowcount or 0
 
     async def touch_episodes(self, episode_ids: Iterable[str]) -> None:
         """Reinforce several episodes in ONE transaction.

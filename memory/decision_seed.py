@@ -316,7 +316,56 @@ def seed_decisions() -> list[Decision]:
                         "background delivery means every event can arrive twice, and "
                         "'Marcus chose the WD Gold' must not accumulate copies. The "
                         "promoter never writes and never calls a model. Refines D7 "
-                        "rather than superseding it.",
+                        "rather than superseding it. "
+                        "LIFECYCLE (P4.2.1): this is a TWO-queue pipeline, so shutdown "
+                        "order is a correctness property. Every stage stops only after "
+                        "everything feeding it has stopped, and drains what it accepted "
+                        "first: all producers, then the promoter, then the persistence "
+                        "worker. The reverse order lost 11 of 12 queued events, and "
+                        "MemoryIngestWorker publishes memory.superseded DURING its own "
+                        "drain. Re-run tests/test_episodic_durability_v421.py before "
+                        "reordering these calls.",
+            decided_at="2026-08-14T00:00:00+00:00",
+        ),
+        Decision(
+            id="D10",
+            title="A changed choice supersedes within its result set, and the old one is kept",
+            decision="Selection episodes are identified by the chosen artifact, so saying "
+                     "the same choice again is one decision. Choosing a DIFFERENT item "
+                     "from the SAME result set marks the earlier selection superseded_by "
+                     "the newer one. Selections from different result sets never affect "
+                     "each other. The superseded episode is marked, never deleted.",
+            rationale="Identity-by-artifact is what makes 'the second one' / 'yeah, that "
+                      "one' / 'I'll take the WD Gold' a single decision, and it is right. "
+                      "It also meant changing your mind produced two episodes with "
+                      "superseded_by IS NULL — measured: 2 — so 'what did I choose?' had "
+                      "two equally current answers with nothing to rank between them. "
+                      "Scope is parent_id because that is the choice CONTEXT; anything "
+                      "wider would have a monitor comparison silently retire a drive "
+                      "choice, which is not something the user did. Keeping the old "
+                      "episode is what makes 'what did I originally pick?' answerable.",
+            alternatives=["Deleting the previous selection (rejected: destroys the history "
+                          "that makes the question answerable; a choice is exactly the "
+                          "thing worth keeping)",
+                          "Global supersession by kind (rejected: unrelated decisions "
+                          "retire each other)",
+                          "Leaving both active and ranking by recency (rejected: a guess "
+                          "presented as an answer — the failure D8 already rejected)"],
+            evidence=["tests/test_episodic_durability_v421.py: changed choice leaves one "
+                      "active and one marked; switching back restores the first without "
+                      "creating a third; a drive and a monitor stay independently current; "
+                      "repeating one choice still yields one active episode"],
+            subsystem="memory",
+            source_refs=["memory/episodes.py::supersede_selections",
+                         "core/episodic_promoter.py::note_selection",
+                         "memory/episodic_recall.py::wants_superseded"],
+            constraints="No new table: superseded_by already existed on episodes with "
+                        "exactly these semantics for decisions, and reusing it is the "
+                        "point. Normal retrieval filters superseded_by IS NULL so a "
+                        "replaced choice stops competing without disappearing; only an "
+                        "explicitly historical question sees it, rendered with a "
+                        "SUPERSEDED marker. Supersession runs in the persistence worker, "
+                        "only for events carrying a scope — ordinary turns never reach it.",
             decided_at="2026-08-14T00:00:00+00:00",
         ),
     ]

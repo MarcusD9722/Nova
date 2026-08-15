@@ -43,7 +43,8 @@ from memory.artifacts import ArtifactStore, capture_tool_result, describe_for_pr
 from memory.episodes import EpisodicStore
 from memory.episodic_recall import (needs_decision_memory, needs_episodic_memory,
                                     resolve_historical_reference, retrieve as episodic_retrieve,
-                                    retrieve_decisions, wants_evidence, is_selection)
+                                    retrieve_decisions, wants_evidence, wants_superseded,
+                                    is_selection)
 from memory.recall_gate import GateDecision, should_recall
 from memory.working_context import WorkingContextStore
 from core.orchestrator.deep_mode import DeepPipeline, is_deep_request
@@ -934,20 +935,41 @@ class RuntimeManager:
         self._agent_supervisor.start()
 
     async def stop(self) -> None:
+        """Shutdown order is a correctness property, not tidiness (V3 P4.2.1).
+
+        Episodic memory is a THREE-stage pipeline, and each stage can only be
+        stopped once everything that feeds it has finished:
+
+            producers -> BUS -> promoter queue -> persistence queue -> SQLite
+
+        P4.2 stopped the promoter second, which put it ahead of five workers that
+        can still publish. Worse, `MemoryIngestWorker` publishes
+        `memory.superseded` *during its own drain* — the moment it decides a
+        belief was contradicted — so the single most likely correction event in
+        a shutdown arrived at a promoter that was next in line to be stopped.
+
+        So: every producer first, then the promoter, then the writer. Each stage
+        drains what it already accepted before it stops.
+        """
+        # 1. Producers. All of these can publish promotable events while they
+        #    finish — memory.superseded from the ingest drain, tool errors from
+        #    a final autonomy cycle, project events from work in flight.
         await self._memory_worker.stop()
-        # Order matters. The promoter stops DECIDING first, or an event accepted
-        # during shutdown would have nowhere to land; then the worker drains
-        # what was already accepted (see EpisodicIngestWorker.stop) — a result
-        # set Nova acknowledged must not vanish because the process happened to
-        # exit before the worker got to it.
-        await self._promoter.stop()
-        if self._episodic_worker is not None:
-            await self._episodic_worker.stop()
         await self._self_improve.stop()
         await self._reminder_worker.stop()
         await self._research_worker.stop()
         await self._autonomy_worker.stop()
         await self._agent_supervisor.stop()
+
+        # 2. The promoter, which drains its subscriber queue before stopping.
+        #    Nothing can publish to it now.
+        await self._promoter.stop()
+
+        # 3. The writer, last, draining everything the promoter just handed it.
+        #    A result set Nova acknowledged must not vanish because the process
+        #    happened to exit before the worker got to it.
+        if self._episodic_worker is not None:
+            await self._episodic_worker.stop()
 
     # ── Episodic memory (V3 P4.1) ────────────────────────────────────────────
 
@@ -1042,7 +1064,11 @@ class RuntimeManager:
             if gate.search:
                 self._episodic_stats["searches"] += 1
                 hydrate = wants_evidence(query)
-                found = await episodic_retrieve(self._episodes, query, hydrate=hydrate)
+                # "What did I originally pick?" is the one question a replaced
+                # decision answers. Every other question must not see it.
+                found = await episodic_retrieve(
+                    self._episodes, query, hydrate=hydrate,
+                    include_superseded=wants_superseded(query))
                 if found.episodes:
                     self._episodic_stats["warm_hits"] += len(found.episodes)
                     self._episodic_stats["cold_hydrations"] += found.hydrated

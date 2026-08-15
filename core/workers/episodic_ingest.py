@@ -103,7 +103,7 @@ class EpisodicIngestWorker:
         self._task: asyncio.Task[None] | None = None
         self.stats: dict[str, Any] = {
             "queued": 0, "persisted": 0, "dropped": 0, "failed": 0,
-            "artifacts": 0, "reinforced": 0, "last_error": None,
+            "artifacts": 0, "reinforced": 0, "superseded": 0, "last_error": None,
         }
 
     # -- lifecycle ------------------------------------------------------------
@@ -262,6 +262,21 @@ class EpisodicIngestWorker:
         # would promise exactly that and fail to deliver it.
         n = await self._store.record_happening(episode, art, children)
         self.stats["artifacts"] += max(0, n - 1)
+
+        # A new choice from the same comparison replaces the previous one.
+        # Runs AFTER the write so the replacement already exists to point at,
+        # and only for events that carry a scope — ordinary turns never reach
+        # this line.
+        if ev.supersede_scope:
+            try:
+                n_old = await self._store.supersede_selections(
+                    parent_id=ev.supersede_scope, keep_episode_id=episode.id)
+                if n_old:
+                    self.stats["superseded"] += n_old
+                    logger.info("episodic_selection_superseded",
+                                replaced=n_old, by=episode.id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("episodic_supersede_failed", error=str(e)[:200])
 
         # Reinforce what this event was ABOUT, rather than copying it. A
         # selection credits the result set it came from, so the set rises in
