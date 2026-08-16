@@ -1,0 +1,428 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova — Speaker Calibration (V3 P5.2)</title>
+<style>
+  :root { --bg:#0e1116; --fg:#e6e9ef; --dim:#9aa4b2; --ok:#2ea043; --bad:#f85149;
+          --warn:#d29922; --line:#232a35; --card:#161b22; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.55 system-ui,sans-serif;
+         margin:0; padding:28px; max-width:920px; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:22px 0 8px; }
+  .dim { color:var(--dim); } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .warn { color:var(--warn); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:16px; margin:12px 0; }
+  button { background:#21262d; color:var(--fg); border:1px solid var(--line);
+           border-radius:7px; padding:9px 14px; font-size:14px; cursor:pointer; }
+  button:hover:not(:disabled) { border-color:#3d4756; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.primary { background:#1f6feb; border-color:#1f6feb; }
+  button.danger { background:#4a1d1d; border-color:#6e2b2b; }
+  input { background:#0d1117; color:var(--fg); border:1px solid var(--line);
+          border-radius:6px; padding:8px; font-size:14px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  pre { background:#0d1117; border:1px solid var(--line); border-radius:8px;
+        padding:12px; overflow:auto; font-size:12px; max-height:340px; }
+  .step { opacity:.35; pointer-events:none; }
+  .step.active { opacity:1; pointer-events:auto; }
+  .step.done { opacity:.7; pointer-events:auto; }
+  .rec { background:#4a1d1d; border-color:#6e2b2b; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px;
+          border:1px solid var(--line); font-size:12px; margin-right:6px; }
+  .bar { height:6px; background:#0d1117; border-radius:3px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--ok); }
+</style>
+
+<h1>Nova speaker calibration</h1>
+<p class="dim">
+  V3 P5.2 · turns the provisional 0.55 / 0.10 into measured numbers.
+  Needs <b>Marcus</b> and <b>one other real person</b>. Nothing here records
+  audio to disk — samples are decoded, embedded and discarded.
+</p>
+
+<div class="card">
+  <label>Backend <input id="base" size="28" value="http://localhost:8008"></label>
+  <label style="margin-left:12px">API token <input id="tok" size="20" placeholder="if set"></label>
+  <button id="ping">Check</button>
+  <div id="pingout" class="dim" style="margin-top:8px"></div>
+</div>
+
+<div id="steps"></div>
+
+<script>
+// ── tiny helpers ────────────────────────────────────────────────────────────
+const $ = (s, r=document) => r.querySelector(s);
+const el = (t, c, h) => { const e=document.createElement(t); if(c)e.className=c;
+                          if(h!==undefined)e.innerHTML=h; return e; };
+const base = () => $("#base").value.replace(/\/$/, "");
+const hdrs = () => { const t=$("#tok").value.trim();
+                     return t ? {"X-API-Token": t} : {}; };
+
+async function api(path, opts={}) {
+  const r = await fetch(base()+path, {...opts, headers:{...hdrs(), ...(opts.headers||{})}});
+  const txt = await r.text();
+  let body; try { body = JSON.parse(txt); } catch { body = {raw:txt}; }
+  if (!r.ok) throw new Error(body?.detail || body?.raw || ("HTTP "+r.status));
+  return body;
+}
+
+// ── autosave: NON-AUDIO progress only ───────────────────────────────────────
+// An accidental refresh must not cost a human twenty utterances. Blobs are
+// never persisted — only labels, scores and counts.
+const SAVE_KEY = "nova.p52.calibration.v1";
+const S = JSON.parse(localStorage.getItem(SAVE_KEY) || "null") || {
+  step: 0, marcusId: null, guestId: null, trials: [], validation: [],
+  enroll: {}, proposal: null, applied: false, latency: [],
+};
+function save() { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); render(); }
+function reset() { localStorage.removeItem(SAVE_KEY); location.reload(); }
+
+// ── recording ───────────────────────────────────────────────────────────────
+let stream = null;
+async function mic() {
+  if (!stream) stream = await navigator.mediaDevices.getUserMedia({audio:true});
+  return stream;
+}
+async function record(ms, btn) {
+  const s = await mic();
+  const mr = new MediaRecorder(s, MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? {mimeType:"audio/webm;codecs=opus"} : undefined);
+  const chunks = [];
+  mr.ondataavailable = e => e.data.size && chunks.push(e.data);
+  const done = new Promise(res => mr.onstop = () => res(new Blob(chunks, {type: mr.mimeType||"audio/webm"})));
+  mr.start(200);
+  if (btn) btn.classList.add("rec");
+  await new Promise(r => setTimeout(r, ms));
+  try { mr.stop(); } catch {}
+  if (btn) btn.classList.remove("rec");
+  return await done;
+}
+
+async function identify(blob) {
+  const fd = new FormData();
+  fd.append("file", blob, "trial.webm");
+  const t0 = performance.now();
+  const out = await api("/speaker/identify", {method:"POST", body:fd});
+  out.round_trip_ms = Math.round(performance.now() - t0);
+  return out;
+}
+
+// ── steps ───────────────────────────────────────────────────────────────────
+const CONDITIONS = [
+  ["normal", 4], ["quiet", 4], ["loud", 4], ["near", 4], ["far", 4],
+];
+const PHRASES = [
+  "The quick brown fox jumps over the lazy dog near the riverbank.",
+  "I need to check the weather before I head out this afternoon.",
+  "Remind me to look at the storage drive comparison again tomorrow.",
+  "There are seventeen boxes stacked in the back of the garage.",
+  "Could you play something quiet while I finish reading this chapter?",
+  "The blue car parked outside has been there since Thursday morning.",
+];
+
+function stepCard(n, title, active, done, body) {
+  const c = el("div", "card step " + (active ? "active" : done ? "done" : ""));
+  c.appendChild(el("h2", null, `${n}. ${title} ${done ? '<span class="ok">✓</span>' : ""}`));
+  if (typeof body === "string") c.appendChild(el("div", null, body));
+  else if (body) c.appendChild(body);
+  return c;
+}
+
+function trialTable(rows) {
+  if (!rows.length) return el("div", "dim", "No trials yet.");
+  const t = el("table");
+  t.innerHTML = "<tr><th>#</th><th>truth</th><th>cond</th><th>status</th>"
+              + "<th>top</th><th>score</th><th>2nd</th><th>thr</th></tr>";
+  rows.slice(-8).forEach((r,i) => {
+    const tr = el("tr");
+    tr.innerHTML = `<td>${rows.length-Math.min(8,rows.length)+i+1}</td><td>${r.truthName||r.truth}</td>`
+      + `<td>${r.condition}</td><td>${r.status}</td><td>${r.topName||"-"}</td>`
+      + `<td>${(r.top_score??0).toFixed(3)}</td>`
+      + `<td>${r.second_score==null?"-":r.second_score.toFixed(3)}</td>`
+      + `<td>${r.threshold==null?"-":r.threshold.toFixed(2)}</td>`;
+    t.appendChild(tr);
+  });
+  return t;
+}
+
+async function enrollFlow(name, role, key) {
+  const box = $("#enroll-"+key);
+  box.innerHTML = "";
+  const kept = [];
+  for (let i = 0; i < 6; i++) {
+    box.appendChild(el("div", "dim", `Sample ${i+1} of 6 — say: “${PHRASES[i]}”`));
+    const b = el("button", "primary", `Record sample ${i+1} (4s)`);
+    box.appendChild(b);
+    await new Promise(res => b.onclick = res);
+    b.disabled = true;
+    const blob = await record(4000, b);
+    kept.push(blob);
+    b.textContent = `Sample ${i+1} recorded`;
+  }
+  const fd = new FormData();
+  fd.append("display_name", name);
+  fd.append("role", role);
+  kept.forEach((b,i) => fd.append("files", b, `s${i}.webm`));
+  box.appendChild(el("div", "dim", "Enrolling…"));
+  const out = await api("/speaker/enroll", {method:"POST", body:fd});
+  S.enroll[key] = out;
+  if (key === "marcus") S.marcusId = out.profile_id; else S.guestId = out.profile_id;
+  save();
+}
+
+async function trialsFlow(truthId, truthName, phase, count, target) {
+  const box = $("#"+target);
+  const plan = [];
+  const per = Math.max(1, Math.round(count / CONDITIONS.length));
+  CONDITIONS.forEach(([c]) => { for (let i=0;i<per;i++) plan.push(c); });
+  while (plan.length < count) plan.push("normal");
+  plan.length = count;
+
+  for (let i = 0; i < count; i++) {
+    box.innerHTML = "";
+    box.appendChild(el("div", null,
+      `<b>Trial ${i+1} / ${count}</b> — <span class="pill">${plan[i]}</span> `
+      + `speak <b>${truthName}</b>, 3–4 seconds, a NEW sentence (not an enrollment phrase).`));
+    const b = el("button", "primary", "Record trial");
+    box.appendChild(b);
+    await new Promise(res => b.onclick = res);
+    b.disabled = true;
+    const blob = await record(3500, b);
+    let out;
+    try { out = await identify(blob); }
+    catch (e) { box.appendChild(el("div","bad","identify failed: "+e.message)); i--; continue; }
+    S.latency.push({embed_ms: out.embed_ms, round_trip_ms: out.round_trip_ms});
+    (phase === "V" ? S.validation : S.trials).push({
+      truth: truthId, truthName,
+      top_profile_id: out.profile_id || null,
+      topName: out.display_name || null,
+      top_score: out.similarity ?? 0,
+      second_score: out.second_best_similarity ?? null,
+      second_profile_id: out.second_best_profile_id ?? null,
+      status: out.status || "", condition: plan[i], phase,
+      threshold: out.threshold ?? null,
+    });
+    save();
+  }
+  box.innerHTML = "<span class='ok'>Done.</span>";
+}
+
+function confusion(rows) {
+  const m = {swap:0, correct:{}, total:{}, unknown:0, ambiguous:0};
+  rows.forEach(r => {
+    m.total[r.truthName] = (m.total[r.truthName]||0)+1;
+    if (r.status === "known") {
+      if (r.top_profile_id === r.truth) m.correct[r.truthName]=(m.correct[r.truthName]||0)+1;
+      else m.swap++;
+    } else if (r.status === "ambiguous") m.ambiguous++;
+    else m.unknown++;
+  });
+  return m;
+}
+
+function render() {
+  const root = $("#steps"); root.innerHTML = "";
+  const st = S.step;
+
+  // 1 preflight
+  const p = el("div");
+  p.appendChild(el("div","dim","Check the backend, review existing profiles, and delete any stale ones deliberately."));
+  const list = el("div", null, "<i class='dim'>press Check above</i>");
+  list.id = "proflist"; p.appendChild(list);
+  const go = el("button","primary","Start calibration");
+  go.onclick = () => { S.step = 1; save(); };
+  p.appendChild(go);
+  root.appendChild(stepCard(1, "Preflight", st===0, st>0, p));
+
+  // 2 Marcus enrollment
+  const m = el("div");
+  m.appendChild(el("div","dim","Six samples, 4 seconds each, different phrases. At least 5 must survive the quality gate."));
+  m.appendChild(el("div",null,"")).id = "enroll-marcus";
+  const mb = el("button","primary","Enrol Marcus (owner)");
+  mb.onclick = async () => { mb.disabled=true; try { await enrollFlow("Marcus","owner","marcus"); S.step=2; save(); }
+                             catch(e){ alert(e.message); mb.disabled=false; } };
+  m.appendChild(mb);
+  if (S.enroll.marcus) {
+    const e = S.enroll.marcus;
+    m.appendChild(el("div", e.meets_p52_bar?"ok":"bad",
+      `kept ${e.sample_count} samples · consistency ${(e.consistency??0).toFixed(3)} · `
+      + (e.meets_p52_bar ? "meets the P5.2 bar" : (e.note||"below the P5.2 bar"))));
+  }
+  root.appendChild(stepCard(2, "Enrol Marcus", st===1, st>1, m));
+
+  // 3 Marcus trials (phase A)
+  const a = el("div");
+  a.appendChild(el("div","dim","20 fresh utterances: 4 normal, 4 quiet, 4 loud, 4 near, 4 far."));
+  const a1 = el("div"); a1.id="trials-marcus"; a.appendChild(a1);
+  const ab = el("button","primary","Start Marcus trials (20)");
+  ab.onclick = async () => { ab.disabled=true;
+    await trialsFlow(S.marcusId,"Marcus","A",20,"trials-marcus"); S.step=3; save(); };
+  a.appendChild(ab);
+  root.appendChild(stepCard(3, "Marcus trials — phase A", st===2, st>2, a));
+
+  // 4 unenrolled guest (impostor) trials
+  const g = el("div");
+  g.appendChild(el("div","dim","The guest is NOT enrolled yet. These 12 utterances measure how close a real stranger gets to Marcus — the impostor distribution."));
+  const g1 = el("div"); g1.id="trials-impostor"; g.appendChild(g1);
+  const gb = el("button","primary","Start impostor trials (12)");
+  gb.onclick = async () => { gb.disabled=true;
+    await trialsFlow("__impostor__","Guest (unenrolled)","A",12,"trials-impostor"); S.step=4; save(); };
+  g.appendChild(gb);
+  root.appendChild(stepCard(4, "Unenrolled guest trials", st===3, st>3, g));
+
+  // 5 guest enrollment
+  const ge = el("div");
+  ge.appendChild(el("div","dim","Now enrol the guest — six samples, same rules."));
+  ge.appendChild(el("div",null,"")).id = "enroll-guest";
+  const geb = el("button","primary","Enrol guest");
+  geb.onclick = async () => { geb.disabled=true;
+    const nm = prompt("Guest's first name?") || "Guest";
+    try { await enrollFlow(nm,"guest","guest");
+          // Relabel the impostor trials now that the guest has an id.
+          S.trials.forEach(t => { if (t.truth === "__impostor__") t.truth = S.guestId; });
+          S.step=5; save(); }
+    catch(e){ alert(e.message); geb.disabled=false; } };
+  ge.appendChild(geb);
+  if (S.enroll.guest) {
+    const e = S.enroll.guest;
+    ge.appendChild(el("div", e.meets_p52_bar?"ok":"bad",
+      `kept ${e.sample_count} samples · consistency ${(e.consistency??0).toFixed(3)}`));
+  }
+  root.appendChild(stepCard(5, "Enrol the guest", st===4, st>4, ge));
+
+  // 6 two-profile trials (phase B)
+  const b2 = el("div");
+  b2.appendChild(el("div","dim","12 each, varied conditions. These calibrate the margin between two real people."));
+  const b1 = el("div"); b1.id="trials-b"; b2.appendChild(b1);
+  const bb = el("button","primary","Start two-profile trials (12 + 12)");
+  bb.onclick = async () => { bb.disabled=true;
+    await trialsFlow(S.marcusId,"Marcus","B",12,"trials-b");
+    alert("Now the GUEST speaks for the next 12.");
+    await trialsFlow(S.guestId, S.enroll.guest?.display_name || "Guest","B",12,"trials-b");
+    S.step=6; save(); };
+  b2.appendChild(bb);
+  b2.appendChild(trialTable(S.trials));
+  root.appendChild(stepCard(6, "Two-profile trials — phase B", st===5, st>5, b2));
+
+  // 7 proposal
+  const pr = el("div");
+  const pb = el("button","primary","Compute proposed calibration");
+  pb.onclick = async () => {
+    try {
+      const out = await api("/speaker/calibration", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({trials: S.trials.map(t => ({
+          truth:t.truth, top_profile_id:t.top_profile_id, top_score:t.top_score,
+          second_score:t.second_score, second_profile_id:t.second_profile_id,
+          status:t.status, condition:t.condition, phase:t.phase})), apply:false})});
+      S.proposal = out; save();
+    } catch(e){ alert(e.message); }
+  };
+  pr.appendChild(pb);
+  if (S.proposal) {
+    pr.appendChild(el("div", S.proposal.ok?"ok":"bad",
+      (S.proposal.ok ? "Calibration fits: " : "CALIBRATION FAILED: ") + S.proposal.reason));
+    pr.appendChild(el("pre", null, JSON.stringify(S.proposal, null, 2)));
+    if (S.proposal.ok) {
+      const ap = el("button","primary","Apply calibration");
+      ap.onclick = async () => {
+        if (!confirm("Persist these thresholds and margin?")) return;
+        try {
+          await api("/speaker/calibration", {method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({trials: S.trials.map(t => ({
+              truth:t.truth, top_profile_id:t.top_profile_id, top_score:t.top_score,
+              second_score:t.second_score, second_profile_id:t.second_profile_id,
+              status:t.status, condition:t.condition, phase:t.phase})), apply:true})});
+          S.applied = true; S.step = 7; save();
+        } catch(e){ alert(e.message); }
+      };
+      pr.appendChild(ap);
+    }
+  }
+  root.appendChild(stepCard(7, "Proposed calibration", st===6, st>6, pr));
+
+  // 8 validation
+  const v = el("div");
+  v.appendChild(el("div","dim","FRESH utterances only — none may reuse a calibration recording. 10 each, varied conditions."));
+  const v1 = el("div"); v1.id="trials-v"; v.appendChild(v1);
+  const vb = el("button","primary","Start validation (10 + 10)");
+  vb.onclick = async () => { vb.disabled=true;
+    await trialsFlow(S.marcusId,"Marcus","V",10,"trials-v");
+    alert("Now the GUEST speaks for the next 10.");
+    await trialsFlow(S.guestId, S.enroll.guest?.display_name || "Guest","V",10,"trials-v");
+    S.step=8; save(); };
+  v.appendChild(vb);
+  v.appendChild(trialTable(S.validation));
+  root.appendChild(stepCard(8, "Fresh validation", st===7, st>7, v));
+
+  // 9 report
+  const rep = el("div");
+  if (S.validation.length) {
+    const c = confusion(S.validation);
+    const names = Object.keys(c.total);
+    const pass = c.swap === 0 && names.every(n => (c.correct[n]||0) / c.total[n] >= 0.9);
+    rep.appendChild(el("div", pass?"ok":"bad",
+      pass ? "VALIDATION PASS — 0 identity swaps, ≥90% for each speaker."
+           : `VALIDATION FAIL — ${c.swap} identity swap(s); ` +
+             names.map(n=>`${n} ${c.correct[n]||0}/${c.total[n]}`).join(", ")));
+    const report = {
+      protocol: "V3 P5.2", generated_at: new Date().toISOString(),
+      profiles: S.enroll, calibration: S.proposal, applied: S.applied,
+      validation: {
+        confusion: c, identity_swaps: c.swap,
+        unknown: c.unknown, ambiguous: c.ambiguous,
+        per_speaker: names.map(n => ({name:n, correct:c.correct[n]||0, total:c.total[n]})),
+      },
+      latency: {
+        n: S.latency.length,
+        embed_p50: pct(S.latency.map(x=>x.embed_ms), .50),
+        embed_p95: pct(S.latency.map(x=>x.embed_ms), .95),
+        round_trip_p50: pct(S.latency.map(x=>x.round_trip_ms), .50),
+        round_trip_p95: pct(S.latency.map(x=>x.round_trip_ms), .95),
+      },
+      trials_collected: S.trials.length,
+      result: pass ? "PASS" : "FAIL",
+    };
+    rep.appendChild(el("pre", null, JSON.stringify(report, null, 2)));
+    const cp = el("button", null, "Copy report JSON");
+    cp.onclick = () => navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+    rep.appendChild(cp);
+  } else {
+    rep.appendChild(el("div","dim","Finish validation to produce the report."));
+  }
+  const rs = el("button","danger","Reset everything"); rs.onclick = reset;
+  rep.appendChild(el("div", null, "")).appendChild(rs);
+  root.appendChild(stepCard(9, "Final report", st===8, false, rep));
+}
+
+function pct(a, q) {
+  if (!a.length) return null;
+  const s = a.slice().sort((x,y)=>x-y);
+  return s[Math.max(0, Math.min(s.length-1, Math.round(q*(s.length-1))))];
+}
+
+$("#ping").onclick = async () => {
+  const out = $("#pingout");
+  try {
+    const st = await api("/speaker/status");
+    const pr = await api("/speaker/profiles");
+    out.innerHTML = `<span class="ok">connected</span> · model ${st.model_id||"?"} `
+      + `· calibrated: <b>${st.threshold_calibrated}</b> · margin ${st.margin} (${st.margin_source})`;
+    const box = $("#proflist"); box.innerHTML = "";
+    if (!pr.profiles.length) box.appendChild(el("div","dim","No profiles enrolled."));
+    pr.profiles.forEach(p => {
+      const row = el("div", null,
+        `<span class="pill">${p.role}</span> <b>${p.name||p.display_name}</b> `
+        + `<span class="dim">${p.profile_id} · ${p.sample_count} samples · ${p.status||""}</span> `);
+      const d = el("button","danger","Delete");
+      d.onclick = async () => { if(!confirm(`Delete ${p.name||p.display_name}?`))return;
+        await api("/speaker/profiles/"+p.profile_id, {method:"DELETE"}); $("#ping").click(); };
+      row.appendChild(d);
+      box.appendChild(row);
+    });
+  } catch (e) { out.innerHTML = `<span class="bad">${e.message}</span>`; }
+};
+
+render();
+</script>
