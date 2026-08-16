@@ -30,6 +30,27 @@ import asyncio
 from typing import Any
 
 from core.events import EpisodicPersistEvent
+from core.turn_identity import OWNER_ENTITY
+
+
+def _speaker_fields(identity) -> tuple[str, str, str]:
+    """(speaker_entity, speaker_label, input_source) for an episode row.
+
+    Structured, and deliberately small: retrieval needs to know WHOSE episode
+    this is and how to name them. It never needs an embedding, a similarity or
+    a threshold, and none is stored.
+    """
+    if identity is None:
+        return (OWNER_ENTITY, "Marcus", "typed")
+    ent = identity.memory_entity
+    if ent is None:
+        # Nova could not attribute the turn. `unverified` is its own namespace,
+        # not a fallback to Marcus — the whole P5.1 boundary rests on that.
+        return ("unverified", "The user", identity.input_source or "voice")
+    if ent == OWNER_ENTITY:
+        return (OWNER_ENTITY, "Marcus", identity.input_source or "typed")
+    return (ent, identity.display_name or "A guest", identity.input_source or "voice")
+
 from core.logging_setup import get_logger
 from core.workers.lifecycle import log_worker_error, stop_worker
 from memory.artifacts import FRESH_STATIC, TRUST_INTERNAL
@@ -193,6 +214,12 @@ class EpisodicIngestWorker:
     async def _persist(self, ev: EpisodicPersistEvent) -> None:
         art = ev.artifact
         children = list(ev.children or [])
+        # Read the SNAPSHOT off the event, never current_identity(): this
+        # worker drains a queue long after the turn ended, on a task that never
+        # entered active_turn. Same rule MemoryIngestEvent already learned
+        # (D12). A missing snapshot means a pre-P5.1e or system event, which
+        # is owner history by the migration assumption.
+        spk_entity, spk_label, spk_source = _speaker_fields(ev.identity)
 
         if art is not None:
             # Provenance is carried through structurally, not flattened into
@@ -228,6 +255,9 @@ class EpisodicIngestWorker:
                 outcome=ev.outcome or ev.reason or None,
                 importance=float(ev.importance),
                 created_at=ev.timestamp.isoformat(),
+                speaker_entity=spk_entity,
+                speaker_label=spk_label,
+                input_source=spk_source,
             )
         else:
             # A correction, a project milestone, a recurring failure (V3 P4.2).
@@ -254,6 +284,9 @@ class EpisodicIngestWorker:
                 outcome=ev.outcome,
                 importance=float(ev.importance),
                 created_at=ev.timestamp.isoformat(),
+                speaker_entity=spk_entity,
+                speaker_label=spk_label,
+                input_source=spk_source,
             )
 
         # Episode and evidence in ONE transaction. The ordered children are the

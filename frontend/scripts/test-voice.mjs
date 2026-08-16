@@ -44,3 +44,24 @@ fs.copyFileSync(path.join(root, "src/voice/bargeIn.test.mjs"),
   path.join(out, "test.mjs"));
 
 execFileSync(process.execPath, [path.join(out, "test.mjs")], { stdio: "inherit" });
+
+// ── V3 P5.1e: the voice transport contract ─────────────────────────────────
+// turnOrigin.ts is pure. recorder.ts is not — but transcribeBlobDetailed takes
+// an injectable `fetchImpl`, so the ONE function that builds the multipart
+// request can be exercised for real without a browser. That matters: the
+// backend reads `speaker` as a form field, and a source-string test would not
+// prove the browser actually sends one.
+await build({
+  entryPoints: [
+    path.join(root, "src/voice/turnOrigin.ts"),
+    path.join(root, "src/voice/recorder.ts"),
+  ],
+  format: "esm",
+  outdir: out,
+  logLevel: "error",
+});
+
+fs.copyFileSync(path.join(root, "src/voice/turnOrigin.test.mjs"),
+  path.join(out, "turnOrigin.test.mjs"));
+
+execFileSync(process.execPath, [path.join(out, "turnOrigin.test.mjs")], { stdio: "inherit" });

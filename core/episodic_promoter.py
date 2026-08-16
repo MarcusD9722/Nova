@@ -51,6 +51,26 @@ from typing import Any, Callable
 from core.error_log import ErrorLog, error_message, is_error_event
 from core.event_bus import BUS
 from core.events import EpisodicPersistEvent
+from contextlib import nullcontext as _no_scope
+
+from core.turn_identity import active_turn, current_identity
+
+
+def _speaker_name() -> str:
+    """How a user-originated episode names whoever did the thing.
+
+    "Marcus chose the WD Gold" is exactly right until Alice can produce a real
+    turn, at which point it is a fabricated quote about the wrong person. An
+    unattributed turn gets neutral wording rather than a guess — Nova does not
+    manufacture Marcus merely because an event lacks attribution.
+    """
+    ident = current_identity()
+    if ident.is_owner:
+        return "Marcus"
+    if ident.is_known_other and ident.display_name:
+        return ident.display_name
+    return "The user"
+
 from core.logging_setup import get_logger
 from core.workers.lifecycle import log_worker_error, stop_worker
 from memory.episodes import (EP_CORRECTION, EP_FAILURE, EP_MCP_RESULT, EP_PROJECT,
@@ -176,7 +196,8 @@ class EpisodicPromoter:
             try:
                 self.on_bus_event(getattr(event, "type", ""),
                                   getattr(event, "data", {}) or {},
-                                  getattr(event, "ts", ""))
+                                  getattr(event, "ts", ""),
+                                  identity=getattr(event, "identity", None))
                 drained += 1
             except Exception as e:  # noqa: BLE001
                 self.stats["errors"] += 1
@@ -213,7 +234,8 @@ class EpisodicPromoter:
             try:
                 self.on_bus_event(getattr(event, "type", ""),
                                   getattr(event, "data", {}) or {},
-                                  getattr(event, "ts", ""))
+                                  getattr(event, "ts", ""),
+                                  identity=getattr(event, "identity", None))
             except Exception as e:  # noqa: BLE001
                 self.stats["errors"] += 1
                 log_worker_error(logger, "episodic_promoter_failed", e)
@@ -235,6 +257,7 @@ class EpisodicPromoter:
             return
         kind = EP_MCP_RESULT if tool.startswith("mcp:") else EP_TOOL_RESULT
         if self._submit(EpisodicPersistEvent(
+            identity=current_identity(),
             conversation_id=artifact.conversation_id,
             turn_id=artifact.turn_id,
             timestamp=datetime.now(timezone.utc),
@@ -281,6 +304,7 @@ class EpisodicPromoter:
             "turn_id": turn_id,
         }
         if self._submit(EpisodicPersistEvent(
+            identity=current_identity(),
             conversation_id=conversation_id,
             turn_id=turn_id,
             timestamp=datetime.now(timezone.utc),
@@ -295,7 +319,7 @@ class EpisodicPromoter:
             trust=selected.trust,
             freshness=selected.freshness,
             source_tool=selected.source_tool or None,
-            summary=f"Marcus chose {title}{where}",
+            summary=f"{_speaker_name()} chose {title}{where}",
             entities=[title] + [str(getattr(i, "title", "")) for i in items[:4]
                                 if getattr(i, "title", "") and i is not selected],
             user_text=user_text,
@@ -316,14 +340,25 @@ class EpisodicPromoter:
 
     # ── bus-sourced events ───────────────────────────────────────────────────
 
-    def on_bus_event(self, event_type: str, data: dict, ts: str = "") -> None:
-        """Route one published event. Synchronous, deterministic, no I/O."""
+    def on_bus_event(self, event_type: str, data: dict, ts: str = "",
+                     identity: Any = None) -> None:
+        """Route one published event. Synchronous, deterministic, no I/O.
+
+        `identity` is the snapshot the bus took at PUBLISH time. This method
+        runs on the promoter's own draining task, so `current_identity()` here
+        would be the typed default and would file a guest's correction as
+        Marcus's — the D12 lesson, one layer down (V3 P5.1e).
+        """
         if not self._enabled or not event_type:
             return
         etype = str(event_type)
         if any(etype.startswith(p) for p in _IGNORED_PREFIXES):
             return
 
+        with active_turn(identity) if identity is not None else _no_scope():
+            self._route(etype, data, ts)
+
+    def _route(self, etype: str, data: dict, ts: str) -> None:
         if etype == "memory.corrected":
             self._note_correction(data, ts, explicit=True)
         elif etype == "memory.superseded":
@@ -357,8 +392,9 @@ class EpisodicPromoter:
                 self.stats["rejected"] += 1
                 return
             subject = f"{entity} {attribute}".replace("user ", "").strip()
-            summary = (f"Marcus corrected {subject}: {was} -> {now}" if was
-                       else f"Marcus corrected {subject} to {now}")
+            who = _speaker_name()
+            summary = (f"{who} corrected {subject}: {was} -> {now}" if was
+                       else f"{who} corrected {subject} to {now}")
             ep_id = f"corr-{_digest(entity, attribute, now)}"
             entities = [e for e in (entity, attribute, was, now) if e]
             provenance = {"entity": entity, "attribute": attribute,
@@ -377,6 +413,7 @@ class EpisodicPromoter:
             outcome = None
 
         if self._submit(EpisodicPersistEvent(
+            identity=current_identity(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             episode_id=ep_id, summary=summary, entities=entities,
             reason="user corrected a belief", kind=EP_CORRECTION,
@@ -405,6 +442,7 @@ class EpisodicPromoter:
         if detail:
             summary += f": {detail}"
         if self._submit(EpisodicPersistEvent(
+            identity=current_identity(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             # A build can legitimately happen many times for one project, so
             # identity includes the moment. The bus timestamp is fixed at
@@ -433,6 +471,7 @@ class EpisodicPromoter:
         if not (slug and error):
             return
         if self._submit(EpisodicPersistEvent(
+            identity=current_identity(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             episode_id=f"fail-proj-{slug}-{_digest(ErrorLog.signature(slug, error))}",
             summary=f"Building {slug} failed: {error[:180]}",
@@ -470,6 +509,7 @@ class EpisodicPromoter:
         # Identity is the SIGNATURE, so the fourth and fiftieth occurrence
         # update one episode instead of adding forty-seven.
         if self._submit(EpisodicPersistEvent(
+            identity=current_identity(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             episode_id=f"fail-{_digest(signature)}",
             summary=f"Recurring failure in {etype} ({count}x): {str(message)[:160]}",

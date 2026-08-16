@@ -204,6 +204,14 @@ async def test_plugin_scope_metadata_is_mandatory():
         check(False, "an invalid scope should be rejected")
     except ValueError as e:
         check("data_scope" in str(e), f"and an invalid value is rejected ({str(e)[:60]})")
+    # P5.1e §0: the dataclass field itself now has no default either, so a
+    # direct ToolSpec construction fails at construction rather than relying on
+    # registration-time validation of an empty sentinel.
+    try:
+        preg.ToolSpec(name="x.nodefault", description="d", fn=None)  # type: ignore[call-arg]
+        check(False, "ToolSpec without data_scope should not construct")
+    except TypeError:
+        check(True, "ToolSpec has no data_scope default")
 
 
 # ── §11. Gmail ───────────────────────────────────────────────────────────────
@@ -415,14 +423,21 @@ async def test_permissions_unchanged():
 
 
 async def test_frontend_untouched():
-    check.section("14: frontend still not wired for speaker identity")
-    for f in ("frontend/src/App.jsx", "frontend/src/voice/recorder.ts"):
-        p = REPO / f
-        if not p.exists():
-            continue
-        src = p.read_text(encoding="utf-8", errors="replace")
-        check("speaker=true" not in src and "voice_turn_id" not in src,
-              f"{f} sends no speaker identity")
+    check.section("frontend: identity is ACTIVE, and still backend-derived")
+    # Until V3 P5.1e this asserted the frontend sent nothing. It now does — that
+    # was the whole point of P5.1e — so the invariant moves to the part that
+    # still must hold: the client forwards an opaque handle and never asserts
+    # who is speaking.
+    from pathlib import Path as _P
+    origin = (REPO / "frontend/src/voice/turnOrigin.ts").read_text(encoding="utf-8")
+    check("input_source" in origin and "voice_turn_id" in origin,
+          "the client sends transport + an opaque handle")
+    for banned in ('"profile_id"', '"display_name"', '"role"'):
+        check(f"out[{banned}]" not in origin and f"{banned}:" not in origin,
+              f"and never asserts {banned}")
+    app = (REPO / "frontend/src/App.jsx").read_text(encoding="utf-8")
+    check("localStorage" not in app.split("voiceOrigin")[-1][:400],
+          "no persisted owner flag near the voice path")
 
 
 async def main():

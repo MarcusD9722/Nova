@@ -29,12 +29,33 @@ def _clip(text: Any, limit: int = 240) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
+def _publisher_identity():
+    """The speaker in scope at publish time, or None off the turn path."""
+    try:
+        from core.turn_identity import current_identity
+        return current_identity()
+    except Exception:  # noqa: BLE001 - the bus never raises
+        return None
+
+
 @dataclass
 class NovaEvent:
     seq: int
     type: str
     ts: str
     data: dict[str, Any] = field(default_factory=dict)
+    #: Who was speaking when this was published (V3 P5.1e).
+    #:
+    #: Stamped at PUBLISH, because that is the last moment the speaker is still
+    #: in scope. Subscribers drain on their own tasks — the episodic promoter
+    #: literally says "this drains in its own task" — so a consumer calling
+    #: `current_identity()` reads the typed default and files a guest's
+    #: correction as Marcus's. Same lesson as MemoryIngestEvent (D12), one layer
+    #: down: identity crosses a queue by snapshot, never by inheritance.
+    #:
+    #: Deliberately NOT in `to_dict()`: the bus feeds an SSE debug stream, and
+    #: this is internal routing rather than something to broadcast.
+    identity: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"seq": self.seq, "type": self.type, "ts": self.ts, "data": self.data}
@@ -60,7 +81,8 @@ class EventBus:
     def publish(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         """Fire-and-forget publish. Never raises. Safe from worker threads."""
         try:
-            event = NovaEvent(seq=next(self._seq), type=str(event_type), ts=_now_iso(), data=dict(data or {}))
+            event = NovaEvent(seq=next(self._seq), type=str(event_type), ts=_now_iso(),
+                              data=dict(data or {}), identity=_publisher_identity())
 
             try:
                 running = asyncio.get_running_loop()

@@ -401,6 +401,9 @@ class SQLiteMemoryBackend:
                 # fresh-database schema and the upgrade path cannot drift apart.
                 for _sql in EPISODIC_DDL:
                     await db.execute(_sql)
+                # AFTER the DDL: the guard inside checks the table exists, and
+                # on a pre-P5.1e database it is this block that creates it.
+                await self._migrate_episodes_schema(db)
 
                 await self._apply_migrations(db)
 
@@ -721,6 +724,32 @@ class SQLiteMemoryBackend:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    async def _migrate_episodes_schema(self, db: aiosqlite.Connection) -> None:
+        """Add speaker provenance to an existing `episodes` table, in place.
+
+        Deliberately NOT a numbered migration. The runner stamps `latest`
+        without replaying history for a fresh database — whose create block
+        already builds these columns — so a versioned ALTER could only ever fire
+        against a table that already had them. This is the same idempotent
+        pattern `_migrate_turns_schema` uses, and for the same reason.
+
+        `user` / `typed` is the correct backfill rather than a guess: every
+        episode written before P5.1e predates live speaker activation, so all of
+        it is Marcus's history.
+        """
+        cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='episodes';")
+        if not await cur.fetchone():
+            return
+        cur = await db.execute("PRAGMA table_info(episodes);")
+        have = {r[1] for r in await cur.fetchall()}
+        for col, default in (("speaker_entity", "'user'"), ("speaker_label", "''"),
+                             ("input_source", "'typed'")):
+            if col not in have:
+                await db.execute(
+                    f"ALTER TABLE episodes ADD COLUMN {col} TEXT NOT NULL DEFAULT {default};")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_episodes_speaker "
+                         "ON episodes(speaker_entity, created_at DESC);")
 
     async def _migrate_turns_schema(self, db: aiosqlite.Connection) -> None:
         """Add speaker attribution to an existing `turns` table, in place.

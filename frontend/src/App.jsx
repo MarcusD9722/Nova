@@ -15,7 +15,8 @@ import useFocusSession from "./hooks/useFocusSession";
 import useNovaBusEffects from "./hooks/useNovaBusEffects";
 
 import { useWakeNova } from "./voice/useWakeNova";
-import { acquireMicStreamHandle, duckPlayback, playAudioUrl, prefetchAudioBlob, recordVoiceActivityFromStreamToBlob, recordVoiceActivityToBlob, restorePlayback, stopActiveAudio, transcribeBlob, unlockAudioContext } from "./voice/recorder";
+import { acquireMicStreamHandle, duckPlayback, playAudioUrl, prefetchAudioBlob, recordVoiceActivityFromStreamToBlob, recordVoiceActivityToBlob, restorePlayback, stopActiveAudio, transcribeBlob, transcribeBlobDetailed, unlockAudioContext, voiceTurnIdOf } from "./voice/recorder";
+import { buildFallbackBody, buildStreamBody, unverifiedVoiceOrigin, voiceOrigin } from "./voice/turnOrigin";
 import { CouplingEstimator, newAttempt, summarize, watchForSpeechOverPlayback } from "./voice/bargeIn";
 
 import SettingsSheet from "./overlays/SettingsSheet";
@@ -596,7 +597,10 @@ export default function App() {
         let heard = "";
         try {
           const blob = await captureCommandBlob({ debugTag: "bargein", maxMs: 4000 });
-          heard = await transcribeBlob(blob, apiUrl("/stt"));
+          // Deliberately NO speaker classification. This capture is mixed
+          // audio — the human plus Nova's own playback — so embedding it would
+          // be classifying Nova's voice as often as anyone's.
+          heard = await transcribeBlob(blob, { url: apiUrl("/stt"), debugTag: "bargein" });
         } catch {
           heard = "";
         }
@@ -699,7 +703,13 @@ export default function App() {
           const blob = await captureCommandBlob({ debugTag: "session", maxMs: 8000 });
 
           setVoiceStatus("transcribing");
-          const text = await transcribeBlob(blob, apiUrl("/stt"));
+          // Each session command gets its OWN classification and its own
+          // one-use handle. A session is not proof the same human is still
+          // talking: Marcus can start one and Alice can answer the next turn.
+          const stt = await transcribeBlobDetailed(blob, {
+            url: apiUrl("/stt"), speaker: true, debugTag: "session",
+          });
+          const text = stt.text;
           if (!text?.trim()) {
             if (Date.now() - lastHeardAt > SESSION_IDLE_TIMEOUT_MS) {
               clearTtsQueue();
@@ -746,21 +756,26 @@ export default function App() {
             // Everything heard here goes through the backend's echo suppression
             // first, because the mic is picking up Nova's own voice through the
             // speakers at the same time.
-            const replyDone = sendMessage(text);
+            const replyDone = sendMessage(text, [], voiceOrigin(voiceTurnIdOf(stt)));
             setPhase("RESPONDING", { reason: "session_sent" });
             const interruption = await watchForBargeIn(replyDone, myToken);
             if (interruption) {
-              // Treat the salvaged words as the next thing Marcus said and
-              // answer them immediately, rather than dropping back to a
-              // listening pause he would have to talk into again.
+              // Answer the salvaged words immediately rather than dropping
+              // back to a pause the speaker would have to talk into again.
+              //
+              // UNVERIFIED on purpose: this text came from MIXED audio (a human
+              // plus Nova's own output through the speakers), which is never
+              // speaker-classified. Reusing the handle from the command Nova
+              // was answering would attribute one person's interruption to
+              // whoever spoke before them.
               lastHeardAt = Date.now();
               setVoiceStatus("speaking");
-              await sendMessage(interruption);
+              await sendMessage(interruption, [], unverifiedVoiceOrigin());
               await waitForResponseToFinish();
             }
             setPhase("CAPTURING_COMMAND", { reason: "session_next" });
           } else {
-            await sendMessage(text);
+            await sendMessage(text, [], voiceOrigin(voiceTurnIdOf(stt)));
             if (!ttsPlayingRef.current) setVoiceStatus("idle");
             setPhase("RESPONDING", { reason: "session_sent" });
             await waitForResponseToFinish();
@@ -1098,17 +1113,22 @@ export default function App() {
     });
   };
 
-  async function nonStreamingFallback(text, files = []) {
+  async function nonStreamingFallback(text, files = [], origin = null) {
     const resolvedLocation = await locationForMessage(text);
+    // Same origin as the stream attempt. If the stream already redeemed the
+    // handle, the backend resolves this retry as UNVERIFIED — correct and safe.
+    // Dropping the origin to make the retry "work" would promote it to typed
+    // owner, which is the one outcome that must never happen (V3 P5.1e).
     const resp = await fetch(apiUrl("/chat"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: text || null,
+      body: JSON.stringify(buildFallbackBody({
+        text,
         attachments: files,
-        ...(conversationId ? { conversation_id: conversationId } : {}),
-        ...(resolvedLocation ? { current_location: resolvedLocation } : {}),
-      }),
+        conversationId,
+        location: resolvedLocation,
+        origin,
+      })),
     });
     if (!resp.ok) {
       const raw = await resp.text();
@@ -1139,7 +1159,7 @@ export default function App() {
   };
 
   // Main sendMessage for ChatPanel
-  const sendMessage = async (text, files = []) => {
+  const sendMessage = async (text, files = [], origin = null) => {
     const cleanText = (text || "").trim();
     const attachments = Array.isArray(files) ? files.filter(Boolean) : [];
     if (!cleanText && !attachments.length) return;
@@ -1169,14 +1189,13 @@ export default function App() {
           "Content-Type": "application/json",
           "Accept": "text/event-stream, text/plain",
         },
-        body: JSON.stringify({
-          msg: cleanText || null,
+        body: JSON.stringify(buildStreamBody({
+          text: cleanText,
           attachments,
-          hint: "",
-          speak: true,
-          ...(conversationId ? { conversation_id: conversationId } : {}),
-          ...(resolvedLocation ? { current_location: resolvedLocation } : {}),
-        }),
+          conversationId,
+          location: resolvedLocation,
+          origin,
+        })),
         signal: ctl.signal,
       });
 
@@ -1300,14 +1319,14 @@ export default function App() {
 
         return assistantText;
       } else {
-        const reply = await nonStreamingFallback(cleanText, attachments);
+        const reply = await nonStreamingFallback(cleanText, attachments, origin);
         return reply;
       }
     } catch (err) {
       if (ctl.signal.aborted) return;
       console.error("stream error:", err);
       try {
-        const reply = await nonStreamingFallback(cleanText, attachments);
+        const reply = await nonStreamingFallback(cleanText, attachments, origin);
         return reply;
       } catch (e2) {
         const msg = (e2 && e2.message) ? String(e2.message) : "Sorry — I hit a connection error.";
@@ -1338,7 +1357,14 @@ export default function App() {
       // Transcription finished gate for wake resumption.
       transcribeDoneAtRef.current = 0;
 
-      const text = await transcribeBlob(blob, apiUrl("/stt"));
+      // Clean command audio: the one place speaker identification belongs.
+      // ONE upload, ONE decode, ONE Whisper pass, at most one embedding — the
+      // handle rides back on this same response rather than costing a second
+      // transcription (V3 P5.1e).
+      const stt = await transcribeBlobDetailed(blob, {
+        url: apiUrl("/stt"), speaker: true, debugTag: "capture",
+      });
+      const text = stt.text;
       transcribeDoneAtRef.current = Date.now();
 
       if (!text?.trim()) {
@@ -1359,8 +1385,9 @@ export default function App() {
       const cooldownMs = 4000;
       wakeResumeAtRef.current = Date.now() + cooldownMs;
 
-      // Send message and then speak last assistant reply
-      await sendMessage(text);
+      // Send message and then speak last assistant reply. A missing handle
+      // still travels as VOICE — never as typed — so it resolves unverified.
+      await sendMessage(text, [], voiceOrigin(voiceTurnIdOf(stt)));
 
       // If TTS is not playing, return to idle immediately.
       if (!ttsPlayingRef.current) {

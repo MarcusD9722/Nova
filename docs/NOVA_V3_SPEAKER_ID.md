@@ -17,7 +17,8 @@ large phase.
 | **P5.1d.1** | read side effects, delimiter-exact namespaces, durable turn attribution, guest lessons applied |
 | **P5.1d.2** | the direct tool surface — the boundary the model could step around by emitting a tool call |
 | **P5.1d.3** | the full persistent-state inventory: durable stores that are not called "memory" |
-| **P5.1d.4 (this pass)** | connected-account plugins, and the last secondary-prompt identity |
+| **P5.1d.4** | connected-account plugins, and the last secondary-prompt identity |
+| **P5.1e (this pass)** | **ACTIVATION** — the live voice path now carries identity, and P4 episodes carry speaker provenance |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -780,6 +781,138 @@ distinction stays honest rather than drifting into an implied guarantee.
 The guard is a property read on a `ContextVar` — **0.16 µs**. A refused
 `email.recent` returns in 55.7 µs median, *faster* than the unwrapped
 `system.time` control at 72.2 µs, because it does no work at all.
+
+---
+
+## P5.1e — the pipeline is ACTIVE
+
+Everything before this built a boundary nothing reached: the frontend requested
+no classification and sent no handle, so a live voice turn resolved as
+typed/legacy owner. Correct, and inert. It is now wired.
+
+### The three audio paths
+
+```
+WAKE          audio → STT only                        → wake trigger
+              (no `speaker` field, zero embeddings)
+
+CLEAN COMMAND audio → one decode → Whisper + ECAPA     → opaque handle
+                    → chat (input_source=voice + handle)
+                    → redeem → TurnIdentity
+                    → prompt / tools / memory / episodes
+
+BARGE-IN      MIXED audio → STT + echo classifier      → no embedding, ever
+                    → salvaged text → chat (input_source=voice, NO handle)
+                    → UNVERIFIED
+```
+
+Identity is requested exactly where the audio is clean and the utterance is a
+command. Wake stays speaker-free — classifying every *"Hey Nova"* would run an
+embedding on the continuous listening loop for no gain. Barge-in stays
+unclassified because the capture contains Nova's own output leaking through the
+speakers, so embedding it would be classifying her voice as often as anyone's.
+
+### The rule the whole activation rests on
+
+> **A voice turn with no handle is still a VOICE turn.**
+
+`input_source` and `voice_turn_id` are independent: the first is transport, the
+second is evidence. Dropping the transport when evidence is missing would
+silently promote an unverified utterance to typed-owner. Asserted for a null
+handle, an undefined handle, a whitespace handle, and barge-in salvage — on
+**both** `/chat/stream` and the `/chat` fallback.
+
+### One STT, one handle, one turn
+
+| path | upload | Whisper | ECAPA | chat |
+|---|---|---|---|---|
+| typed | 0 | 0 | 0 | 1 |
+| wake chunk | 1 | 1 | **0** | 0 |
+| clean command | 1 | 1 | ≤1 | 1 |
+| empty command | 1 | 1 | **0** | **0** |
+| barge-in (mixed) | 1 | 1 | **0** | 0 or 1 unverified |
+
+The handle rides back on the *same* `/stt` response, so identity never costs a
+second transcription. `speaker` is a multipart **form field**, matching the
+existing backend contract — `/stt?speaker=true` would have been a second,
+divergent API.
+
+### The retry case
+
+The `/chat` fallback carries the **same** origin as the stream attempt. If the
+stream already redeemed the handle, replay protection resolves the retry as
+unverified. That is the correct outcome, and the client deliberately does not
+"help" by dropping the handle or minting a fresh one — either would upgrade the
+retry to typed owner. `VoiceTurnRegistry` stays single-use.
+
+### Session commands are independent
+
+Each command in an active voice session gets its own classification and its own
+one-use handle. A session is not proof the same human is still talking: Marcus
+can start one and Alice can answer the next turn. This is why identity is
+per-command rather than per-conversation.
+
+### The client asserts nothing
+
+The only fields it sends are `input_source` and `voice_turn_id`. `display_name`
+and `status` come back for optional debug UI, but no client branch decides "this
+is Marcus, therefore…" — there is no localStorage owner flag, no persisted
+profile id, and no client-generated handle. Privacy behaviour comes from the
+backend redeeming the handle, and a test asserts the forbidden fields never
+appear in either body.
+
+### P4 episodes: provenance and read scope
+
+Episodes said *"Marcus chose …"* unconditionally and were retrieved with no
+speaker boundary at all. Both are closed.
+
+`episodes` gained `speaker_entity` / `speaker_label` / `input_source` by
+idempotent in-place migration. Wording follows attribution — *"Alice chose …"*,
+and *"The user chose …"* when Nova could not attribute the turn. **Nova does not
+manufacture Marcus merely because an event lacks attribution.**
+
+| | reads |
+|---|---|
+| owner | everything, unchanged |
+| known guest | their own episodes + `system` |
+| unknown | `system` only |
+| **unattributed / legacy** | **treated as owner-private** |
+
+Ownership is read from structured provenance, never by parsing summary prose.
+
+**Migration assumption, stated plainly:** every episode written before this
+phase is Marcus's, because nothing else could reach the turn path.
+
+### The bug this phase found in itself
+
+The episodic promoter drains the event bus **on its own task** — its own
+docstring says so. So `current_identity()` inside it read the typed default, and
+a guest's correction would have been recorded as *"Marcus corrected …"*. That is
+D12 exactly, one layer further down.
+
+`NovaEvent` now carries an identity snapshot stamped at **publish**, the last
+moment the speaker is still in scope, and the promoter re-enters it. Verified
+through the real publish → promoter → worker → SQLite path, not a helper.
+
+### Denied episodes leave no trace
+
+The same ordering P5.1d.1 established for semantic memory: **filter → rank →
+reinforce**. A denied episode gets no `access_count` bump, no `last_accessed_at`
+stamp — and no **cold read**, which would otherwise pull Marcus's evidence off
+disk for someone not allowed to see it.
+
+### Still not authentication
+
+Permissions are identical for typed owner, recognised owner, known guest and
+unknown. `evaluate()` still takes no identity argument. Connected-account
+plugins remain owner data-scoped (P5.1d.4), and **generic actuator permission
+coverage is still P8**.
+
+### What is NOT validated
+
+No live human accuracy figure exists. Thresholds remain provisional and
+`status()` still reports `threshold_calibrated: false`. **P5.2 human calibration
+is required before any accuracy claim.**
 
 ### What the owner can still see
 

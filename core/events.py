@@ -88,6 +88,12 @@ class EpisodicPersistEvent:
     #: Set only for selections. Scoped to the choice context, so an unrelated
     #: comparison's live choice is untouched.
     supersede_scope: str | None = None
+    #: Who this happened with (V3 P5.1e). Snapshotted at capture, exactly as
+    #: MemoryIngestEvent already does and for the same reason: this event
+    #: crosses a queue, and a ContextVar does not. The worker must read THIS,
+    #: never `current_identity()`. None means a pre-P5.1e or system-originated
+    #: event and is treated as owner history.
+    identity: TurnIdentity | None = None
 
 
 @dataclass(frozen=True)
