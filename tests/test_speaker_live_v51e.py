@@ -159,12 +159,16 @@ async def test_episode_wording_and_provenance():
                   "an unattributed turn gets neutral wording, not a manufactured Marcus")
 
         # And the durable row carries structured provenance, not just prose.
-        from core.workers.episodic_ingest import _speaker_fields
-        check(_speaker_fields(None) == ("user", "Marcus", "typed"),
-              "a pre-P5.1e event is owner history (the migration assumption)")
-        check(_speaker_fields(TurnIdentity.typed())[0] == "user", "typed is owner")
-        check(_speaker_fields(alice)[0] == "speaker:p-alice", "a guest gets their namespace")
-        e, lab, src = _speaker_fields(unk)
+        from core.workers.episodic_ingest import _actor_fields, _privacy_for
+        # P5.1e.1: no identity now means NO HUMAN, not "assume Marcus". The
+        # actor is Nova; the privacy owner is still Marcus (see _privacy_for).
+        check(_actor_fields(None) == ("system", "Nova", "system"),
+              "an off-turn event's ACTOR is Nova, not a fabricated Marcus")
+        check(_privacy_for(None, "project_event") == "user",
+              "while its PRIVACY OWNER is still Marcus")
+        check(_actor_fields(TurnIdentity.typed())[0] == "user", "typed is owner")
+        check(_actor_fields(alice)[0] == "speaker:p-alice", "a guest gets their namespace")
+        e, lab, src = _actor_fields(unk)
         check(e == "unverified" and lab == "The user",
               f"and an unattributed turn is its OWN namespace, not Marcus ({e})")
 
@@ -241,13 +245,18 @@ async def test_episodic_read_scope_and_no_side_effects():
 
         await store.record_episode(Episode(
             id="ep-owner", kind="selection", summary=f"Marcus chose the {OWNER_EPISODE} drive",
-            entities=[OWNER_EPISODE], speaker_entity="user", speaker_label="Marcus"))
+            entities=[OWNER_EPISODE], speaker_entity="user", speaker_label="Marcus",
+            actor_entity="user", privacy_scope="user"))
         await store.record_episode(Episode(
             id="ep-alice", kind="selection", summary=f"Alice chose the {ALICE_PROFILE} option",
-            entities=[ALICE_PROFILE], speaker_entity="speaker:p-alice", speaker_label="Alice"))
+            entities=[ALICE_PROFILE], speaker_entity="speaker:p-alice", speaker_label="Alice",
+            actor_entity="speaker:p-alice", privacy_scope="speaker:p-alice"))
         await store.record_episode(Episode(
             id="ep-sys", kind="project_milestone", summary="The SHARED-BUILD-990 finished",
-            entities=["SHARED-BUILD-990"], speaker_entity="system", speaker_label=""))
+            # Explicitly classified impersonal, which is what makes it shared —
+            # NOT the fact that Nova was the actor (P5.1e.1).
+            entities=["SHARED-BUILD-990"], speaker_entity="system",
+            actor_entity="system", actor_label="Nova", privacy_scope="system"))
         # A legacy row with no attribution at all — must be treated as owner.
         async with aiosqlite.connect(str(nova.memory._sqlite._db_path)) as db:
             await db.execute(
@@ -255,7 +264,9 @@ async def test_episodic_read_scope_and_no_side_effects():
                 "freshness, provenance, importance, access_count, created_at, "
                 "speaker_entity, speaker_label, input_source) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("ep-legacy", "selection", f"chose the LEGACY-EP-993 item", '["LEGACY-EP-993"]',
+                # No attribution at all — the pre-P5.1e shape. Must read back as
+                # owner-private, which is what the column default gives it.
+                ("ep-legacy", "selection", "chose the LEGACY-EP-993 item", '["LEGACY-EP-993"]',
                  "TOOL_RESULT", "SESSION", "{}", 0.5, 0, "2026-01-01T00:00:00+00:00",
                  "", "", "typed"))
             await db.commit()
@@ -320,7 +331,7 @@ async def test_cold_evidence_not_hydrated_for_denied_episode():
         await store.record_episode(Episode(
             id="ep-cold", kind="selection", summary=f"Marcus chose {OWNER_EPISODE}",
             entities=[OWNER_EPISODE], speaker_entity="user", speaker_label="Marcus",
-            provenance={"cold_ref": ref}))
+            actor_entity="user", privacy_scope="user", provenance={"cold_ref": ref}))
 
         reads = {"n": 0}
         orig_get = store.cold.get
@@ -369,7 +380,8 @@ async def test_production_sentinels_through_live_voice():
         store = EpisodicStore(Path(m._sqlite._db_path))
         await store.record_episode(Episode(
             id="ep-sent", kind="selection", summary=f"Marcus chose {OWNER_EPISODE}",
-            entities=[OWNER_EPISODE], speaker_entity="user", speaker_label="Marcus"))
+            entities=[OWNER_EPISODE], speaker_entity="user", speaker_label="Marcus",
+            actor_entity="user", privacy_scope="user"))
 
         async def prompts_for(handle, source="voice"):
             ident = await resolve(handle, source)

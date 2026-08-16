@@ -744,12 +744,36 @@ class SQLiteMemoryBackend:
         cur = await db.execute("PRAGMA table_info(episodes);")
         have = {r[1] for r in await cur.fetchall()}
         for col, default in (("speaker_entity", "'user'"), ("speaker_label", "''"),
-                             ("input_source", "'typed'")):
+                             ("input_source", "'typed'"), ("actor_entity", "'user'"),
+                             ("actor_label", "''"), ("privacy_scope", "'user'")):
             if col not in have:
                 await db.execute(
                     f"ALTER TABLE episodes ADD COLUMN {col} TEXT NOT NULL DEFAULT {default};")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_episodes_speaker "
-                         "ON episodes(speaker_entity, created_at DESC);")
+        # V3 P5.1e.1 backfill. Rows written by PR #41 carry speaker_entity and
+        # nothing else, so derive BOTH new fields from it — the actor and the
+        # privacy owner genuinely were the same thing for those human turns.
+        # `user`/`speaker:<id>` map across unchanged; anything unrecognised
+        # (including '' from a pre-P5.1e row) falls closed to owner-private,
+        # because widening legacy data to shared is the one irreversible
+        # mistake available here.
+        if "privacy_scope" not in have:
+            await db.execute(
+                "UPDATE episodes SET privacy_scope = CASE "
+                "  WHEN speaker_entity IN ('user','unverified') THEN speaker_entity "
+                "  WHEN speaker_entity LIKE 'speaker:%' THEN speaker_entity "
+                "  ELSE 'user' END")
+        if "actor_entity" not in have:
+            await db.execute(
+                "UPDATE episodes SET actor_entity = CASE "
+                "  WHEN speaker_entity IN ('user','unverified','system') THEN speaker_entity "
+                "  WHEN speaker_entity LIKE 'speaker:%' THEN speaker_entity "
+                "  ELSE 'user' END, "
+                "actor_label = speaker_label")
+        for idx in ("CREATE INDEX IF NOT EXISTS idx_episodes_speaker "
+                    "ON episodes(speaker_entity, created_at DESC);",
+                    "CREATE INDEX IF NOT EXISTS idx_episodes_privacy "
+                    "ON episodes(privacy_scope, created_at DESC);"):
+            await db.execute(idx)
 
     async def _migrate_turns_schema(self, db: aiosqlite.Connection) -> None:
         """Add speaker attribution to an existing `turns` table, in place.

@@ -212,9 +212,43 @@ _CURRENT: contextvars.ContextVar[TurnIdentity] = contextvars.ContextVar(
     "nova_turn_identity", default=TurnIdentity.typed())
 
 
+#: Is a human turn actually in scope on this task?
+#:
+#: Separate from `_CURRENT` because `_CURRENT` has a legacy DEFAULT, and a
+#: default is indistinguishable from a real value once you read it. Off the turn
+#: path — a background worker, a scheduled build, a bus publish from a timer —
+#: `current_identity()` returns typed Marcus, which reads as "Marcus is here"
+#: and is simply false (V3 P5.1e.1). Measured: an off-turn `project.completed`
+#: was persisted as `speaker_label="Marcus"` next to a summary that said "Nova
+#: finished …".
+_IN_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "nova_turn_active", default=False)
+
+
 def current_identity() -> TurnIdentity:
-    """Identity of the turn on this task. Typed/legacy when nothing is set."""
+    """Identity of the turn on this task. Typed/legacy when nothing is set.
+
+    Unchanged on purpose. A great deal of code relies on the legacy default —
+    typed Marcus is the right answer for every pre-P5 caller — and making this
+    return None would be a far larger change than the bug warrants. Callers that
+    genuinely need to know whether a human is present ask
+    `current_identity_or_none()`.
+    """
     return _CURRENT.get()
+
+
+def has_active_turn() -> bool:
+    """True only inside `active_turn(...)`. False for the legacy default."""
+    return _IN_TURN.get()
+
+
+def current_identity_or_none() -> TurnIdentity | None:
+    """The identity of a REAL turn, or None when nothing is in scope.
+
+    Use this anywhere the answer "nobody" is meaningfully different from
+    "Marcus" — attribution, provenance, anything that will be written down.
+    """
+    return _CURRENT.get() if _IN_TURN.get() else None
 
 
 @contextmanager
@@ -222,9 +256,11 @@ def active_turn(identity: TurnIdentity | None) -> Iterator[TurnIdentity]:
     """Scope an identity to one logical turn, always restoring it afterwards."""
     ident = identity or TurnIdentity.typed()
     token = _CURRENT.set(ident)
+    marker = _IN_TURN.set(True)
     try:
         yield ident
     finally:
+        _IN_TURN.reset(marker)
         _CURRENT.reset(token)
 
 

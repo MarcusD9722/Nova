@@ -30,10 +30,17 @@ def _clip(text: Any, limit: int = 240) -> str:
 
 
 def _publisher_identity():
-    """The speaker in scope at publish time, or None off the turn path."""
+    """The speaker in scope at publish time, or None off the turn path.
+
+    `current_identity_or_none()`, NOT `current_identity()`: the latter has a
+    legacy default of typed Marcus, so every background publish — a finished
+    build, a recurring failure, a scheduled job — was snapshotted as though he
+    had said it (V3 P5.1e.1). None here means "no human was involved", which is
+    a different and true thing.
+    """
     try:
-        from core.turn_identity import current_identity
-        return current_identity()
+        from core.turn_identity import current_identity_or_none
+        return current_identity_or_none()
     except Exception:  # noqa: BLE001 - the bus never raises
         return None
 

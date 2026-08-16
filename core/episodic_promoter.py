@@ -53,7 +53,8 @@ from core.event_bus import BUS
 from core.events import EpisodicPersistEvent
 from contextlib import nullcontext as _no_scope
 
-from core.turn_identity import active_turn, current_identity
+from core.turn_identity import (OWNER_ENTITY, active_turn, current_identity,
+                                current_identity_or_none)
 
 
 def _speaker_name() -> str:
@@ -62,14 +63,41 @@ def _speaker_name() -> str:
     "Marcus chose the WD Gold" is exactly right until Alice can produce a real
     turn, at which point it is a fabricated quote about the wrong person. An
     unattributed turn gets neutral wording rather than a guess — Nova does not
-    manufacture Marcus merely because an event lacks attribution.
+    manufacture Marcus merely because an event lacks attribution, and off the
+    turn path entirely she says nobody's name (V3 P5.1e.1).
     """
-    ident = current_identity()
+    ident = current_identity_or_none()
+    if ident is None:
+        return "Nova"
     if ident.is_owner:
         return "Marcus"
     if ident.is_known_other and ident.display_name:
         return ident.display_name
     return "The user"
+
+
+def _correction_subject(entity: str, attribute: str) -> str:
+    """"favorite_color", not "speaker:p-alice favorite_color".
+
+    Strips the SPEAKER'S OWN personal root — structurally, from turn identity,
+    not by pattern-matching entity strings. That distinction matters: a blind
+    `replace("speaker:", "")` would also rewrite a subject that legitimately
+    mentions a different speaker, turning "Alice corrected Bob's note" into
+    something Nova never observed.
+
+    Provenance keeps the true entity; this only affects the sentence.
+    """
+    ent = str(entity or "").strip()
+    attr = str(attribute or "").strip()
+    ident = current_identity_or_none()
+    own = ident.memory_entity if ident is not None else OWNER_ENTITY
+    if own and ent.lower() == str(own).lower():
+        return attr                       # their own root: just the attribute
+    if own and ent.lower().startswith(str(own).lower() + ":"):
+        return f"{ent[len(str(own)) + 1:]} {attr}".strip()   # their sub-namespace
+    if ent.lower() == OWNER_ENTITY:
+        return attr                       # legacy "user name" -> "name"
+    return f"{ent} {attr}".strip()
 
 from core.logging_setup import get_logger
 from core.workers.lifecycle import log_worker_error, stop_worker
@@ -257,7 +285,7 @@ class EpisodicPromoter:
             return
         kind = EP_MCP_RESULT if tool.startswith("mcp:") else EP_TOOL_RESULT
         if self._submit(EpisodicPersistEvent(
-            identity=current_identity(),
+            identity=current_identity_or_none(),
             conversation_id=artifact.conversation_id,
             turn_id=artifact.turn_id,
             timestamp=datetime.now(timezone.utc),
@@ -304,7 +332,7 @@ class EpisodicPromoter:
             "turn_id": turn_id,
         }
         if self._submit(EpisodicPersistEvent(
-            identity=current_identity(),
+            identity=current_identity_or_none(),
             conversation_id=conversation_id,
             turn_id=turn_id,
             timestamp=datetime.now(timezone.utc),
@@ -391,7 +419,7 @@ class EpisodicPromoter:
             if was and was.lower() == now.lower():
                 self.stats["rejected"] += 1
                 return
-            subject = f"{entity} {attribute}".replace("user ", "").strip()
+            subject = _correction_subject(entity, attribute)
             who = _speaker_name()
             summary = (f"{who} corrected {subject}: {was} -> {now}" if was
                        else f"{who} corrected {subject} to {now}")
@@ -413,7 +441,7 @@ class EpisodicPromoter:
             outcome = None
 
         if self._submit(EpisodicPersistEvent(
-            identity=current_identity(),
+            identity=current_identity_or_none(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             episode_id=ep_id, summary=summary, entities=entities,
             reason="user corrected a belief", kind=EP_CORRECTION,
@@ -442,7 +470,7 @@ class EpisodicPromoter:
         if detail:
             summary += f": {detail}"
         if self._submit(EpisodicPersistEvent(
-            identity=current_identity(),
+            identity=current_identity_or_none(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             # A build can legitimately happen many times for one project, so
             # identity includes the moment. The bus timestamp is fixed at
@@ -471,7 +499,7 @@ class EpisodicPromoter:
         if not (slug and error):
             return
         if self._submit(EpisodicPersistEvent(
-            identity=current_identity(),
+            identity=current_identity_or_none(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             episode_id=f"fail-proj-{slug}-{_digest(ErrorLog.signature(slug, error))}",
             summary=f"Building {slug} failed: {error[:180]}",
@@ -509,7 +537,7 @@ class EpisodicPromoter:
         # Identity is the SIGNATURE, so the fourth and fiftieth occurrence
         # update one episode instead of adding forty-seven.
         if self._submit(EpisodicPersistEvent(
-            identity=current_identity(),
+            identity=current_identity_or_none(),
             conversation_id="", turn_id="", timestamp=datetime.now(timezone.utc),
             episode_id=f"fail-{_digest(signature)}",
             summary=f"Recurring failure in {etype} ({count}x): {str(message)[:160]}",

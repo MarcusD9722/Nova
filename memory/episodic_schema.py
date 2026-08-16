@@ -42,17 +42,30 @@ EPISODIC_DDL: list[str] = [
         last_accessed_at TEXT,
         superseded_by TEXT,
         created_at TEXT NOT NULL,
-        -- V3 P5.1e: whose episode this is. `user` is the correct backfill for
-        -- every pre-activation row: the frontend never sent a speaker identity
-        -- before this phase, so all existing episodic history IS Marcus's.
-        -- Never store an embedding, similarity, threshold or raw audio here.
+        -- V3 P5.1e / P5.1e.1: WHO did it, and WHO may read it. These are two
+        -- questions, and conflating them is a real hazard in both directions:
+        -- a background build failure on Marcus's private project has actor
+        -- `system` but must stay owner-private, while labelling it `user` to
+        -- keep it private would assert he ran the build.
+        --
+        --   actor_*        provenance: who caused this. Never authorises.
+        --   privacy_scope  authorisation: whose episode this is. Never rendered.
+        --
+        -- `user` is the correct backfill for every pre-activation row: the
+        -- frontend sent no speaker identity before P5.1e, so all existing
+        -- episodic history IS Marcus's. Never store an embedding, similarity,
+        -- threshold or raw audio here.
         speaker_entity TEXT NOT NULL DEFAULT 'user',
         speaker_label TEXT NOT NULL DEFAULT '',
-        input_source TEXT NOT NULL DEFAULT 'typed'
+        input_source TEXT NOT NULL DEFAULT 'typed',
+        actor_entity TEXT NOT NULL DEFAULT 'user',
+        actor_label TEXT NOT NULL DEFAULT '',
+        privacy_scope TEXT NOT NULL DEFAULT 'user'
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_speaker ON episodes(speaker_entity, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_episodes_privacy ON episodes(privacy_scope, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_project ON episodes(project, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_conv ON episodes(conversation_id, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind, importance DESC);",
@@ -152,5 +165,6 @@ EPISODIC_SPEAKER_MIGRATION = (
         "ALTER TABLE episodes ADD COLUMN speaker_label TEXT NOT NULL DEFAULT '';",
         "ALTER TABLE episodes ADD COLUMN input_source TEXT NOT NULL DEFAULT 'typed';",
         "CREATE INDEX IF NOT EXISTS idx_episodes_speaker ON episodes(speaker_entity, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_episodes_privacy ON episodes(privacy_scope, created_at DESC);",
     ],
 )

@@ -18,7 +18,8 @@ large phase.
 | **P5.1d.2** | the direct tool surface — the boundary the model could step around by emitting a tool call |
 | **P5.1d.3** | the full persistent-state inventory: durable stores that are not called "memory" |
 | **P5.1d.4** | connected-account plugins, and the last secondary-prompt identity |
-| **P5.1e (this pass)** | **ACTIVATION** — the live voice path now carries identity, and P4 episodes carry speaker provenance |
+| **P5.1e** | **ACTIVATION** — the live voice path now carries identity, and P4 episodes carry speaker provenance |
+| **P5.1e.1 (this pass)** | off-turn attribution, and actor separated from privacy owner |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -913,6 +914,91 @@ coverage is still P8**.
 No live human accuracy figure exists. Thresholds remain provisional and
 `status()` still reports `threshold_calibrated: false`. **P5.2 human calibration
 is required before any accuracy claim.**
+
+---
+
+## P5.1e.1 — who did it is not who owns it
+
+Two defects in P5.1e, both reproduced on `edc458a`.
+
+### Off-turn events claimed to be Marcus
+
+`current_identity()` has a ContextVar **default** of typed Marcus, and a default
+is indistinguishable from a real value once read. `_publisher_identity()` — whose
+own docstring said *"or None off the turn path"* — therefore returned him for
+every background publish.
+
+Measured: an off-turn `project.completed` persisted as
+`speaker_label="Marcus"` beside a summary reading *"Nova finished …"*. One row,
+contradicting itself.
+
+`current_identity()` is **unchanged** — far too much code correctly relies on the
+legacy default. What is new is the ability to tell the states apart:
+
+| | `current_identity()` | `current_identity_or_none()` |
+|---|---|---|
+| outside a turn | typed owner *(unchanged)* | **None** |
+| `active_turn(typed)` | typed owner | typed owner |
+| `active_turn(Alice)` | Alice | Alice |
+
+The bus now snapshots the second one. Nesting, unwinding and concurrent turns are
+asserted; `identity` stays out of `to_dict()` so it never reaches the SSE stream.
+
+### Actor is not the privacy owner
+
+P5.1e used one field for both, and that is unsafe in **both** directions. A
+background build failure on Marcus's private project:
+
+| marking | actor | privacy | verdict |
+|---|---|---|---|
+| `system` | correct | **a guest can read his project** | leak |
+| `user` | **claims he ran the build** | correct | false provenance |
+
+So they are two fields now, and neither lies:
+
+```
+actor_entity / actor_label   who caused it   -> decides WORDING
+privacy_scope                whose it is     -> decides ACCESS
+```
+
+The privacy of that row *today* was an accident of the first bug. Fixing the
+actor without splitting the concepts would have **opened** it — which is why
+these two land together.
+
+### What "system" actually means
+
+`_SHARED_SYSTEM_KINDS` is **empty**, deliberately. Every system episode Nova
+currently produces — project events, build failures, recurring internal errors —
+carries project names, tool arguments, file paths or query excerpts, all of which
+are Marcus's. Nova executing something does not make its contents impersonal.
+
+A reserved scope with zero current producers is better than widening private
+state to fit a category that reads well. A genuinely public event can be added
+later, one kind at a time, with its content checked.
+
+| speaker | reads |
+|---|---|
+| owner | everything |
+| known guest | own `privacy_scope` + explicitly shared `system` |
+| unknown | explicitly shared `system` only |
+| legacy / unmigrated | **owner-private** |
+
+Authorisation reads `privacy_scope` and nothing else — never the actor, never the
+summary.
+
+### Migration
+
+Idempotent, in place, no rebuild. PR #41 rows derive both new fields from
+`speaker_entity` (actor and owner genuinely were the same for those human turns);
+anything unrecognised falls closed to owner-private. Legacy data is never widened.
+
+### Correction wording
+
+`Alice corrected speaker:p-alice favorite_color …` now reads
+`Alice corrected favorite_color …`. Done structurally by stripping the speaker's
+**own** root from turn identity — a blind string replace would have rewritten a
+subject that legitimately mentions a *different* speaker. Provenance keeps the
+true entity.
 
 ### What the owner can still see
 

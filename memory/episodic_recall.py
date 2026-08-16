@@ -192,6 +192,9 @@ def _may_read_episode(ep) -> bool:
     Structured provenance only — the summary is prose written for a human and
     parsing it to decide ownership would make privacy depend on phrasing.
 
+    Reads `privacy_scope`, NOT the actor: who did a thing and whose thing it is
+    are different questions, and only the second one authorises.
+
     Conservative by construction: an episode whose attribution is missing or
     unrecognised is treated as OWNER-PRIVATE, because every episode written
     before speaker activation was Marcus's.
@@ -203,10 +206,16 @@ def _may_read_episode(ep) -> bool:
     ident = current_identity()
     if ident.is_owner:
         return True
-    owner_of = str(getattr(ep, "speaker_entity", "") or OWNER_ENTITY).strip().lower()
+    # PRIVACY SCOPE, never the actor (V3 P5.1e.1). A background failure on
+    # Marcus's project has actor `system` and belongs to him; reading the actor
+    # here would hand it to anyone in the room.
+    owner_of = str(getattr(ep, "privacy_scope", "") or "").strip().lower()
+    if not owner_of:
+        # An unmigrated or hand-built row. Fail closed to the owner.
+        owner_of = OWNER_ENTITY
     if owner_of == EPISODE_SYSTEM_SCOPE:
-        # Things that happened without a human saying them — a build finished,
-        # a capability was registered. Impersonal, so shared.
+        # Explicitly classified impersonal. Nothing currently produces this —
+        # see _SHARED_SYSTEM_KINDS — so it is a reserved scope, not a hole.
         return True
     own = ident.memory_entity
     return bool(own) and owner_of == str(own).strip().lower()
