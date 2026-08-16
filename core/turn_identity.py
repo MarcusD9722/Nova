@@ -265,6 +265,14 @@ SHARED_ENTITY_PREFIXES = SHARED_ENTITY_ROOTS
 #: The one delimiter that means "inside". Everything here is exact about it.
 SEP = ":"
 
+#: The complete set of beside-the-root child namespaces P5.1d could write
+#: (`lesson:speaker:p-alice` and friends). Finite and closed on purpose: the
+#: compatibility rule matches these exact shapes and nothing else.
+LEGACY_SPEAKER_CHILD_ROOTS: tuple[str, ...] = ("lesson", "mood", "wellbeing", "session")
+
+#: What a speaker means when they say "me".
+SELF_ALIASES: frozenset[str] = frozenset({"user", "me", "myself", ""})
+
 
 def under_root(entity: Any, root: str) -> bool:
     """Is `entity` the namespace `root`, or something nested inside it?
@@ -309,10 +317,18 @@ def entity_belongs_to_speaker(entity: Any, memory_entity: Any) -> bool:
         return True
     # Back-compat: P5.1d wrote the child namespaces the other way round
     # (`lesson:speaker:p-alice`). Nothing live produced those — the frontend has
-    # never sent a speaker — but recognising them here costs one comparison and
-    # avoids stranding any that a test run or a manual write left behind.
+    # never sent a speaker — but recognising them avoids stranding any a test
+    # run or manual write left behind.
+    #
+    # It must match the EXACT shapes P5.1d could produce, not a suffix. An
+    # `endswith(":" + own)` rule read `speaker:p-bob:lesson:speaker:p-alice` as
+    # Alice's, which is Bob's namespace with her name appended — the same
+    # substring-for-structure mistake `under_root` exists to prevent, smuggled
+    # back in through the compatibility path (P5.1d.2).
     e = str(entity or "").strip().lower()
-    return e.endswith(SEP + own) and own.startswith("speaker" + SEP)
+    if not own.startswith("speaker" + SEP):
+        return False
+    return any(e == f"{root}{SEP}{own}" for root in LEGACY_SPEAKER_CHILD_ROOTS)
 
 
 def personal_tail(entity: Any) -> str:
@@ -392,6 +408,55 @@ def remap_entity_for(entity: Any, identity: "TurnIdentity | None" = None) -> str
     # Their people, their notes, their projects — kept under their own root so
     # "person:sarah" from a guest never merges with Marcus's Sarah.
     return f"{own}:{e}"
+
+
+def resolve_write_target(entity: Any,
+                         identity: "TurnIdentity | None" = None,
+                         *, allow_shared: bool = False) -> tuple[str | None, str]:
+    """Where an EXPLICITLY NAMED entity may be written by the current speaker.
+
+    `remap_entity_for` answers "where do this speaker's words belong" for text
+    the extractor parsed. This answers the harder question: the model has handed
+    us an entity string and we must not trust it. The model does not know who is
+    in the room, and asking it to pick a safe target would make a privacy
+    boundary probabilistic (P5.1d.2).
+
+    Returns `(target, reason)`. A `None` target means refuse — never write.
+
+        owner                  -> (entity, "owner")          unchanged, always
+        unverified             -> (None,   "unverified_speaker")
+        guest, "me"/"user"     -> (their root, "self")
+        guest, own namespace   -> (entity, "own")
+        guest, another speaker -> (None,   "other_speaker")   <- the real attack
+        guest, shared entity   -> (entity, "shared") if allowed, else refuse
+        guest, anything else   -> (nested under them, "nested")
+
+    The `other_speaker` case is why this is a refusal rather than a remap:
+    measured on `d1ec5a9`, Alice calling memory.correct with
+    `entity="speaker:p-bob"` changed Bob's stored fact from blue to red.
+    """
+    ident = identity or current_identity()
+    e = str(entity or "").strip()
+    own = ident.memory_entity
+    if own is None:
+        return (None, "unverified_speaker")
+    if own == OWNER_ENTITY:
+        # Typed / legacy voice / recognised owner: byte-for-byte legacy.
+        return (e or OWNER_ENTITY, "owner")
+
+    low = e.lower()
+    if low in SELF_ALIASES:
+        return (own, "self")
+    if entity_belongs_to_speaker(low, own):
+        return (e, "own")
+    if low.startswith("speaker" + SEP):
+        # Names a speaker root that is not theirs. Refuse outright: nesting it
+        # under them would silently invent `speaker:p-alice:speaker:p-bob`,
+        # which reads like a claim about Bob and belongs to nobody.
+        return (None, "other_speaker")
+    if is_shared_entity(low):
+        return (e, "shared") if allow_shared else (None, "shared_write_refused")
+    return (f"{own}{SEP}{e}", "nested")
 
 
 def turn_speaker_label(identity: "TurnIdentity | None" = None) -> str:

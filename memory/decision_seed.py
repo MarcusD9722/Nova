@@ -511,6 +511,62 @@ def seed_decisions() -> list[Decision]:
                         "speaker identity.",
             decided_at="2026-08-15T00:00:00+00:00",
         ),
+        Decision(
+            id="D14",
+            title="The tool surface is scoped by data ownership, not by permission",
+            decision="Every direct memory tool routes through the same identity policy as "
+                     "the rest of memory. Writes resolve through resolve_write_target(), "
+                     "which REFUSES an entity naming another speaker's namespace rather "
+                     "than remapping it. Stores with no per-person ownership - people, "
+                     "events, the knowledge graph, the digital twin, reminders, thoughts - "
+                     "fail closed for non-owners with a scoped_unavailable result. "
+                     "memory.remember_person is scoped instead of refused because "
+                     "speaker:<id>:person:<key> already exists in the canonical hierarchy. "
+                     "PermissionBroker is untouched: every speaker may call every tool and "
+                     "receives the identical decision; only the reachable DATA changes.",
+            rationale="P5.1d and P5.1d.1 scoped the paths Nova takes on her own. The tools "
+                      "the MODEL calls were still global, and emitting a tool call is the "
+                      "ordinary way the model touches memory, so the boundary had a door "
+                      "in it. Measured on d1ec5a9: a guest overwrote another speaker's "
+                      "stored fact via memory.correct(entity='speaker:p-bob'), added "
+                      "people and events to Marcus's stores, mutated his relationship "
+                      "graph, and read Nova's private notes about him. Refusal beats "
+                      "remapping for another speaker's root: nesting it would produce "
+                      "speaker:p-alice:speaker:p-bob, which reads like a claim about Bob "
+                      "and belongs to nobody. The model cannot be asked to pick a safe "
+                      "entity - it does not know who is in the room, so delegating that "
+                      "would make a privacy boundary probabilistic.",
+            alternatives=["Routing identity into PermissionBroker (rejected: speaker "
+                          "identity is not authentication; this would make a voice match "
+                          "an authorisation level)",
+                          "Building parallel guest stores for people/events/graph in this "
+                          "patch (rejected: a half-built second memory system is harder to "
+                          "remove than a gap)",
+                          "Partially scoping memory.timeline (rejected: it aggregates "
+                          "events, digests and reminders - scoping one source leaves a "
+                          "history that looks complete and is not)",
+                          "Trusting tool descriptions to keep the model away from other "
+                          "speakers' data (rejected: descriptions are guidance, execution "
+                          "is the boundary)"],
+            evidence=["tests/test_speaker_tools_v51d2.py: Alice cannot correct Bob, Marcus "
+                      "or beneath either root, and Bob cannot correct Alice; an unverified "
+                      "speaker persists nothing, asserted against the facts table rather "
+                      "than the tool's return text; guests neither read nor mutate "
+                      "Marcus's people, events, timeline or graph; thoughts.recall, "
+                      "twin.profile, executive.brief and reminder.create are owner-only; "
+                      "shared world knowledge still reaches every speaker; permissions "
+                      "identical across five identities and three capabilities"],
+            subsystem="memory",
+            source_refs=["core/turn_identity.py::resolve_write_target",
+                         "core/tooling.py::_owner_only",
+                         "core/tooling.py::_memory_correct"],
+            constraints="Fail-closed refusals must stay DATA refusals with a sentence Nova "
+                        "can say aloud - never permission errors. The legacy namespace rule "
+                        "matches only the four exact shapes P5.1d could write; an endswith "
+                        "rule read speaker:p-bob:lesson:speaker:p-alice as Alice's and must "
+                        "never return.",
+            decided_at="2026-08-15T00:00:00+00:00",
+        ),
     ]
 
 
