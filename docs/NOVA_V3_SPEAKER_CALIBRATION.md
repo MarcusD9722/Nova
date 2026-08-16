@@ -16,7 +16,11 @@ suite deliberately cannot mark it passed.
 2. Open `tests/live_speaker_calibration.html` in a browser — **directly is
    fine**, it is a single static file with no build step.
 3. Set the backend URL (and the API token, if `NOVA_API_TOKEN` is configured).
-4. Press **Check**, then work down the nine steps.
+4. Press **Check**, then work down the twelve steps.
+
+Allow ~30–40 minutes with both people present for the whole run. Steps 1–8 are
+recognition; 9–11 are the acceptance checks that make the result mean something;
+12 is the report.
 
 The harness autosaves *non-audio* progress to `localStorage`, so an accidental
 refresh does not cost twenty utterances. **Audio is never saved** — each sample
@@ -36,7 +40,16 @@ is recorded, uploaded, embedded, and discarded.
 | 6 | both | 12 + 12 trials | calibrates the **margin** between two real people |
 | 7 | — | review the proposed fit, then apply it | fitting and applying are separate |
 | 8 | both | 10 + 10 **fresh** utterances | validation may not reuse calibration audio |
-| 9 | — | copy the JSON report | the artefact to hand back |
+| 9 | both **+ a third, unenrolled person** | memory sentinel, 5 turns in ONE conversation | proves attribution is real, not per-conversation luck |
+| 10 | both | permission probe — typed, Marcus voice, guest voice | identity must change no decision |
+| 11 | one person | 12 recordings, `/stt` only | what identification costs, off vs on |
+| 12 | — | copy the JSON report | the artefact to hand back |
+
+**Step 9 needs a third voice** — someone not enrolled, for the unverified turn.
+It can be the same session; just have a third person say one sentence. If no
+third person is available, an unverified condition also works (a deliberately
+poor or too-short recording), as long as `/stt` genuinely returns something
+other than `known`.
 
 Every trial utterance must be **new speech**, not an enrollment phrase.
 
