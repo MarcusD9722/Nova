@@ -31,10 +31,15 @@ class ToolSpec:
     name: str
     description: str
     fn: AsyncToolFn
-    #: Required. There is deliberately no default: a plugin added later must be
-    #: triaged, because the failure mode being closed here is a new integration
-    #: silently inheriting public access to somebody's private account.
-    data_scope: str = ""
+    #: Required, with NO default (V3 P5.1e §0). The decorator already refused to
+    #: omit it, but the dataclass still accepted a direct
+    #: `ToolSpec(name=…, description=…, fn=…)` and fell back to an empty string
+    #: that `_validate` then rejected. Fail-closed either way — but the docs
+    #: claimed "no default" while the code had one, and a safety claim that is
+    #: stronger than its implementation is worth closing even when the runtime
+    #: behaviour is already correct. Now both paths fail, and the direct one
+    #: fails at construction rather than at registration.
+    data_scope: str
 
 
 def _validate(spec: ToolSpec) -> None:

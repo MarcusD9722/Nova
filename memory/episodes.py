@@ -111,6 +111,13 @@ class Episode:
     last_accessed_at: str | None = None
     superseded_by: str | None = None
     created_at: str = field(default_factory=_now_iso)
+    #: Whose episode this is (V3 P5.1e). `user` for Marcus, `speaker:<id>` for a
+    #: known guest, `unverified` when Nova could not attribute the turn, and
+    #: `system` for things that happened without a human saying them. Structured
+    #: on purpose: read scoping must never be decided by parsing summary prose.
+    speaker_entity: str = "user"
+    speaker_label: str = ""
+    input_source: str = "typed"
 
     @classmethod
     def from_row(cls, row) -> "Episode":
@@ -123,6 +130,9 @@ class Episode:
             importance=float(row["importance"] or 0.0),
             access_count=int(row["access_count"] or 0),
             last_accessed_at=row["last_accessed_at"],
+            speaker_entity=_row_get(row, "speaker_entity", "user"),
+            speaker_label=_row_get(row, "speaker_label", ""),
+            input_source=_row_get(row, "input_source", "typed"),
             superseded_by=row["superseded_by"], created_at=row["created_at"],
         )
 
@@ -172,6 +182,15 @@ class Decision:
         )
 
 
+def _row_get(row, key: str, default):
+    """Read a column that may be absent from an older row or a partial SELECT."""
+    try:
+        val = row[key]
+    except (IndexError, KeyError):
+        return default
+    return default if val is None else val
+
+
 class EpisodicStore:
     """Warm persistence over Nova's existing SQLite database.
 
@@ -201,14 +220,17 @@ class EpisodicStore:
     _EPISODE_SQL = """INSERT OR REPLACE INTO episodes
                    (id, kind, summary, entities, conversation_id, project, source_tool,
                     trust, freshness, provenance, outcome, importance, access_count,
-                    last_accessed_at, superseded_by, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+                    last_accessed_at, superseded_by, created_at,
+                    speaker_entity, speaker_label, input_source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
     def _episode_row(self, ep: Episode) -> tuple:
         return (ep.id, ep.kind, ep.summary, json.dumps(ep.entities), ep.conversation_id,
                 ep.project, ep.source_tool, ep.trust, ep.freshness,
                 json.dumps(ep.provenance, default=str), ep.outcome, ep.importance,
-                ep.access_count, ep.last_accessed_at, ep.superseded_by, ep.created_at)
+                ep.access_count, ep.last_accessed_at, ep.superseded_by, ep.created_at,
+                ep.speaker_entity or "user", ep.speaker_label or "",
+                ep.input_source or "typed")
 
     async def record_episode(self, ep: Episode) -> str:
         async with self._conn() as db:

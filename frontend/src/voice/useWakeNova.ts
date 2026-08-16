@@ -284,6 +284,10 @@ export function useWakeNova(
           if (!runningRef.current) break;
 
           // Transcribe via backend
+          // No `speaker` field: wake detection stays speaker-free (V3 P5.1e).
+          // Identity belongs to the COMMAND utterance after the wake phrase —
+          // classifying every "Hey Nova" chunk would run an embedding on the
+          // continuous listening loop for no privacy or personalisation gain.
           const stt = await transcribeBlobDetailed(blob, { path: "/stt", debugTag: tag });
           const txtRaw = String(stt?.text || "").trim();
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+#: Episodes with no human behind them; readable by anyone.
+EPISODE_SYSTEM_SCOPE = "system"
+
 """Staged episodic retrieval, and the rules for what is worth remembering.
 
 The failure mode this exists to avoid is the obvious one: run a semantic search
@@ -183,6 +186,32 @@ def wants_evidence(query: str) -> bool:
     return bool(_WANTS_EVIDENCE.search(query or ""))
 
 
+def _may_read_episode(ep) -> bool:
+    """May the current speaker see this episode?
+
+    Structured provenance only — the summary is prose written for a human and
+    parsing it to decide ownership would make privacy depend on phrasing.
+
+    Conservative by construction: an episode whose attribution is missing or
+    unrecognised is treated as OWNER-PRIVATE, because every episode written
+    before speaker activation was Marcus's.
+    """
+    try:
+        from core.turn_identity import OWNER_ENTITY, current_identity
+    except Exception:  # noqa: BLE001
+        return True
+    ident = current_identity()
+    if ident.is_owner:
+        return True
+    owner_of = str(getattr(ep, "speaker_entity", "") or OWNER_ENTITY).strip().lower()
+    if owner_of == EPISODE_SYSTEM_SCOPE:
+        # Things that happened without a human saying them — a build finished,
+        # a capability was registered. Impersonal, so shared.
+        return True
+    own = ident.memory_entity
+    return bool(own) and owner_of == str(own).strip().lower()
+
+
 def _tokens(text: str) -> set[str]:
     """Stemmed content tokens.
 
@@ -247,6 +276,14 @@ async def retrieve(store: EpisodicStore, query: str, *, limit: int = 3,
                                              include_superseded=include_superseded)
     if not candidates and not terms:
         candidates = await store.recent_episodes(limit=candidate_pool, project=project)
+
+    # ── Speaker scope, BEFORE ranking, hydration or reinforcement (P5.1e) ────
+    # P5.1d.1 established this ordering for semantic memory after measuring a
+    # denied hit still bumping access_count. The same rule applies here, and
+    # the stakes are slightly higher: a denied episode must also never trigger
+    # a COLD read, which would pull his evidence off disk for someone who is
+    # not allowed to see it.
+    candidates = [ep for ep in candidates if _may_read_episode(ep)]
 
     scored = [(score_episode(ep, terms), ep) for ep in candidates]
     scored = [(s, ep) for s, ep in scored if s > 0]

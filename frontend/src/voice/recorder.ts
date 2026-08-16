@@ -705,44 +705,107 @@ export async function recordOnceToBlob(
   }
 }
 
+/**
+ * Additive speaker metadata `/stt` returns when classification was requested.
+ *
+ * DIAGNOSTIC ONLY on the client. `display_name` and `status` may be shown in
+ * debug UI, but no branch here may conclude "this is Marcus, therefore …" —
+ * privacy behaviour comes from the backend redeeming `voice_turn_id`. The
+ * client never sends any field from this object except the handle.
+ */
+export type SttSpeakerInfo = {
+  status?: string;
+  reason?: string | null;
+  attempted?: boolean;
+  profile_id?: string | null;
+  display_name?: string | null;
+  similarity?: number | null;
+  model_id?: string | null;
+  voice_turn_id?: string | null;
+};
+
+export type SttResult = {
+  text: string;
+  durationMs?: number;
+  sampleRate?: number;
+  empty?: boolean;
+  speaker?: SttSpeakerInfo | null;
+};
+
+export type TranscribeOptions = {
+  url?: string;
+  path?: string;
+  debugTag?: string;
+  /**
+   * Ask the backend to classify who is speaking (V3 P5.1e).
+   *
+   * Sent as a multipart FORM FIELD, matching the existing backend contract —
+   * not a query parameter. Off by default, so wake chunks and barge-in captures
+   * stay speaker-free without every caller having to remember to disable it.
+   */
+  speaker?: boolean;
+  /** Injectable for tests; defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+};
+
 export async function transcribeBlobDetailed(
   blob: Blob,
-  urlOrOpts?: string | { url?: string; path?: string; debugTag?: string }
-): Promise<{ text: string; durationMs?: number; sampleRate?: number; empty?: boolean }> {
+  urlOrOpts?: string | TranscribeOptions
+): Promise<SttResult> {
   const fd = new FormData();
   const ext = blob.type.includes("wav") ? "wav" : blob.type.includes("ogg") ? "ogg" : "webm";
   fd.append("file", blob, `recording.${ext}`);
 
   let url = apiUrl("/stt");
   let debugTag: string | undefined;
+  let wantSpeaker = false;
+  let doFetch: typeof fetch = fetch;
   if (typeof urlOrOpts === "string") {
     url = urlOrOpts;
   } else if (urlOrOpts) {
     debugTag = urlOrOpts.debugTag;
     if (urlOrOpts.url) url = String(urlOrOpts.url);
     else if (urlOrOpts.path) url = apiUrl(String(urlOrOpts.path));
+    wantSpeaker = Boolean(urlOrOpts.speaker);
+    if (urlOrOpts.fetchImpl) doFetch = urlOrOpts.fetchImpl;
   }
+  // Only appended when asked. An absent field means "don't classify", which is
+  // what keeps wake detection at zero embeddings.
+  if (wantSpeaker) fd.append("speaker", "true");
 
   const t0 = performance.now();
-  vlog(debugTag, "STT request", { url, size: blob.size, type: blob.type });
-  const res = await fetch(url, { method: "POST", body: fd });
+  vlog(debugTag, "STT request", { url, size: blob.size, type: blob.type, speaker: wantSpeaker });
+  const res = await doFetch(url, { method: "POST", body: fd });
   const dtMs = Math.round(performance.now() - t0);
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
   const text = String(data?.text || data?.transcript || "");
-  const result = {
+  const result: SttResult = {
     text,
     durationMs: Number.isFinite(Number(data?.duration_ms)) ? Number(data.duration_ms) : undefined,
     sampleRate: Number.isFinite(Number(data?.sample_rate)) ? Number(data.sample_rate) : undefined,
     empty: Boolean(data?.empty),
+    speaker: (data && typeof data.speaker === "object" && data.speaker) ? data.speaker : null,
   };
   vlog(debugTag, "STT response", { dtMs, ...result });
   return result;
 }
 
+/**
+ * Handle from an STT result, or null.
+ *
+ * Null is a normal outcome — speaker ID disabled, an empty transcript, a
+ * service failure — and callers must still mark the turn as voice. See
+ * turnOrigin.ts.
+ */
+export function voiceTurnIdOf(stt: SttResult | null | undefined): string | null {
+  const id = stt?.speaker?.voice_turn_id;
+  return typeof id === "string" && id.trim() ? id : null;
+}
+
 export async function transcribeBlob(
   blob: Blob,
-  urlOrOpts?: string | { url?: string; path?: string; debugTag?: string }
+  urlOrOpts?: string | TranscribeOptions
 ): Promise<string> {
   const result = await transcribeBlobDetailed(blob, urlOrOpts);
   return result.text;

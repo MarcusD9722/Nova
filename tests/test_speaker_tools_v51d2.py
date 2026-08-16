@@ -426,14 +426,17 @@ async def test_permissions_unchanged():
 
 
 async def test_frontend_untouched():
-    check.section("the frontend is still not wired for speaker identity")
-    for f in ("frontend/src/App.jsx", "frontend/src/voice/recorder.ts"):
-        p = REPO / f
-        if not p.exists():
-            continue
-        src = p.read_text(encoding="utf-8", errors="replace")
-        check("speaker=true" not in src and "voice_turn_id" not in src,
-              f"{f} still sends no speaker identity")
+    check.section("frontend: identity is ACTIVE, and still backend-derived")
+    # Until V3 P5.1e this asserted the frontend sent nothing. It now does — that
+    # was the point of P5.1e — so the invariant moves to the part that still
+    # must hold: the client forwards an opaque handle and never asserts who is
+    # speaking.
+    origin = (REPO / "frontend/src/voice/turnOrigin.ts").read_text(encoding="utf-8")
+    check("input_source" in origin and "voice_turn_id" in origin,
+          "the client sends transport + an opaque handle")
+    for banned in ("profile_id", "display_name", "role"):
+        check(f'out["{banned}"]' not in origin,
+              f"and never asserts {banned}")
 
 
 async def main():

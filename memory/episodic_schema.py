@@ -41,10 +41,18 @@ EPISODIC_DDL: list[str] = [
         access_count INTEGER NOT NULL DEFAULT 0,
         last_accessed_at TEXT,
         superseded_by TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        -- V3 P5.1e: whose episode this is. `user` is the correct backfill for
+        -- every pre-activation row: the frontend never sent a speaker identity
+        -- before this phase, so all existing episodic history IS Marcus's.
+        -- Never store an embedding, similarity, threshold or raw audio here.
+        speaker_entity TEXT NOT NULL DEFAULT 'user',
+        speaker_label TEXT NOT NULL DEFAULT '',
+        input_source TEXT NOT NULL DEFAULT 'typed'
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_episodes_speaker ON episodes(speaker_entity, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_project ON episodes(project, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_conv ON episodes(conversation_id, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind, importance DESC);",
@@ -128,4 +136,21 @@ EPISODIC_MIGRATION = (
     7,
     "V3 P4: episodic memory (episodes, artifacts, decisions, cold_evidence)",
     EPISODIC_DDL,
+)
+
+#: V3 P5.1e. Adds speaker provenance to an EXISTING episodes table. The DDL
+#: above already carries the columns for a fresh database; this is the in-place
+#: path so nobody has to delete their history to activate voice identity.
+#: Defaults are the migration assumption, stated plainly: every episode written
+#: before live speaker activation was Marcus's, because nothing else could
+#: reach the turn path.
+EPISODIC_SPEAKER_MIGRATION = (
+    8,
+    "V3 P5.1e: episodes.speaker_entity / speaker_label / input_source",
+    [
+        "ALTER TABLE episodes ADD COLUMN speaker_entity TEXT NOT NULL DEFAULT 'user';",
+        "ALTER TABLE episodes ADD COLUMN speaker_label TEXT NOT NULL DEFAULT '';",
+        "ALTER TABLE episodes ADD COLUMN input_source TEXT NOT NULL DEFAULT 'typed';",
+        "CREATE INDEX IF NOT EXISTS idx_episodes_speaker ON episodes(speaker_entity, created_at DESC);",
+    ],
 )
