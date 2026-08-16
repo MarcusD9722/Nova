@@ -284,7 +284,7 @@ def _is_lesson_fact_text(text: Any) -> bool:
     return ent == "lesson" or ent.endswith(":lesson")
 
 
-def _conv_entity(conversation_id, suffix: str = "") -> str:
+def _conv_entity(conversation_id, suffix: str = "") -> str | None:
     """Memory entity for conversation-local durable state (summary, story).
 
     Owner keeps `conversation:<id>` exactly as before, so no existing summary or
@@ -300,7 +300,14 @@ def _conv_entity(conversation_id, suffix: str = "") -> str:
     if scope == OWNER_ENTITY:
         return base
     if scope == UNVERIFIED_SCOPE:
-        return f"{UNVERIFIED_SCOPE}:{base}"
+        # Deliberately None rather than an ephemeral key. Story state and the
+        # rolling summary are DURABLE fact memory, unlike the hot working
+        # context — writing `unverified:<nonce>:...` would stop one stranger
+        # reading another's, and leave permanent garbage behind for every
+        # unidentified turn Nova ever takes (V3 P5.1 hotfix). Callers skip both
+        # the read and the write; storytelling still works for the current
+        # response, it just has no cross-turn bible.
+        return None
     return f"{scope}:{base}"
 
 
@@ -1523,9 +1530,13 @@ class RuntimeManager:
         # persistent "story bible" so a story continues across turns/sessions.
         story_state = ""
         try:
-            sf = await self._memory.get_latest_fact(entity=_conv_entity(conversation_id, ":story"), attribute="state")
-            if sf and sf.value.strip():
-                story_state = sf.value.strip()
+            _story_ent = _conv_entity(conversation_id, ":story")
+            # None = an unidentified speaker: no cross-turn story bible, so the
+            # next stranger does not continue this one's story.
+            if _story_ent:
+                sf = await self._memory.get_latest_fact(entity=_story_ent, attribute="state")
+                if sf and sf.value.strip():
+                    story_state = sf.value.strip()
         except Exception:
             pass
         if is_story_request(clean_user, story_active=bool(story_state)):
@@ -1556,9 +1567,10 @@ class RuntimeManager:
                     prior_state=story_state,
                     latest_exchange=f"{user_name or 'Reader'}: {clean_user}\nStory: {story_reply}",
                 )
-                if new_state.strip():
+                _story_ent = _conv_entity(conversation_id, ":story")
+                if new_state.strip() and _story_ent:
                     await self._memory.add_fact(
-                        entity=_conv_entity(conversation_id, ":story"), attribute="state",
+                        entity=_story_ent, attribute="state",
                         value=new_state[:2000], confidence=0.8,
                     )
             except Exception:
@@ -1640,9 +1652,12 @@ class RuntimeManager:
 
         conversation_summary = ""
         try:
-            summary_fact = await self._memory.get_latest_fact(entity=_conv_entity(conversation_id), attribute="summary")
-            if summary_fact and summary_fact.value.strip():
-                conversation_summary = summary_fact.value.strip()
+            _sum_ent = _conv_entity(conversation_id)
+            if _sum_ent:
+                summary_fact = await self._memory.get_latest_fact(
+                    entity=_sum_ent, attribute="summary")
+                if summary_fact and summary_fact.value.strip():
+                    conversation_summary = summary_fact.value.strip()
         except Exception:
             pass
         recent_chat = await self._state_store.recent_chat_text(conversation_id)

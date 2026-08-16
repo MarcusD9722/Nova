@@ -244,14 +244,19 @@ async def test_summary_and_story_are_partitioned():
                              confidence=0.9)
             await m.add_fact(entity=aes, attribute="state", value=A_STORY, confidence=0.9)
         with active_turn(UNKNOWN()):
-            ue = _conv_entity(cid)
-            check(ue.startswith("unverified:"), f"unknown gets an ephemeral key ({ue})")
+            # Not an ephemeral KEY — no durable entity at all. Summary and story
+            # are durable fact memory, so an `unverified:<nonce>:...` key would
+            # stop one stranger reading another's and leave permanent garbage
+            # behind for every unidentified turn (P5.1 hotfix).
+            check(_conv_entity(cid) is None,
+                  f"an unknown speaker gets NO durable entity ({_conv_entity(cid)})")
+            check(_conv_entity(cid, ":story") is None, "for story either")
 
         async def read(who):
             with active_turn(who):
-                sm = await m.get_latest_fact(entity=_conv_entity(cid), attribute="summary")
-                st = await m.get_latest_fact(entity=_conv_entity(cid, ":story"),
-                                             attribute="state")
+                e, es = _conv_entity(cid), _conv_entity(cid, ":story")
+                sm = await m.get_latest_fact(entity=e, attribute="summary") if e else None
+                st = await m.get_latest_fact(entity=es, attribute="state") if es else None
             return (sm.value if sm else None, st.value if st else None)
 
         check(await read(OWNER()) == (O_SUM, O_STORY), "the owner reads his own")
@@ -338,6 +343,80 @@ async def test_same_conversation_acceptance():
             check(s not in o, f"and he does not inherit theirs ({s}) {_where(o, s)}")
 
 
+async def test_two_unknown_speakers_do_not_share():
+    check.section("hotfix: two different strangers are two different people")
+    import aiosqlite
+
+    from core.runtime import _conv_entity
+    from core.turn_identity import (active_turn, conversation_scope,
+                                    conversation_storage_scope)
+
+    A_WORK, A_A, A_B = "UNKNOWN-A-WORK-991", "UNKNOWN-A-ART-992-A", "UNKNOWN-A-ART-992-B"
+    A_STORY = "UNKNOWN-A-STORY-993"
+
+    async with boot() as nova:
+        rt, m, cid = nova.runtime, nova.memory, uuid.uuid4()
+
+        # Semantic scope stays "unverified" — that value is useful for policy.
+        # Only the STORAGE scope differs, and it must differ per turn.
+        with active_turn(UNKNOWN()):
+            check(conversation_scope() == "unverified",
+                  "the semantic scope is unchanged")
+            s1 = conversation_storage_scope()
+        with active_turn(UNKNOWN()):
+            s2 = conversation_storage_scope()
+        check(s1.startswith("unverified:") and s2.startswith("unverified:"),
+              f"storage scope is per turn ({s1[:22]}…)")
+        check(s1 != s2, "and two turns never collide")
+        with active_turn(OWNER()):
+            check(conversation_storage_scope() == "user",
+                  "while the owner's storage scope is unchanged")
+        with active_turn(ALICE()):
+            check(conversation_storage_scope() == "speaker:p-alice",
+                  "and a known guest keeps their durable one")
+
+        # ── UNKNOWN A: one complete turn ────────────────────────────────────
+        with active_turn(UNKNOWN()):
+            rt._working.get(str(cid)).record_user(A_WORK)
+            rt._artifacts.add_result_set(conversation_id=str(cid), turn_id="tA",
+                                         summary="A's results", source_tool="web.search",
+                                         items=[{"title": A_A}, {"title": A_B}])
+            # Same-turn usability is the point of an ephemeral scope, not an
+            # accident of it: A must be able to use what A just created.
+            items = rt._artifacts.active_items(str(cid))
+            check(len(items) == 2, f"A can use her own result set in-turn ({len(items)})")
+            ref = rt._artifacts.resolve("the second one", str(cid))
+            check(ref is not None and A_B in ref.summary,
+                  "and resolve her own ordinal within the turn")
+            check(A_WORK in rt._working.get(str(cid)).recent_text(6),
+                  "and read back her own working context")
+            check(_conv_entity(cid, ":story") is None,
+                  "but gets NO durable story entity at all")
+            a_item2 = [x for x in items if x.item_index == 2][0]
+        before = a_item2.access_count
+
+        # ── UNKNOWN B: a different person, same conversation ────────────────
+        with active_turn(UNKNOWN()):
+            w = (rt._working.get(str(cid)).recent_text(6)
+                 + rt._working.get(str(cid)).describe_for_prompt())
+            check(A_WORK not in w, f"B sees none of A's working context ({w[:40]!r})")
+            check(rt._artifacts.latest_result_set(str(cid)) is None,
+                  "B sees no result set of A's")
+            ref = rt._artifacts.resolve("tell me about the second one", str(cid))
+            check(ref is None, f"B cannot resolve A's ordinal ({ref})")
+            check(_conv_entity(cid, ":story") is None, "and has no story entity either")
+        check(a_item2.access_count == before,
+              f"and A's item was never touched ({before} -> {a_item2.access_count})")
+
+        # Story state is DURABLE, so the fix is no write at all — not an
+        # ephemeral key, which would leave garbage behind for every stranger.
+        async with aiosqlite.connect(str(m._sqlite._db_path)) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM facts WHERE entity LIKE 'unverified%'")
+            n = (await cur.fetchone())[0]
+        check(n == 0, f"no durable row was written under an unverified key ({n})")
+
+
 # ── H. memory.superseded through the real path ───────────────────────────────
 
 async def test_superseded_episode_is_speaker_correct():
@@ -400,6 +479,7 @@ async def main():
     await test_working_context_is_partitioned()
     await test_hot_artifacts_and_zero_side_effects()
     await test_summary_and_story_are_partitioned()
+    await test_two_unknown_speakers_do_not_share()
     await test_same_conversation_acceptance()
     await test_superseded_episode_is_speaker_correct()
     await test_permissions_unchanged()

@@ -388,11 +388,14 @@ class ArtifactStore:
 
     @staticmethod
     def _scope() -> str:
+        # STORAGE scope, not the semantic one: every unidentified speaker is
+        # semantically "unverified", but two strangers in one conversation must
+        # not share a hot result set (V3 P5.1 hotfix).
         try:
-            from core.turn_identity import conversation_scope
+            from core.turn_identity import conversation_storage_scope
         except Exception:  # noqa: BLE001
             return "user"
-        return conversation_scope()
+        return conversation_storage_scope()
 
     def for_conversation(self, conversation_id: str) -> list[Artifact]:
         """Artifacts in this conversation that the CURRENT speaker may see.

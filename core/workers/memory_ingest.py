@@ -22,7 +22,7 @@ from memory.unifier import MemoryUnifier
 logger = get_logger(__name__)
 
 
-def _conv_entity(conversation_id) -> str:
+def _conv_entity(conversation_id) -> str | None:
     """Conversation-local durable entity, scoped to the current speaker.
 
     Mirrors core.runtime._conv_entity; the owner's key is unchanged so no
@@ -36,7 +36,14 @@ def _conv_entity(conversation_id) -> str:
     if scope == OWNER_ENTITY:
         return base
     if scope == UNVERIFIED_SCOPE:
-        return f"{UNVERIFIED_SCOPE}:{base}"
+        # Deliberately None rather than an ephemeral key. Story state and the
+        # rolling summary are DURABLE fact memory, unlike the hot working
+        # context — writing `unverified:<nonce>:...` would stop one stranger
+        # reading another's, and leave permanent garbage behind for every
+        # unidentified turn Nova ever takes (V3 P5.1 hotfix). Callers skip both
+        # the read and the write; storytelling still works for the current
+        # response, it just has no cross-turn bible.
+        return None
     return f"{scope}:{base}"
 
 
@@ -303,6 +310,8 @@ class MemoryIngestWorker:
         if not s.summary.strip():
             return
         base = _conv_entity(hint.conversation_id)
+        if not base:
+            return          # no durable summary for an unidentified speaker
         # Rolling "right now" summary (singleton, overwrites).
         await self._memory.add_fact(
             entity=base, attribute="summary",

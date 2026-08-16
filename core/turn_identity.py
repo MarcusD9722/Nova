@@ -37,6 +37,7 @@ and reset around one logical turn, in a `finally`.
 """
 
 import contextvars
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -251,15 +252,35 @@ def current_identity_or_none() -> TurnIdentity | None:
     return _CURRENT.get() if _IN_TURN.get() else None
 
 
+#: An opaque, per-turn token used to keep one unidentified speaker's ephemeral
+#: state apart from the next one's.
+#:
+#: `conversation_scope()` answers "unverified" for every unrecognised speaker,
+#: which is the right SEMANTIC answer and useful for policy. It is the wrong
+#: STORAGE key: two different strangers in one conversation both hash to
+#: "unverified" and inherit each other's working context, hot result sets and
+#: story. Measured — a second unknown speaker resolved the first one's "second
+#: one" and read back their story state.
+#:
+#: Backend-generated, in-memory only, never rendered into a prompt, never
+#: persisted, never logged, never accepted from a client.
+_TURN_NONCE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "nova_turn_nonce", default="")
+
+
 @contextmanager
 def active_turn(identity: TurnIdentity | None) -> Iterator[TurnIdentity]:
     """Scope an identity to one logical turn, always restoring it afterwards."""
     ident = identity or TurnIdentity.typed()
     token = _CURRENT.set(ident)
     marker = _IN_TURN.set(True)
+    # Minted for every turn so there is no branch to get wrong; only the
+    # ephemeral scope actually reads it.
+    nonce = _TURN_NONCE.set(uuid.uuid4().hex)
     try:
         yield ident
     finally:
+        _TURN_NONCE.reset(nonce)
         _IN_TURN.reset(marker)
         _CURRENT.reset(token)
 
@@ -538,6 +559,26 @@ def is_ephemeral_scope(scope: str | None = None) -> bool:
     return (scope if scope is not None else conversation_scope()) == UNVERIFIED_SCOPE
 
 
+def conversation_storage_scope(identity: "TurnIdentity | None" = None) -> str:
+    """Where conversation-local state is actually KEPT for this turn.
+
+    Deliberately distinct from `conversation_scope()`:
+
+        conversation_scope()          semantic — what KIND of speaker this is
+        conversation_storage_scope()  physical — which bucket their state lives in
+
+    They agree for the owner (`user`) and for a known guest
+    (`speaker:<id>`), whose state is meant to persist across turns. They diverge
+    for an unrecognised speaker, who gets `unverified:<per-turn token>` — so the
+    state is usable within their turn and unreachable by the next stranger.
+    """
+    ident = identity or current_identity()
+    ent = ident.memory_entity
+    if ent is not None:
+        return ent
+    return f"{UNVERIFIED_SCOPE}:{_TURN_NONCE.get() or 'no-turn'}"
+
+
 def scoped_conversation_key(conversation_id: Any,
                             identity: "TurnIdentity | None" = None) -> str:
     """The per-speaker key for conversation-local storage.
@@ -547,7 +588,7 @@ def scoped_conversation_key(conversation_id: Any,
     after this change.
     """
     cid = str(conversation_id)
-    scope = conversation_scope(identity)
+    scope = conversation_storage_scope(identity)
     return cid if scope == OWNER_ENTITY else f"{cid}#{scope}"
 
 
