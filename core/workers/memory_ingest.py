@@ -22,6 +22,24 @@ from memory.unifier import MemoryUnifier
 logger = get_logger(__name__)
 
 
+def _conv_entity(conversation_id) -> str:
+    """Conversation-local durable entity, scoped to the current speaker.
+
+    Mirrors core.runtime._conv_entity; the owner's key is unchanged so no
+    existing summary or digest is orphaned.
+    """
+    from core.turn_identity import (OWNER_ENTITY, UNVERIFIED_SCOPE,
+                                    conversation_scope)
+
+    scope = conversation_scope()
+    base = f"conversation:{conversation_id}"
+    if scope == OWNER_ENTITY:
+        return base
+    if scope == UNVERIFIED_SCOPE:
+        return f"{UNVERIFIED_SCOPE}:{base}"
+    return f"{scope}:{base}"
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -102,7 +120,9 @@ class MemoryIngestWorker:
             self._turn_counter[cid] = self._turn_counter.get(cid, 0) + 1
             if self._turn_counter[cid] % self._summary_every_n == 0:
                 try:
-                    await self._sq.put(SummarizeHintEvent(conversation_id=ev.conversation_id, timestamp=_now(), reason="periodic"))
+                    await self._sq.put(SummarizeHintEvent(
+                        conversation_id=ev.conversation_id, timestamp=_now(),
+                        reason="periodic", identity=ev.identity))
                 except Exception:
                     pass
 
@@ -270,6 +290,33 @@ class MemoryIngestWorker:
                 [{"role": "user", "content": prompt}], max_tokens=220, temperature=0.0, thinking=False
             )
 
+    async def _summarize_one(self, hint: SummarizeHintEvent) -> None:
+        """Summarise one conversation for whoever the hint belongs to."""
+        transcript = await self._state.recent_chat_text(hint.conversation_id)
+        if not transcript:
+            return
+        # Same yield as extraction: summarization is the single most expensive
+        # background call (a whole transcript) and fires every 8 turns, which is
+        # exactly the periodic "why was THAT one so slow?" spike.
+        await GATE.wait_for_idle(what="summarize")
+        s = await self._summarizer.summarize(transcript=transcript)
+        if not s.summary.strip():
+            return
+        base = _conv_entity(hint.conversation_id)
+        # Rolling "right now" summary (singleton, overwrites).
+        await self._memory.add_fact(
+            entity=base, attribute="summary",
+            value=s.summary.strip(), confidence=0.75,
+        )
+        # Dated digest that ACCUMULATES across days, so history isn't destroyed
+        # on the next summarization — this is what makes "what did we talk about
+        # last Tuesday" answerable.
+        day = _now().strftime("%Y-%m-%d")
+        await self._memory.add_fact(
+            entity=f"{base}:digest", attribute=day,
+            value=f"[{day}] {s.summary.strip()}", confidence=0.75,
+        )
+
     async def _drain_summarize_hints(self, *, max_items: int = 2) -> None:
         for _ in range(max_items):
             if self._stop.is_set():
@@ -279,32 +326,14 @@ class MemoryIngestWorker:
             except Exception:
                 return
             try:
-                transcript = await self._state.recent_chat_text(hint.conversation_id)
-                if transcript:
-                    # Same yield as extraction: summarization is the single
-                    # most expensive background call (a whole transcript) and
-                    # fires every 8 turns, which is exactly the periodic
-                    # "why was THAT one so slow?" spike.
-                    await GATE.wait_for_idle(what="summarize")
-                    s = await self._summarizer.summarize(transcript=transcript)
-                    if s.summary.strip():
-                        # Rolling "right now" summary (singleton, overwrites).
-                        await self._memory.add_fact(
-                            entity=f"conversation:{hint.conversation_id}",
-                            attribute="summary",
-                            value=s.summary.strip(),
-                            confidence=0.75,
-                        )
-                        # Dated digest that ACCUMULATES across days, so history
-                        # isn't destroyed on the next summarization — this is what
-                        # makes "what did we talk about last Tuesday" answerable.
-                        day = _now().strftime("%Y-%m-%d")
-                        await self._memory.add_fact(
-                            entity=f"conversation:{hint.conversation_id}:digest",
-                            attribute=day,
-                            value=f"[{day}] {s.summary.strip()}",
-                            confidence=0.75,
-                        )
+                # Re-enter the speaker for the WHOLE hint (V3 P5.1 closure).
+                # This worker drains off the turn path, so without the snapshot
+                # `recent_chat_text` would return the owner's transcript and the
+                # digest would land under his entity — summarising a shared
+                # conversation as one person's history, which is precisely the
+                # cross-speaker channel this closure removes.
+                with active_turn(hint.identity or TurnIdentity.typed()):
+                    await self._summarize_one(hint)
             except Exception as e:  # noqa: BLE001
                 logger.debug("summarize_failed", error=str(e))
             finally:

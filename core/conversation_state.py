@@ -77,9 +77,24 @@ class ConversationStateStore:
         self._write_lock = asyncio.Lock()
 
     def _key(self, conversation_id: UUID) -> str:
-        return f"conv_state:{conversation_id}"
+        """Per-speaker (V3 P5.1 final closure).
+
+        Recent turns and assistant replies are conversation-local, and a
+        conversation is not one person once a guest can speak into it. The
+        OWNER's key is unchanged, so every cached conversation stays reachable.
+        """
+        from core.turn_identity import scoped_conversation_key
+
+        return f"conv_state:{scoped_conversation_key(conversation_id)}"
 
     async def load(self, conversation_id: UUID) -> ConversationState:
+        from core.turn_identity import is_ephemeral_scope
+
+        # An unrecognised speaker gets no cross-turn history: the next
+        # unrecognised voice is not necessarily the same person, so reading one
+        # back would hand a stranger someone else's conversation.
+        if is_ephemeral_scope():
+            return ConversationState.from_obj(None)
         raw = await self._cache.get(self._key(conversation_id))
         return ConversationState.from_obj(raw)
 
@@ -113,6 +128,10 @@ class ConversationStateStore:
             st.last_assistant_replies = st.last_assistant_replies[-self._max_turns :]
             st.last_follow_up_questions = st.last_follow_up_questions[-max(self._max_turns, self._followup_window) :]
 
+            from core.turn_identity import is_ephemeral_scope
+
+            if is_ephemeral_scope():
+                return          # nothing durable for a speaker Nova cannot name
             await self._cache.set(self._key(conversation_id), json.loads(st.to_json()), ttl_s=7 * 24 * 3600)
 
     async def recent_chat_text(self, conversation_id: UUID) -> str:

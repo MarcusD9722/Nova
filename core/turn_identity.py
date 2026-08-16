@@ -510,6 +510,47 @@ def turn_speaker_label(identity: "TurnIdentity | None" = None) -> str:
     return "An unidentified speaker"
 
 
+#: Scope token for state that is keyed by conversation rather than by entity.
+#:
+#: Speaker identity is per COMMAND, but Nova keeps a lot of state per
+#: CONVERSATION: recent turns, the working context, hot result sets, the rolling
+#: summary, story state. All of it predates P5 and all of it was therefore
+#: implicitly Marcus's. Once a guest can speak into the same conversation, every
+#: one of those becomes a cross-speaker channel (V3 P5.1 final closure).
+UNVERIFIED_SCOPE = "unverified"
+
+
+def conversation_scope(identity: "TurnIdentity | None" = None) -> str:
+    """Whose conversation-local state this turn may touch.
+
+    `user` for the owner — so his keys stay byte-for-byte what they were and no
+    existing conversation is orphaned. `speaker:<id>` for a known guest.
+    `unverified` for anyone Nova cannot name, and callers must treat that as
+    ephemeral: nothing under it may be read back on a later turn, because the
+    next unrecognised voice is not necessarily the same person.
+    """
+    ident = identity or current_identity()
+    return ident.memory_entity or UNVERIFIED_SCOPE
+
+
+def is_ephemeral_scope(scope: str | None = None) -> bool:
+    """True when conversation-local state must not survive the turn."""
+    return (scope if scope is not None else conversation_scope()) == UNVERIFIED_SCOPE
+
+
+def scoped_conversation_key(conversation_id: Any,
+                            identity: "TurnIdentity | None" = None) -> str:
+    """The per-speaker key for conversation-local storage.
+
+    The OWNER's key is the bare conversation id, unchanged — that is what keeps
+    every existing cached conversation, working context and artifact reachable
+    after this change.
+    """
+    cid = str(conversation_id)
+    scope = conversation_scope(identity)
+    return cid if scope == OWNER_ENTITY else f"{cid}#{scope}"
+
+
 def personal_scope_note(identity: "TurnIdentity | None" = None) -> str:
     """One line for diagnostics/logs describing the active read scope."""
     ident = identity or current_identity()

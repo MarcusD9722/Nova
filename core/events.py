@@ -29,6 +29,11 @@ class SummarizeHintEvent:
     conversation_id: UUID
     timestamp: datetime
     reason: str = "periodic"
+    #: Whose transcript to summarise (V3 P5.1 final closure). Snapshotted at
+    #: enqueue for the same reason MemoryIngestEvent is (D12): the summarizer
+    #: drains this later, off the turn path, where `current_identity()` is only
+    #: the legacy default. None means a pre-closure or owner hint.
+    identity: TurnIdentity | None = None
 
 
 @dataclass(frozen=True)

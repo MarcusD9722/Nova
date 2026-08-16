@@ -433,7 +433,8 @@ class EpisodicPromoter:
             retired = int(data.get("retired") or 0)
             if not because or retired <= 0:
                 return
-            summary = f"Nova retired {retired} outdated belief(s) after Marcus said: {because}"
+            summary = (f"Nova retired {retired} outdated belief(s) after "
+                       f"{_speaker_name()} said: {because}")
             ep_id = f"corr-{_digest(because, retired)}"
             entities = [because[:80]]
             provenance = {"retired": retired, "because": because,

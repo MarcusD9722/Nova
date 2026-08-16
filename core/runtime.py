@@ -284,6 +284,26 @@ def _is_lesson_fact_text(text: Any) -> bool:
     return ent == "lesson" or ent.endswith(":lesson")
 
 
+def _conv_entity(conversation_id, suffix: str = "") -> str:
+    """Memory entity for conversation-local durable state (summary, story).
+
+    Owner keeps `conversation:<id>` exactly as before, so no existing summary or
+    story is orphaned. A guest gets their own under the canonical speaker
+    hierarchy; an unrecognised speaker gets an ephemeral key that is never read
+    back on a later turn (V3 P5.1 final closure).
+    """
+    from core.turn_identity import (OWNER_ENTITY, conversation_scope,
+                                    UNVERIFIED_SCOPE)
+
+    scope = conversation_scope()
+    base = f"conversation:{conversation_id}{suffix}"
+    if scope == OWNER_ENTITY:
+        return base
+    if scope == UNVERIFIED_SCOPE:
+        return f"{UNVERIFIED_SCOPE}:{base}"
+    return f"{scope}:{base}"
+
+
 def _lesson_header(ident) -> str:
     """Heading for the behavioural-lessons block, named for whose they are.
 
@@ -1503,7 +1523,7 @@ class RuntimeManager:
         # persistent "story bible" so a story continues across turns/sessions.
         story_state = ""
         try:
-            sf = await self._memory.get_latest_fact(entity=f"conversation:{conversation_id}:story", attribute="state")
+            sf = await self._memory.get_latest_fact(entity=_conv_entity(conversation_id, ":story"), attribute="state")
             if sf and sf.value.strip():
                 story_state = sf.value.strip()
         except Exception:
@@ -1538,7 +1558,7 @@ class RuntimeManager:
                 )
                 if new_state.strip():
                     await self._memory.add_fact(
-                        entity=f"conversation:{conversation_id}:story", attribute="state",
+                        entity=_conv_entity(conversation_id, ":story"), attribute="state",
                         value=new_state[:2000], confidence=0.8,
                     )
             except Exception:
@@ -1620,7 +1640,7 @@ class RuntimeManager:
 
         conversation_summary = ""
         try:
-            summary_fact = await self._memory.get_latest_fact(entity=f"conversation:{conversation_id}", attribute="summary")
+            summary_fact = await self._memory.get_latest_fact(entity=_conv_entity(conversation_id), attribute="summary")
             if summary_fact and summary_fact.value.strip():
                 conversation_summary = summary_fact.value.strip()
         except Exception:
@@ -1803,8 +1823,9 @@ class RuntimeManager:
             # failures but stops discouraging the reasoning, so it thinks on
             # every turn instead. Keep both properties: forbid the block, do not
             # name it.
-            + "\n\nIMPORTANT: Reply with ONLY what you'd actually say to Marcus out loud. Do NOT write "
-            "any analysis, planning, notes, or a reasoning block — just say your reply directly."
+            + f"\n\nIMPORTANT: Reply with ONLY what you'd actually say to {_speaker_label()} "
+            "out loud. Do NOT write any analysis, planning, notes, or a reasoning "
+            "block — just say your reply directly."
         )
         messages = [
             {"role": "system", "content": system_prompt},
