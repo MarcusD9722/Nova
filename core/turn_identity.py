@@ -252,27 +252,95 @@ def active_turn(identity: TurnIdentity | None) -> Iterator[TurnIdentity]:
 #: building, and the names of everything he has built, is a personal detail a
 #: stranger in the room has no claim on. Only genuinely impersonal knowledge
 #: stays here.
-SHARED_ENTITY_PREFIXES: tuple[str, ...] = (
+SHARED_ENTITY_ROOTS: tuple[str, ...] = (
     "world",        # general knowledge Nova looked up
     "system",       # how Nova herself is configured
     "capability",   # what she can do
 )
 
+#: Kept as an alias: the old name said "prefixes", which is exactly the mistake
+#: `under_root` fixes. These are roots, and only `:` descends from them.
+SHARED_ENTITY_PREFIXES = SHARED_ENTITY_ROOTS
+
+#: The one delimiter that means "inside". Everything here is exact about it.
+SEP = ":"
+
+
+def under_root(entity: Any, root: str) -> bool:
+    """Is `entity` the namespace `root`, or something nested inside it?
+
+    `world` and `world:weather` are. `worldsecret` and `world_private` are NOT —
+    they are unrelated entities that merely start with the same letters.
+
+    This existed as `startswith(root)`, which meant an allow-list of three roots
+    silently admitted every entity whose name began with one of them. An
+    allow-list that matches on substring is not an allow-list.
+    """
+    e = str(entity or "").strip().lower()
+    r = str(root or "").strip().lower().rstrip(SEP)
+    if not e or not r:
+        return False
+    return e == r or e.startswith(r + SEP)
+
 
 def is_shared_entity(entity: Any) -> bool:
     """Is this entity safe for ANY speaker to read?"""
-    e = str(entity or "").strip().lower()
-    if not e:
+    return any(under_root(entity, r) for r in SHARED_ENTITY_ROOTS)
+
+
+def entity_belongs_to_speaker(entity: Any, memory_entity: Any) -> bool:
+    """Does `entity` live inside the personal namespace `memory_entity` owns?
+
+    One canonical hierarchy per person, so the policy is a single containment
+    check rather than a list of special cases:
+
+        speaker:p-alice                    their root
+        speaker:p-alice:lesson             what they asked Nova to do differently
+        speaker:p-alice:mood               how they have seemed
+        speaker:p-alice:person:sarah       someone THEY know
+
+    `speaker:p-alice2` is not inside `speaker:p-alice`, which is precisely why
+    this must not be a `startswith`.
+    """
+    own = str(memory_entity or "").strip().lower()
+    if not own:
         return False
-    return any(e == p.rstrip(":") or e.startswith(p) for p in SHARED_ENTITY_PREFIXES)
+    if under_root(entity, own):
+        return True
+    # Back-compat: P5.1d wrote the child namespaces the other way round
+    # (`lesson:speaker:p-alice`). Nothing live produced those — the frontend has
+    # never sent a speaker — but recognising them here costs one comparison and
+    # avoids stranding any that a test run or a manual write left behind.
+    e = str(entity or "").strip().lower()
+    return e.endswith(SEP + own) and own.startswith("speaker" + SEP)
+
+
+def personal_tail(entity: Any) -> str:
+    """What `entity` would be called if the speaker were the owner.
+
+    `speaker:p-alice` -> `user`, `speaker:p-alice:note` -> `note`,
+    `speaker:p-alice:person:sarah` -> `person:sarah`. Anything else is itself.
+
+    This is what makes person-quality memory parity a property of the namespace
+    rather than a rule duplicated into salience, decay and singleton handling —
+    each of which had drifted apart. A guest's own name is as much a core
+    identity fact as Marcus's; a guest's passing note is as forgettable as his.
+    """
+    e = str(entity or "").strip().lower()
+    if not e.startswith("speaker" + SEP):
+        return e
+    rest = e.split(SEP, 2)          # ["speaker", "<id>", "<tail>"?]
+    if len(rest) < 2 or not rest[1]:
+        return e
+    return rest[2] if len(rest) > 2 and rest[2] else OWNER_ENTITY
 
 
 def may_read_entity(entity: Any, identity: "TurnIdentity | None" = None) -> bool:
     """May the current speaker see a fact stored under `entity`?
 
     Conservative by construction: anything not positively recognised as shared,
-    and not the speaker's own namespace, is refused. A new personal entity added
-    later is private by default rather than public by oversight.
+    and not inside the speaker's own namespace, is refused. A new personal
+    entity added later is private by default rather than public by oversight.
     """
     ident = identity or current_identity()
     e = str(entity or "").strip().lower()
@@ -285,9 +353,9 @@ def may_read_entity(entity: Any, identity: "TurnIdentity | None" = None) -> bool
     if own == OWNER_ENTITY:
         # The owner reads everything, exactly as before P5.
         return True
-    # A known guest reads their OWN namespace and nothing else personal —
-    # including no other guest's.
-    return e == own.lower()
+    # A known guest reads their own namespace ENTIRELY — root and children —
+    # and nothing else personal, including no other guest's.
+    return entity_belongs_to_speaker(e, own)
 
 
 def remap_entity_for(entity: Any, identity: "TurnIdentity | None" = None) -> str | None:

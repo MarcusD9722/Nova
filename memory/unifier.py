@@ -75,14 +75,28 @@ def _now() -> datetime:
 #: Entities whose facts never decay. Being old doesn't make your name less
 #: true, and sinking identity facts would falsely trip the CH1 low-confidence
 #: hedge. Prefix match, so "project:flappy-bird" is covered by "project:".
-_UNDECAYED_ENTITY_PREFIXES = ("user", "lesson", "project:", "projects", "session",
-                              # A known speaker's core identity should not decay
-                              # away either (V3 P5.1d).
-                              "speaker:")
+_UNDECAYED_ENTITY_PREFIXES = ("user", "lesson", "project:", "projects", "session")
+
+
+def _personal_tail(entity: Any) -> str:
+    """`speaker:p-alice:note` -> `note`; `speaker:p-alice` -> `user`.
+
+    Imported from the identity policy so the namespace shape is defined once.
+    Wrapped because memory must not hard-depend on the runtime package.
+    """
+    try:
+        from core.turn_identity import personal_tail
+    except Exception:  # noqa: BLE001
+        return str(entity or "").strip().lower()
+    return personal_tail(entity)
 
 
 def _is_undecayed(entity: Any) -> bool:
-    e = str(entity or "").strip().lower()
+    # Normalised, so a known speaker's identity facts survive exactly as the
+    # owner's do — and their passing notes decay exactly as his do. Prefix-
+    # matching `speaker:` made every guest fact permanent, which is not parity,
+    # it is a different and worse rule.
+    e = _personal_tail(entity)
     return any(e == p or e.startswith(p) for p in _UNDECAYED_ENTITY_PREFIXES)
 
 
@@ -102,7 +116,7 @@ def _default_salience(entity: str, attribute: str, confidence: float) -> float:
     core/mood.py. Callers that know more (the runtime knows the emotional tone
     of the message that produced the fact) should pass `salience` explicitly.
     """
-    e = str(entity or "").strip().lower()
+    e = _personal_tail(str(entity or "").strip().lower())
     a = str(attribute or "").strip().lower()
     if e == "user" and a in _CORE_IDENTITY_ATTRS:
         return 1.0
@@ -172,6 +186,15 @@ def _staleness_factor(
     return 0.85 + 0.15 * math.exp(-age_days / max(1.0, effective_half_life))
 
 
+def _read_scope_entity() -> str | None:
+    """The current speaker's personal root, or None if they have no history."""
+    try:
+        from core.turn_identity import current_identity
+    except Exception:  # noqa: BLE001
+        return "user"
+    return current_identity().memory_entity
+
+
 def _read_scope_key() -> str:
     """Cache-key component identifying WHOSE view of memory this is."""
     try:
@@ -194,11 +217,17 @@ def scoped_entity(base: str) -> str | None:
     and a guest's bad evening would have been recorded as his mood.
 
         owner / typed / legacy voice -> "lesson"                  (unchanged)
-        known guest                  -> "lesson:speaker:p-alice"
+        known guest                  -> "speaker:p-alice:lesson"
         unverified voice             -> None  (write nothing, read nothing)
 
     None means nothing: callers return early. They must never fall back to the
     unscoped base, which is the whole failure this prevents.
+
+    The guest form nests UNDER their root rather than beside it (P5.1d.1). The
+    original `lesson:speaker:p-alice` shape meant read policy had to enumerate
+    every child namespace by hand, and it missed all of them — Alice's own
+    lessons were unreadable by Alice. One hierarchy makes it one containment
+    check; see core.turn_identity.entity_belongs_to_speaker.
     """
     try:
         from core.turn_identity import OWNER_ENTITY, current_identity
@@ -209,7 +238,7 @@ def scoped_entity(base: str) -> str | None:
         return None
     if ent == OWNER_ENTITY:
         return base
-    return f"{base}:{ent}"
+    return f"{ent}:{base}"
 
 
 def _scope_is_owner() -> bool:
@@ -219,6 +248,20 @@ def _scope_is_owner() -> bool:
     except Exception:  # noqa: BLE001
         return True
     return current_identity().is_owner
+
+
+def _turn_source_meta() -> tuple[str, str]:
+    """(input_source, speaker_status) for the durable turn row.
+
+    Diagnostics-grade only. Deliberately never similarity, never an embedding,
+    never audio — the same rule the profile store follows.
+    """
+    try:
+        from core.turn_identity import current_identity
+    except Exception:  # noqa: BLE001
+        return ("typed", "")
+    ident = current_identity()
+    return (ident.input_source or "typed", ident.speaker_status or "")
 
 
 def _turn_speaker_meta(role: str) -> tuple[str, str]:
@@ -276,17 +319,15 @@ def _filter_hits_for_scope(hits: list[MemoryHit]) -> list[MemoryHit]:
             if may_read_entity(prov.get("entity"), ident):
                 kept.append(h)
             continue
-        # An indexed turn now records whose it was, so a recognised guest can
-        # recall their own conversation without seeing any of Marcus's.
-        if str(prov.get("kind") or "") == "turn":
+        # A turn now records whose it was — in Chroma metadata AND in the
+        # durable SQLite row — so a recognised guest can recall their own
+        # conversation without seeing any of Marcus's. Anything without
+        # attribution is withheld: legacy rows are backfilled as `user`, so
+        # "missing" here means genuinely unknown, not merely old.
+        if table == "turns" or str(prov.get("kind") or "") == "turn":
             spk = str(prov.get("speaker_entity") or "")
             if own and spk and spk.lower() == own.lower():
                 kept.append(h)
-            continue
-        if table == "turns":
-            # Durable cross-session conversation is personal history. A guest
-            # who has just arrived must not be able to read back what Marcus
-            # said in previous sessions.
             continue
         if table in {"people", "events"}:
             # Marcus's relationships and calendar are his.
@@ -398,14 +439,15 @@ class MemoryUnifier:
         return self._thoughts
 
     def _is_singleton_fact(self, entity: str, attribute: str) -> bool:
-        ent = (entity or "").strip().lower()
+        # V3 P5.1d.1: normalise first, then apply the OWNER's rules unchanged.
+        # A known enrolled speaker is a person and gets the same memory quality
+        # Marcus has — but only at the same level. `speaker:p-alice` is a
+        # personal root like `user`; `speaker:p-alice:person:sarah` is one of
+        # HER acquaintances, and must behave like `person:sarah`, not like a
+        # second `user`. Prefix-matching `speaker:` conflated the two.
+        ent = _personal_tail((entity or "").strip().lower())
         attr = (attribute or "").strip().lower()
-        if ent == "user" or ent.startswith("speaker:"):
-            # V3 P5.1d: a known enrolled speaker is a PERSON, and gets the same
-            # singleton semantics Marcus has. Without this, Alice moving from
-            # Berlin to Dallas left both current — measured — so her memory was
-            # structurally worse than his purely because she is not the owner.
-            # This routes memory; it grants nothing.
+        if ent == "user":
             return attr in self._SINGLETON_USER_ATTRS
         if ent == INSIGHT_ENTITY:
             # One belief per topic. Re-deriving "he works late on Thursdays"
@@ -593,6 +635,13 @@ class MemoryUnifier:
             and len((content or "").strip()) >= 25
         )
 
+        # Whose turn this is, resolved once and written to all three stores so
+        # they cannot disagree (V3 P5.1d.1). Chroma metadata alone was not
+        # enough: the durable SQLite row is what date-range recall reads, and it
+        # had no idea who had spoken.
+        speaker, owner_ent = _turn_speaker_meta(role)
+        src, status = _turn_source_meta()
+
         async with self._write_lock:
             writes = [
                 self._sqlite.add_turn(
@@ -601,6 +650,10 @@ class MemoryUnifier:
                     role=role,
                     content=content,
                     created_at_iso=created_at,
+                    speaker_entity=owner_ent,
+                    speaker_label=speaker,
+                    input_source=src,
+                    speaker_status=status,
                 ),
                 self._json.append_audit(
                     {
@@ -610,11 +663,14 @@ class MemoryUnifier:
                         "role": role,
                         "content": content,
                         "created_at": created_at,
+                        "speaker_entity": owner_ent,
+                        "speaker_label": speaker,
+                        "input_source": src,
+                        "speaker_status": status,
                     }
                 ),
             ]
             if index_turn and self._chroma is not None:
-                speaker, owner_ent = _turn_speaker_meta(role)
                 writes.append(
                     self._chroma_upsert_safe(
                         doc_id=f"turn:{turn_id}",
@@ -2211,15 +2267,32 @@ class MemoryUnifier:
         until_iso: str | None = None,
         limit: int = 30,
     ) -> list[dict[str, Any]]:
-        """Keyword/date-range recall over the full turn history (any age)."""
+        """Keyword/date-range recall over the full turn history (any age).
+
+        Scoped to the current speaker (V3 P5.1d.1): "what did we talk about last
+        Tuesday" means the conversations *this person* had with Nova. The owner
+        gets his own history exactly as before — legacy rows are stamped `user`,
+        so nothing he ever said becomes unreachable. An unverified speaker gets
+        nothing: there is no history that belongs to nobody.
+
+        This is the narrower reading of D11 on purpose. D11 lets the owner see a
+        guest's stored facts, but "what did WE talk about" is a question about a
+        shared thread, and answering it by merging two people's transcripts
+        would put words in Marcus's mouth rather than merely show him data.
+        """
         await self.initialize()
+        own = _read_scope_entity()
+        if own is None:
+            return []
         rows = await self._sqlite.search_turns(
-            term=(term or None), since_iso=since_iso, until_iso=until_iso, limit=int(limit)
+            term=(term or None), since_iso=since_iso, until_iso=until_iso,
+            limit=int(limit), speaker_entity=own,
         )
         return [
             {
                 "role": str(r.get("role")),
-                "speaker": "Marcus" if str(r.get("role")) == "user" else "Nova",
+                "speaker": (str(r.get("speaker_label") or "")
+                            or ("Marcus" if str(r.get("role")) == "user" else "Nova")),
                 "content": str(r.get("content") or ""),
                 "created_at": str(r.get("created_at") or ""),
             }
@@ -2609,7 +2682,14 @@ class MemoryUnifier:
         cache_key = (f"search:{self._search_gen}:{_scope}:{conversation_id}:"
                      f"{'|'.join(terms) or q_norm}:{limit}")
         cached = await self._diskcache.get(cache_key)
-        if isinstance(cached, list) and cached:
+        if isinstance(cached, list):
+            # `isinstance` rather than a truthiness check (P5.1d.1): the cache
+            # now stores the ALLOWED view, and for a guest asking about
+            # something private that view is legitimately empty. Treating empty
+            # as a miss made every such search re-run the whole fan-out —
+            # measured 47ms median for a guest against 0.6ms for the owner.
+            # A miss is `None`; an empty list is a real, cacheable answer.
+            #
             # Filtered again on the way out: a cache written before a policy
             # change must not outlive it.
             return _filter_hits_for_scope([MemoryHit.model_validate(x) for x in cached])
@@ -2696,7 +2776,12 @@ class MemoryUnifier:
                         kind="turn",
                         text=f"{row['role']}: {row['content']}",
                         score=0.15 * recency_score,
-                        provenance={"backend": "sqlite", "table": "turns", "conversation_id": row["conversation_id"]},
+                        provenance={"backend": "sqlite", "table": "turns",
+                                    "conversation_id": row["conversation_id"],
+                                    # Durable attribution (P5.1d.1) — so a guest
+                                    # can see their own recent turns instead of
+                                    # the whole table being withheld from them.
+                                    "speaker_entity": str(row.get("speaker_entity") or "user")},
                     )
                 )
 
@@ -2823,23 +2908,35 @@ class MemoryUnifier:
 
         ranked = sorted(merged.values(), key=lambda x: x.score, reverse=True)[: int(limit)]
 
-        await self._reinforce_recalled(ranked)
-
-        await self._diskcache.set(cache_key, [r.model_dump() for r in ranked], ttl_s=120)
-        # NOTE: previously every search() appended its full result set to
-        # snapshots.jsonl — the fastest-growing file in the system, with no code
-        # ever reading it back. Dropped: search runs on every chat turn.
-
-        # ── Read-scope filter (V3 P5.1d) ────────────────────────────────────
+        # ── Read-scope filter (V3 P5.1d, ordering corrected in P5.1d.1) ─────
         # `search()` fed "Things you remember" in the prompt AND backed the
         # memory.recall tool, so it was a side door around grounding privacy:
         # measured, an unknown speaker could retrieve a private owner fact
         # through both. Filtering here closes both at once.
         #
+        # This MUST happen before reinforcement and before the cache write.
+        # P5.1d filtered afterwards, so a denied hit still left a trace:
+        # measured, an unknown speaker searching for Marcus's private fact took
+        # its access_count from 0 to 1 and stamped last_accessed_at. The content
+        # never reached them, but a read they were not allowed to perform still
+        # made his memory of it stronger — a side channel, and a corruption of
+        # the signal reinforcement exists to carry.
+        #
         # Conservative: anything not positively recognised as shared, and not
-        # the speaker's own namespace, is dropped. Durable conversation turns
-        # count as personal history, not shared context.
-        return _filter_hits_for_scope(ranked)
+        # inside the speaker's own namespace, is dropped. Durable conversation
+        # turns count as personal history, not shared context.
+        allowed = _filter_hits_for_scope(ranked)
+
+        # Only what this speaker was actually allowed to see gets strengthened,
+        # and only that is cached — under a key that already includes who they
+        # are, so one speaker's view is never replayed to another.
+        await self._reinforce_recalled(allowed)
+        await self._diskcache.set(cache_key, [r.model_dump() for r in allowed], ttl_s=120)
+        # NOTE: previously every search() appended its full result set to
+        # snapshots.jsonl — the fastest-growing file in the system, with no code
+        # ever reading it back. Dropped: search runs on every chat turn.
+
+        return allowed
 
     #: A recalled fact is only reinforced if it actually surfaced strongly.
     #: search() returns up to `limit` hits whether or not they were any good;

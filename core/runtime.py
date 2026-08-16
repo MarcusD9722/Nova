@@ -270,6 +270,34 @@ def _speaker_label() -> str:
     return "The speaker"
 
 
+def _is_lesson_fact_text(text: Any) -> bool:
+    """Is this search hit a behavioural lesson, whosever it is?
+
+    Matches `FACT lesson …` and `FACT speaker:<id>:lesson …`. Lessons get their
+    own prompt section, so they must not also appear in the general memory
+    block.
+    """
+    t = str(text or "")
+    if not t.startswith("FACT "):
+        return False
+    ent = t[5:].split(" ", 1)[0]
+    return ent == "lesson" or ent.endswith(":lesson")
+
+
+def _lesson_header(ident) -> str:
+    """Heading for the behavioural-lessons block, named for whose they are.
+
+    The owner's wording is unchanged. A guest's lessons are theirs and must not
+    be introduced as things learned from Marcus — that would both misattribute
+    them and tell a visitor that Marcus has standing instructions.
+    """
+    if ident.is_owner:
+        return "Lessons you've learned from Marcus — apply these unless he says otherwise:\n"
+    who = ident.display_name or "this person"
+    return (f"Lessons you've learned from {who} — apply these unless they say "
+            f"otherwise. They are {who}'s preferences, not Marcus's:\n")
+
+
 def _guest_persona(ident) -> str:
     """Nova's persona for someone who is not Marcus.
 
@@ -1559,7 +1587,12 @@ class RuntimeManager:
         # Lessons are stored under the "lesson" entity and can surface as search
         # hits too; keep them out of the general memory block so they only appear
         # in the dedicated "lessons" section below.
-        stable_mem = "\n".join(h.text for h in mem_hits if h.kind != "turn" and not str(h.text).startswith("FACT lesson "))
+        # A guest's lessons live at `speaker:<id>:lesson`, so matching the bare
+        # "FACT lesson " prefix would have let theirs through into the general
+        # block and printed them twice (V3 P5.1d.1).
+        stable_mem = "\n".join(
+            h.text for h in mem_hits
+            if h.kind != "turn" and not _is_lesson_fact_text(h.text))
         grounding = await self._build_grounding_context(
             user_text=clean_user, user_name=user_name, available_tools=self._router.list_tools(),
             conversation_id=conversation_id,
@@ -1717,9 +1750,16 @@ class RuntimeManager:
                 # Marcus's behavioural lessons are HIS. Applying "keep answers
                 # short, Marcus said" to a guest is both wrong and a quiet leak
                 # of how he likes to be spoken to.
-                "Lessons you've learned from Marcus — apply these unless he says otherwise:\n"
+                #
+                # But `get_lessons()` is speaker-scoped, so these are already
+                # whoever is speaking — and gating on is_owner meant a guest's
+                # own corrections were stored faithfully and then ignored
+                # forever (V3 P5.1d.1). Nova would be told "stop doing that",
+                # write it down, and carry on doing it. An unverified speaker
+                # still gets none: nothing was stored for them to begin with.
+                _lesson_header(_ident)
                 + "\n".join(f"- {l}" for l in lessons) + "\n"
-                if (lessons and _ident.is_owner) else ""
+                if (lessons and not _ident.is_unverified) else ""
             )
             + (f"Earlier in this conversation: {conversation_summary}\n" if conversation_summary else "")
             + (f"Things you remember:\n{stable_mem}\n" if stable_mem else "")
