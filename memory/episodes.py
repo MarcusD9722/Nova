@@ -111,13 +111,23 @@ class Episode:
     last_accessed_at: str | None = None
     superseded_by: str | None = None
     created_at: str = field(default_factory=_now_iso)
-    #: Whose episode this is (V3 P5.1e). `user` for Marcus, `speaker:<id>` for a
-    #: known guest, `unverified` when Nova could not attribute the turn, and
-    #: `system` for things that happened without a human saying them. Structured
-    #: on purpose: read scoping must never be decided by parsing summary prose.
+    #: Retained from P5.1e for compatibility; mirrors `actor_entity`.
     speaker_entity: str = "user"
     speaker_label: str = ""
     input_source: str = "typed"
+    #: WHO caused this (V3 P5.1e.1). `user`, `speaker:<id>`, `unverified`, or
+    #: `system` for things Nova did with no human present. Provenance only —
+    #: this decides WORDING and never decides who may read.
+    actor_entity: str = "user"
+    actor_label: str = ""
+    #: WHOSE episode this is. The only field read authorisation consults.
+    #:
+    #: Distinct from the actor because the two genuinely differ: a background
+    #: build failure on Marcus's private project has actor `system` and privacy
+    #: `user`. Marking it `system` for accuracy would make it readable by a
+    #: guest; marking it `user` for safety would claim he ran the build. Both
+    #: fields, and neither lies.
+    privacy_scope: str = "user"
 
     @classmethod
     def from_row(cls, row) -> "Episode":
@@ -133,6 +143,13 @@ class Episode:
             speaker_entity=_row_get(row, "speaker_entity", "user"),
             speaker_label=_row_get(row, "speaker_label", ""),
             input_source=_row_get(row, "input_source", "typed"),
+            actor_entity=_row_get(row, "actor_entity",
+                                  _row_get(row, "speaker_entity", "user")),
+            actor_label=_row_get(row, "actor_label",
+                                 _row_get(row, "speaker_label", "")),
+            # Missing privacy_scope means a row this build has never migrated.
+            # Fail closed to the owner rather than to anything wider.
+            privacy_scope=_row_get(row, "privacy_scope", "user"),
             superseded_by=row["superseded_by"], created_at=row["created_at"],
         )
 
@@ -221,8 +238,9 @@ class EpisodicStore:
                    (id, kind, summary, entities, conversation_id, project, source_tool,
                     trust, freshness, provenance, outcome, importance, access_count,
                     last_accessed_at, superseded_by, created_at,
-                    speaker_entity, speaker_label, input_source)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+                    speaker_entity, speaker_label, input_source,
+                    actor_entity, actor_label, privacy_scope)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
     def _episode_row(self, ep: Episode) -> tuple:
         return (ep.id, ep.kind, ep.summary, json.dumps(ep.entities), ep.conversation_id,
@@ -230,7 +248,10 @@ class EpisodicStore:
                 json.dumps(ep.provenance, default=str), ep.outcome, ep.importance,
                 ep.access_count, ep.last_accessed_at, ep.superseded_by, ep.created_at,
                 ep.speaker_entity or "user", ep.speaker_label or "",
-                ep.input_source or "typed")
+                ep.input_source or "typed",
+                ep.actor_entity or ep.speaker_entity or "user",
+                ep.actor_label or ep.speaker_label or "",
+                ep.privacy_scope or "user")
 
     async def record_episode(self, ep: Episode) -> str:
         async with self._conn() as db:

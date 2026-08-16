@@ -673,6 +673,61 @@ def seed_decisions() -> list[Decision]:
                         "delivered by P5.",
             decided_at="2026-08-15T00:00:00+00:00",
         ),
+        Decision(
+            id="D17",
+            title="Actor and privacy owner are separate fields, and a default is not a value",
+            decision="Episodes carry actor_entity/actor_label (WHO caused this - decides "
+                     "wording) and privacy_scope (WHOSE it is - the only field read "
+                     "authorisation consults), set independently. current_identity() keeps "
+                     "its legacy typed-owner default unchanged; a new "
+                     "current_identity_or_none()/has_active_turn() pair distinguishes 'a "
+                     "turn is active' from 'the ContextVar default is answering', and the "
+                     "event bus snapshots the second. _SHARED_SYSTEM_KINDS is deliberately "
+                     "EMPTY.",
+            rationale="A ContextVar default is indistinguishable from a real value once "
+                      "read. _publisher_identity() documented itself as returning None off "
+                      "the turn path while returning typed Marcus, so every background "
+                      "publish was snapshotted as his - measured, an off-turn "
+                      "project.completed persisted with speaker_label='Marcus' beside a "
+                      "summary reading 'Nova finished ...'. Fixing that ALONE would have "
+                      "made things worse: P5.1e used one field for both questions, and for "
+                      "a background failure on Marcus's private project the answers differ "
+                      "- 'system' is accurate about the actor and lets a guest read his "
+                      "project, 'user' keeps it private and claims he ran the build. The "
+                      "privacy of that row was an accident of the first bug, so correcting "
+                      "the actor without splitting the concepts would have OPENED it. "
+                      "_SHARED_SYSTEM_KINDS is empty because every system episode Nova "
+                      "produces today carries project names, tool arguments, file paths or "
+                      "query excerpts - Nova executing something does not make its contents "
+                      "impersonal.",
+            alternatives=["Making current_identity() return None off-turn (rejected: much "
+                          "pre-P5 code correctly relies on the typed default; the blast "
+                          "radius dwarfs the bug)",
+                          "One field with a 'system means shared' convention (rejected: "
+                          "that IS the leak - accuracy and privacy trade against each "
+                          "other)",
+                          "Inferring ownership from the summary (rejected: privacy would "
+                          "depend on phrasing; D13/D15 already refused prose-parsing)",
+                          "Classifying project events shared because Nova is the actor "
+                          "(rejected: the actor is not the subject)"],
+            evidence=["tests/test_speaker_actor_scope_v51e1.py: off-turn publish carries "
+                      "None while current_identity() is unchanged; nesting, unwinding and "
+                      "concurrent turns keep their own marker; the real BUS -> promoter -> "
+                      "worker -> SQLite path produces a row that is simultaneously "
+                      "actor_entity=system and privacy_scope=user; a guest reads her own "
+                      "and an explicitly shared episode but not the system-actor episode "
+                      "belonging to Marcus; a denied episode causes no access_count change, "
+                      "no timestamp and no cold read"],
+            subsystem="memory",
+            source_refs=["core/turn_identity.py::current_identity_or_none",
+                         "core/event_bus.py::_publisher_identity",
+                         "core/workers/episodic_ingest.py::_privacy_for"],
+            constraints="Read authorisation must use privacy_scope ONLY - never the actor, "
+                        "never the summary. Rows with a missing scope fail closed to the "
+                        "owner. Adding a kind to _SHARED_SYSTEM_KINDS requires checking "
+                        "what that kind's payload actually contains, one kind at a time.",
+            decided_at="2026-08-16T00:00:00+00:00",
+        ),
     ]
 
 

@@ -33,15 +33,40 @@ from core.events import EpisodicPersistEvent
 from core.turn_identity import OWNER_ENTITY
 
 
-def _speaker_fields(identity) -> tuple[str, str, str]:
-    """(speaker_entity, speaker_label, input_source) for an episode row.
+#: Episode kinds Nova produces with no human in the room. The actor is `system`
+#: — but see `_privacy_for` before concluding anything about who may read them.
+_SYSTEM_KINDS: frozenset[str] = frozenset({
+    "project_event", "failure", "project_milestone",
+})
 
-    Structured, and deliberately small: retrieval needs to know WHOSE episode
-    this is and how to name them. It never needs an embedding, a similarity or
-    a threshold, and none is stored.
+#: Episode kinds that are genuinely impersonal and safe for ANY speaker.
+#:
+#: Deliberately EMPTY today, and that is the honest answer rather than an
+#: oversight (V3 P5.1e.1). Every system episode Nova currently produces —
+#: project events, build failures, recurring internal errors — carries project
+#: names, tool arguments, file paths or query excerpts, all of which are
+#: Marcus's. A reserved scope with no current producers is better than widening
+#: private state to fit a category that reads well.
+#:
+#: A future genuinely-public event ("a capability became available") can be
+#: added here deliberately, with the content checked, one kind at a time.
+_SHARED_SYSTEM_KINDS: frozenset[str] = frozenset()
+
+#: The privacy scope meaning "anyone may read this".
+SHARED_SCOPE = "system"
+
+
+def _actor_fields(identity, kind: str = "") -> tuple[str, str, str]:
+    """(actor_entity, actor_label, input_source) — WHO did this.
+
+    Provenance only. It decides how the summary reads and never decides who may
+    read it; `_privacy_for` answers that separately.
     """
     if identity is None:
-        return (OWNER_ENTITY, "Marcus", "typed")
+        # No human turn was in scope. Before P5.1e.1 this returned typed Marcus,
+        # so a background build was persisted as `speaker_label="Marcus"` beside
+        # a summary that said "Nova finished …". Nova did it; say so.
+        return ("system", "Nova", "system")
     ent = identity.memory_entity
     if ent is None:
         # Nova could not attribute the turn. `unverified` is its own namespace,
@@ -50,6 +75,28 @@ def _speaker_fields(identity) -> tuple[str, str, str]:
     if ent == OWNER_ENTITY:
         return (OWNER_ENTITY, "Marcus", identity.input_source or "typed")
     return (ent, identity.display_name or "A guest", identity.input_source or "voice")
+
+
+def _privacy_for(identity, kind: str = "") -> str:
+    """WHOSE episode this is — the ONLY field read authorisation consults.
+
+    The separation matters most in one direction: a system-actor episode about
+    Marcus's project is his, not everyone's. Nova executing the build does not
+    make its contents impersonal.
+    """
+    if identity is not None:
+        ent = identity.memory_entity
+        if ent is not None:
+            return ent
+        return "unverified"
+    # No human present. Shared ONLY if this kind is explicitly on the list,
+    # which is currently empty by design. Everything else is the owner's.
+    return SHARED_SCOPE if str(kind) in _SHARED_SYSTEM_KINDS else OWNER_ENTITY
+
+
+def _speaker_fields(identity) -> tuple[str, str, str]:
+    """Back-compat shim for callers/tests written against P5.1e."""
+    return _actor_fields(identity)
 
 from core.logging_setup import get_logger
 from core.workers.lifecycle import log_worker_error, stop_worker
@@ -219,7 +266,8 @@ class EpisodicIngestWorker:
         # entered active_turn. Same rule MemoryIngestEvent already learned
         # (D12). A missing snapshot means a pre-P5.1e or system event, which
         # is owner history by the migration assumption.
-        spk_entity, spk_label, spk_source = _speaker_fields(ev.identity)
+        spk_entity, spk_label, spk_source = _actor_fields(ev.identity, ev.kind)
+        privacy = _privacy_for(ev.identity, ev.kind)
 
         if art is not None:
             # Provenance is carried through structurally, not flattened into
@@ -258,6 +306,9 @@ class EpisodicIngestWorker:
                 speaker_entity=spk_entity,
                 speaker_label=spk_label,
                 input_source=spk_source,
+                actor_entity=spk_entity,
+                actor_label=spk_label,
+                privacy_scope=privacy,
             )
         else:
             # A correction, a project milestone, a recurring failure (V3 P4.2).
@@ -287,6 +338,9 @@ class EpisodicIngestWorker:
                 speaker_entity=spk_entity,
                 speaker_label=spk_label,
                 input_source=spk_source,
+                actor_entity=spk_entity,
+                actor_label=spk_label,
+                privacy_scope=privacy,
             )
 
         # Episode and evidence in ONE transaction. The ordered children are the

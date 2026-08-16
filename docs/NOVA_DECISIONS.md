@@ -720,3 +720,68 @@ coverage is later P8 work and must not be claimed as delivered by P5.
 **Revisit if.** A plugin gains genuine per-speaker connected accounts. Then its
 scope becomes a third value rather than a refusal, and the wrapper resolves the
 speaker's own credentials.
+
+---
+
+## D17 - Actor and privacy owner are separate fields, and a default is not a value
+
+**Decided:** 2026-08-16 (V3 P5.1e.1)
+
+**Decision.** Episodes carry `actor_entity` / `actor_label` (WHO caused this,
+which decides wording) and `privacy_scope` (WHOSE it is, the only field read
+authorisation consults). They are set independently. Separately,
+`current_identity()` keeps its legacy typed-owner default unchanged, and a new
+`current_identity_or_none()` / `has_active_turn()` pair distinguishes "a turn is
+active" from "the ContextVar default is answering". The event bus snapshots the
+second one.
+
+`_SHARED_SYSTEM_KINDS` - the set of episode kinds readable by any speaker - is
+deliberately EMPTY.
+
+**Rationale.** Two defects, both introduced by P5.1e itself.
+
+A ContextVar default is indistinguishable from a real value once read.
+`_publisher_identity()` documented itself as returning "None off the turn path"
+while returning typed Marcus, so every background publish was snapshotted as his.
+Measured: an off-turn `project.completed` persisted with `speaker_label="Marcus"`
+beside a summary reading "Nova finished ...". One row contradicting itself.
+
+Fixing that alone would have made things WORSE. P5.1e used one field for both
+questions, and for a background build failure on Marcus's private project the two
+answers differ: marking it `system` is accurate about the actor and lets a guest
+read his project; marking it `user` keeps it private and claims he ran the build.
+The privacy of that row was an accident of the first bug, so correcting the actor
+without splitting the concepts would have opened it. That is why both land
+together.
+
+`_SHARED_SYSTEM_KINDS` is empty because every system episode Nova currently
+produces carries project names, tool arguments, file paths or query excerpts -
+all Marcus's. Nova executing something does not make its contents impersonal. A
+reserved scope with no producers is better than widening private state to fit a
+category that reads well.
+
+**Alternatives rejected.** Making `current_identity()` return None off-turn
+(rejected: a great deal of pre-P5 code correctly relies on the typed default, and
+the blast radius dwarfs the bug); one field with a convention like "system means
+shared" (rejected: that IS the leak - it makes accuracy and privacy trade against
+each other); inferring ownership from the summary (rejected: privacy would depend
+on phrasing, and D13/D15 already refused prose-parsing); classifying project
+events as shared because Nova is the actor (rejected: the actor is not the
+subject).
+
+**Evidence.** `tests/test_speaker_actor_scope_v51e1.py` - off-turn publish
+carries None while `current_identity()` is unchanged; nesting, unwinding and
+concurrent turns keep their own marker; the real BUS -> promoter -> worker ->
+SQLite path produces a row that is simultaneously `actor_entity=system` and
+`privacy_scope=user`; a guest reads her own episode and an explicitly shared one
+but not the system-actor episode belonging to Marcus; a denied episode causes no
+access_count change, no timestamp and no cold read.
+
+**Constraint.** Read authorisation must use `privacy_scope` ONLY - never the
+actor, never the summary. Rows with a missing scope fail closed to the owner.
+Adding a kind to `_SHARED_SYSTEM_KINDS` requires checking what that kind's
+payload actually contains, one kind at a time.
+
+**Revisit if.** A genuinely impersonal system event appears (a capability became
+available, with no owner content). Add that kind explicitly; do not relax the
+default.
