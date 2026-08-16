@@ -102,6 +102,17 @@ class Artifact:
     last_accessed: float | None = None
     importance: float = 0.5
     active: bool = True
+    #: Whose artifact this is (V3 P5.1 final closure). `user`, `speaker:<id>`,
+    #: or `unverified`. A hot result set is conversation-local, and a
+    #: conversation is not one person once a guest can speak into it — without
+    #: this, "the second one" resolved against whatever the previous speaker had
+    #: on screen. Stamped at creation from the live turn; never client-supplied.
+    #:
+    #: Defaults to EMPTY so `ArtifactStore.add` can tell "not yet stamped" from
+    #: a real scope — a default of "user" is truthy and would silently never be
+    #: replaced, which is exactly the bug this comment now guards against.
+    #: Readers treat empty as the owner, which every pre-P5.1 artifact was.
+    privacy_scope: str = ""
 
     @property
     def title(self) -> str:
@@ -305,6 +316,10 @@ class ArtifactStore:
     # -- writing --------------------------------------------------------------
 
     def add(self, artifact: Artifact, *, notify: bool = True) -> Artifact:
+        # Stamped here rather than at each call site: `add` is the only way an
+        # artifact enters the store, so a new producer cannot forget.
+        if not getattr(artifact, "privacy_scope", ""):
+            artifact.privacy_scope = self._scope()
         self._by_id[artifact.artifact_id] = artifact
         ids = self._by_conversation.setdefault(artifact.conversation_id, [])
         ids.append(artifact.artifact_id)
@@ -371,9 +386,27 @@ class ArtifactStore:
     def get(self, artifact_id: str) -> Artifact | None:
         return self._by_id.get(artifact_id)
 
+    @staticmethod
+    def _scope() -> str:
+        try:
+            from core.turn_identity import conversation_scope
+        except Exception:  # noqa: BLE001
+            return "user"
+        return conversation_scope()
+
     def for_conversation(self, conversation_id: str) -> list[Artifact]:
+        """Artifacts in this conversation that the CURRENT speaker may see.
+
+        The single choke point: `items_of`, `latest_result_set`, `active_items`,
+        `resolve` and `latest_of_type` all funnel through here, so filtering
+        once covers ordinal resolution, prompt injection, selection and the
+        `touch()` inside `resolve` — a denied artifact is never reached, so it
+        is never reinforced (the ordering P5.1d.1 established for facts).
+        """
+        scope = self._scope()
         return [self._by_id[i] for i in self._by_conversation.get(str(conversation_id), [])
-                if i in self._by_id]
+                if i in self._by_id
+                and (self._by_id[i].privacy_scope or "user") == scope]
 
     def items_of(self, parent_id: str) -> list[Artifact]:
         parent = self._by_id.get(parent_id)

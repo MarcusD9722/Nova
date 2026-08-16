@@ -135,7 +135,23 @@ class WorkingContextStore:
         self._order: deque[str] = deque()
         self._max = max_conversations
 
+    @staticmethod
+    def _scoped(conversation_id: str) -> str:
+        """Partition per speaker (V3 P5.1 final closure).
+
+        Recent turns, tool traces, the active topic/project, the open question,
+        the result-set pointer and the current selection are all conversation-
+        local — and every one of them is somebody's. The owner's key is
+        unchanged.
+        """
+        try:
+            from core.turn_identity import scoped_conversation_key
+        except Exception:  # noqa: BLE001
+            return str(conversation_id)
+        return scoped_conversation_key(conversation_id)
+
     def get(self, conversation_id: str) -> WorkingContext:
+        conversation_id = self._scoped(conversation_id)
         key = str(conversation_id)
         ctx = self._contexts.get(key)
         if ctx is None:
@@ -147,9 +163,11 @@ class WorkingContextStore:
         return ctx
 
     def peek(self, conversation_id: str) -> WorkingContext | None:
+        conversation_id = self._scoped(conversation_id)
         return self._contexts.get(str(conversation_id))
 
     def drop(self, conversation_id: str) -> None:
+        conversation_id = self._scoped(conversation_id)
         key = str(conversation_id)
         self._contexts.pop(key, None)
         try:
