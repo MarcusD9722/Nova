@@ -44,11 +44,24 @@ class SQLiteMemoryBackend:
                         role TEXT NOT NULL,
                         content TEXT NOT NULL,
                         created_at TEXT NOT NULL,
+                        -- V3 P5.1d.1: who this turn actually belongs to. The
+                        -- speaker label lived only in Chroma metadata, so the
+                        -- durable record — the one date-range recall reads —
+                        -- could not tell Marcus's sentences from a guest's.
+                        -- Defaults are the legacy answer: every row written
+                        -- before speaker identity existed WAS Marcus.
+                        -- Never store embeddings, similarity or audio here.
+                        speaker_entity TEXT NOT NULL DEFAULT 'user',
+                        speaker_label TEXT NOT NULL DEFAULT '',
+                        input_source TEXT NOT NULL DEFAULT 'typed',
+                        speaker_status TEXT NOT NULL DEFAULT '',
                         FOREIGN KEY(conversation_id) REFERENCES conversations(id)
                     );
                     """
                 )
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_turns_conv_created ON turns(conversation_id, created_at);")
+                await self._migrate_turns_schema(db)
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_turns_speaker_created ON turns(speaker_entity, created_at);")
                 await db.execute(
                     """
                     CREATE TABLE IF NOT EXISTS facts (
@@ -709,6 +722,26 @@ class SQLiteMemoryBackend:
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    async def _migrate_turns_schema(self, db: aiosqlite.Connection) -> None:
+        """Add speaker attribution to an existing `turns` table, in place.
+
+        Every row that predates this column existed before Nova could tell who
+        was speaking, and every one of them was Marcus — the frontend has never
+        sent a speaker identity. So the backfill is not a guess: `user` / typed
+        is what those turns actually were, and it keeps his history readable
+        exactly as before. No DB deletion, no rebuild.
+        """
+        cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='turns';")
+        if not await cur.fetchone():
+            return
+        cur = await db.execute("PRAGMA table_info(turns);")
+        have = {r[1] for r in await cur.fetchall()}
+        for col, default in (("speaker_entity", "'user'"), ("speaker_label", "''"),
+                             ("input_source", "'typed'"), ("speaker_status", "''")):
+            if col not in have:
+                await db.execute(
+                    f"ALTER TABLE turns ADD COLUMN {col} TEXT NOT NULL DEFAULT {default};")
+
     async def _migrate_tasks_schema(self, db: aiosqlite.Connection) -> None:
         """Best-effort, in-place schema migration for the tasks table.
 
@@ -779,13 +812,30 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def add_turn(self, turn_id: UUID, conversation_id: UUID, role: str, content: str, created_at_iso: str | None = None) -> None:
+    async def add_turn(
+        self,
+        turn_id: UUID,
+        conversation_id: UUID,
+        role: str,
+        content: str,
+        created_at_iso: str | None = None,
+        *,
+        speaker_entity: str = "user",
+        speaker_label: str = "",
+        input_source: str = "typed",
+        speaker_status: str = "",
+    ) -> None:
         await self.initialize()
         await self.ensure_conversation(conversation_id)
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO turns(id, conversation_id, role, content, created_at) VALUES(?, ?, ?, ?, ?)",
-                (str(turn_id), str(conversation_id), role, content, created_at_iso or self._now_iso()),
+                "INSERT INTO turns(id, conversation_id, role, content, created_at, "
+                "speaker_entity, speaker_label, input_source, speaker_status) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(turn_id), str(conversation_id), role, content,
+                 created_at_iso or self._now_iso(),
+                 speaker_entity or "user", speaker_label or "",
+                 input_source or "typed", speaker_status or ""),
             )
             await db.commit()
 
@@ -903,7 +953,7 @@ class SQLiteMemoryBackend:
 
     async def recent_turns(self, conversation_id: UUID | None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
-        query = "SELECT id, conversation_id, role, content, created_at FROM turns"
+        query = "SELECT id, conversation_id, role, content, created_at, speaker_entity, speaker_label, input_source, speaker_status FROM turns"
         params: tuple[Any, ...]
         if conversation_id is not None:
             query += " WHERE conversation_id=?"
@@ -925,16 +975,25 @@ class SQLiteMemoryBackend:
         until_iso: str | None = None,
         conversation_id: UUID | None = None,
         limit: int = 30,
+        speaker_entity: str | None = None,
     ) -> list[dict[str, Any]]:
         """Retrieve turns by keyword and/or created_at range (ISO strings sort
         lexicographically). Enables 'what did we talk about last Tuesday' and
-        keyword recall over the full history, which recent_turns can't do."""
+        keyword recall over the full history, which recent_turns can't do.
+
+        `speaker_entity` restricts the result to one person's side of the
+        history plus Nova's replies to them (V3 P5.1d.1). Assistant turns are
+        stamped with whoever they were answering, so an exchange stays whole.
+        """
         await self.initialize()
         where: list[str] = []
         params: list[Any] = []
         if conversation_id is not None:
             where.append("conversation_id=?")
             params.append(str(conversation_id))
+        if speaker_entity:
+            where.append("speaker_entity=?")
+            params.append(str(speaker_entity))
         if term:
             where.append("content LIKE ?")
             params.append(f"%{term}%")
@@ -944,7 +1003,7 @@ class SQLiteMemoryBackend:
         if until_iso:
             where.append("created_at <= ?")
             params.append(until_iso)
-        sql = "SELECT id, conversation_id, role, content, created_at FROM turns"
+        sql = "SELECT id, conversation_id, role, content, created_at, speaker_entity, speaker_label, input_source, speaker_status FROM turns"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY created_at DESC LIMIT ?"

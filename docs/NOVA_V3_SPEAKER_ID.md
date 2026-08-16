@@ -13,7 +13,8 @@ large phase.
 | **P5.1b** | the same invariant when the speaker *service itself* fails |
 | **P5.1 main** | live turn carriage, write isolation, read privacy, correction enforcement |
 | **P5.1c** | audit only — nine remaining failures reproduced against `78cba4d`, nothing fixed |
-| **P5.1d (this pass)** | every backend read and write path made speaker-safe, including the ones that run after the turn ends |
+| **P5.1d** | every backend read and write path made speaker-safe, including the ones that run after the turn ends |
+| **P5.1d.1 (this pass)** | read side effects, delimiter-exact namespaces, durable turn attribution, guest lessons applied |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -312,7 +313,8 @@ the backlog drains.
 
 ### The read policy
 
-`may_read_entity` is a positive allow-list, not a deny-list. Shared entities
+`may_read_entity` is a positive allow-list, not a deny-list — and matching is
+delimiter-exact, see P5.1d.1 below. Shared entities
 (`world`, `system`, `capability`) are readable by anyone;
 the owner reads everything; a known guest reads their own namespace and shared
 knowledge; an unverified speaker gets shared knowledge only. Anything not
@@ -350,6 +352,154 @@ disk-cache hit, above the filter, and the cache key had no speaker component —
 so Marcus's cached result set was served verbatim to the next guest. Fixed by
 putting the scope in the key *and* re-filtering cached results, because a key
 alone still trusts whatever was stored under it.
+
+---
+
+## P5.1d.1 — the four things P5.1d still got wrong
+
+All reproduced against `62672cf` before anything changed.
+
+### A read you are not allowed to make left a trace
+
+The scope filter ran *after* reinforcement and after the cache write:
+
+```
+rank → reinforce → cache → filter        (P5.1d)
+rank → filter → reinforce → cache        (now)
+```
+
+Measured: an unknown speaker searching for Marcus's private fact took its
+`access_count` from **0 → 1** and stamped `last_accessed_at`. The content never
+reached them — but the read still made his memory of it stronger, which is both
+a side channel and a corruption of the signal reinforcement exists to carry.
+A denied hit now produces **zero** read-triggered writes.
+
+### The allow-list matched on substring
+
+`is_shared_entity` used `startswith`, so an allow-list of three roots quietly
+admitted `worldsecret`, `world_private`, `system_personal`, `capability_notes`
+and anything else beginning with those letters. An allow-list that matches on
+substring is not an allow-list.
+
+`under_root(entity, root)` is now exact: `root` itself, or `root:` and below.
+The same helper backs `is_shared_entity`, `entity_belongs_to_speaker` and
+`may_read_entity`, so the three cannot drift apart.
+
+### The speaker namespace model
+
+P5.1d put a guest's child namespaces *beside* their root
+(`lesson:speaker:p-alice`) while `may_read_entity` allowed only the exact root —
+so Alice's own lessons, mood and wellbeing were unreadable by Alice. One
+canonical hierarchy replaces it:
+
+```
+speaker:<id>                    their root         (peer of `user`)
+speaker:<id>:lesson             what they asked Nova to do differently
+speaker:<id>:mood
+speaker:<id>:wellbeing
+speaker:<id>:session
+speaker:<id>:person:<x>         someone THEY know
+```
+
+Read policy is then one containment check, centralised in
+`entity_belongs_to_speaker`. A known speaker reads their root and everything
+below it, plus shared knowledge — never the owner's, never another speaker's.
+`speaker:p-alice2` is not inside `speaker:p-alice`, which is exactly why this
+cannot be a prefix match. The older beside-the-root form is still recognised on
+read, so nothing already written is stranded.
+
+### Person-quality memory was claimed, not delivered
+
+`_default_salience("speaker:p-alice", "name", .9)` returned **0.45** where the
+owner's returned **1.00**. Three separate rules (salience, decay, singleton) had
+each grown their own idea of what a speaker entity was, and prefix-matching
+`speaker:` in the decay rule made *every* guest fact permanent — which is not
+parity either, just a different wrong answer.
+
+`personal_tail()` normalises once (`speaker:p-alice` → `user`,
+`speaker:p-alice:note` → `note`, `speaker:p-alice:person:sarah` →
+`person:sarah`) and the owner's existing rules apply unchanged. Parity is now a
+property of the namespace rather than three rules that have to agree.
+
+| | owner | known speaker |
+|---|---|---|
+| core identity (`name`, `spouse`, …) | 1.00, never decays, singleton | identical |
+| an acquaintance's details | 0.70, decays, not singleton | identical |
+| a passing note | 0.20, decays | identical |
+
+Parity, not promotion: a guest's hobby does not become a permanent identity
+fact, and their acquaintance's location does not supersede.
+
+### Turn attribution was not durable
+
+The speaker label lived only in Chroma metadata. The durable SQLite row — which
+is what date-range recall actually reads — could not tell Marcus's sentences
+from a guest's, so `recall_conversation` had to refuse guests wholesale, and
+Alice could not recall her own history.
+
+`turns` gained four columns via in-place `ALTER TABLE`, no rebuild:
+
+| column | default | why |
+|---|---|---|
+| `speaker_entity` | `'user'` | whose history this row belongs to |
+| `speaker_label` | `''` | how to name them when reading it back |
+| `input_source` | `'typed'` | typed vs voice |
+| `speaker_status` | `''` | known / unknown / … |
+
+No embeddings, no similarity, no audio — the same rule the profile store
+follows. Every pre-migration row predates speaker identity and *was* Marcus, so
+the defaults are the correct answer rather than a guess, and his history reads
+back exactly as before.
+
+### Date-range recall matrix
+
+| speaker | "what did we talk about last Tuesday" |
+|---|---|
+| owner | his own durable history, legacy behaviour, legacy rows included |
+| known guest | **their own** history only |
+| unverified | refused — there is no history belonging to nobody |
+
+This is the narrower reading of D11 on purpose. D11 lets the owner see a guest's
+stored *facts*; "what did **we** talk about" is a question about a shared
+thread, and answering it by merging two transcripts would put words in Marcus's
+mouth rather than merely show him data.
+
+### `memory.recall` matrix
+
+P5.1d refused an unverified speaker outright, before any search — stricter than
+the stated policy, and it left Nova unable to say where the Eiffel Tower is to
+someone she simply had not met. Generic recall now delegates to the one entity
+filter inside `search()` instead of keeping a second copy of the policy.
+
+| | shared (`world`/`system`/`capability`) | own personal | others' personal | date-range history |
+|---|---|---|---|---|
+| owner | yes | yes | yes (D11) | own |
+| known guest | yes | yes | no | own |
+| unverified | **yes** | — | no | no |
+
+### A guest's corrections now actually apply
+
+Lessons were stored per speaker and then injected only `if _ident.is_owner`, so
+Nova would be told "stop doing that", write it down, and carry on doing it. Both
+the storage and the prompt are now speaker-scoped, with the guest block headed
+`Lessons you've learned from <name> … They are <name>'s preferences, not
+Marcus's` — never presented as things learned from Marcus.
+
+### Latency
+
+Filtering earlier costs the owner nothing, and fixed a regression it would
+otherwise have introduced for guests. `may_read_entity` is 2.4 µs.
+
+| | median | p90 |
+|---|---|---|
+| owner, typed | 0.70 ms | 0.96 ms |
+| guest, first cut of this change | 47.20 ms | 89.90 ms |
+| guest, after the cache fix | 0.61 ms | 0.78 ms |
+
+The middle row is the one worth keeping: caching the *allowed* view means a
+guest's view is legitimately empty sometimes, and the early return treated empty
+as a cache miss — so every such search re-ran the whole fan-out. A miss is
+`None`; an empty list is a real answer and is cached as one.
 
 ### What the owner can still see
 

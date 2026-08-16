@@ -90,7 +90,10 @@ async def test_lessons_are_speaker_scoped():
             unk = await m.get_lessons(limit=20)
         check(unk == [], f"an unverified speaker has no lessons at all ({unk})")
 
-        rows = await m.get_facts(entity="lesson:speaker:p-alice", limit=10)
+        # P5.1d.1 moved the child namespaces UNDER the speaker root, so read
+        # policy is one containment check instead of a hand-written list that
+        # missed every one of them.
+        rows = await m.get_facts(entity="speaker:p-alice:lesson", limit=10)
         check(len(rows) == 1, "the guest's lesson lives in its own namespace")
 
 

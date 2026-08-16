@@ -419,7 +419,21 @@ callers. The cache key alone is insufficient — cached results are re-filtered,
 because a key still trusts whatever was stored under it.
 
 **Revisit if.** A guest needs to read something shared that is currently private.
-Add it to `SHARED_ENTITY_PREFIXES` explicitly; do not weaken the default.
+Add it to `SHARED_ENTITY_ROOTS` explicitly; do not weaken the default.
+
+**Amended 2026-08-15 (P5.1d.1).** Three corrections, all reproduced first:
+
+1. Matching is now **delimiter-exact** (`under_root`). The original
+   `startswith` meant `worldsecret` and `system_private` were classified as
+   shared. An allow-list that matches on substring is not an allow-list.
+2. The filter runs **before** reinforcement and before the cache write. It ran
+   after, so a denied hit still bumped `access_count` 0 → 1 and stamped
+   `last_accessed_at` — a side channel, and a corruption of the reinforcement
+   signal itself.
+3. The unverified-speaker refusal in `memory.recall` was removed. It predated
+   this rule and contradicted it: shared knowledge is readable by anyone, and
+   Nova could not tell a visitor where the Eiffel Tower is. Generic recall
+   delegates to this filter; only date-range *history* keeps its own gate.
 
 ---
 
@@ -464,3 +478,64 @@ outside the `active_turn` block.
 
 **Revisit if.** Another queue-crossing event grows a personal write. Give it a
 snapshot field too rather than reaching for the ContextVar.
+
+---
+
+## D13 — One canonical namespace per person, and turn attribution lives in SQLite
+
+**Decided:** 2026-08-15 (V3 P5.1d.1)
+
+**Decision.** Every person's memory is one hierarchy rooted at their personal
+entity — `user` for the owner, `speaker:<id>` for a known speaker — with
+structured children below it (`speaker:<id>:lesson`, `:mood`, `:wellbeing`,
+`:session`, `:person:<x>`). Read policy is a single containment check,
+`entity_belongs_to_speaker`, using the same delimiter-exact `under_root` helper
+as the shared allow-list. `personal_tail()` normalises a speaker entity to its
+owner-equivalent, and salience, decay and singleton rules apply the owner's
+existing logic to that normalised form.
+
+Conversation attribution is persisted on the `turns` row itself —
+`speaker_entity`, `speaker_label`, `input_source`, `speaker_status` — added by
+in-place `ALTER TABLE`, never embeddings or similarity or audio.
+
+**Rationale.** P5.1d put a guest's child namespaces *beside* their root
+(`lesson:speaker:p-alice`) while the read policy allowed only the exact root, so
+Alice's own lessons, mood and wellbeing were unreadable by Alice. Enumerating
+child namespaces by hand is what produced that gap, and would produce it again
+for the next one added.
+
+The same fragmentation had already broken person-quality memory: salience,
+decay and singleton each had their own idea of what a speaker entity was.
+Prefix-matching `speaker:` in the decay rule made every guest fact permanent —
+not parity, a different wrong answer. Normalising once makes parity a property
+of the namespace rather than three rules that must agree.
+
+Attribution had to move into SQLite because the durable row is what date-range
+recall reads. With it only in Chroma metadata, `recall_conversation` could not
+distinguish speakers at all, so it refused guests wholesale rather than scoping
+them — the reason Alice could not recall her own history.
+
+**Alternatives rejected.** Keeping the beside-the-root shape and listing each
+child in the policy (rejected: it is the design that produced the bug, and the
+list is unbounded); a separate table for speaker turns (rejected: a second
+parallel memory subsystem, and D5's reasoning applies — no new store to fit an
+architecture); storing the profile id only and joining (rejected: the label and
+input source are what a read needs, and a join buys nothing at this size);
+rebuilding the DB rather than migrating (rejected: Marcus's history is the
+product).
+
+**Evidence.** `tests/test_speaker_scope_v51d1.py` — Alice reads her root, her
+lesson and her nested person fact and none of Bob's or Marcus's;
+`speaker:p-alice2` is not inside `speaker:p-alice`; owner and known speaker get
+identical salience on all ten core-identity attributes while a guest's hobby and
+their acquaintance's name do not become max-salience; the durable row carries
+the attribution and a pre-migration row still reads back as owner history.
+
+**Constraint.** `under_root` is the only way to test namespace containment —
+never `startswith`. Legacy `<base>:speaker:<id>` entities are still recognised on
+read so nothing already written is stranded. Column defaults (`user` / `typed`)
+are the correct backfill because every row predating them was Marcus: the
+frontend has never sent a speaker identity.
+
+**Revisit if.** A child namespace needs different read semantics from its
+parent. That is a policy change in one function, not a new namespace shape.

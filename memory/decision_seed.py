@@ -454,6 +454,63 @@ def seed_decisions() -> list[Decision]:
                         "not person-level — and run outside the active_turn block.",
             decided_at="2026-08-15T00:00:00+00:00",
         ),
+        Decision(
+            id="D13",
+            title="One canonical namespace per person, and turn attribution lives in SQLite",
+            decision="Every person's memory is ONE hierarchy rooted at their personal "
+                     "entity - `user` for the owner, `speaker:<id>` for a known speaker - "
+                     "with structured children below it (speaker:<id>:lesson, :mood, "
+                     ":wellbeing, :session, :person:<x>). Read policy is a single "
+                     "containment check, entity_belongs_to_speaker, using the same "
+                     "delimiter-exact under_root helper as the shared allow-list. "
+                     "personal_tail() normalises a speaker entity to its owner-equivalent, "
+                     "and salience, decay and singleton rules apply the OWNER's existing "
+                     "logic to that normalised form. Conversation attribution is persisted "
+                     "on the turns row itself (speaker_entity, speaker_label, input_source, "
+                     "speaker_status) via in-place ALTER TABLE - never embeddings, "
+                     "similarity or audio.",
+            rationale="P5.1d put a guest's child namespaces BESIDE their root "
+                      "(lesson:speaker:p-alice) while read policy allowed only the exact "
+                      "root, so Alice's own lessons, mood and wellbeing were unreadable by "
+                      "Alice. Enumerating child namespaces by hand is what produced that "
+                      "gap and would produce it again for the next one added. The same "
+                      "fragmentation had already broken person-quality memory: salience, "
+                      "decay and singleton each had their own idea of what a speaker "
+                      "entity was, and prefix-matching `speaker:` in the decay rule made "
+                      "EVERY guest fact permanent - not parity, a different wrong answer. "
+                      "Attribution had to move into SQLite because the durable row is what "
+                      "date-range recall reads; with it only in Chroma metadata "
+                      "recall_conversation could not distinguish speakers at all, so it "
+                      "refused guests wholesale.",
+            alternatives=["Keeping the beside-the-root shape and listing each child in the "
+                          "policy (rejected: it is the design that produced the bug, and "
+                          "the list is unbounded)",
+                          "A separate table for speaker turns (rejected: a second parallel "
+                          "memory subsystem; D5's reasoning applies)",
+                          "Storing the profile id only and joining (rejected: the label "
+                          "and input source are what a read needs)",
+                          "Rebuilding the DB rather than migrating (rejected: Marcus's "
+                          "history is the product)"],
+            evidence=["tests/test_speaker_scope_v51d1.py: Alice reads her root, her lesson "
+                      "and her nested person fact and none of Bob's or Marcus's; "
+                      "speaker:p-alice2 is not inside speaker:p-alice; owner and known "
+                      "speaker get identical salience on all ten core-identity attributes "
+                      "while a guest's hobby and their acquaintance's name do not become "
+                      "max-salience; the durable row carries the attribution and a "
+                      "pre-migration row still reads back as owner history"],
+            subsystem="memory",
+            source_refs=["core/turn_identity.py::entity_belongs_to_speaker",
+                         "core/turn_identity.py::under_root",
+                         "core/turn_identity.py::personal_tail",
+                         "memory/backends/sqlite_backend.py::_migrate_turns_schema"],
+            constraints="under_root is the ONLY way to test namespace containment - never "
+                        "startswith. Legacy <base>:speaker:<id> entities are still "
+                        "recognised on read so nothing already written is stranded. Column "
+                        "defaults (user / typed) are the correct backfill because every "
+                        "row predating them was Marcus: the frontend has never sent a "
+                        "speaker identity.",
+            decided_at="2026-08-15T00:00:00+00:00",
+        ),
     ]
 
 
