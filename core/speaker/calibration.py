@@ -34,6 +34,7 @@ transcripts — the same rule the profile store follows.
 """
 
 import json
+import math
 import statistics
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
@@ -57,9 +58,39 @@ PROTOCOL_VERSION = 1
 MIN_GENUINE_ACCEPT_RATE = 0.90
 MAX_FALSE_ACCEPTS = 0
 
-#: Candidate grids. Coarse enough to stay deterministic and explainable, fine
-#: enough to matter: 0.01 is well below the run-to-run spread of a real voice.
-THRESHOLD_GRID = [round(0.30 + 0.01 * i, 2) for i in range(61)]      # .30 … .90
+# ── the candidate grid, and why it starts where it does ──────────────────────
+#
+# The scores being fitted are TRUE COSINE similarities between L2-normalised
+# ECAPA embeddings (`matcher.cosine`), so the metric is bounded [-1, 1] — not
+# [0, 1], and emphatically not [0.30, 0.90].
+#
+# The first real human calibration run failed on exactly that. Marcus measured
+# genuine p05 0.2405 against impostor max 0.2001 — positive separation, a valid
+# threshold sitting near 0.21-0.25 — and the fitter reported "the distributions
+# overlap" because it never evaluated a candidate below 0.30. The floor was an
+# unexamined guess carried over from synthetic fixtures whose scores happened to
+# be high; real speech is not obliged to agree with it.
+#
+# LOWER BOUND 0.00, and this one IS principled rather than a guess. A cosine
+# threshold at or below zero cannot express an identity claim: it admits vectors
+# with no directional agreement with the centroid at all, which for 192-d unit
+# vectors is roughly half of everything. The empirical bars below ("no impostor
+# in THIS sample cleared it") cannot protect against that, because the sample is
+# 12-23 utterances and the runtime population is every voice that ever speaks.
+# If no non-negative threshold satisfies both bars, the honest answer is that
+# this pair of voices is not separable — so the fit fails closed.
+#
+# UPPER BOUND 1.00 rather than 0.90, for the same reason the floor moved: 0.90
+# would reject a genuinely tight speaker whose impostor max sat above it.
+#
+# 0.01 resolution is kept: well below the run-to-run spread of a real voice, and
+# it keeps the search deterministic and explainable.
+THRESHOLD_MIN, THRESHOLD_MAX = 0.00, 1.00
+THRESHOLD_GRID = [round(THRESHOLD_MIN + 0.01 * i, 2)
+                  for i in range(int(round((THRESHOLD_MAX - THRESHOLD_MIN) / 0.01)) + 1)]
+
+#: Margin candidates. The ceiling is exercised, not binding: the first human run
+#: fitted 0.29, meaning 0.30 was evaluated and rejected.
 MARGIN_GRID = [round(0.02 + 0.01 * i, 2) for i in range(29)]         # .02 … .30
 
 
@@ -96,6 +127,10 @@ class ProfileFit:
     impostor_max: float | None = None
     impostor_median: float | None = None
     separation: float | None = None      # genuine_p05 - impostor_max
+    #: The highest threshold that still accepts MIN_GENUINE_ACCEPT_RATE of this
+    #: speaker's genuine scores. This — not `genuine_p05` — is the real ceiling
+    #: the decision is made against, so a failure can say which side it fell on.
+    accept_ceiling: float | None = None
     ok: bool = False
     reason: str = ""
 
@@ -155,6 +190,12 @@ def fit_profile_threshold(profile_id: str, display_name: str,
     fit.impostor_median = float(statistics.median(impostor))
     fit.separation = round(float(fit.genuine_p05) - float(fit.impostor_max), 4)
 
+    # How many genuine scores must clear the bar, and therefore the highest bar
+    # that can still clear that many. `ceil` because 28.8 of 32 means 29.
+    need = math.ceil(MIN_GENUINE_ACCEPT_RATE * len(genuine))
+    desc = sorted(genuine, reverse=True)
+    fit.accept_ceiling = float(desc[min(need, len(desc)) - 1]) if need >= 1 else None
+
     best: float | None = None
     for cand in reversed(THRESHOLD_GRID):          # strictest first
         fa = sum(1 for s in impostor if s >= cand)
@@ -166,12 +207,44 @@ def fit_profile_threshold(profile_id: str, display_name: str,
             break
 
     if best is None:
-        fit.reason = (
-            f"no threshold gives 0 false accepts and >= "
-            f"{MIN_GENUINE_ACCEPT_RATE:.0%} acceptance: genuine p05 "
-            f"{fit.genuine_p05:.3f} vs impostor max {fit.impostor_max:.3f} "
-            f"(separation {fit.separation:+.3f}) — the distributions overlap"
-        )
+        # WHY it failed, derived from the data — never inferred from `best is
+        # None`. The old message asserted "the distributions overlap" for every
+        # failure, which was actively misleading on the first human run: the
+        # distributions were separated by +0.04 and the real fault was the
+        # search floor. A diagnostic that names the wrong cause sends a person
+        # to re-record forty utterances that were fine.
+        #
+        # `accept_ceiling` is the highest threshold that still accepts the
+        # required share of genuine speech; any threshold above `impostor_max`
+        # admits no impostor. So a valid real-valued threshold exists precisely
+        # when accept_ceiling > impostor_max.
+        ceiling = fit.accept_ceiling
+        imax = float(fit.impostor_max)
+        if ceiling is None or ceiling <= imax:
+            fit.reason = (
+                f"no threshold gives 0 false accepts and >= "
+                f"{MIN_GENUINE_ACCEPT_RATE:.0%} acceptance: accepting "
+                f"{MIN_GENUINE_ACCEPT_RATE:.0%} of this speaker needs a "
+                f"threshold at or below {ceiling:.4f}, but an impostor reached "
+                f"{imax:.4f} — the distributions genuinely overlap, so any bar "
+                f"loose enough to admit them admits somebody else too"
+            )
+        elif not any(imax < c <= ceiling for c in THRESHOLD_GRID):
+            # A valid threshold exists in the data but not on the grid. After
+            # widening the range to the metric's real bounds this should only be
+            # reachable when the usable window is narrower than one 0.01 step.
+            fit.reason = (
+                f"a valid threshold exists in ({imax:.4f}, {ceiling:.4f}] but no "
+                f"candidate falls inside it — the search range "
+                f"[{THRESHOLD_MIN:.2f}, {THRESHOLD_MAX:.2f}] at 0.01 resolution "
+                f"cannot express it. This is a FITTER limitation, not a property "
+                f"of the voices"
+            )
+        else:  # pragma: no cover - defensive; the loop should have found it
+            fit.reason = (
+                f"internal: a candidate in ({imax:.4f}, {ceiling:.4f}] satisfies "
+                f"both bars but the search did not select it"
+            )
         return fit
 
     fit.threshold = best
