@@ -539,3 +539,63 @@ frontend has never sent a speaker identity.
 
 **Revisit if.** A child namespace needs different read semantics from its
 parent. That is a policy change in one function, not a new namespace shape.
+
+---
+
+## D14 - The tool surface is scoped by data ownership, not by permission
+
+**Decided:** 2026-08-15 (V3 P5.1d.2)
+
+**Decision.** Every direct memory tool routes through the same identity policy
+as the rest of memory. Writes resolve through `resolve_write_target()`, which
+**refuses** an entity naming another speaker's namespace rather than remapping
+it. Stores with no per-person ownership - `people`, `events`, the knowledge
+graph, the digital twin, reminders, thoughts - fail closed for non-owners with a
+`scoped_unavailable` result. `memory.remember_person` is scoped instead of
+refused, because `speaker:<id>:person:<key>` already exists in the canonical
+hierarchy and needs no new store.
+
+`PermissionBroker` is untouched. Every speaker may call every tool and receives
+the identical decision; only the reachable data changes.
+
+**Rationale.** P5.1d and P5.1d.1 scoped the paths Nova takes on her own -
+grounding, semantic search, quick-fact capture, the async extractor. The tools
+the *model* calls were still global, and emitting a tool call is the ordinary
+way the model touches memory, so the boundary had a door in it.
+
+Measured on `d1ec5a9`: a guest overwrote another speaker's stored fact via
+`memory.correct(entity="speaker:p-bob")`, added people and events to Marcus's
+stores, mutated his relationship graph, and read Nova's private notes about him.
+
+The `memory.correct` case shows why refusal beats remapping. Nesting Bob's root
+under Alice would produce `speaker:p-alice:speaker:p-bob` - an entity that reads
+like a claim about Bob and belongs to nobody. And the model cannot be asked to
+pick a safe entity: it does not know who is in the room, so delegating that
+would make a privacy boundary probabilistic.
+
+**Alternatives rejected.** Routing identity into `PermissionBroker` (rejected:
+speaker identity is not authentication, and D-series precedent is explicit -
+this would make a voice match into an authorisation level); building parallel
+guest stores for people/events/graph in this patch (rejected: a half-built
+second memory system is harder to remove than a gap, and fail-closed is safer
+before frontend activation); partially scoping `memory.timeline` (rejected: it
+aggregates events, digests and reminders - scoping one source leaves a history
+that looks complete and is not); trusting the tool descriptions to keep the
+model away from other speakers' data (rejected: descriptions are guidance,
+execution is the boundary).
+
+**Evidence.** `tests/test_speaker_tools_v51d2.py` - Alice cannot correct Bob,
+Marcus, or beneath either root, and Bob cannot correct Alice; an unverified
+speaker persists nothing, asserted against the facts table rather than the
+tool's return text; guests neither read nor mutate Marcus's people, events,
+timeline or graph; `thoughts.recall` / `twin.profile` / `executive.brief` /
+`reminder.create` are owner-only; shared world knowledge still reaches every
+speaker; permissions identical across five identities and three capabilities.
+
+**Constraint.** Fail-closed refusals must stay *data* refusals with a sentence
+Nova can say aloud - never permission errors. The legacy namespace rule matches
+only the four exact shapes P5.1d could write; an `endswith` rule read
+`speaker:p-bob:lesson:speaker:p-alice` as Alice's and must never return.
+
+**Revisit if.** `people`, `events` or the graph gain per-person ownership. Then
+the `_owner_only` refusals become scoped reads, one call site at a time.

@@ -69,15 +69,56 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         t = re.sub(r"[^a-z0-9]+", "_", (t or "").strip().lower()).strip("_")
         return t[:48] or "general"
 
+    # ── Personal-data scope for the DIRECT tool surface (V3 P5.1d.2) ─────────
+    #
+    # P5.1d/d.1 scoped the paths Nova takes on her own: grounding, semantic
+    # search, quick-fact capture, the background extractor. The tools the MODEL
+    # calls were still global, so the whole boundary could be stepped around by
+    # emitting a tool call — measured: a guest overwrote another speaker's fact,
+    # added people and events to Marcus's stores, mutated his relationship
+    # graph, and read his private thoughts.
+    #
+    # These helpers route DATA. They never touch PermissionBroker: a guest may
+    # still call every tool, and gets the identical permission decision Marcus
+    # gets. What changes is whose data the call can reach.
+
+    def _owner_only(what: str, *, detail: str) -> dict[str, Any] | None:
+        """Refuse a Marcus-personal operation for anyone else. None = proceed.
+
+        Used where the underlying store has no per-person ownership yet (the
+        `people` table, `events`, the knowledge graph, the digital twin). Those
+        are Marcus's, modelled as his, and inventing a parallel store for guests
+        inside a corrective patch would be a worse outcome than a clear refusal.
+        Fail closed now; scoped support can come later without a migration.
+        """
+        from core.turn_identity import current_identity
+
+        ident = current_identity()
+        if ident.is_owner:
+            return None
+        who = ident.display_name if ident.is_known_other else None
+        return {"ok": False, "error": "scoped_unavailable", "scope": what,
+                "detail": detail,
+                "speaker": who or "unidentified speaker"}
+
     async def _memory_remember(args: dict[str, Any]) -> dict[str, Any]:
+        from core.turn_identity import current_identity, remap_entity_for
+
         fact = str(args.get("fact") or args.get("value") or args.get("note") or "").strip()
         topic = _slug_topic(str(args.get("topic") or args.get("attribute") or ""))
         if not fact:
             return {"ok": False, "error": "missing_fact"}
+        # "note" is a personal namespace, not a shared one — a guest saying
+        # "remember my locker code" was writing into the same bucket as Marcus.
+        entity = remap_entity_for("note", current_identity())
+        if entity is None:
+            return {"ok": False, "error": "unverified_speaker", "saved": None,
+                    "detail": ("I can't save that to memory when I'm not sure "
+                               "who I'm speaking with.")}
         # The user explicitly asked Nova to remember this — record it as stated
         # (#19), the highest-trust provenance, so recall never hedges on it later.
         await memory.add_fact(
-            entity="note", attribute=topic, value=fact[:400], confidence=0.9,
+            entity=entity, attribute=topic, value=fact[:400], confidence=0.9,
             source="user", verification_status="stated",
         )
         return {"ok": True, "saved": fact[:400], "topic": topic}
@@ -91,23 +132,33 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         who is in the room, and asking it to would make a safety boundary
         probabilistic. So it is enforced here, from turn identity (V3 P5.1).
 
-        Personal corrections only. An explicit correction about a NAMED third
-        party or a non-personal entity is left alone: the point is to stop a
-        guest rewriting Marcus, not to stop guests using memory at all.
+        P5.1 protected only the DEFAULT `user` case. Every other entity string
+        went straight through to `correct_fact`, so the guard was one argument
+        wide: measured on `d1ec5a9`, Alice calling this with
+        `entity="speaker:p-bob"` changed Bob's stored favourite colour from blue
+        to red. Routing now goes through `resolve_write_target`, which refuses
+        another speaker's namespace outright and nests anything else under the
+        current speaker (V3 P5.1d.2).
         """
-        from core.turn_identity import OWNER_ENTITY, current_identity
+        from core.turn_identity import current_identity, resolve_write_target
 
-        entity = str(args.get("entity") or "user").strip()
         ident = current_identity()
-        if entity.strip().lower() in {"user", "me", "myself", ""}:
-            target = ident.memory_entity
-            if target is None:
-                # Unverified voice: refuse rather than write somewhere wrong.
-                # Returning a clear non-persisting result lets Nova say so.
-                return {"ok": False, "error": "unverified_speaker",
-                        "detail": ("I can't update a personal fact when I'm not "
-                                   "sure who I'm speaking with.")}
-            entity = target
+        requested = str(args.get("entity") or "user").strip()
+        entity, why = resolve_write_target(requested, ident)
+        if entity is None:
+            if why == "other_speaker":
+                return {"ok": False, "error": "not_your_memory",
+                        "detail": ("That's someone else's memory — I can only "
+                                   "correct things about you.")}
+            if why == "shared_write_refused":
+                return {"ok": False, "error": "shared_memory_readonly",
+                        "detail": ("That's shared knowledge rather than a "
+                                   "personal fact; I won't rewrite it here.")}
+            # Unverified voice: refuse rather than write somewhere wrong.
+            # Returning a clear non-persisting result lets Nova say so.
+            return {"ok": False, "error": "unverified_speaker",
+                    "detail": ("I can't update a personal fact when I'm not "
+                               "sure who I'm speaking with.")}
         attribute = str(args.get("attribute") or args.get("topic") or "").strip()
         new_value = str(args.get("value") or args.get("new_value") or args.get("correction") or "").strip()
         old_value = str(args.get("old_value") or "").strip() or None
@@ -182,10 +233,31 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         topic = str(args.get("topic") or "general").strip()
         if not lesson:
             return {"ok": False, "error": "missing_lesson"}
+        # add_lesson is speaker-scoped, and returns without writing for an
+        # unverified speaker. Reporting "learned" there would be a lie the model
+        # then repeats aloud, so say what actually happened.
+        from core.turn_identity import current_identity
+
+        if current_identity().is_unverified:
+            return {"ok": False, "error": "unverified_speaker", "learned": None,
+                    "detail": ("I can't store that as a standing instruction "
+                               "without knowing who I'm speaking with.")}
         await memory.add_lesson(lesson, topic=topic)
         return {"ok": True, "learned": lesson[:200], "topic": topic}
 
+    def _person_key(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")[:48]
+
     async def _memory_remember_person(args: dict[str, Any]) -> dict[str, Any]:
+        """Save someone the speaker mentions.
+
+        The `people` table and its graph edges are Marcus's social map, so a
+        guest does not write there (measured: they could). They get the
+        fact-backed representation the canonical hierarchy already provides —
+        `speaker:<id>:person:<key>` — which needs no new store and no migration.
+        """
+        from core.turn_identity import current_identity, speaker_entity
+
         name = str(args.get("name") or "").strip()
         if not name:
             return {"ok": False, "error": "missing_name"}
@@ -194,7 +266,23 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         if not isinstance(attrs, dict):
             attrs = {k: str(v) for k, v in args.items() if k not in {"name", "attributes"} and v}
         attrs = {str(k): str(v)[:300] for k, v in (attrs or {}).items() if str(v).strip()}
-        await memory.upsert_person(name=name, attributes=attrs)
+
+        ident = current_identity()
+        if ident.is_owner:
+            await memory.upsert_person(name=name, attributes=attrs)
+            return {"ok": True, "person": name, "attributes": attrs}
+        if ident.is_unverified:
+            return {"ok": False, "error": "unverified_speaker", "person": None,
+                    "detail": ("I can't save someone to memory without knowing "
+                               "who's telling me about them.")}
+        root = f"{speaker_entity(ident.profile_id or '')}:person:{_person_key(name)}"
+        await memory.add_fact(entity=root, attribute="name", value=name[:200],
+                              confidence=0.9, source="user",
+                              verification_status="stated")
+        for k, v in attrs.items():
+            await memory.add_fact(entity=root, attribute=_slug_topic(k), value=v,
+                                  confidence=0.85, source="user",
+                                  verification_status="stated")
         return {"ok": True, "person": name, "attributes": attrs}
 
     async def _memory_remember_event(args: dict[str, Any]) -> dict[str, Any]:
@@ -202,22 +290,53 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         date = str(args.get("date") or args.get("when") or "").strip()
         if not note:
             return {"ok": False, "error": "missing_note"}
+        # The events table IS Marcus's timeline — his trips, appointments,
+        # milestones. A guest speaking must not be able to put "surgery on the
+        # 4th" onto it, so this fails closed until events carry ownership.
+        refused = _owner_only("events", detail=(
+            "I only keep the calendar of events for Marcus, so I won't add that "
+            "to his timeline."))
+        if refused is not None:
+            return refused
         await memory.add_event(date=date or "unspecified", note=note[:400])
         return {"ok": True, "event": note[:200], "date": date or "unspecified"}
 
     async def _memory_recall_person(args: dict[str, Any]) -> dict[str, Any]:
+        from core.turn_identity import current_identity, speaker_entity
+
         name = str(args.get("name") or "").strip()
         if not name:
             return {"ok": False, "error": "missing_name"}
-        person = await memory.recall_person(name)
-        if person is None:
+        ident = current_identity()
+        if ident.is_owner:
+            person = await memory.recall_person(name)
+            if person is None:
+                return {"ok": False, "error": "not_found", "name": name}
+            return {"ok": True, **person}
+        if ident.is_unverified:
+            return {"ok": False, "error": "unverified_speaker", "name": name,
+                    "detail": ("I don't know who I'm speaking with, so I can't "
+                               "look anyone up.")}
+        # A known guest reads only the people THEY told Nova about.
+        root = f"{speaker_entity(ident.profile_id or '')}:person:{_person_key(name)}"
+        rows = await memory.get_facts(entity=root, limit=40)
+        if not rows:
             return {"ok": False, "error": "not_found", "name": name}
-        return {"ok": True, **person}
+        return {"ok": True, "name": name,
+                "attributes": {r.attribute: r.value for r in rows if r.attribute != "name"}}
 
     async def _memory_related(args: dict[str, Any]) -> dict[str, Any]:
         key = str(args.get("name") or args.get("key") or args.get("topic") or "").strip()
         if not key:
             return {"ok": False, "error": "missing_name"}
+        # P5.1d made automatic edge extraction owner-only because the graph is
+        # Marcus's social map. The direct tools have to agree, or the same data
+        # is one tool call away.
+        refused = _owner_only("graph", detail=(
+            "The relationship map I keep is Marcus's, so I can't look through "
+            "it for someone else."))
+        if refused is not None:
+            return refused
         result = await memory.related(key)
         if not result["neighbors"] and not result["two_hop"]:
             return {"ok": False, "error": "no_connections_recorded", "key": key,
@@ -230,6 +349,15 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             days = max(1, min(int(args.get("days") or 14), 120))
         except (TypeError, ValueError):
             days = 14
+        # A timeline aggregates events, conversation digests, fired reminders
+        # and more. Scoping one of those sources would not make the composite
+        # safe, and a partially-scoped history is worse than none — so it fails
+        # closed for anyone but the owner until every source carries ownership.
+        refused = _owner_only("timeline", detail=(
+            "The history I keep — events, past conversations, reminders — is "
+            "Marcus's, so I can't lay it out for someone else."))
+        if refused is not None:
+            return refused
         entries = await memory.timeline(about=about, days=days)
         if not entries:
             return {"ok": True, "entries": [], "note": f"Nothing recorded in the last {days} day(s)" + (f" about '{about}'" if about else "") + "."}
@@ -240,6 +368,11 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         b = str(args.get("to") or args.get("b") or args.get("target") or "").strip()
         if not a or not b:
             return {"ok": False, "error": "missing_endpoints", "note": "need both 'from' and 'to'"}
+        refused = _owner_only("graph", detail=(
+            "The relationship map I keep is Marcus's, so I can't trace "
+            "connections through it for someone else."))
+        if refused is not None:
+            return refused
         path = await memory.graph_path(a, b)
         if not path:
             return {"ok": True, "connected": False, "from": a, "to": b,
@@ -255,6 +388,11 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         dst_kind = str(args.get("to_kind") or args.get("target_kind") or "topic").strip()
         if not src or not dst:
             return {"ok": False, "error": "missing_endpoints", "note": "need both 'from' and 'to'"}
+        refused = _owner_only("graph", detail=(
+            "The relationship map I keep is Marcus's, so I won't add "
+            "connections to it from this conversation."))
+        if refused is not None:
+            return refused
         ok = await memory.link(src_kind, src, predicate, dst_kind, dst)
         if not ok:
             return {"ok": False, "error": "invalid_edge"}
@@ -301,12 +439,25 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     async def _thoughts_recall(args: dict[str, Any]) -> dict[str, Any]:
         topic = str(args.get("topic") or args.get("about") or "").strip() or None
         kind = str(args.get("kind") or "").strip() or None
+        # Nova's private working notes are about Marcus and his life — measured
+        # returning "I worry about the deadline" verbatim to an unknown speaker.
+        refused = _owner_only("thoughts", detail=(
+            "Those are my own notes about Marcus, so they're not mine to share."))
+        if refused is not None:
+            return refused
         thoughts = await memory.recall_thoughts(topic=topic, kind=kind)
         if not thoughts:
             return {"ok": True, "thoughts": [], "note": "No open internal thoughts recorded" + (f" about '{topic}'" if topic else "") + "."}
         return {"ok": True, "thoughts": [{"kind": t["kind"], "topic": t["topic"], "content": t["content"]} for t in thoughts]}
 
     async def _twin_profile(args: dict[str, Any]) -> dict[str, Any]:
+        # Marcus's work hours, focus periods and routine — a behavioural
+        # profile of one specific person, built from his activity.
+        refused = _owner_only("twin", detail=(
+            "That's Marcus's working-pattern profile, so it isn't something I "
+            "can hand to someone else."))
+        if refused is not None:
+            return refused
         profile = await memory.digital_twin_profile()
         if not profile.get("enabled", True):
             return {"ok": False, "error": "digital_twin_disabled"}
@@ -315,6 +466,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         return {"ok": True, **profile}
 
     async def _executive_brief(args: dict[str, Any]) -> dict[str, Any]:
+        # Looming deadlines, stalled goals, timing nudges — all Marcus's.
+        refused = _owner_only("executive_brief", detail=(
+            "That briefing is about Marcus's deadlines and goals, so it's not "
+            "something I can go through with someone else."))
+        if refused is not None:
+            return refused
         recs = await memory.executive_recommendations(throttle=False)
         if not recs:
             return {"ok": True, "recommendations": [], "note": "Nothing worth flagging right now — no looming deadlines, stalled goals, or timing nudges."}
@@ -563,6 +720,13 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": False, "error": "missing_title"}
         if not when_text:
             return {"ok": False, "error": "missing_when", "note": "Ask the user when — never guess a time."}
+        # Reminders fire at Marcus, through his notifications, on his schedule.
+        # A guest scheduling one is writing into his day.
+        refused = _owner_only("reminders", detail=(
+            "Reminders here go to Marcus, so I shouldn't put something on his "
+            "schedule from this conversation."))
+        if refused is not None:
+            return refused
         parsed = parse_reminder_time(when_text)
         if parsed is None:
             return {"ok": False, "error": "could_not_parse_time",
@@ -833,18 +997,19 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "code.read": "Read a text file inside the repo or projects workspace. args: {path}",
         "code.write": "Write a text file inside the repo or projects workspace. args: {path, content}",
         "memory.rebuild_index": "Rebuild the semantic memory index from the primary store. args: {}",
-        "memory.remember": "Save a fact or note to permanent long-term memory when the user asks you to remember something. args: {fact, topic?}",
+        "memory.remember": "Save a fact or note to permanent long-term memory when the current speaker asks you to remember something. It is filed under whoever is speaking. args: {fact, topic?}",
         "memory.recall": "Search permanent long-term memory for previously saved facts and notes. args: {query}",
-        "memory.correct": ("Fix something you remembered WRONG when Marcus corrects you ('no, her birthday is the 14th'). This SUPERSEDES the old value instead of storing a second contradictory fact. args: {attribute, value, entity?, old_value?}"),
-        "memory.learn_lesson": ("Save a durable lesson about how Marcus wants you to behave (a correction or "
-                                 "preference) so you apply it in future replies. args: {lesson, topic?}"),
-        "memory.remember_person": ("Save someone Marcus mentions (a friend, coworker, family member) so you can "
-                                    "recall who they are later. ALWAYS use this (not memory.remember) whenever he "
-                                    "gives you a birthday or anniversary for someone — put it in attributes as "
-                                    "birthday/anniversary (e.g. 'April 12') so you can remind him before it comes "
+        "memory.correct": ("Fix something you remembered WRONG when the current speaker corrects you ('no, her birthday is the 14th'). This SUPERSEDES the old value instead of storing a second contradictory fact. Corrections apply to the speaker's own memory; you cannot use this to change what is stored about anyone else. args: {attribute, value, entity?, old_value?}"),
+        "memory.learn_lesson": ("Save a durable lesson about how the current speaker wants you to behave (a "
+                                 "correction or preference) so you apply it in future replies with them. "
+                                 "args: {lesson, topic?}"),
+        "memory.remember_person": ("Save someone this person mentions (a friend, coworker, family member) so you "
+                                    "can recall who they are later. ALWAYS use this (not memory.remember) whenever "
+                                    "they give you a birthday or anniversary for someone — put it in attributes as "
+                                    "birthday/anniversary (e.g. 'April 12') so you can mention it before it comes "
                                     "up. args: {name, attributes?:{relation, how_met, works_at, birthday, anniversary, notes}}"),
-        "memory.remember_event": ("Save a dated life event Marcus mentions (a trip, appointment, milestone). "
-                                   "args: {note, date?}"),
+        "memory.remember_event": ("Save a dated life event the speaker mentions (a trip, appointment, "
+                                   "milestone). args: {note, date?}"),
         "memory.recall_person": ("Look up everything remembered about a specific person by name — attributes, "
                                   "when they were last mentioned, and any upcoming birthdays/anniversaries. "
                                   "args: {name}"),
@@ -870,9 +1035,9 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                            "unresolved question, a potential improvement, an interesting discovery, a future plan. "
                            "These persist across sessions and are private. kinds: idea|question|unresolved|"
                            "improvement|discovery|failed_experiment|future_plan. args: {content, kind?, topic?}"),
-        "thoughts.recall": ("Surface your own internal thoughts — use ONLY when Marcus asks what you've been "
-                             "thinking about / pondering / your ideas. Never volunteer these unprompted. "
-                             "args: {topic?, kind?}"),
+        "thoughts.recall": ("Surface your own internal thoughts — use ONLY when the speaker asks what "
+                             "you've been thinking about / pondering / your ideas. Never volunteer these "
+                             "unprompted. args: {topic?, kind?}"),
         "twin.profile": ("Get Marcus's working-pattern profile (preferred work hours, peak focus period, "
                           "procrastination likelihood, interests) derived from his recorded activity. Use when he "
                           "asks about his own habits/productivity or when timing a suggestion. Predicts patterns; "

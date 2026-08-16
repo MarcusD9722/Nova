@@ -14,7 +14,8 @@ large phase.
 | **P5.1 main** | live turn carriage, write isolation, read privacy, correction enforcement |
 | **P5.1c** | audit only — nine remaining failures reproduced against `78cba4d`, nothing fixed |
 | **P5.1d** | every backend read and write path made speaker-safe, including the ones that run after the turn ends |
-| **P5.1d.1 (this pass)** | read side effects, delimiter-exact namespaces, durable turn attribution, guest lessons applied |
+| **P5.1d.1** | read side effects, delimiter-exact namespaces, durable turn attribution, guest lessons applied |
+| **P5.1d.2 (this pass)** | the direct tool surface — the boundary the model could step around by emitting a tool call |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -500,6 +501,106 @@ The middle row is the one worth keeping: caching the *allowed* view means a
 guest's view is legitimately empty sometimes, and the early return treated empty
 as a cache miss — so every such search re-ran the whole fan-out. A miss is
 `None`; an empty list is a real answer and is cached as one.
+
+---
+
+## P5.1d.2 — the tool surface the model can reach
+
+Everything up to here scoped the paths **Nova** takes on her own: grounding,
+semantic search, quick-fact capture, the background extractor. The tools the
+**model** calls were still global. So the whole boundary could be stepped around
+by emitting a tool call — which is not a hypothetical, it is the ordinary way
+the model interacts with memory.
+
+All four speakers were exercised against the real `ToolRouter` on `d1ec5a9`.
+Everything below reproduced.
+
+| tool | before | now |
+|---|---|---|
+| `memory.remember` | every speaker wrote to the one global `note` | owner `note`; guest `speaker:<id>:note`; unverified refused |
+| `memory.correct` | Alice passing `entity="speaker:p-bob"` **changed Bob's fact** | another speaker's namespace is refused; anything else nests under the caller |
+| `memory.remember_person` | guests wrote into Marcus's `people` table | owner unchanged; guest fact-backed at `speaker:<id>:person:<key>`; unverified refused |
+| `memory.recall_person` | returned Marcus's people to anyone | owner unchanged; guest reads only their own |
+| `memory.remember_event` | guests added to Marcus's timeline | owner-only |
+| `memory.timeline` | returned Marcus's history to anyone | owner-only |
+| `memory.link` / `related` / `path` | guests read **and mutated** Marcus's graph | owner-only |
+| `thoughts.recall` | handed Nova's private notes about Marcus to a stranger | owner-only |
+| `twin.profile` | Marcus's behavioural profile, to anyone | owner-only |
+| `executive.brief` | his deadlines and stalled goals, to anyone | owner-only |
+| `reminder.create` | a guest could put items on his schedule | owner-only |
+| `memory.learn_lesson` | reported success for an unverified speaker who wrote nothing | honest refusal |
+| `world.recall` / `world.learn` | shared | **unchanged — still shared** |
+
+### The one that mattered most
+
+`memory.correct` was guarded — but only on the *default* entity. P5.1 remapped
+`user` / `me` / `myself` and let every other string through to `correct_fact`.
+A guard one argument wide is not a guard:
+
+```
+Alice: memory.correct(entity="speaker:p-bob", favorite_color="red")
+   →   Bob's stored colour changed from blue to red
+```
+
+`resolve_write_target()` now answers "where may this speaker write an entity the
+model named", and it is a **refusal**, not a remap, when the entity names
+someone else's root. Nesting it under Alice would have invented
+`speaker:p-alice:speaker:p-bob`, which reads like a claim about Bob and belongs
+to nobody.
+
+### Scope, not permission
+
+Every one of these is **data routing**. `PermissionBroker` is untouched: a guest
+may still call every tool and gets the identical decision Marcus gets, asserted
+across three capabilities and five identities. What changes is whose data the
+call reaches. Speaker identity is still not authentication.
+
+### Where this fails closed, and why
+
+`people`, `events`, the knowledge graph and the digital twin are modelled as
+Marcus's, with no per-person ownership column. Inventing a parallel store for
+guests inside a corrective patch would be a worse outcome than a clear refusal —
+a half-built second memory system is harder to remove than a gap. Those return
+`scoped_unavailable` with a sentence Nova can say out loud, and scoped support
+can land later without a migration.
+
+`memory.remember_person` is the exception, because the canonical hierarchy
+already had a home for it: `speaker:<id>:person:<key>` is ordinary facts, no new
+store, and a guest can read their own people back.
+
+`memory.timeline` fails closed rather than partially scoping. A timeline
+aggregates events, conversation digests and reminders; scoping one source would
+not make the composite safe, and a partially-scoped history is worse than none
+because it looks complete.
+
+### Legacy namespace compatibility, tightened
+
+P5.1d.1's compatibility rule matched `endswith(":" + own)`, which read
+`speaker:p-bob:lesson:speaker:p-alice` as **Alice's** — Bob's namespace with her
+name appended. That is the same substring-for-structure mistake `under_root`
+exists to prevent, smuggled back in through the compatibility path. The rule now
+matches only the four exact shapes P5.1d could actually write
+(`lesson|mood|wellbeing|session:speaker:<id>`).
+
+### Tool descriptions
+
+The descriptions are shown to the model and said things like *"when Marcus
+corrects you"*, *"someone Marcus mentions"*. Those become wrong the moment Alice
+is speaking, and a description that misdescribes the situation invites the model
+to act on the wrong assumption. They now say "the current speaker" / "this
+person". Execution remains the boundary — the descriptions are guidance, not
+enforcement, and no speaker name is ever placed in a client-provided argument.
+
+### Latency
+
+The scope checks are not measurable against the I/O they guard.
+
+| | |
+|---|---|
+| `resolve_write_target` (owner path) | 0.19 µs |
+| `resolve_write_target` (guest, nested) | 3.24 µs |
+| `entity_belongs_to_speaker` | 0.45 µs |
+| `memory.remember` end to end (owner) | 45.99 ms median |
 
 ### What the owner can still see
 
