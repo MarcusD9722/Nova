@@ -82,7 +82,11 @@ class SpeakerMatch:
     second_best_similarity: float | None = None
     second_best_name: str | None = None
     threshold: float | None = None
+    #: Where `threshold` came from: "profile" (calibrated) or "default"
+    #: (global/env fallback). Diagnostics only — never reaches a prompt.
+    threshold_source: str | None = None
     margin: float | None = None
+    second_best_profile_id: str | None = None
     reason: str = ""
     #: Was speaker identification actually ATTEMPTED for this turn? (V3 P5.1a)
     #:
@@ -118,6 +122,8 @@ class SpeakerMatch:
             "second_best_similarity": (round(self.second_best_similarity, 4)
                                        if self.second_best_similarity is not None else None),
             "threshold": self.threshold,
+            "threshold_source": self.threshold_source,
+            "second_best_profile_id": self.second_best_profile_id,
             "model_id": model_id,
         }
 
@@ -171,14 +177,20 @@ def match(embedding: np.ndarray | None, profiles: Iterable[SpeakerProfile],
     top_score, top = scored[0]
     second_score, second = (scored[1] if len(scored) > 1 else (None, None))
 
+    # A per-profile threshold wins if calibration produced one.
+    effective = top.threshold if top.threshold is not None else thresh
+
     result = SpeakerMatch(
         similarity=top_score, second_best_similarity=second_score,
         second_best_name=second.display_name if second else None,
-        threshold=thresh, margin=min_margin,
+        second_best_profile_id=second.profile_id if second else None,
+        # The EFFECTIVE threshold, not the global fallback (V3 P5.2). Reporting
+        # the fallback while deciding on a calibrated per-profile value made the
+        # diagnostic describe a decision that was never made.
+        threshold=effective,
+        threshold_source=("profile" if top.threshold is not None else "default"),
+        margin=min_margin,
     )
-
-    # A per-profile threshold wins if enrollment calibrated one.
-    effective = top.threshold if top.threshold is not None else thresh
 
     if top_score < effective:
         result.status = STATUS_UNKNOWN

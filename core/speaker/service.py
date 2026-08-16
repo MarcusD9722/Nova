@@ -38,17 +38,42 @@ from core.speaker import matcher as M
 from core.speaker.backend import (EMBEDDER, MODEL_ID, MODEL_REVISION,
                                   command_quality, enabled)
 from core.speaker.matcher import SpeakerMatch, check_sample
+from core.speaker.calibration import CalibrationStore
 from core.speaker.registry import SpeakerProfile, SpeakerRegistry, new_profile_id
 from core.speaker.voice_turns import (VOICE_TURN_MAX, VOICE_TURN_TTL_S,
                                       VOICE_TURNS)
 
 logger = get_logger(__name__)
 
+
+def _env_threshold() -> float | None:
+    """An explicit NOVA_SPEAKER_THRESHOLD, or None.
+
+    Precedence is documented rather than implied (V3 P5.2): an env override
+    beats calibration, calibration beats the provisional default, and `status()`
+    names which one is in force. A hidden threshold source is how a measured
+    system quietly stops being one.
+    """
+    raw = os.getenv("NOVA_SPEAKER_THRESHOLD", "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _env_margin() -> float | None:
+    raw = os.getenv("NOVA_SPEAKER_MARGIN", "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
 class SpeakerService:
     """Identify, enrol, and hand out short-lived voice-turn handles."""
 
     def __init__(self, db_path: Path) -> None:
         self.registry = SpeakerRegistry(db_path)
+        self.calib = CalibrationStore(db_path)
         self._ready = False
         self._lock = asyncio.Lock()
         self.stats: dict[str, int] = {
@@ -109,7 +134,10 @@ class SpeakerService:
                                     attempted=True)
 
             profiles = await self.registry.matchable()
-            result = M.match(emb, profiles)
+            # A valid calibration supplies the margin; per-profile thresholds
+            # already ride on the profiles themselves (V3 P5.2). Falls back to
+            # the provisional defaults when nothing has been calibrated.
+            result = M.match(emb, profiles, min_margin=await self.effective_margin())
             result.attempted = True
             self.stats[result.status] = self.stats.get(result.status, 0) + 1
             return result
@@ -229,19 +257,78 @@ class SpeakerService:
 
     # ── diagnostics ──────────────────────────────────────────────────────────
 
+    async def calibration(self):
+        """The persisted calibration, or None when there is none for THIS build."""
+        try:
+            rec = await self.calib.load()
+        except Exception:  # noqa: BLE001
+            return None
+        if rec is None or not rec.valid_for_build:
+            return None
+        return rec
+
+    async def effective_margin(self) -> float:
+        """Calibrated margin if valid, else the env/provisional default."""
+        rec = await self.calibration()
+        if rec is not None and _env_margin() is None:
+            return float(rec.margin)
+        return M.margin()
+
     async def status(self) -> dict[str, Any]:
         await self.initialize()
         try:
             reg = await self.registry.stats()
         except Exception:  # noqa: BLE001
             reg = {"profiles": 0}
+        try:
+            profiles = await self.registry.all()
+        except Exception:  # noqa: BLE001
+            profiles = []
+
+        rec = await self.calibration()
+        env_margin = _env_margin()
+        # Calibration is only real when it covers every compatible profile: a
+        # newly enrolled speaker makes it honestly stale rather than partly
+        # true, and "partly calibrated" is not a claim worth making (V3 P5.2).
+        compatible = [p for p in profiles if p.compatible]
+        covered = (rec is not None
+                   and compatible
+                   and all(p.profile_id in set(rec.profile_ids) for p in compatible)
+                   and all(p.threshold is not None for p in compatible))
+
+        if env_margin is not None:
+            margin_source = "env override"
+        elif rec is not None:
+            margin_source = "calibrated"
+        else:
+            margin_source = "provisional default"
+
         return {
             **EMBEDDER.status(),
             **reg,
             "threshold": M.threshold(),
-            "margin": M.margin(),
-            "threshold_calibrated": False,   # until the live harness has run
+            "margin": await self.effective_margin(),
+            "margin_source": margin_source,
+            "threshold_calibrated": bool(covered),
+            "calibrated_at": (rec.calibrated_at if rec else None),
+            "calibration_protocol": (rec.protocol_version if rec else None),
+            "calibration_covers": (list(rec.profile_ids) if rec else []),
             "raw_audio_retained": False,
             "voice_turns_cached": len(VOICE_TURNS),
             "matches": dict(self.stats),
+            "profiles_detail": [
+                {
+                    "profile_id": p.profile_id,
+                    "name": p.display_name,
+                    "role": p.role,
+                    "calibrated_threshold": p.threshold,
+                    "threshold_source": ("calibrated" if p.threshold is not None
+                                         else ("env override" if _env_threshold() is not None
+                                               else "provisional default")),
+                    "sample_count": p.sample_count,
+                    "consistency": p.consistency,
+                    "compatible": p.compatible,
+                }
+                for p in profiles
+            ],
         }
