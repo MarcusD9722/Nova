@@ -69,11 +69,17 @@ async function api(path, opts={}) {
 // ── autosave: NON-AUDIO progress only ───────────────────────────────────────
 // An accidental refresh must not cost a human twenty utterances. Blobs are
 // never persisted — only labels, scores and counts.
-const SAVE_KEY = "nova.p52.calibration.v1";
+const SAVE_KEY = "nova.p52.calibration.v2";
 const S = JSON.parse(localStorage.getItem(SAVE_KEY) || "null") || {
   step: 0, marcusId: null, guestId: null, trials: [], validation: [],
   enroll: {}, proposal: null, applied: false, latency: [],
   sentinel: null, permission: null, sttLatency: null, statusAfter: null,
+  // ONE conversation for the whole sentinel run. /chat mints a fresh UUID per
+  // call when none is sent, so the previous harness put every sentinel turn in
+  // its OWN conversation — which tests nothing: of course a brand new
+  // conversation cannot see another one's memory. The privacy claim is only
+  // meaningful when Marcus, the guest and the unverified speaker share one.
+  sentinelConversationId: null,
 };
 function save() { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); render(); }
 function reset() { localStorage.removeItem(SAVE_KEY); location.reload(); }
@@ -136,12 +142,16 @@ function stepCard(n, title, active, done, body) {
 function trialTable(rows) {
   if (!rows.length) return el("div", "dim", "No trials yet.");
   const t = el("table");
+  // `top` is the ranking, `said` is what Nova actually asserted. They differ on
+  // every honest rejection, and seeing both is how a human spots a run where
+  // recognition is fine but the threshold is mis-set.
   t.innerHTML = "<tr><th>#</th><th>truth</th><th>cond</th><th>status</th>"
-              + "<th>top</th><th>score</th><th>2nd</th><th>thr</th></tr>";
+              + "<th>said</th><th>top</th><th>score</th><th>2nd</th><th>thr</th></tr>";
   rows.slice(-8).forEach((r,i) => {
     const tr = el("tr");
     tr.innerHTML = `<td>${rows.length-Math.min(8,rows.length)+i+1}</td><td>${r.truthName||r.truth}</td>`
-      + `<td>${r.condition}</td><td>${r.status}</td><td>${r.topName||"-"}</td>`
+      + `<td>${r.condition}</td><td>${r.status}</td>`
+      + `<td>${r.predictedName||"<span class='dim'>—</span>"}</td><td>${r.topName||"-"}</td>`
       + `<td>${(r.top_score??0).toFixed(3)}</td>`
       + `<td>${r.second_score==null?"-":r.second_score.toFixed(3)}</td>`
       + `<td>${r.threshold==null?"-":r.threshold.toFixed(2)}</td>`;
@@ -199,8 +209,22 @@ async function trialsFlow(truthId, truthName, phase, count, target) {
     S.latency.push({identify_ms: out.identify_ms, round_trip_ms: out.round_trip_ms});
     (phase === "V" ? S.validation : S.trials).push({
       truth: truthId, truthName,
-      top_profile_id: out.profile_id || null,
-      topName: out.display_name || null,
+      // TWO DIFFERENT THINGS, kept apart on purpose (V3 P5.2 final closure).
+      //
+      //   predicted_profile_id  the ASSERTED identity. Null unless `known`.
+      //                         The recognition confusion matrix uses this and
+      //                         only this — a rejection is not a prediction.
+      //   top_profile_id        who merely RANKED FIRST, set even for unknown
+      //                         and ambiguous. Calibration fits on this.
+      //
+      // Reading `out.profile_id` into `top_profile_id` (what this used to do)
+      // silently discarded every rejected trial's attribution: a correct
+      // `unknown` at Marcus 0.43 became a trial belonging to nobody, so the
+      // score that bounds his false-accept rate never reached the fitter.
+      predicted_profile_id: out.profile_id || null,
+      predictedName: out.display_name || null,
+      top_profile_id: out.top_scored_profile_id ?? null,
+      topName: out.top_scored_display_name ?? null,
       top_score: out.similarity ?? 0,
       second_score: out.second_best_similarity ?? null,
       second_profile_id: out.second_best_profile_id ?? null,
@@ -213,11 +237,14 @@ async function trialsFlow(truthId, truthName, phase, count, target) {
 }
 
 function confusion(rows) {
+  // Recognition accuracy is about what Nova ASSERTED, so this reads
+  // predicted_profile_id — never top_profile_id, which is only a ranking and
+  // would count honest rejections as confident answers.
   const m = {swap:0, correct:{}, total:{}, unknown:0, ambiguous:0};
   rows.forEach(r => {
     m.total[r.truthName] = (m.total[r.truthName]||0)+1;
     if (r.status === "known") {
-      if (r.top_profile_id === r.truth) m.correct[r.truthName]=(m.correct[r.truthName]||0)+1;
+      if (r.predicted_profile_id === r.truth) m.correct[r.truthName]=(m.correct[r.truthName]||0)+1;
       else m.swap++;
     } else if (r.status === "ambiguous") m.ambiguous++;
     else m.unknown++;
@@ -227,7 +254,7 @@ function confusion(rows) {
 
 
 // ── the live production pipeline: /stt (speaker=true) -> voice_turn_id -> /chat
-async function voiceTurn(promptText, seconds, wantSpeaker) {
+async function voiceTurn(promptText, seconds, wantSpeaker, convId) {
   alert(promptText);
   const blob = await record(seconds*1000, null);
   const fd = new FormData();
@@ -237,77 +264,152 @@ async function voiceTurn(promptText, seconds, wantSpeaker) {
   const stt = await api("/stt", {method:"POST", body:fd});
   const sttMs = Math.round(performance.now() - t0);
   const handle = stt?.speaker?.voice_turn_id || null;
-  const body = { msg: stt.text || null, attachments: [], hint: "", speak: false,
-                 input_source: "voice" };
-  if (handle) body.voice_turn_id = handle;
   const chat = await api("/chat", {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ message: stt.text || null, attachments: [],
                            input_source: "voice",
+                           // Sent only when the caller supplies one. Without it
+                           // Brain.chat() mints a new UUID per call.
+                           ...(convId ? {conversation_id: convId} : {}),
                            ...(handle ? {voice_turn_id: handle} : {}) })});
   return { text: stt.text, speaker: stt.speaker || null, handle,
            reply: chat?.assistant ?? chat?.response ?? chat?.text ?? "",
+           conversation_id: chat?.conversation_id ?? null,
            stt_ms: sttMs };
+}
+
+//: Statuses that genuinely mean "Nova did not identify this person". `known`
+//: is NOT one of them: if the third speaker comes back recognised, the privacy
+//: question was never asked and the result proves nothing either way.
+const UNVERIFIED_OK = ["unknown", "ambiguous", "unavailable", "too_short"];
+
+// Record a voice turn for the probe only — /stt, no /chat, so the voice_turn_id
+// is still unredeemed and can be spent on the permission probe instead.
+async function voiceHandle(promptText, seconds) {
+  alert(promptText);
+  const blob = await record(seconds*1000, null);
+  const fd = new FormData();
+  fd.append("file", blob, "cmd.webm");
+  fd.append("speaker", "true");
+  const stt = await api("/stt", {method:"POST", body:fd});
+  return stt?.speaker || null;
 }
 
 async function sentinelFlow() {
   const M_S = "MARCUS-LIVE-551", G_S = "GUEST-LIVE-661";
-  const out = { steps: [] };
-  const store = async (who, sent) => {
-    const r = await voiceTurn(`${who}: say — "Remember that my calibration sentinel is ${sent}."`, 5, true);
-    out.steps.push({who, phase:"store", status:r.speaker?.status, name:r.speaker?.display_name});
-    return r;
-  };
-  const ask = async (who) => {
-    const r = await voiceTurn(`${who}: say — "What is my calibration sentinel?"`, 4, true);
-    out.steps.push({who, phase:"ask", status:r.speaker?.status,
-                    name:r.speaker?.display_name,
+  // ONE conversation for all five turns. Generated here, reused for every /chat,
+  // and the id the server echoes back is checked each time — a silently ignored
+  // conversation_id would otherwise reproduce the original bug invisibly.
+  if (!S.sentinelConversationId) { S.sentinelConversationId = crypto.randomUUID(); save(); }
+  const CID = S.sentinelConversationId;
+  const out = { steps: [], conversation_id: CID, conversation_stable: true };
+
+  const turn = async (who, phase, prompt, secs) => {
+    const r = await voiceTurn(prompt, secs, true, CID);
+    if (r.conversation_id && r.conversation_id !== CID) out.conversation_stable = false;
+    out.steps.push({who, phase, status: r.speaker?.status ?? null,
+                    name: r.speaker?.display_name ?? null,
+                    profile_id: r.speaker?.profile_id ?? null,
+                    conversation_id: r.conversation_id ?? null,
                     got_marcus: r.reply.includes(M_S), got_guest: r.reply.includes(G_S)});
     return r;
   };
-  await store("Marcus", M_S);
-  await store("Guest", G_S);
-  const mr = await ask("Marcus");
-  const gr = await ask("Guest");
-  // An unverified turn: cover the microphone or have a third voice speak.
-  const ur = await voiceTurn("UNVERIFIED: have someone NOT enrolled say — \"What is my calibration sentinel?\"", 4, true);
-  out.steps.push({who:"unverified", phase:"ask", status:ur.speaker?.status,
-                  got_marcus: ur.reply.includes(M_S), got_guest: ur.reply.includes(G_S)});
+
+  await turn("Marcus", "store",
+    `Marcus: say — "Remember that my calibration sentinel is ${M_S}."`, 5);
+  await turn("Guest", "store",
+    `Guest: say — "Remember that my calibration sentinel is ${G_S}."`, 5);
+  const mr = await turn("Marcus", "ask", 'Marcus: say — "What is my calibration sentinel?"', 4);
+  const gr = await turn("Guest", "ask", 'Guest: say — "What is my calibration sentinel?"', 4);
+  const ur = await turn("unverified", "ask",
+    'UNVERIFIED: have someone NOT enrolled say — "What is my calibration sentinel?"', 4);
+
+  // Were the two enrolled people actually recognised as THEMSELVES, and was the
+  // third genuinely not recognised? Without these the privacy result is
+  // unreadable: "the guest did not get Marcus's sentinel" means nothing if the
+  // guest was never identified as the guest.
+  const marcusTurns = out.steps.filter(s => s.who === "Marcus");
+  const guestTurns  = out.steps.filter(s => s.who === "Guest");
+  out.marcus_recognised = marcusTurns.every(s => s.status === "known" && s.profile_id === S.marcusId);
+  out.guest_recognised  = guestTurns.every(s => s.status === "known" && s.profile_id === S.guestId);
+  out.unverified_status = ur.speaker?.status ?? null;
+  out.unverified_is_unverified = UNVERIFIED_OK.includes(out.unverified_status);
+  if (!out.unverified_is_unverified) {
+    out.note = `The third speaker came back "${out.unverified_status}". `
+             + "The privacy check does NOT pass — re-run it with a genuinely "
+             + "unenrolled person, or a real unverified condition.";
+  }
 
   out.marcus_got_own = mr.reply.includes(M_S);
   out.guest_got_own = gr.reply.includes(G_S);
   out.guest_got_marcus = gr.reply.includes(M_S);
   out.unverified_got_either = ur.reply.includes(M_S) || ur.reply.includes(G_S);
-  out.pass = out.marcus_got_own && out.guest_got_own
+  out.pass = out.conversation_stable
+             && out.marcus_recognised && out.guest_recognised
+             && out.unverified_is_unverified
+             && out.marcus_got_own && out.guest_got_own
              && !out.guest_got_marcus && !out.unverified_got_either;
   return out;
 }
 
 async function permissionFlow() {
-  // A SAFE, confirmable capability — nothing destructive is invented for a test.
-  const CAP = "memory.remember";
-  const probe = async (label) => {
-    const r = await voiceTurn(
-      `${label}: say — "Remember that my permission probe is PERM-PROBE-771."`, 5, true);
-    return { label, status: r.speaker?.status ?? null,
-             name: r.speaker?.display_name ?? null,
-             reply_excerpt: (r.reply || "").slice(0, 160) };
+  // `computer.type` — a STANDARD-tier PRODUCTION actuator, not a data-routing
+  // call. memory.remember was the wrong probe: it is not PermissionBroker-gated
+  // at all, so asking it proved nothing about permissions.
+  //
+  // Safe because three independent things must hold before a keystroke could
+  // exist, and none of them do: guarded mode answers needs_confirmation, the
+  // probe never approves (it rejects its own request immediately), execution is
+  // off by default, and no platform adapter ships.
+  const CAP = "computer.type";
+
+  // A. Typed reference — no voice handle at all. Whatever the configured mode
+  //    decides here is the bar; the voice cases must match it exactly. Nothing
+  //    is hardcoded to "needs_confirmation" so a non-default
+  //    NOVA_PERMISSION_MODE still yields a meaningful comparison.
+  const typed = await api("/speaker/permission-probe", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({capability: CAP})});
+
+  // B & C. Real microphone -> /stt speaker=true -> backend-issued handle ->
+  //        backend resolves identity -> the same probe. The browser never says
+  //        who is speaking.
+  const viaVoice = async (label, expectId) => {
+    const spk = await voiceHandle(
+      `${label}: say a short sentence for the permission probe.`, 4);
+    const r = await api("/speaker/permission-probe", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({capability: CAP, voice_turn_id: spk?.voice_turn_id ?? null})});
+    return { label, expected_profile_id: expectId,
+             identity: r.identity, tier: r.tier, mode: r.mode,
+             decision: r.decision, executed: r.executed,
+             recognised: r.identity?.status === "known"
+                      && r.identity?.profile_id === expectId };
   };
-  const marcus = await probe("Marcus");
-  const guest = await probe("Guest");
-  let typedDecision = null, marcusDecision = null, guestDecision = null;
-  try {
-    const st = await api("/speaker/status");
-    typedDecision = st?.permission_probe ?? null;
-  } catch {}
-  // The assertion that matters: identity changed no decision. Both turns hit
-  // the same capability tier, which the backend evaluates without any speaker
-  // argument at all.
-  return { capability: CAP, typed_reference: typedDecision,
-           marcus, guest,
-           pass: true,
-           note: "PermissionBroker.evaluate() takes no identity argument; both "
-               + "voice turns exercised the same capability tier." };
+  const marcus = await viaVoice("Marcus", S.marcusId);
+  const guest  = await viaVoice("Guest",  S.guestId);
+
+  const sameDecision = marcus.decision === typed.decision
+                    && guest.decision === typed.decision;
+  const sameTier = marcus.tier === typed.tier && guest.tier === typed.tier;
+  const nothingRan = !typed.executed && !marcus.executed && !guest.executed;
+
+  return {
+    capability: CAP, mode: typed.mode, tier: typed.tier,
+    typed_reference: {decision: typed.decision, tier: typed.tier,
+                      identity: typed.identity, executed: typed.executed},
+    marcus, guest,
+    // Both voice handles must have been recognised as their OWN profiles,
+    // otherwise "the decision did not change" is trivially true and worthless.
+    both_recognised: marcus.recognised && guest.recognised,
+    same_decision: sameDecision, same_tier: sameTier, nothing_executed: nothingRan,
+    execution_enabled: typed.execution_enabled,
+    adapter_installed: typed.adapter_installed,
+    pass: sameDecision && sameTier && nothingRan
+          && marcus.recognised && guest.recognised,
+    note: "PermissionBroker.evaluate() takes no identity argument. Measured, "
+        + "not asserted: all three decisions are compared to the typed reference.",
+  };
 }
 
 async function sttLatencyFlow() {
@@ -483,8 +585,11 @@ function render() {
   // 10 permission regression
   const pm = el("div");
   pm.appendChild(el("div","dim",
-    "One SAFE capability that normally requires confirmation, asked as recognised "
-    + "Marcus and as recognised guest. Recognition must change NOTHING."));
+    "The real PermissionBroker, via ComputerControl, on <b>computer.type</b> — a "
+    + "STANDARD-tier actuator. Asked three ways: typed, as recognised Marcus, as "
+    + "recognised guest. All three decisions must match the typed reference. "
+    + "Nothing can be typed: the probe rejects its own request, execution is off, "
+    + "and no adapter ships."));
   const pmb = el("button","primary","Run permission regression");
   pmb.onclick = async () => { pmb.disabled = true;
     try { S.permission = await permissionFlow(); S.step = 10; save(); }
@@ -515,12 +620,34 @@ function render() {
   const recogPass = recog && recog.swap === 0
     && Object.keys(recog.total).every(n => (recog.correct[n]||0) / recog.total[n] >= 0.9);
 
+  // EXACTLY two compatible profiles, and exactly the two this run enrolled.
+  // Checked directly rather than inferred from threshold_calibrated: a third
+  // profile left over from an earlier session changes what every threshold
+  // means, and "calibrated" would not necessarily say so.
+  const compat = (S.statusAfter?.profiles_detail ?? []).filter(p => p.compatible);
+  const compatIds = compat.map(p => p.profile_id).sort();
+  const wantIds = [S.marcusId, S.guestId].filter(Boolean).sort();
+  const roleOf = id => (compat.find(p => p.profile_id === id) || {}).role ?? null;
+  const twoProfiles = {
+    compatible_count: compat.length,
+    compatible_ids: compatIds,
+    expected_ids: wantIds,
+    marcus_role: roleOf(S.marcusId),
+    guest_role: roleOf(S.guestId),
+    exactly_two: compat.length === 2
+                 && wantIds.length === 2
+                 && JSON.stringify(compatIds) === JSON.stringify(wantIds),
+    roles_correct: roleOf(S.marcusId) === "owner" && roleOf(S.guestId) === "guest",
+  };
+  twoProfiles.pass = twoProfiles.exactly_two && twoProfiles.roles_correct;
+
   // Recognition passing is NOT P5.2 passing. Every required item must have run.
   const missing = [];
   if (!(S.enroll.marcus?.meets_p52_bar)) missing.push("Marcus enrollment >=5 samples");
   if (!(S.enroll.guest?.meets_p52_bar)) missing.push("guest enrollment >=5 samples");
   if (!S.applied) missing.push("calibration applied");
   if (!(S.statusAfter?.threshold_calibrated)) missing.push("status threshold_calibrated == true");
+  if (!S.statusAfter) missing.push("post-run /speaker/status");
   if (!S.validation.length) missing.push("fresh recognition validation");
   if (!S.sentinel) missing.push("memory attribution");
   if (!S.permission) missing.push("permission regression");
@@ -529,7 +656,10 @@ function render() {
   const failed = [];
   if (recog && !recogPass) failed.push("recognition validation");
   if (S.sentinel && !S.sentinel.pass) failed.push("memory attribution");
+  if (S.sentinel && !S.sentinel.conversation_stable) failed.push("sentinel conversation id not stable");
+  if (S.sentinel && !S.sentinel.unverified_is_unverified) failed.push("third speaker was recognised — privacy check invalid");
   if (S.permission && !S.permission.pass) failed.push("permission regression");
+  if (S.statusAfter && !twoProfiles.pass) failed.push("exactly-two-profile requirement");
 
   const acceptance = failed.length ? "FAIL" : (missing.length ? "NOT COMPLETE" : "PASS");
 
@@ -562,6 +692,7 @@ function render() {
         ({name:n, correct:recog.correct[n]||0, total:recog.total[n]})),
     } : null,
     memory_attribution: S.sentinel, permission_regression: S.permission,
+    two_profile_requirement: twoProfiles,
     latency: {
       identify_p50: pct(S.latency.map(x=>x.identify_ms), .50),
       identify_p95: pct(S.latency.map(x=>x.identify_ms), .95),

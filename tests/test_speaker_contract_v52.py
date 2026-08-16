@@ -188,20 +188,46 @@ async def test_stale_calibration_is_inert():
           f"A: his stored 0.71 is INERT ({pol.threshold_for(M_ID)})")
     check(abs(pol.margin - DEFAULT_MARGIN) < 1e-9, "A: and so is the margin")
 
-    # B. a covered profile is deleted
-    from core.speaker.calibration import CalibrationRecord, resolve_policy
+    # B. a covered profile is deleted.
+    #
+    # This assertion was BACKWARDS in the first closure pass: it required that
+    # removing the guest "leaves the rest covered". It does not, and must not.
+    # Marcus's fitted threshold exists because the guest's voice supplied the
+    # impostor evidence that bounded his false-accept rate. Delete the guest and
+    # the number outlives the only measurement that justified it. Coverage is
+    # EXACT SET EQUALITY.
+    from core.speaker.calibration import (CalibrationRecord, calibration_covers,
+                                          resolve_policy)
     rec = CalibrationRecord(margin=0.22, profile_ids=[M_ID, G_ID], metrics={})
     pol = resolve_policy(P[:1], rec, env_threshold=None, env_margin=None,
                          default_threshold=DEFAULT_THRESHOLD,
                          default_margin=DEFAULT_MARGIN)
-    check(pol.calibrated, "B: removing a profile leaves the rest covered")
+    check(not pol.calibrated, "B: deleting a covered profile invalidates it")
+    check(abs(pol.threshold_for(M_ID) - DEFAULT_THRESHOLD) < 1e-9,
+          f"B: and his stored 0.71 is inert ({pol.threshold_for(M_ID)})")
 
-    # ...but removing one the record NAMED and keeping an uncovered one is not.
+    # B2. a profile the record never named
     pol = resolve_policy(_profiles(("p-other", "Other", 0.6)), rec,
                          env_threshold=None, env_margin=None,
                          default_threshold=DEFAULT_THRESHOLD,
                          default_margin=DEFAULT_MARGIN)
-    check(not pol.calibrated, "B: an uncovered profile invalidates it")
+    check(not pol.calibrated, "B2: an uncovered profile invalidates it")
+
+    # B3. REPLACED — same count, different people. Containment would also miss
+    # this if the record happened to name a superset.
+    swapped = _profiles((M_ID, "Marcus", 0.71), ("p-replacement", "Someone", 0.69))
+    pol = resolve_policy(swapped, rec, env_threshold=None, env_margin=None,
+                         default_threshold=DEFAULT_THRESHOLD,
+                         default_margin=DEFAULT_MARGIN)
+    check(not pol.calibrated, "B3: replacing a profile invalidates it")
+
+    # B4. THE FAIL-CLOSED BACKSTOP. `_invalidate_calibration()` deletes the row
+    # on enrol/delete — but if that write fails (locked db, disk error) the stale
+    # row is still there on the next boot. Set equality is what makes it inert
+    # anyway, so a failed clear degrades to provisional defaults instead of a
+    # silent stale claim.
+    check(not calibration_covers(rec, P[:1]),
+          "B4: a stale row surviving a failed clear is INERT (fails closed)")
 
     # C. model revision mismatch
     pol = await _policy_case(profiles=P, calibrated=True, revision="deadbeef")
@@ -361,6 +387,140 @@ async def test_harness_acceptance_is_two_tier():
         check(banned not in rep.lower(), f"the report contains no {banned}")
 
 
+def _code_only(js: str) -> str:
+    """Strip JS comments.
+
+    Every "this string must NOT appear" check has to run against code, not
+    prose: the harness explains in comments exactly which mistakes it is
+    avoiding, and naming them there would otherwise fail the check that they
+    are gone.
+    """
+    out = []
+    for line in js.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("//"):
+            continue
+        if "//" in line and "://" not in line:
+            line = line[:line.index("//")]
+        out.append(line)
+    return "\n".join(out)
+
+
+async def test_harness_separates_prediction_from_ranking():
+    check.section("3: the harness records BOTH fields, and uses each correctly")
+    html = HARNESS.read_text(encoding="utf-8")
+
+    check("predicted_profile_id: out.profile_id" in html,
+          "prediction comes from the asserted identity")
+    check("top_profile_id: out.top_scored_profile_id" in html,
+          "ranking comes from the score attribution, NOT profile_id")
+    check("topName: out.top_scored_display_name" in html,
+          "and the ranked name likewise")
+    check("top_profile_id: out.profile_id" not in html,
+          "the old conflation is gone — profile_id never feeds top_profile_id")
+
+    # The confusion matrix is about what Nova ASSERTED.
+    conf = _code_only(html[html.index("function confusion("):
+                           html.index("// ── the live production")])
+    check("r.predicted_profile_id" in conf,
+          "the confusion matrix scores the asserted identity")
+    check("r.top_profile_id" not in conf,
+          "and never counts a ranking as a prediction")
+
+    # Calibration fits on the ranking + runner-up.
+    check("top_profile_id:t.top_profile_id" in html.replace(" ", ""),
+          "the calibration payload sends the ranked profile")
+    check("second_profile_id:t.second_profile_id" in html.replace(" ", ""),
+          "and the runner-up, which the impostor bound needs")
+
+
+async def test_harness_sentinel_shares_one_conversation():
+    check.section("5: one conversation id for the whole sentinel run")
+    html = HARNESS.read_text(encoding="utf-8")
+
+    check("crypto.randomUUID()" in html, "the harness generates a UUID itself")
+    check("sentinelConversationId" in html, "and persists it in non-audio state")
+    check("conversation_id: convId" in html,
+          "every /chat in the flow sends it")
+    check("conversation_stable" in html,
+          "and the echoed id is checked, so a silently-ignored one cannot pass")
+
+    sent = html[html.index("async function sentinelFlow"):html.index("async function permissionFlow")]
+    check(sent.count("await turn(") == 5,
+          f"five turns in one conversation ({sent.count('await turn(')})")
+    for who in ('"Marcus", "store"', '"Guest", "store"', '"Marcus", "ask"',
+                '"Guest", "ask"', '"unverified", "ask"'):
+        check(who in sent, f"including: {who}")
+
+    # The unverified turn must actually BE unverified.
+    check("UNVERIFIED_OK" in html, "allowed unverified statuses are named")
+    check('"unknown", "ambiguous", "unavailable", "too_short"' in html,
+          "exactly the four honest non-identifications")
+    check("unverified_is_unverified" in sent,
+          "and the run records whether that held")
+    check("marcus_recognised" in sent and "guest_recognised" in sent,
+          "the two enrolled people must be recognised as THEMSELVES")
+    check("out.unverified_is_unverified" in sent and "out.pass" in sent,
+          "all of which gate the sentinel verdict")
+
+
+async def test_harness_permission_pass_is_measured():
+    check.section("6: the permission verdict is computed, never asserted")
+    html = HARNESS.read_text(encoding="utf-8")
+    raw = html[html.index("async function permissionFlow"):html.index("async function sttLatencyFlow")]
+    flow = _code_only(raw)
+
+    check("pass: true" not in flow and "pass:true" not in flow.replace(" ", ""),
+          "no hardcoded pass in permissionFlow")
+    check('"computer.type"' in flow or "'computer.type'" in flow,
+          "it probes computer.type — a real PermissionBroker-gated actuator")
+    check('"memory.remember"' not in flow and "'memory.remember'" not in flow,
+          "and no longer memory.remember, which is not permission-gated at all")
+    check("/speaker/permission-probe" in flow,
+          "through the real backend probe, not a JS reimplementation")
+    # The browser must not decide anything itself — no tier table, no decision
+    # literals, no local allow/deny logic. Every decision is read off the
+    # backend response.
+    for literal in ('"allowed"', '"denied"', '"standard"', '"admin"', '"critical"',
+                    '"guarded"', '"trusted"', '"locked"'):
+        check(literal not in flow,
+              f"no {literal} literal in the browser — the backend decides")
+    check("decision: r.decision" in flow and "tier: r.tier" in flow,
+          "decisions and tiers are READ from the response, not computed")
+
+    # Three cases, compared against the typed reference rather than a constant.
+    check("typed" in flow and "voice_turn_id" in flow,
+          "typed reference plus voice handles")
+    check("marcus.decision === typed.decision" in flow
+          and "guest.decision === typed.decision" in flow,
+          "both voice decisions are compared to the typed one")
+    check("needs_confirmation" not in flow,
+          "with no hardcoded expectation of guarded mode")
+    check("recognised" in flow,
+          "and both handles must have been recognised for the result to mean anything")
+    check("pass: sameDecision" in flow, "the verdict is that comparison")
+
+
+async def test_harness_requires_exactly_two_profiles():
+    check.section("7: exactly two compatible profiles, with the right roles")
+    html = HARNESS.read_text(encoding="utf-8")
+
+    check("twoProfiles" in html, "the report carries a two-profile check")
+    check("compat.length === 2" in html, "compatible profile count must be 2")
+    check("JSON.stringify(compatIds) === JSON.stringify(wantIds)" in html,
+          "and they must be exactly the two this run enrolled")
+    check('roleOf(S.marcusId) === "owner"' in html, "Marcus is the owner")
+    check('roleOf(S.guestId) === "guest"' in html, "the guest is a guest")
+    check("exactly-two-profile requirement" in html,
+          "failing it fails P5.2 acceptance")
+    check("two_profile_requirement" in html, "and it is reported in the JSON")
+
+    # Not inferred from threshold_calibrated.
+    idx = html.index("const twoProfiles")
+    check("threshold_calibrated" not in html[html.index("const compat ="):idx],
+          "the check does not lean on threshold_calibrated")
+
+
 async def main():
     await test_enroll_contract_matches_the_real_return_shape()
     await test_enroll_gate_counts_real_samples()
@@ -370,6 +530,10 @@ async def main():
     await test_enrol_and_delete_invalidate_centrally()
     await test_margin_uses_the_real_classifier()
     await test_harness_acceptance_is_two_tier()
+    await test_harness_separates_prediction_from_ranking()
+    await test_harness_sentinel_shares_one_conversation()
+    await test_harness_permission_pass_is_measured()
+    await test_harness_requires_exactly_two_profiles()
     check.finish()
 
 

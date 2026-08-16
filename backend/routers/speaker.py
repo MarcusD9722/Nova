@@ -44,7 +44,26 @@ MIN_KEPT_SAMPLES = 5
 
 
 def _service():
+    """The process-wide speaker service, CREATING it if this is the first use.
+
+    It used to just read `STATE.speaker` — which is populated lazily by the
+    `/stt` path and by nothing else. On a freshly-booted backend every route in
+    this file therefore answered 503 until some voice turn happened to run
+    first, so the calibration harness 503'd on its very first preflight check
+    and there was no order of operations a human could follow to avoid it.
+
+    Same lazy factory `/stt` uses, so there is exactly one service and one
+    profile registry either way. Imported inside the function because
+    `backend.app` imports this router.
+    """
     svc = getattr(STATE, "speaker", None)
+    if svc is None:
+        try:
+            from backend.app import _speaker_service
+            svc = _speaker_service()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("speaker_service_create_failed", error=str(e)[:200])
+            svc = None
     if svc is None:
         raise HTTPException(status_code=503, detail="speaker subsystem unavailable")
     return svc
@@ -170,6 +189,119 @@ async def identify(file: UploadFile = File(...)) -> dict[str, Any]:
     out["embed_ms"] = ms
     out["duration_ms"] = int(round(len(pcm) / max(sr, 1) * 1000))
     return out
+
+
+class PermissionProbeIn(BaseModel):
+    #: A handle from `/stt` with `speaker=true`. Omit it for the TYPED reference
+    #: case. The client never asserts who is speaking — the handle is redeemed
+    #: here, backend-side, exactly as `/chat` redeems it.
+    voice_turn_id: str | None = None
+    #: Fixed by default and validated against an allow-list below.
+    capability: str = "computer.type"
+
+
+#: The only capabilities this probe may ask about. `computer.type` is the
+#: intended one: STANDARD tier, so guarded mode answers `needs_confirmation`;
+#: no platform adapter ships and `NOVA_COMPUTER_CONTROL` is off by default, so
+#: even an approval could not synthesize a keystroke. The probe additionally
+#: never approves — see below. Nothing here can type on Marcus's machine.
+PROBE_CAPABILITIES = {"computer.type", "computer.observe"}
+
+#: Capability -> ComputerControl action kind, so the probe goes through the
+#: SHIPPED mapping in core/computer_control.py rather than a copy of it.
+_PROBE_ACTION = {"computer.type": "type"}
+
+
+@router.post("/permission-probe")
+async def permission_probe(body: PermissionProbeIn) -> dict[str, Any]:
+    """Prove that speaker identity changes NO permission decision (V3 P5.2 §6).
+
+    This exists because the previous harness asserted `pass: true` as a literal.
+    A privacy invariant asserted by a constant is not tested, it is announced.
+
+    What actually runs here is production code: the real `PermissionBroker`
+    built at startup with Marcus's configured mode, reached through the real
+    `ComputerControl.act()` and its real capability mapping. Nothing about
+    `evaluate()` is reimplemented — the point is that it takes no identity
+    argument at all, and the only way to show that is to call it.
+
+    SAFETY. `wait_for_confirm=False`, so the probe never waits for and never
+    receives an approval. Any pending request it creates is immediately resolved
+    as REJECTED, so no confirmation prompt is left hanging in the UI and no
+    action can proceed. With guarded mode, no adapter and execution disabled,
+    there are three independent reasons nothing can be typed; the probe relies
+    on all three rather than any one.
+    """
+    cap = (body.capability or "computer.type").strip()
+    if cap not in PROBE_CAPABILITIES:
+        raise HTTPException(status_code=400,
+                            detail=f"'{cap}' is not probeable; use one of "
+                                   f"{sorted(PROBE_CAPABILITIES)}")
+
+    rt = getattr(STATE, "runtime", None)
+    if rt is None:
+        raise HTTPException(status_code=503, detail="runtime unavailable")
+    broker = rt.permission_broker
+    computer = rt.computer
+
+    # Identity is RESOLVED BY THE BACKEND from the opaque handle, never taken
+    # from the request body. An unredeemable or absent handle is the typed
+    # owner reference case, which is what we compare the voice cases against.
+    identity: dict[str, Any] = {"source": "typed", "status": None,
+                                "profile_id": None, "display_name": None,
+                                "attempted": False}
+    if body.voice_turn_id:
+        match = _service().redeem_voice_turn(body.voice_turn_id)
+        if match is None:
+            raise HTTPException(status_code=400,
+                                detail="voice_turn_id is unknown, expired, or already used")
+        identity = {
+            "source": "voice",
+            "status": match.status,
+            # Asserted identity only — `top_scored_profile_id` is deliberately
+            # NOT consulted for anything here.
+            "profile_id": match.profile_id,
+            "display_name": match.display_name,
+            "attempted": match.attempted,
+        }
+
+    from core.permissions import TIER_NAMES, tier_of
+
+    kind = _PROBE_ACTION.get(cap)
+    if kind is not None:
+        result = await computer.act(kind, target="", details={"probe": "v3-p5.2"},
+                                    wait_for_confirm=False)
+        decision = str(result.get("status") or "")
+        request_id = result.get("request_id")
+    else:
+        result = await computer.observe("windows")
+        decision = "allowed" if result.get("ok") else str(result.get("status") or "")
+        request_id = None
+
+    # Never leave a live confirmation behind. Resolving as rejected also leaves
+    # an honest audit line: this probe asked and declined its own request.
+    if request_id:
+        try:
+            broker.resolve(str(request_id), False, by="p52-permission-probe")
+        except Exception:  # noqa: BLE001
+            pass
+
+    from core.computer_control import execution_enabled
+
+    return {
+        "capability": cap,
+        "tier": TIER_NAMES.get(tier_of(cap), "unknown"),
+        "mode": broker.mode,
+        "decision": decision,
+        "identity": identity,
+        # Proof, in the response, that nothing could have run.
+        "executed": decision == "executed",
+        "execution_enabled": execution_enabled(),
+        "adapter_installed": bool(getattr(computer, "_adapter", None) is not None),
+        "note": ("PermissionBroker.evaluate() takes no identity argument. This "
+                 "decision must be identical for typed, Marcus-voice and "
+                 "guest-voice turns; the harness compares all three."),
+    }
 
 
 class TrialIn(BaseModel):

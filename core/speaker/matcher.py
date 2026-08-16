@@ -82,11 +82,31 @@ class SpeakerMatch:
     second_best_similarity: float | None = None
     second_best_name: str | None = None
     threshold: float | None = None
-    #: Where `threshold` came from: "profile" (calibrated) or "default"
-    #: (global/env fallback). Diagnostics only — never reaches a prompt.
+    #: Where `threshold` came from — the resolved policy's source
+    #: ("env override" / "calibrated" / "provisional default"), or "explicit" /
+    #: "default" for a direct call with no policy. Diagnostics only; never
+    #: reaches a prompt, and NEVER "profile": a stored per-profile threshold is
+    #: only ever activated by `resolve_policy()` (V3 P5.2 final closure).
     threshold_source: str | None = None
     margin: float | None = None
     second_best_profile_id: str | None = None
+    #: ── SCORE ATTRIBUTION, NOT IDENTITY (V3 P5.2 final closure) ─────────────
+    #:
+    #: `profile_id` is the ASSERTED identity: populated only when the decision
+    #: was `known`. These two say who merely RANKED FIRST, and are populated
+    #: whenever any compatible profile was scored — including when the honest
+    #: answer was `unknown` or `ambiguous`.
+    #:
+    #: Calibration needs this. A rejection at Marcus 0.43 against a 0.55 bar is
+    #: exactly the impostor evidence that bounds his false-accept rate, and with
+    #: `profile_id` blanked (correctly) the trial used to carry no way of knowing
+    #: whose profile earned the 0.43 — so the score was collected against nobody
+    #: and silently dropped from the fit.
+    #:
+    #: NEVER treat these as identity. They authorise nothing, attribute no
+    #: memory, and name nobody in a prompt. Diagnostics and calibration only.
+    top_scored_profile_id: str | None = None
+    top_scored_display_name: str | None = None
     reason: str = ""
     #: Was speaker identification actually ATTEMPTED for this turn? (V3 P5.1a)
     #:
@@ -123,7 +143,14 @@ class SpeakerMatch:
                                        if self.second_best_similarity is not None else None),
             "threshold": self.threshold,
             "threshold_source": self.threshold_source,
+            "margin": self.margin,
             "second_best_profile_id": self.second_best_profile_id,
+            "second_best_name": self.second_best_name,
+            # Ranking, NOT identity. Survives an `unknown` on purpose — see the
+            # field docs above. A caller that reads these as "who is speaking"
+            # has defeated the open-set decision entirely.
+            "top_scored_profile_id": self.top_scored_profile_id,
+            "top_scored_display_name": self.top_scored_display_name,
             "model_id": model_id,
         }
 
@@ -157,12 +184,20 @@ def match(embedding: np.ndarray | None, profiles: Iterable[SpeakerProfile],
           policy: Any = None) -> SpeakerMatch:
     """Score against every compatible profile and decide honestly.
 
-    `policy` is the resolved effective policy (V3 P5.2 closure). When supplied it
-    is the ONLY source of thresholds — the matcher no longer reads
-    `profile.threshold` on its own, because a stored value survives its
-    calibration going stale and would otherwise keep deciding after nobody
-    stands behind it.
+    `policy` is the resolved effective policy. `resolve_policy()` is the ONLY
+    thing that may turn a stored `SpeakerProfile.threshold` into an effective
+    threshold (V3 P5.2 final closure).
+
+    This function does not read `profile.threshold` at all. It used to, as a
+    fallback whenever no policy was passed — which meant a stored number kept
+    deciding after its calibration went stale, and any direct caller (a tool, a
+    test, a future code path that forgets the policy) silently reactivated it.
+    Making the policy authoritative in one place and leaving a second, quieter
+    place that disagrees is not a fix.
+
+    With no policy: an explicitly supplied `thresh`, else the global/env default.
     """
+    explicit_thresh = thresh is not None
     thresh = threshold() if thresh is None else thresh
     min_margin = margin() if min_margin is None else min_margin
     if policy is not None:
@@ -187,20 +222,23 @@ def match(embedding: np.ndarray | None, profiles: Iterable[SpeakerProfile],
     top_score, top = scored[0]
     second_score, second = (scored[1] if len(scored) > 1 else (None, None))
 
-    # Precedence lives in the policy, not here. Without one (a direct call in a
-    # test or a tool), fall back to the legacy per-profile behaviour.
+    # Precedence lives in the policy, and ONLY in the policy. `top.threshold` is
+    # deliberately not consulted here.
     if policy is not None:
         effective = policy.threshold_for(top.profile_id)
         source = policy.threshold_source
-    elif top.threshold is not None:
-        effective, source = top.threshold, "profile"
     else:
-        effective, source = thresh, "default"
+        effective = thresh
+        source = "explicit" if explicit_thresh else "default"
 
     result = SpeakerMatch(
         similarity=top_score, second_best_similarity=second_score,
         second_best_name=second.display_name if second else None,
         second_best_profile_id=second.profile_id if second else None,
+        # Stamped BEFORE any decision, so a rejection still records whose
+        # profile earned the score. Every early return below inherits it.
+        top_scored_profile_id=top.profile_id,
+        top_scored_display_name=top.display_name,
         # The EFFECTIVE threshold, not the global fallback (V3 P5.2). Reporting
         # the fallback while deciding on a calibrated per-profile value made the
         # diagnostic describe a decision that was never made.

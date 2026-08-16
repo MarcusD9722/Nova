@@ -464,19 +464,33 @@ class EffectivePolicy:
 def calibration_covers(rec: "CalibrationRecord | None", profiles: Sequence[Any]) -> bool:
     """Does this calibration describe the population Nova has RIGHT NOW?
 
-    Requires validity for the build, every compatible profile covered, and every
-    one of them carrying a fitted threshold. Adding or removing a speaker makes
-    the answer False — the fit described a different population, and
-    partly-calibrated is not a claim worth making.
+    EXACT SET EQUALITY, not containment (V3 P5.2 final closure):
+
+        set(rec.profile_ids) == {every current compatible profile id}
+
+    and every one of them carries a fitted threshold.
+
+    Containment was wrong in the direction that matters. A fit over
+    {Marcus, Guest} still "covered" a population of {Marcus} alone, so deleting
+    the guest left Marcus judged by a threshold whose entire justification was
+    the impostor evidence that guest provided. The fit's false-accept bound came
+    from a voice that is no longer enrolled — the number survived the evidence
+    for it.
+
+    This is also the backstop for a failed clear: if `_invalidate_calibration()`
+    cannot delete the row (disk error, locked database), the stale row is still
+    read on the next boot. Set equality makes it INERT rather than trusted, so
+    the failure mode of the delete is a fall back to provisional defaults rather
+    than a silent stale claim. Fail closed.
     """
     if rec is None or not rec.valid_for_build:
         return False
     compatible = [p for p in profiles if getattr(p, "compatible", False)]
     if not compatible:
         return False
-    covered = set(rec.profile_ids)
-    return all(p.profile_id in covered and p.threshold is not None
-               for p in compatible)
+    if set(rec.profile_ids) != {p.profile_id for p in compatible}:
+        return False
+    return all(p.threshold is not None for p in compatible)
 
 
 def resolve_policy(profiles: Sequence[Any], rec: "CalibrationRecord | None",

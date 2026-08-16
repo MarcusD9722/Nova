@@ -194,23 +194,51 @@ async def test_effective_threshold_is_reported():
                               embedding_dim=EMBEDDING_DIM, centroid=cen,
                               sample_count=6, threshold=thr)
 
+    from core.speaker.calibration import CalibrationRecord, resolve_policy
+    from core.speaker.matcher import DEFAULT_MARGIN
+
+    def policy_for(profiles, *, calibrated):
+        rec = (CalibrationRecord(margin=0.10,
+                                 profile_ids=[p.profile_id for p in profiles],
+                                 metrics={}) if calibrated else None)
+        return resolve_policy(profiles, rec, env_threshold=None, env_margin=None,
+                              default_threshold=DEFAULT_THRESHOLD,
+                              default_margin=DEFAULT_MARGIN)
+
     # Uncalibrated: the default, and it says so.
     r = match(v, [prof(M_ID, "Marcus", v)])
     check(abs(r.threshold - DEFAULT_THRESHOLD) < 1e-9,
           f"an uncalibrated profile reports the default ({r.threshold})")
     check(r.threshold_source == "default", "labelled as the default")
 
-    # Calibrated: the per-profile value, NOT the global fallback. This is the
-    # bug P5.2 fixes — the diagnostic used to describe a decision never made.
-    r = match(v, [prof(M_ID, "Marcus", v, thr=0.71)])
+    # Calibrated: the per-profile value, NOT the global fallback — but it takes
+    # a RESOLVED POLICY to activate it. `match()` never reads profile.threshold
+    # itself (V3 P5.2 final closure §2), so the stored number reaches the
+    # decision through exactly one door.
+    P = [prof(M_ID, "Marcus", v, thr=0.71)]
+    pol = policy_for(P, calibrated=True)
+    r = match(v, P, policy=pol)
     check(abs(r.threshold - 0.71) < 1e-9,
           f"a calibrated profile reports ITS threshold ({r.threshold})")
-    check(r.threshold_source == "profile", "labelled as calibrated")
+    check(r.threshold_source == "calibrated", "labelled as calibrated")
     check(r.status == "known", "and the decision still lands")
 
-    r = match(w, [prof(M_ID, "Marcus", v, thr=0.71)])
+    r = match(w, P, policy=pol)
     check(r.status == "unknown" and "0.710" in r.reason,
           f"a rejection quotes the same effective number ({r.reason})")
+
+    # THE ESCAPE HATCH THAT IS NOW CLOSED. A stored threshold with no valid
+    # policy behind it must not decide anything — this is what let a stale
+    # calibration keep ruling, and what let any direct caller reactivate it.
+    hot = [prof(M_ID, "Marcus", v, thr=0.91)]
+    r = match(v, hot)
+    check(abs(r.threshold - DEFAULT_THRESHOLD) < 1e-9,
+          f"a stored 0.91 with NO policy is not used ({r.threshold})")
+    check(r.threshold_source != "profile",
+          f"and is never sourced from the profile ({r.threshold_source})")
+    r = match(v, hot, policy=policy_for(hot, calibrated=False))
+    check(abs(r.threshold - DEFAULT_THRESHOLD) < 1e-9,
+          "nor when the policy says uncalibrated")
 
     # Runner-up diagnostics, for calibration only.
     r = match(v, [prof(M_ID, "Marcus", v, thr=0.10), prof(G_ID, "Guest", w, thr=0.10)])
@@ -282,6 +310,209 @@ async def test_calibration_goes_stale_when_a_speaker_is_added():
               "a newly enrolled speaker makes it stale")
 
 
+# ── the matcher -> Trial -> fitter chain, end to end (§3, §9) ────────────────
+#
+# Deliberately NOT built from hand-written Trials. A synthetic Trial that hands
+# an `unknown` result a classification profile_id is the exact mistake this
+# section exists to catch: it would pass while the live pipeline threw the score
+# away, because the field the harness reads (`top_scored_profile_id`) is not the
+# field a classification writes (`profile_id`).
+#
+# So every Trial below is derived from a REAL `match()` result through the same
+# mapping the browser uses.
+
+def _basis(a: float, b: float):
+    """A unit vector with cosine `a` to e0 (Marcus) and `b` to e1 (Guest)."""
+    import numpy as np
+
+    from core.speaker.backend import EMBEDDING_DIM
+
+    v = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    v[0], v[1] = a, b
+    rest = 1.0 - a * a - b * b
+    v[2] = float(np.sqrt(max(rest, 0.0)))
+    return (v / np.linalg.norm(v)).astype(np.float32)
+
+
+def _trial_from_match(match, truth, *, phase="A", condition="normal"):
+    """EXACTLY the mapping tests/live_speaker_calibration.html performs."""
+    from core.speaker.calibration import Trial
+
+    return Trial(truth=truth,
+                 top_profile_id=match.top_scored_profile_id,
+                 top_score=match.similarity,
+                 second_score=match.second_best_similarity,
+                 second_profile_id=match.second_best_profile_id,
+                 status=match.status, condition=condition, phase=phase)
+
+
+async def test_rejected_trial_keeps_its_score_attribution():
+    check.section("3: an UNKNOWN at 0.43 is still Marcus impostor evidence")
+    import numpy as np
+
+    from core.speaker.matcher import match
+    from core.speaker.registry import SpeakerProfile
+    from core.speaker.backend import EMBEDDING_DIM, MODEL_ID, MODEL_REVISION
+
+    def prof(pid, name, cen):
+        return SpeakerProfile(profile_id=pid, display_name=name, role="guest",
+                              model_id=MODEL_ID, model_revision=MODEL_REVISION,
+                              embedding_dim=EMBEDDING_DIM, centroid=cen,
+                              sample_count=6)
+
+    marcus_only = [prof(M_ID, "Marcus", _basis(1.0, 0.0))]
+
+    # A real stranger, scoring 0.43 against the only enrolled profile.
+    r = match(_basis(0.43, 0.0), marcus_only, thresh=0.55, min_margin=0.10)
+    check(r.status == "unknown", f"the honest answer is unknown ({r.status})")
+    check(r.profile_id is None, "so nobody is asserted")
+    check(r.display_name is None, "and no name is asserted")
+    check(r.top_scored_profile_id == M_ID,
+          f"but Marcus's profile is recorded as the top scorer ({r.top_scored_profile_id})")
+    check(r.top_scored_display_name == "Marcus", "with his display name")
+    check(abs(r.similarity - 0.43) < 1e-4, f"at exactly 0.43 ({r.similarity:.4f})")
+
+    # The mapping the harness performs must carry that through to a Trial.
+    t = _trial_from_match(r, truth=G_ID)
+    check(t.top_profile_id == M_ID,
+          "the Trial derived from it attributes the score to Marcus")
+    check(abs(t.top_score - 0.43) < 1e-4, "and carries the score itself")
+
+    # Had the harness read `profile_id` (the pre-closure bug), this trial would
+    # be attributed to nobody and the score would vanish from the fit.
+    check(r.profile_id != r.top_scored_profile_id,
+          "reading profile_id here would have lost it — the fields differ")
+
+    # Now prove the FITTER keeps it. Marcus's impostor evidence here comes from
+    # nothing but rejected trials, so if a rejection's score were dropped his
+    # impostor distribution would be empty and the fit would refuse outright.
+    from core.speaker.calibration import calibrate
+
+    two = [prof(M_ID, "Marcus", _basis(1.0, 0.0)),
+           prof(G_ID, "Guest", _basis(0.0, 1.0))]
+    trials = []
+    for i in range(6):                       # Marcus, genuinely recognised
+        trials.append(_trial_from_match(
+            match(_basis(0.86 - i * 0.01, 0.04), two, thresh=0.55, min_margin=0.10),
+            M_ID, phase="B"))
+    guest_rows = []
+    for i in range(6):                       # the guest speaks; Marcus sits at 0.43
+        gm = match(_basis(0.43, 0.52 + i * 0.06), two, thresh=0.55, min_margin=0.10)
+        guest_rows.append(gm)
+        trials.append(_trial_from_match(gm, G_ID, phase="B"))
+
+    rejected = [g for g in guest_rows if g.status != "known"]
+    check(rejected, f"some guest trials were REJECTED, not known "
+                    f"({[g.status for g in guest_rows]})")
+
+    res = calibrate(trials, names={M_ID: "Marcus", G_ID: "Guest"})
+    mf = {f.profile_id: f for f in res.profiles}[M_ID]
+    check(mf.impostor_n == len(guest_rows),
+          f"every guest trial gave Marcus impostor evidence, rejected ones "
+          f"included ({mf.impostor_n} of {len(guest_rows)})")
+    check(mf.impostor_max is not None and abs(mf.impostor_max - 0.43) < 1e-3,
+          f"and the bound IS that 0.43 ({mf.impostor_max})")
+    check(mf.threshold is None or mf.threshold > 0.43,
+          f"so his fitted threshold sits above it ({mf.threshold})")
+
+
+async def test_no_score_disappears_across_the_scoring_matrix():
+    check.section("9: every required trial shape keeps its evidence")
+    from core.speaker.calibration import calibrate
+    from core.speaker.matcher import match
+    from core.speaker.registry import SpeakerProfile
+    from core.speaker.backend import EMBEDDING_DIM, MODEL_ID, MODEL_REVISION
+
+    def prof(pid, name, cen):
+        return SpeakerProfile(profile_id=pid, display_name=name, role="guest",
+                              model_id=MODEL_ID, model_revision=MODEL_REVISION,
+                              embedding_dim=EMBEDDING_DIM, centroid=cen,
+                              sample_count=6)
+
+    P = [prof(M_ID, "Marcus", _basis(1.0, 0.0)),
+         prof(G_ID, "Guest", _basis(0.0, 1.0))]
+
+    trials, shapes = [], {}
+
+    def add(label, emb, truth, phase="A"):
+        r = match(emb, P, thresh=0.55, min_margin=0.10)
+        trials.append(_trial_from_match(r, truth, phase=phase))
+        shapes.setdefault(label, r)
+        return r
+
+    # 1. known, correct top — Marcus speaking as himself.
+    for i in range(6):
+        add("known_correct", _basis(0.88 - i * 0.01, 0.05), M_ID, phase="B")
+    check(shapes["known_correct"].status == "known"
+          and shapes["known_correct"].profile_id == M_ID,
+          f"known/correct produced ({shapes['known_correct'].status})")
+
+    # 2. unknown — top below threshold. A stranger, Marcus nearest.
+    for i in range(3):
+        add("unknown_low", _basis(0.43 - i * 0.01, 0.10), "p-stranger")
+    check(shapes["unknown_low"].status == "unknown",
+          f"unknown/below-threshold produced ({shapes['unknown_low'].status})")
+
+    # 3. ambiguous — both clear the bar, neither by the margin.
+    for i in range(2):
+        add("ambiguous", _basis(0.66, 0.62 + i * 0.005), M_ID, phase="B")
+    check(shapes["ambiguous"].status == "ambiguous",
+          f"ambiguous produced ({shapes['ambiguous'].status})")
+
+    # 4. the TRUE human as RUNNER-UP — guest speaking, but Marcus ranks first.
+    for i in range(2):
+        add("truth_runner_up", _basis(0.70, 0.64 - i * 0.01), G_ID, phase="B")
+    r4 = shapes["truth_runner_up"]
+    check(r4.top_scored_profile_id == M_ID and r4.second_best_profile_id == G_ID,
+          "true speaker ranked SECOND (the hard case)")
+
+    # 5 & 6. the guest speaking: Marcus earns impostor evidence as runner-up.
+    for i in range(6):
+        add("guest_genuine", _basis(0.28 + i * 0.01, 0.90 - i * 0.01), G_ID, phase="B")
+    r5 = shapes["guest_genuine"]
+    check(r5.top_scored_profile_id == G_ID and r5.second_best_profile_id == M_ID,
+          "guest tops, Marcus is runner-up — impostor evidence for Marcus")
+
+    res = calibrate(trials, names={M_ID: "Marcus", G_ID: "Guest"})
+    fits = {f.profile_id: f for f in res.profiles}
+
+    check(M_ID in fits and G_ID in fits, "both humans were fitted")
+    mf, gf = fits[M_ID], fits[G_ID]
+
+    # NO SCORE MAY DISAPPEAR because the classification was unknown/ambiguous.
+    # Marcus's genuine evidence spans trials where he ranked top AND second;
+    # his impostor evidence spans rejected trials AND runner-up trials.
+    marcus_truth = [t for t in trials if t.truth == M_ID]
+    marcus_scored_when_others_spoke = [
+        t for t in trials if t.truth != M_ID
+        and (t.top_profile_id == M_ID
+             or (t.second_profile_id == M_ID and t.second_score is not None))]
+    check(mf.genuine_n == len(marcus_truth),
+          f"every trial Marcus spoke counts as genuine ({mf.genuine_n} of "
+          f"{len(marcus_truth)})")
+    check(mf.impostor_n == len(marcus_scored_when_others_spoke),
+          f"every score his profile earned while others spoke counts as impostor "
+          f"({mf.impostor_n} of {len(marcus_scored_when_others_spoke)})")
+    check(mf.impostor_n > 0, "which is not zero — the bound has something to bound")
+
+    # And specifically: the 0.43 rejection is in there.
+    check(mf.impostor_max is not None and mf.impostor_max >= 0.43 - 1e-4,
+          f"the rejected 0.43 reached his impostor distribution "
+          f"(max {mf.impostor_max})")
+
+    # The guest's evidence comes almost entirely from runner-up scores, which
+    # is exactly the case top-only collection used to drop to zero.
+    check(gf.impostor_n > 0,
+          f"the guest has impostor evidence too ({gf.impostor_n})")
+
+    # An ambiguous trial is still evidence, not a discarded row.
+    amb = [t for t in trials if t.status == "ambiguous"]
+    check(amb, "the matrix really did produce ambiguous trials")
+    for t in amb:
+        check(t.top_profile_id is not None and t.second_profile_id is not None,
+              "an ambiguous trial keeps BOTH ranks")
+
+
 async def main():
     await test_threshold_prefers_zero_false_accepts()
     await test_overlap_fails_rather_than_loosening()
@@ -291,6 +522,8 @@ async def main():
     await test_effective_threshold_is_reported()
     await test_status_tells_the_truth()
     await test_calibration_goes_stale_when_a_speaker_is_added()
+    await test_rejected_trial_keeps_its_score_attribution()
+    await test_no_score_disappears_across_the_scoring_matrix()
     check.finish()
 
 
