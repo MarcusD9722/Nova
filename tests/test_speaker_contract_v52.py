@@ -421,7 +421,7 @@ async def test_harness_separates_prediction_from_ranking():
 
     # The confusion matrix is about what Nova ASSERTED.
     conf = _code_only(html[html.index("function confusion("):
-                           html.index("// ── the live production")])
+                           html.index("function pct(")])
     check("r.predicted_profile_id" in conf,
           "the confusion matrix scores the asserted identity")
     check("r.top_profile_id" not in conf,
@@ -455,11 +455,18 @@ async def test_harness_sentinel_shares_one_conversation():
           "the id check is strict equality against the requested CID")
     check("r.conversation_id &&" not in code,
           "no truthiness guard — a missing id is not 'stable'")
-    check(sent.count("await turn(") == 5,
-          f"five turns in one conversation ({sent.count('await turn(')})")
-    for who in ('"Marcus", "store"', '"Guest", "store"', '"Marcus", "ask"',
-                '"Guest", "ask"', '"unverified", "ask"'):
-        check(who in sent, f"including: {who}")
+    # The five turns are data now (SENTINEL_STEPS), driven by the batch engine.
+    steps = html[html.index("const SENTINEL_STEPS"):html.index("async function sentinelFlow")]
+    check(steps.count('who:"') == 5, f"five sentinel turns ({steps.count('who:')})")
+    flat = re.sub(r"\s+", " ", steps)
+    for who, phase in (('Marcus', 'store'), ('Guest', 'store'),
+                       ('Marcus', 'ask'), ('Guest', 'ask'), ('unverified', 'ask')):
+        check(f'who:"{who}", phase:"{phase}"' in flat,
+              f"including: {who} / {phase}")
+    check("MARCUS-LIVE-551" in steps and "GUEST-LIVE-661" in steps,
+          "each speaker stores their own sentinel")
+    check("chatTurn(blob, CID)" in code,
+          "and every turn goes through the full /stt -> /chat pipeline with that CID")
 
     # The unverified turn must actually BE unverified.
     check("UNVERIFIED_OK" in html, "allowed unverified statuses are named")
@@ -479,31 +486,28 @@ async def test_harness_latency_measures_stt_only():
 
     check("async function sttOnly" in html, "an /stt-only helper exists")
     only = _code_only(html[html.index("async function sttOnly"):
-                           html.index("async function voiceHandle")])
+                           html.index("// ── composite flows")])
     check('api("/stt"' in only, "it calls /stt")
     check('"/chat"' not in only, "and never /chat")
     check("stt_ms" in only, "returning the /stt round trip")
     check("speaker" in only, "plus the speaker metadata the probe needs")
 
     flow = _code_only(html[html.index("async function sttLatencyFlow"):
-                           html.index("function render()")])
-    # Two call sites, each in a loop of 6 — 12 samples total.
-    check(flow.count("await sttOnly(") == 2,
-          f"both sample loops call sttOnly ({flow.count('await sttOnly(')} sites)")
-    check(flow.count("i < 6") == 2, "six samples each side")
-    check(", 3, false)" in flow and ", 3, true)" in flow,
-          "one loop with speaker OFF, one with speaker ON")
-    check("voiceTurn(" not in flow,
-          "no latency sample goes through voiceTurn — /chat is not in the number")
+                           html.index("// ── steps UI")])
+    check("sttOnly(blob, i >= 6)" in flow,
+          "six OFF then six ON, through the same /stt-only path")
+    check("count:12" in flow, "twelve latency samples")
+    check("chatTurn(" not in flow,
+          "no latency sample goes through the /chat pipeline")
     check('"/chat"' not in flow, "and /chat appears nowhere in the benchmark")
     check("n_off" in flow and "n_on" in flow,
           "and the report states how many samples each side actually got")
 
-    # voiceTurn itself must still do the full pipeline: the sentinel needs it.
-    vt = _code_only(html[html.index("async function voiceTurn"):
-                         html.index("const UNVERIFIED_OK")])
+    # chatTurn must still do the full pipeline: the sentinel needs it.
+    vt = _code_only(html[html.index("async function chatTurn"):
+                         html.index("async function sttOnly")])
     check('api("/stt"' in vt and '"/chat"' in vt,
-          "voiceTurn still runs /stt -> /chat for the memory sentinel")
+          "chatTurn still runs /stt -> /chat for the memory sentinel")
 
 
 async def test_harness_permission_pass_is_measured():

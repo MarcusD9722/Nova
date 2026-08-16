@@ -3,7 +3,7 @@
 <title>Nova — Speaker Calibration (V3 P5.2)</title>
 <style>
   :root { --bg:#0e1116; --fg:#e6e9ef; --dim:#9aa4b2; --ok:#2ea043; --bad:#f85149;
-          --warn:#d29922; --line:#232a35; --card:#161b22; }
+          --warn:#d29922; --line:#232a35; --card:#161b22; --hot:#f85149; }
   body { background:var(--bg); color:var(--fg); font:15px/1.55 system-ui,sans-serif;
          margin:0; padding:28px; max-width:920px; }
   h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:22px 0 8px; }
@@ -26,18 +26,36 @@
   .step { opacity:.35; pointer-events:none; }
   .step.active { opacity:1; pointer-events:auto; }
   .step.done { opacity:.7; pointer-events:auto; }
-  .rec { background:#4a1d1d; border-color:#6e2b2b; }
   .pill { display:inline-block; padding:1px 8px; border-radius:999px;
           border:1px solid var(--line); font-size:12px; margin-right:6px; }
   .bar { height:6px; background:#0d1117; border-radius:3px; overflow:hidden; }
-  .bar > i { display:block; height:100%; background:var(--ok); }
+  .bar > i { display:block; height:100%; background:var(--ok); transition:width .2s; }
+
+  /* ── the guided stage: one card that drives the whole run ─────────────── */
+  #stage { position:sticky; top:0; z-index:20; background:var(--card);
+           border:1px solid var(--line); border-radius:12px; padding:18px;
+           margin:12px 0; display:none; }
+  #stage.on { display:block; }
+  #stage.rec { border-color:var(--hot); box-shadow:0 0 0 1px var(--hot) inset; }
+  .who { font-size:13px; letter-spacing:.14em; text-transform:uppercase;
+         color:var(--dim); }
+  .cue { font-size:23px; line-height:1.32; margin:8px 0 4px; font-weight:600; }
+  .state { font-size:15px; margin-top:10px; min-height:22px; }
+  .count { font-size:52px; font-weight:700; line-height:1.05; margin:6px 0; }
+  .meta { display:flex; gap:18px; flex-wrap:wrap; font-size:12.5px;
+          color:var(--dim); margin-top:12px; }
+  .ctrls { margin-top:14px; display:flex; gap:8px; flex-wrap:wrap; }
+  .banner { border:1px solid var(--line); border-left:4px solid #1f6feb;
+            border-radius:10px; padding:18px; margin:12px 0; background:var(--card); }
+  .banner h3 { margin:0 0 6px; font-size:18px; }
 </style>
 
 <h1>Nova speaker calibration</h1>
 <p class="dim">
   V3 P5.2 · turns the provisional 0.55 / 0.10 into measured numbers.
-  Needs <b>Marcus</b> and <b>one other real person</b>. Nothing here records
-  audio to disk — samples are decoded, embedded and discarded.
+  Needs <b>Marcus</b> and <b>one other real person</b> — the guest is only needed
+  from step 4 onward. Nothing here records audio to disk: samples are decoded,
+  embedded and discarded.
 </p>
 
 <div class="card">
@@ -47,11 +65,285 @@
   <div id="pingout" class="dim" style="margin-top:8px"></div>
 </div>
 
+<div id="stage"></div>
 <div id="steps"></div>
 
 <script>
-// ── tiny helpers ────────────────────────────────────────────────────────────
-const $ = (s, r=document) => r.querySelector(s);
+// ═══════════════════════════════════════════════════════════════════════════
+// PART 1 — PURE LOGIC.  No DOM, no network, no timers.
+//
+// Everything that decides WHAT gets recorded, HOW it is labelled, and WHETHER
+// the run passes lives here, so tests/test_calibration_harness_v52.py can
+// execute it under node and assert on real behaviour instead of grepping the
+// source. A UX rewrite is exactly the kind of change that can silently drop a
+// sample, mislabel a speaker, or reuse calibration audio for validation, and
+// none of those are visible in a screenshot.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── recording windows ───────────────────────────────────────────────────────
+// MediaRecorder records a FIXED window, so the prompt has to fit inside it —
+// a shorter window with the old long phrases would simply truncate speech
+// mid-word and hand ECAPA a clipped sample. The phrases below were shortened
+// to match. Backend floors: enrollment 1.5s (matcher.MIN_SAMPLE_S), command
+// 1.0s (backend.MIN_SPEECH_S); 3.0s keeps a 2x margin over the stricter one
+// rather than operating near it.
+const DUR = {
+  enroll: 3.0,
+  trial: 3.0,
+  validation: 3.0,
+  permission: 3.0,
+  latency: 2.5,       // OFF and ON identical, so the delta stays a fair test
+  sentinelStore: 5.0, // NOT shortened: the phrase carries a sentinel token
+  sentinelAsk: 4.0,
+};
+
+//: Gap between a processed sample and the next countdown. Long enough to draw
+//: breath, short enough that 107 recordings do not become an afternoon.
+const GAP_MS = 800;
+const LEAD_IN_S = 3;   // 3-2-1 at the start of a block
+const LEAD_NEXT_S = 1; // between samples inside a block
+
+const CONDITION_NAMES = ["normal", "quiet", "loud", "near", "far"];
+const CONDITION_HINT = {
+  normal: "normal speaking voice",
+  quiet:  "quieter than normal, but not whispering",
+  loud:   "louder than normal, as if across a room",
+  near:   "close to the microphone",
+  far:    "further back than usual",
+};
+
+// Six short read phrases. Each is ~8 words / ~2.5s, so a 3.0s window captures
+// all of it with headroom.
+const ENROLL_PHRASES = [
+  "Blue umbrellas dry slowly on the front porch.",
+  "Seven trucks passed the old stone bridge today.",
+  "My coffee went cold while I was reading.",
+  "The garage light flickers almost every evening.",
+  "She packed thirty books into two small boxes.",
+  "Warm rain fell across the empty quiet street.",
+];
+
+// Trials must be FRESH natural speech, never an enrollment phrase — reusing one
+// would inflate the genuine distribution and the fitted threshold would be
+// measuring how well someone repeats themselves. These two pools are
+// deliberately DISJOINT so calibration audio can never become validation audio.
+const CAL_CUES = [
+  "Name three things you can see right now.",
+  "Say what you ate most recently.",
+  "Describe the weather outside in one sentence.",
+  "Count backwards from twenty down to fourteen.",
+  "Say the days of the week, starting Wednesday.",
+  "Name four colours you like.",
+  "Say where you went last weekend.",
+  "Describe the room you are sitting in.",
+  "Name three cities you have visited.",
+  "Say what you plan to do tomorrow.",
+  "List four things in your kitchen.",
+  "Say one sentence about your favourite meal.",
+];
+const VAL_CUES = [
+  "Name three animals with four legs.",
+  "Say two things you did this morning.",
+  "Count from thirty-one up to thirty-eight.",
+  "Name four items of clothing.",
+  "Say one sentence about music you like.",
+  "Describe your favourite season briefly.",
+  "Name three tools you have used.",
+  "Say what time you usually wake up.",
+  "List four kinds of fruit.",
+  "Say a short sentence about travel.",
+];
+
+//: Honest non-identifications. `known` is NOT here: if the third speaker comes
+//: back recognised, the privacy question was never asked.
+const UNVERIFIED_OK = ["unknown", "ambiguous", "unavailable", "too_short"];
+
+/** Even, deterministic spread across the five acoustic conditions.
+ *  20 -> exactly 4 each, which is what P5.2 requires for Phase A. */
+function planConditions(count, conds) {
+  conds = conds || CONDITION_NAMES;
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(conds[i % conds.length]);
+  return out;
+}
+
+/** Rotate through a cue pool. Separate pools per phase keep the audio fresh. */
+function cueFor(pool, i) { return pool[i % pool.length]; }
+
+/** The whole run, as data. Counts here ARE the statistical evidence — they are
+ *  unchanged from the pre-UX-rewrite protocol and must stay that way. */
+function blockPlan() {
+  return [
+    {id:"enroll_marcus", step:2,  who:"Marcus", kind:"enroll",     count:6,  seconds:DUR.enroll},
+    {id:"trials_marcus", step:3,  who:"Marcus", kind:"trial",      count:20, seconds:DUR.trial,      phase:"A"},
+    {id:"trials_guest",  step:4,  who:"Guest",  kind:"trial",      count:12, seconds:DUR.trial,      phase:"A"},
+    {id:"enroll_guest",  step:5,  who:"Guest",  kind:"enroll",     count:6,  seconds:DUR.enroll},
+    {id:"phaseb_marcus", step:6,  who:"Marcus", kind:"trial",      count:12, seconds:DUR.trial,      phase:"B"},
+    {id:"phaseb_guest",  step:6,  who:"Guest",  kind:"trial",      count:12, seconds:DUR.trial,      phase:"B"},
+    {id:"valid_marcus",  step:8,  who:"Marcus", kind:"validation", count:10, seconds:DUR.validation, phase:"V"},
+    {id:"valid_guest",   step:8,  who:"Guest",  kind:"validation", count:10, seconds:DUR.validation, phase:"V"},
+    {id:"sentinel",      step:9,  who:"mixed",  kind:"sentinel",   count:5,  seconds:DUR.sentinelAsk},
+    {id:"permission",    step:10, who:"mixed",  kind:"permission", count:2,  seconds:DUR.permission},
+    {id:"latency",       step:11, who:"either", kind:"latency",    count:12, seconds:DUR.latency},
+  ];
+}
+
+function totalRecordings(plan) {
+  return (plan || blockPlan()).reduce((n, b) => n + b.count, 0);
+}
+
+/** Where a trial is stored. Validation NEVER shares storage with calibration:
+ *  the fit must not be able to see the audio it will later be judged on. */
+function storeFor(phase) { return phase === "V" ? "validation" : "trials"; }
+
+/** The advance rule, isolated so it can be proven.
+ *  Only a genuinely processed sample moves the index; a retry or an error
+ *  repeats the SAME index, so nothing is skipped and nothing is double-counted. */
+function advance(i, outcome) { return outcome === "ok" ? i + 1 : i; }
+
+/** Recognition accuracy is about what Nova ASSERTED — predicted_profile_id,
+ *  never top_profile_id, which is only a ranking. */
+function confusion(rows) {
+  const m = {swap:0, correct:{}, total:{}, unknown:0, ambiguous:0};
+  rows.forEach(r => {
+    m.total[r.truthName] = (m.total[r.truthName]||0)+1;
+    if (r.status === "known") {
+      if (r.predicted_profile_id === r.truth) m.correct[r.truthName]=(m.correct[r.truthName]||0)+1;
+      else m.swap++;
+    } else if (r.status === "ambiguous") m.ambiguous++;
+    else m.unknown++;
+  });
+  return m;
+}
+
+function pct(a, q) {
+  if (!a || !a.length) return null;
+  const s = a.slice().sort((x,y)=>x-y);
+  return s[Math.max(0, Math.min(s.length-1, Math.round(q*(s.length-1))))];
+}
+
+/** Every stored row must carry the block it came from, and that block's
+ *  declared speaker must match the truth id it was filed under. This is the
+ *  guard against a handoff error labelling the guest's audio as Marcus. */
+function auditTruth(rows, marcusId, guestId) {
+  const bad = [];
+  (rows||[]).forEach((r, i) => {
+    if (!r.block) { bad.push({i, why:"no block recorded"}); return; }
+    const expect = r.block.indexOf("marcus") >= 0 ? marcusId
+                 : r.block.indexOf("guest")  >= 0 ? guestId : null;
+    // The unenrolled impostor block is relabelled once the guest has an id.
+    if (expect && r.truth !== expect && r.truth !== "__impostor__") {
+      bad.push({i, block:r.block, truth:r.truth, expected:expect});
+    }
+  });
+  return {ok: bad.length === 0, mismatches: bad};
+}
+
+/** The complete P5.2 gate. Unchanged bars — this is a UX rewrite, and a faster
+ *  workflow must not be a more permissive one. */
+function computeAcceptance(S) {
+  const recog = (S.validation && S.validation.length) ? confusion(S.validation) : null;
+  const recogPass = !!(recog && recog.swap === 0
+    && Object.keys(recog.total).every(n => (recog.correct[n]||0) / recog.total[n] >= 0.9));
+
+  const compat = ((S.statusAfter && S.statusAfter.profiles_detail) || []).filter(p => p.compatible);
+  const compatIds = compat.map(p => p.profile_id).sort();
+  const wantIds = [S.marcusId, S.guestId].filter(Boolean).sort();
+  const roleOf = id => (compat.find(p => p.profile_id === id) || {}).role || null;
+  const twoProfiles = {
+    compatible_count: compat.length, compatible_ids: compatIds, expected_ids: wantIds,
+    marcus_role: roleOf(S.marcusId), guest_role: roleOf(S.guestId),
+    exactly_two: compat.length === 2 && wantIds.length === 2
+                 && JSON.stringify(compatIds) === JSON.stringify(wantIds),
+    roles_correct: roleOf(S.marcusId) === "owner" && roleOf(S.guestId) === "guest",
+  };
+  twoProfiles.pass = twoProfiles.exactly_two && twoProfiles.roles_correct;
+
+  const audit = auditTruth((S.trials||[]).concat(S.validation||[]), S.marcusId, S.guestId);
+
+  const plan = blockPlan();
+  const need = {};
+  plan.forEach(b => { need[b.id] = b.count; });
+  const counts = {
+    enroll_marcus: (S.enroll && S.enroll.marcus) ? (S.enroll.marcus.sample_count||0) : 0,
+    trials_marcus: (S.trials||[]).filter(t => t.block === "trials_marcus").length,
+    trials_guest:  (S.trials||[]).filter(t => t.block === "trials_guest").length,
+    enroll_guest:  (S.enroll && S.enroll.guest) ? (S.enroll.guest.sample_count||0) : 0,
+    phaseb_marcus: (S.trials||[]).filter(t => t.block === "phaseb_marcus").length,
+    phaseb_guest:  (S.trials||[]).filter(t => t.block === "phaseb_guest").length,
+    valid_marcus:  (S.validation||[]).filter(t => t.block === "valid_marcus").length,
+    valid_guest:   (S.validation||[]).filter(t => t.block === "valid_guest").length,
+  };
+
+  const missing = [];
+  if (!(S.enroll && S.enroll.marcus && S.enroll.marcus.meets_p52_bar)) missing.push("Marcus enrollment >=5 samples");
+  if (!(S.enroll && S.enroll.guest && S.enroll.guest.meets_p52_bar)) missing.push("guest enrollment >=5 samples");
+  if (counts.trials_marcus < need.trials_marcus) missing.push("Marcus phase A trials");
+  if (counts.trials_guest < need.trials_guest) missing.push("unenrolled guest trials");
+  if (counts.phaseb_marcus < need.phaseb_marcus) missing.push("Marcus phase B trials");
+  if (counts.phaseb_guest < need.phaseb_guest) missing.push("guest phase B trials");
+  if (!S.applied) missing.push("calibration applied");
+  if (!(S.statusAfter && S.statusAfter.threshold_calibrated)) missing.push("status threshold_calibrated == true");
+  if (!S.statusAfter) missing.push("post-run /speaker/status");
+  if (counts.valid_marcus < need.valid_marcus) missing.push("Marcus validation");
+  if (counts.valid_guest < need.valid_guest) missing.push("guest validation");
+  if (!S.sentinel) missing.push("memory attribution");
+  if (!S.permission) missing.push("permission regression");
+  if (!S.sttLatency) missing.push("latency measurement");
+  else if (!S.sttLatency.n_off || !S.sttLatency.n_on) missing.push("latency OFF/ON samples");
+
+  const failed = [];
+  if (recog && !recogPass) failed.push("recognition validation");
+  if (S.sentinel && !S.sentinel.pass) failed.push("memory attribution");
+  if (S.sentinel && !S.sentinel.conversation_stable) failed.push("sentinel conversation id not stable");
+  if (S.sentinel && !S.sentinel.unverified_is_unverified) failed.push("third speaker was recognised — privacy check invalid");
+  if (S.permission && !S.permission.pass) failed.push("permission regression");
+  if (S.statusAfter && !twoProfiles.pass) failed.push("exactly-two-profile requirement");
+  if (!audit.ok) failed.push("speaker/truth attribution mismatch");
+
+  const acceptance = failed.length ? "FAIL" : (missing.length ? "NOT COMPLETE" : "PASS");
+  return {recog, recogPass, twoProfiles, audit, counts, missing, failed, acceptance};
+}
+
+function freshState() {
+  return {
+    step: 0, marcusId: null, guestId: null, trials: [], validation: [],
+    enroll: {}, proposal: null, applied: false, latency: [],
+    sentinel: null, permission: null, sttLatency: null, statusAfter: null,
+    // ONE conversation for the whole sentinel run: /chat mints a fresh UUID per
+    // call when none is sent, and five separate conversations cannot test
+    // whether one person can read another's memory.
+    sentinelConversationId: null,
+    // Non-audio progress, so a refresh never costs completed utterances.
+    blocks: {}, startedAt: null, paceMs: [], latencySamples: {off:[], on:[]},
+  };
+}
+
+const P52 = {
+  DUR, GAP_MS, LEAD_IN_S, LEAD_NEXT_S, CONDITION_NAMES, CONDITION_HINT,
+  ENROLL_PHRASES, CAL_CUES, VAL_CUES, UNVERIFIED_OK,
+  planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
+  confusion, pct, auditTruth, computeAcceptance, freshState,
+};
+if (typeof module !== "undefined" && module.exports) module.exports = P52;
+if (typeof globalThis !== "undefined") globalThis.P52 = P52;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PART 2 — BROWSER.  Everything below needs a DOM, a microphone and a backend.
+// ═══════════════════════════════════════════════════════════════════════════
+const HAS_DOM = typeof document !== "undefined";
+//: Autosave is a convenience, not a requirement. Some contexts (an opaque
+//: origin, a locked-down profile) throw on any localStorage access — and merely
+//: TESTING for it throws too, which would abort the whole script and leave a
+//: blank page. Probe it once, defensively, and degrade to a working harness
+//: without resume rather than to nothing at all.
+const CAN_SAVE = (() => {
+  try { localStorage.setItem("nova.p52.probe", "1");
+        localStorage.removeItem("nova.p52.probe"); return true; }
+  catch { return false; }
+})();
+
+const $ = (s, r) => (r||document).querySelector(s);
 const el = (t, c, h) => { const e=document.createElement(t); if(c)e.className=c;
                           if(h!==undefined)e.innerHTML=h; return e; };
 const base = () => $("#base").value.replace(/\/$/, "");
@@ -66,23 +358,20 @@ async function api(path, opts={}) {
   return body;
 }
 
-// ── autosave: NON-AUDIO progress only ───────────────────────────────────────
-// An accidental refresh must not cost a human twenty utterances. Blobs are
-// never persisted — only labels, scores and counts.
-const SAVE_KEY = "nova.p52.calibration.v2";
-const S = JSON.parse(localStorage.getItem(SAVE_KEY) || "null") || {
-  step: 0, marcusId: null, guestId: null, trials: [], validation: [],
-  enroll: {}, proposal: null, applied: false, latency: [],
-  sentinel: null, permission: null, sttLatency: null, statusAfter: null,
-  // ONE conversation for the whole sentinel run. /chat mints a fresh UUID per
-  // call when none is sent, so the previous harness put every sentinel turn in
-  // its OWN conversation — which tests nothing: of course a brand new
-  // conversation cannot see another one's memory. The privacy claim is only
-  // meaningful when Marcus, the guest and the unverified speaker share one.
-  sentinelConversationId: null,
-};
-function save() { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); render(); }
-function reset() { localStorage.removeItem(SAVE_KEY); location.reload(); }
+const SAVE_KEY = "nova.p52.calibration.v3";
+const S = (() => {
+  if (!CAN_SAVE) return freshState();
+  try { return JSON.parse(localStorage.getItem(SAVE_KEY) || "null") || freshState(); }
+  catch { return freshState(); }
+})();
+function save() {
+  if (CAN_SAVE) { try { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); } catch {} }
+  render();
+}
+function reset() {
+  if (CAN_SAVE) { try { localStorage.removeItem(SAVE_KEY); } catch {} }
+  location.reload();
+}
 
 // ── recording ───────────────────────────────────────────────────────────────
 let stream = null;
@@ -90,7 +379,7 @@ async function mic() {
   if (!stream) stream = await navigator.mediaDevices.getUserMedia({audio:true});
   return stream;
 }
-async function record(ms, btn) {
+async function record(ms) {
   const s = await mic();
   const mr = new MediaRecorder(s, MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
     ? {mimeType:"audio/webm;codecs=opus"} : undefined);
@@ -98,12 +387,172 @@ async function record(ms, btn) {
   mr.ondataavailable = e => e.data.size && chunks.push(e.data);
   const done = new Promise(res => mr.onstop = () => res(new Blob(chunks, {type: mr.mimeType||"audio/webm"})));
   mr.start(200);
-  if (btn) btn.classList.add("rec");
-  await new Promise(r => setTimeout(r, ms));
+  await sleep(ms);
   try { mr.stop(); } catch {}
-  if (btn) btn.classList.remove("rec");
   return await done;
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── the guided stage ────────────────────────────────────────────────────────
+// Replaces the old click-per-utterance + alert() model. The human clicks once
+// per BLOCK; every sample inside it counts down, records, uploads and advances
+// on its own. alert() is gone entirely: it blocks the event loop, it cannot
+// show progress, and 107 of them is not a workflow.
+const RUN = { paused:false, retry:false, abort:false, active:false };
+
+function stageEl() { return $("#stage"); }
+
+function stageShow(html) {
+  const st = stageEl(); st.className = "on"; st.innerHTML = html;
+}
+function stageHide() { const st = stageEl(); st.className = ""; st.innerHTML = ""; }
+
+function fmtMs(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  const s = Math.max(0, Math.round(ms/1000));
+  return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+}
+
+/** Overall counts, from what has actually been stored — not a hardcoded total. */
+function progress() {
+  const plan = blockPlan();
+  const total = totalRecordings(plan);
+  let done = 0;
+  plan.forEach(b => { done += Math.min(b.count, (S.blocks[b.id]||{}).done || 0); });
+  const paces = (S.paceMs||[]).slice(-25);
+  const perSample = paces.length >= 3 ? pct(paces, .5) : null;
+  const remaining = perSample != null ? (total - done) * perSample : null;
+  return {done, total, remaining,
+          elapsed: S.startedAt ? (Date.now() - S.startedAt) : 0};
+}
+
+function stageRender({who, title, cue, condition, state, big, blockDone, blockTotal, hot}) {
+  const p = progress();
+  const pctOverall = p.total ? Math.round(100 * p.done / p.total) : 0;
+  const pctBlock = blockTotal ? Math.round(100 * blockDone / blockTotal) : 0;
+  stageShow(`
+    <div class="who">${who} · ${title}</div>
+    ${condition ? `<div style="margin-top:6px"><span class="pill">${condition}</span>
+       <span class="dim">${CONDITION_HINT[condition]||""}</span></div>` : ""}
+    <div class="cue">${cue||""}</div>
+    ${big ? `<div class="count">${big}</div>` : ""}
+    <div class="state">${state||""}</div>
+    <div style="margin-top:12px">
+      <div class="dim" style="font-size:12.5px;margin-bottom:4px">
+        this block ${blockDone||0} / ${blockTotal||0}</div>
+      <div class="bar"><i style="width:${pctBlock}%"></i></div>
+    </div>
+    <div class="meta">
+      <span><b>${p.done} / ${p.total}</b> recordings complete</span>
+      <span>elapsed ${fmtMs(p.elapsed)}</span>
+      <span>est. remaining ${p.remaining != null ? fmtMs(p.remaining) : "measuring…"}</span>
+    </div>
+    <div style="margin-top:6px"><div class="bar"><i style="width:${pctOverall}%"></i></div></div>
+    <div class="ctrls">
+      <button id="st-pause">${RUN.paused ? "Resume" : "Pause"}</button>
+      <button id="st-retry">Retry this sample</button>
+      <button id="st-abort" class="danger">Stop block</button>
+    </div>
+  `);
+  if (hot) stageEl().classList.add("rec");
+  $("#st-pause").onclick = () => { RUN.paused = !RUN.paused; };
+  $("#st-retry").onclick = () => { RUN.retry = true; };
+  $("#st-abort").onclick = () => { RUN.abort = true; };
+}
+
+/** A deliberate handoff. One click, on a full-width inline banner — NOT an
+ *  alert(), and not once per utterance. */
+function handoff(title, body, cta) {
+  return new Promise(res => {
+    stageShow(`<div class="who">next up</div>
+      <div class="cue">${title}</div>
+      <div class="state dim">${body}</div>
+      <div class="ctrls"><button id="go" class="primary">${cta||"Continue"}</button></div>`);
+    $("#go").onclick = () => res();
+  });
+}
+
+async function waitWhilePaused(ctx) {
+  while (RUN.paused && !RUN.abort) {
+    stageRender({...ctx, state:'<span class="warn">paused</span>', big:"⏸"});
+    await sleep(200);
+  }
+}
+
+/**
+ * Run one block of samples: countdown -> record -> process -> advance.
+ *
+ * `doSample` returns truthy on success. A throw, or a falsy return, repeats the
+ * SAME index — a failed sample is never silently skipped, and never counted.
+ */
+async function runBlock(spec) {
+  const {id, who, title, count, seconds, secondsOf, condFor, cueOf, doSample} = spec;
+  const secsAt = i => (secondsOf ? secondsOf(i) : seconds);
+  RUN.paused = false; RUN.retry = false; RUN.abort = false; RUN.active = true;
+  if (!S.startedAt) { S.startedAt = Date.now(); }
+  let i = (S.blocks[id] || {}).done || 0;
+  const started = i;
+
+  while (i < count) {
+    const cond = condFor ? condFor(i) : null;
+    const cue = cueOf ? cueOf(i) : "";
+    const ctx = {who, title, cue, condition:cond, blockDone:i, blockTotal:count};
+    await waitWhilePaused(ctx);
+    if (RUN.abort) break;
+
+    // Countdown: a full 3-2-1 at the top of a block, one beat between samples.
+    const lead = (i === started) ? LEAD_IN_S : LEAD_NEXT_S;
+    for (let n = lead; n > 0; n--) {
+      stageRender({...ctx, big:String(n), state:"get ready"});
+      await sleep(1000);
+      if (RUN.abort) break;
+    }
+    if (RUN.abort) break;
+
+    const t0 = Date.now();
+    stageRender({...ctx, big:"●", state:'<span class="bad">RECORDING</span>', hot:true});
+    RUN.retry = false;
+    const blob = await record(secsAt(i) * 1000);
+
+    if (RUN.retry) {                       // a cough, an interruption, a bad take
+      RUN.retry = false;
+      stageRender({...ctx, state:'<span class="warn">discarded — recording again</span>'});
+      await sleep(500);
+      continue;                            // SAME index
+    }
+
+    stageRender({...ctx, state:"processing…"});
+    let outcome = "error", detail = "";
+    try {
+      const ok = await doSample(blob, i, cond, cue);
+      outcome = (ok === false) ? "error" : "ok";
+      if (ok && ok.note) detail = ok.note;
+    } catch (e) {
+      detail = e.message || String(e);
+    }
+
+    if (outcome !== "ok") {
+      stageRender({...ctx, state:`<span class="bad">sample failed: ${detail}</span>
+        <br><span class="dim">retrying this same sample — nothing was counted</span>`});
+      await sleep(1600);
+      continue;                            // SAME index. Never skipped.
+    }
+
+    i = advance(i, "ok");
+    S.blocks[id] = {done:i};
+    S.paceMs = (S.paceMs||[]).concat(Date.now() - t0).slice(-40);
+    save();
+    stageRender({...ctx, blockDone:i,
+      state:`<span class="ok">✓ captured</span> ${detail ? '<span class="dim">'+detail+'</span>' : ""}`});
+    if (i < count) await sleep(GAP_MS);
+  }
+
+  RUN.active = false;
+  stageHide();
+  return i >= count;
+}
+
+// ── per-sample processors ───────────────────────────────────────────────────
 
 async function identify(blob) {
   const fd = new FormData();
@@ -111,26 +560,245 @@ async function identify(blob) {
   const t0 = performance.now();
   const out = await api("/speaker/identify", {method:"POST", body:fd});
   out.round_trip_ms = Math.round(performance.now() - t0);
-  // NOT "embed_ms": the server measures the whole identify() call — quality
-  // gate, embedding and scoring. Naming it embedding-only would overstate
-  // what was measured.
+  // NOT "embed_ms": the server times the whole identify() call — quality gate,
+  // embedding and scoring. Naming it embedding-only would overstate it.
   out.identify_ms = out.embed_ms;
   return out;
 }
 
-// ── steps ───────────────────────────────────────────────────────────────────
-const CONDITIONS = [
-  ["normal", 4], ["quiet", 4], ["loud", 4], ["near", 4], ["far", 4],
-];
-const PHRASES = [
-  "The quick brown fox jumps over the lazy dog near the riverbank.",
-  "I need to check the weather before I head out this afternoon.",
-  "Remind me to look at the storage drive comparison again tomorrow.",
-  "There are seventeen boxes stacked in the back of the garage.",
-  "Could you play something quiet while I finish reading this chapter?",
-  "The blue car parked outside has been there since Thursday morning.",
+function recordTrial(out, {truthId, truthName, phase, condition, block}) {
+  S.latency.push({identify_ms: out.identify_ms, round_trip_ms: out.round_trip_ms});
+  const row = {
+    truth: truthId, truthName, block, phase, condition,
+    // TWO DIFFERENT THINGS, kept apart:
+    //   predicted_profile_id  the ASSERTED identity, null unless `known`.
+    //                         The confusion matrix uses this and only this.
+    //   top_profile_id        who merely RANKED FIRST, set even for unknown.
+    //                         Calibration fits on this.
+    predicted_profile_id: out.profile_id || null,
+    predictedName: out.display_name || null,
+    top_profile_id: out.top_scored_profile_id ?? null,
+    topName: out.top_scored_display_name ?? null,
+    top_score: out.similarity ?? 0,
+    second_score: out.second_best_similarity ?? null,
+    second_profile_id: out.second_best_profile_id ?? null,
+    status: out.status || "", threshold: out.threshold ?? null,
+  };
+  // Validation is stored SEPARATELY from calibration. The fit must never see
+  // the audio it will later be judged against.
+  (storeFor(phase) === "validation" ? S.validation : S.trials).push(row);
+  return row;
+}
+
+async function enrolBatch(name, role, key, blocks) {
+  const fd = new FormData();
+  fd.append("display_name", name);
+  fd.append("role", role);
+  blocks.forEach((b,i) => fd.append("files", b, `s${i}.webm`));
+  const out = await api("/speaker/enroll", {method:"POST", body:fd});
+  S.enroll[key] = out;
+  if (key === "marcus") S.marcusId = out.profile_id; else S.guestId = out.profile_id;
+  save();
+  return out;
+}
+
+// ── the live production pipeline: /stt -> voice_turn_id -> /chat ────────────
+// Takes an already-recorded blob, because the batch engine owns recording. The
+// memory sentinel is the ONLY caller: it is the one check that has to prove
+// attribution through the real turn path, not just the classifier.
+async function chatTurn(blob, convId) {
+  const fd = new FormData();
+  fd.append("file", blob, "cmd.webm");
+  fd.append("speaker", "true");
+  const t0 = performance.now();
+  const stt = await api("/stt", {method:"POST", body:fd});
+  const sttMs = Math.round(performance.now() - t0);
+  const handle = stt?.speaker?.voice_turn_id || null;
+  const chat = await api("/chat", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ message: stt.text || null, attachments: [],
+                           input_source: "voice",
+                           ...(convId ? {conversation_id: convId} : {}),
+                           ...(handle ? {voice_turn_id: handle} : {}) })});
+  return { text: stt.text, speaker: stt.speaker || null, handle,
+           reply: chat?.assistant ?? chat?.response ?? chat?.text ?? "",
+           conversation_id: chat?.conversation_id ?? null, stt_ms: sttMs };
+}
+
+/** /stt and NOTHING else — for the latency benchmark, which must not have an
+ *  LLM turn inside the number, and for the permission probe, which needs an
+ *  UNREDEEMED voice_turn_id (a /chat call would spend it). */
+async function sttOnly(blob, wantSpeaker) {
+  const fd = new FormData();
+  fd.append("file", blob, "cmd.webm");
+  if (wantSpeaker) fd.append("speaker", "true");
+  const t0 = performance.now();
+  const stt = await api("/stt", {method:"POST", body:fd});
+  return { text: stt.text, speaker: stt.speaker || null,
+           stt_ms: Math.round(performance.now() - t0) };
+}
+
+// ── composite flows ─────────────────────────────────────────────────────────
+
+const SENTINEL_STEPS = [
+  {who:"Marcus",     phase:"store", secs:DUR.sentinelStore,
+   cue:'Marcus: say — "Remember that my calibration sentinel is MARCUS-LIVE-551."'},
+  {who:"Guest",      phase:"store", secs:DUR.sentinelStore,
+   cue:'Guest: say — "Remember that my calibration sentinel is GUEST-LIVE-661."'},
+  {who:"Marcus",     phase:"ask",   secs:DUR.sentinelAsk,
+   cue:'Marcus: say — "What is my calibration sentinel?"'},
+  {who:"Guest",      phase:"ask",   secs:DUR.sentinelAsk,
+   cue:'Guest: say — "What is my calibration sentinel?"'},
+  {who:"unverified", phase:"ask",   secs:DUR.sentinelAsk,
+   cue:'A THIRD, unenrolled person: say — "What is my calibration sentinel?"'},
 ];
 
+async function sentinelFlow() {
+  const M_S = "MARCUS-LIVE-551", G_S = "GUEST-LIVE-661";
+  if (!S.sentinelConversationId) { S.sentinelConversationId = crypto.randomUUID(); save(); }
+  const CID = S.sentinelConversationId;
+  const out = { steps: [], conversation_id: CID, conversation_stable: true };
+  const replies = [];
+
+  // ATOMIC. The five turns accumulate their results in memory, so a reload
+  // partway through would resume at turn 4 with no record of turns 1-3 and
+  // silently report an incomplete sentinel as complete. Five recordings is a
+  // cheap thing to redo; a wrong privacy verdict is not.
+  S.blocks.sentinel = {done:0}; save();
+
+  await runBlock({
+    id:"sentinel", who:"one turn each — Marcus, guest, then a third voice",
+    title:"memory attribution (live pipeline)",
+    count:SENTINEL_STEPS.length,
+    secondsOf: i => SENTINEL_STEPS[i].secs,
+    cueOf: i => SENTINEL_STEPS[i].cue,
+    doSample: async (blob, i) => {
+      const spec = SENTINEL_STEPS[i];
+      const r = await chatTurn(blob, CID);
+      // STRICT. A missing or null returned id is a FAILURE, not a pass: that is
+      // exactly what a server ignoring conversation_id produces.
+      if (r.conversation_id !== CID) out.conversation_stable = false;
+      replies[i] = r.reply;
+      out.steps.push({who:spec.who, phase:spec.phase,
+                      status: r.speaker?.status ?? null,
+                      name: r.speaker?.display_name ?? null,
+                      profile_id: r.speaker?.profile_id ?? null,
+                      conversation_id: r.conversation_id,
+                      got_marcus: r.reply.includes(M_S), got_guest: r.reply.includes(G_S)});
+      return {note: `${spec.who}: ${r.speaker?.status ?? "?"}`};
+    },
+  });
+  if (out.steps.length < SENTINEL_STEPS.length) return null;   // aborted
+
+  const marcusTurns = out.steps.filter(s => s.who === "Marcus");
+  const guestTurns  = out.steps.filter(s => s.who === "Guest");
+  const ur = out.steps.find(s => s.who === "unverified") || {};
+  out.marcus_recognised = marcusTurns.length > 0
+    && marcusTurns.every(s => s.status === "known" && s.profile_id === S.marcusId);
+  out.guest_recognised = guestTurns.length > 0
+    && guestTurns.every(s => s.status === "known" && s.profile_id === S.guestId);
+  out.unverified_status = ur.status ?? null;
+  out.unverified_is_unverified = UNVERIFIED_OK.includes(out.unverified_status);
+  if (!out.unverified_is_unverified) {
+    out.note = `The third speaker came back "${out.unverified_status}". The privacy `
+             + "check does NOT pass — re-run it with a genuinely unenrolled person, "
+             + "or a real unverified condition.";
+  }
+  out.marcus_got_own = !!replies[2] && replies[2].includes(M_S);
+  out.guest_got_own = !!replies[3] && replies[3].includes(G_S);
+  out.guest_got_marcus = !!replies[3] && replies[3].includes(M_S);
+  out.unverified_got_either = !!replies[4] && (replies[4].includes(M_S) || replies[4].includes(G_S));
+  out.pass = out.conversation_stable && out.marcus_recognised && out.guest_recognised
+             && out.unverified_is_unverified && out.marcus_got_own && out.guest_got_own
+             && !out.guest_got_marcus && !out.unverified_got_either;
+  return out;
+}
+
+async function permissionFlow() {
+  // computer.type — a STANDARD-tier PRODUCTION actuator, not a data-routing
+  // call. Safe because guarded mode answers needs_confirmation, the probe
+  // rejects its own request immediately, execution is off, and no adapter ships.
+  const CAP = "computer.type";
+  const typed = await api("/speaker/permission-probe", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({capability: CAP})});
+
+  const voices = [];
+  const who = [{label:"Marcus", id:S.marcusId}, {label:"Guest", id:S.guestId}];
+  S.blocks.permission = {done:0}; save();   // atomic, same reason as the sentinel
+  const done = await runBlock({
+    id:"permission", who:"Marcus, then the guest", title:"permission probe",
+    count:2, seconds:DUR.permission,
+    cueOf: i => `${who[i].label}: say any short sentence.`,
+    doSample: async (blob, i) => {
+      const spk = await sttOnly(blob, true);
+      const r = await api("/speaker/permission-probe", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({capability: CAP,
+                              voice_turn_id: spk?.speaker?.voice_turn_id ?? null})});
+      voices[i] = { label: who[i].label, expected_profile_id: who[i].id,
+                    identity: r.identity, tier: r.tier, mode: r.mode,
+                    decision: r.decision, executed: r.executed,
+                    recognised: r.identity?.status === "known"
+                             && r.identity?.profile_id === who[i].id };
+      return {note: `${who[i].label}: ${r.decision}`};
+    },
+  });
+  if (!done) return null;
+
+  const [marcus, guest] = voices;
+  const sameDecision = marcus.decision === typed.decision && guest.decision === typed.decision;
+  const sameTier = marcus.tier === typed.tier && guest.tier === typed.tier;
+  const nothingRan = !typed.executed && !marcus.executed && !guest.executed;
+  return {
+    capability: CAP, mode: typed.mode, tier: typed.tier,
+    typed_reference: {decision: typed.decision, tier: typed.tier,
+                      identity: typed.identity, executed: typed.executed},
+    marcus, guest,
+    both_recognised: marcus.recognised && guest.recognised,
+    same_decision: sameDecision, same_tier: sameTier, nothing_executed: nothingRan,
+    execution_enabled: typed.execution_enabled, adapter_installed: typed.adapter_installed,
+    pass: sameDecision && sameTier && nothingRan && marcus.recognised && guest.recognised,
+    note: "PermissionBroker.evaluate() takes no identity argument. Measured, not "
+        + "asserted: all three decisions are compared to the typed reference.",
+  };
+}
+
+async function sttLatencyFlow() {
+  // 6 OFF + 6 ON, both at the SAME window length, both /stt-only. Speaker-ON
+  // /stt timings do exist elsewhere in this session (the sentinel turns), but
+  // those recordings are 4-5s and /stt time scales with audio length through
+  // Whisper — pooling them against a 2.5s OFF control would bias the delta.
+  // Unlike inputs are not a control, so they are not reused.
+  // Persisted, so a reload resumes rather than re-recording twelve samples.
+  // Index-aligned with S.blocks.latency.done, so nothing is double-counted.
+  if (!S.latencySamples) S.latencySamples = {off:[], on:[]};
+  const off = S.latencySamples.off, on = S.latencySamples.on;
+  const done = await runBlock({
+    id:"latency", who:"either person", title:"/stt latency — OFF then ON",
+    count:12, seconds:DUR.latency,
+    cueOf: i => (i < 6 ? `Speaker OFF ${i+1}/6 — say a short sentence.`
+                       : `Speaker ON ${i-5}/6 — say a short sentence.`),
+    doSample: async (blob, i) => {
+      const r = await sttOnly(blob, i >= 6);
+      (i < 6 ? off : on).push(r.stt_ms);
+      S.latencySamples = {off, on};
+      return {note: `${r.stt_ms} ms`};
+    },
+  });
+  if (!done) return null;
+  return { stt_off_p50: pct(off,.5), stt_off_p95: pct(off,.95),
+           stt_on_p50: pct(on,.5),  stt_on_p95: pct(on,.95),
+           delta_p50: pct(on,.5) - pct(off,.5),
+           delta_p95: pct(on,.95) - pct(off,.95),
+           n_off: off.length, n_on: on.length,
+           window_s: DUR.latency, path: "/stt only, no /chat",
+           reuse_note: "speaker-ON samples were recorded fresh at the same window "
+                     + "length as the OFF control; longer sentinel recordings were "
+                     + "NOT pooled in, because /stt scales with audio length" };
+}
+
+// ── steps UI ────────────────────────────────────────────────────────────────
 function stepCard(n, title, active, done, body) {
   const c = el("div", "card step " + (active ? "active" : done ? "done" : ""));
   c.appendChild(el("h2", null, `${n}. ${title} ${done ? '<span class="ok">✓</span>' : ""}`));
@@ -139,10 +807,17 @@ function stepCard(n, title, active, done, body) {
   return c;
 }
 
+function blockStatus(id, count) {
+  const d = (S.blocks[id]||{}).done || 0;
+  if (d === 0) return el("div","dim",`0 / ${count} recorded`);
+  return el("div", d >= count ? "ok" : "warn",
+    d >= count ? `${d} / ${count} recorded ✓` : `${d} / ${count} recorded — resume to finish`);
+}
+
 function trialTable(rows) {
   if (!rows.length) return el("div", "dim", "No trials yet.");
   const t = el("table");
-  // `top` is the ranking, `said` is what Nova actually asserted. They differ on
+  // `said` is what Nova ASSERTED; `top` is only the ranking. They differ on
   // every honest rejection, and seeing both is how a human spots a run where
   // recognition is fine but the threshold is mis-set.
   t.innerHTML = "<tr><th>#</th><th>truth</th><th>cond</th><th>status</th>"
@@ -160,313 +835,79 @@ function trialTable(rows) {
   return t;
 }
 
-async function enrollFlow(name, role, key) {
-  const box = $("#enroll-"+key);
-  box.innerHTML = "";
+function trialPayload(t) {
+  return {truth:t.truth, top_profile_id:t.top_profile_id, top_score:t.top_score,
+          second_score:t.second_score, second_profile_id:t.second_profile_id,
+          status:t.status, condition:t.condition, phase:t.phase};
+}
+
+async function runEnrollBlock(key, name, role, id, stepAfter) {
   const kept = [];
-  for (let i = 0; i < 6; i++) {
-    box.appendChild(el("div", "dim", `Sample ${i+1} of 6 — say: “${PHRASES[i]}”`));
-    const b = el("button", "primary", `Record sample ${i+1} (4s)`);
-    box.appendChild(b);
-    await new Promise(res => b.onclick = res);
-    b.disabled = true;
-    const blob = await record(4000, b);
-    kept.push(blob);
-    b.textContent = `Sample ${i+1} recorded`;
-  }
-  const fd = new FormData();
-  fd.append("display_name", name);
-  fd.append("role", role);
-  kept.forEach((b,i) => fd.append("files", b, `s${i}.webm`));
-  box.appendChild(el("div", "dim", "Enrolling…"));
-  const out = await api("/speaker/enroll", {method:"POST", body:fd});
-  S.enroll[key] = out;
-  if (key === "marcus") S.marcusId = out.profile_id; else S.guestId = out.profile_id;
-  save();
-}
-
-async function trialsFlow(truthId, truthName, phase, count, target) {
-  const box = $("#"+target);
-  const plan = [];
-  const per = Math.max(1, Math.round(count / CONDITIONS.length));
-  CONDITIONS.forEach(([c]) => { for (let i=0;i<per;i++) plan.push(c); });
-  while (plan.length < count) plan.push("normal");
-  plan.length = count;
-
-  for (let i = 0; i < count; i++) {
-    box.innerHTML = "";
-    box.appendChild(el("div", null,
-      `<b>Trial ${i+1} / ${count}</b> — <span class="pill">${plan[i]}</span> `
-      + `speak <b>${truthName}</b>, 3–4 seconds, a NEW sentence (not an enrollment phrase).`));
-    const b = el("button", "primary", "Record trial");
-    box.appendChild(b);
-    await new Promise(res => b.onclick = res);
-    b.disabled = true;
-    const blob = await record(3500, b);
-    let out;
-    try { out = await identify(blob); }
-    catch (e) { box.appendChild(el("div","bad","identify failed: "+e.message)); i--; continue; }
-    S.latency.push({identify_ms: out.identify_ms, round_trip_ms: out.round_trip_ms});
-    (phase === "V" ? S.validation : S.trials).push({
-      truth: truthId, truthName,
-      // TWO DIFFERENT THINGS, kept apart on purpose (V3 P5.2 final closure).
-      //
-      //   predicted_profile_id  the ASSERTED identity. Null unless `known`.
-      //                         The recognition confusion matrix uses this and
-      //                         only this — a rejection is not a prediction.
-      //   top_profile_id        who merely RANKED FIRST, set even for unknown
-      //                         and ambiguous. Calibration fits on this.
-      //
-      // Reading `out.profile_id` into `top_profile_id` (what this used to do)
-      // silently discarded every rejected trial's attribution: a correct
-      // `unknown` at Marcus 0.43 became a trial belonging to nobody, so the
-      // score that bounds his false-accept rate never reached the fitter.
-      predicted_profile_id: out.profile_id || null,
-      predictedName: out.display_name || null,
-      top_profile_id: out.top_scored_profile_id ?? null,
-      topName: out.top_scored_display_name ?? null,
-      top_score: out.similarity ?? 0,
-      second_score: out.second_best_similarity ?? null,
-      second_profile_id: out.second_best_profile_id ?? null,
-      status: out.status || "", condition: plan[i], phase,
-      threshold: out.threshold ?? null,
-    });
-    save();
-  }
-  box.innerHTML = "<span class='ok'>Done.</span>";
-}
-
-function confusion(rows) {
-  // Recognition accuracy is about what Nova ASSERTED, so this reads
-  // predicted_profile_id — never top_profile_id, which is only a ranking and
-  // would count honest rejections as confident answers.
-  const m = {swap:0, correct:{}, total:{}, unknown:0, ambiguous:0};
-  rows.forEach(r => {
-    m.total[r.truthName] = (m.total[r.truthName]||0)+1;
-    if (r.status === "known") {
-      if (r.predicted_profile_id === r.truth) m.correct[r.truthName]=(m.correct[r.truthName]||0)+1;
-      else m.swap++;
-    } else if (r.status === "ambiguous") m.ambiguous++;
-    else m.unknown++;
+  const ok = await runBlock({
+    id, who:name, title:"enrollment — read each phrase aloud", count:6, seconds:DUR.enroll,
+    cueOf: i => ENROLL_PHRASES[i],
+    doSample: async (blob) => { kept.push(blob); return {note:"held for upload"}; },
   });
-  return m;
+  if (!ok) return false;
+  stageShow(`<div class="who">${name}</div><div class="cue">Enrolling…</div>
+             <div class="state dim">Uploading 6 samples; audio is discarded after embedding.</div>`);
+  const out = await enrolBatch(name, role, key, kept);
+  stageHide();
+  if (!out.ok) { S.blocks[id] = {done:0}; save();
+                 alertBanner(`Enrollment failed: ${out.error||"unknown"}`); return false; }
+  S.step = stepAfter; save();
+  return true;
 }
 
-
-// ── the live production pipeline: /stt (speaker=true) -> voice_turn_id -> /chat
-async function voiceTurn(promptText, seconds, wantSpeaker, convId) {
-  alert(promptText);
-  const blob = await record(seconds*1000, null);
-  const fd = new FormData();
-  fd.append("file", blob, "cmd.webm");
-  if (wantSpeaker) fd.append("speaker", "true");
-  const t0 = performance.now();
-  const stt = await api("/stt", {method:"POST", body:fd});
-  const sttMs = Math.round(performance.now() - t0);
-  const handle = stt?.speaker?.voice_turn_id || null;
-  const chat = await api("/chat", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ message: stt.text || null, attachments: [],
-                           input_source: "voice",
-                           // Sent only when the caller supplies one. Without it
-                           // Brain.chat() mints a new UUID per call.
-                           ...(convId ? {conversation_id: convId} : {}),
-                           ...(handle ? {voice_turn_id: handle} : {}) })});
-  return { text: stt.text, speaker: stt.speaker || null, handle,
-           reply: chat?.assistant ?? chat?.response ?? chat?.text ?? "",
-           conversation_id: chat?.conversation_id ?? null,
-           stt_ms: sttMs };
+function alertBanner(msg) {
+  const b = el("div","banner"); b.innerHTML = `<h3 class="bad">Problem</h3><div>${msg}</div>`;
+  $("#steps").prepend(b);
+  setTimeout(() => b.remove(), 9000);
 }
 
-//: Statuses that genuinely mean "Nova did not identify this person". `known`
-//: is NOT one of them: if the third speaker comes back recognised, the privacy
-//: question was never asked and the result proves nothing either way.
-const UNVERIFIED_OK = ["unknown", "ambiguous", "unavailable", "too_short"];
-
-// /stt and NOTHING else. Two callers need this: the latency benchmark, which
-// must not have a full LLM turn inside the number it reports, and the
-// permission probe, which needs an UNREDEEMED voice_turn_id (a /chat call would
-// spend it).
-async function sttOnly(promptText, seconds, wantSpeaker) {
-  alert(promptText);
-  const blob = await record(seconds*1000, null);
-  const fd = new FormData();
-  fd.append("file", blob, "cmd.webm");
-  if (wantSpeaker) fd.append("speaker", "true");
-  const t0 = performance.now();
-  const stt = await api("/stt", {method:"POST", body:fd});
-  return { text: stt.text, speaker: stt.speaker || null,
-           stt_ms: Math.round(performance.now() - t0) };
-}
-
-// Record a voice turn for the probe only, leaving the handle unspent.
-async function voiceHandle(promptText, seconds) {
-  return (await sttOnly(promptText, seconds, true)).speaker;
-}
-
-async function sentinelFlow() {
-  const M_S = "MARCUS-LIVE-551", G_S = "GUEST-LIVE-661";
-  // ONE conversation for all five turns. Generated here, reused for every /chat,
-  // and the id the server echoes back is checked each time — a silently ignored
-  // conversation_id would otherwise reproduce the original bug invisibly.
-  if (!S.sentinelConversationId) { S.sentinelConversationId = crypto.randomUUID(); save(); }
-  const CID = S.sentinelConversationId;
-  const out = { steps: [], conversation_id: CID, conversation_stable: true };
-
-  const turn = async (who, phase, prompt, secs) => {
-    const r = await voiceTurn(prompt, secs, true, CID);
-    // STRICT. A missing or null returned id is a FAILURE, not a pass: the
-    // previous `r.conversation_id && ...` guard treated "the server told us
-    // nothing" as "the server agreed", which is exactly the state a silently
-    // ignored conversation_id produces — the bug this check exists to catch.
-    if (r.conversation_id !== CID) out.conversation_stable = false;
-    out.steps.push({who, phase, status: r.speaker?.status ?? null,
-                    name: r.speaker?.display_name ?? null,
-                    profile_id: r.speaker?.profile_id ?? null,
-                    conversation_id: r.conversation_id ?? null,
-                    got_marcus: r.reply.includes(M_S), got_guest: r.reply.includes(G_S)});
-    return r;
-  };
-
-  await turn("Marcus", "store",
-    `Marcus: say — "Remember that my calibration sentinel is ${M_S}."`, 5);
-  await turn("Guest", "store",
-    `Guest: say — "Remember that my calibration sentinel is ${G_S}."`, 5);
-  const mr = await turn("Marcus", "ask", 'Marcus: say — "What is my calibration sentinel?"', 4);
-  const gr = await turn("Guest", "ask", 'Guest: say — "What is my calibration sentinel?"', 4);
-  const ur = await turn("unverified", "ask",
-    'UNVERIFIED: have someone NOT enrolled say — "What is my calibration sentinel?"', 4);
-
-  // Were the two enrolled people actually recognised as THEMSELVES, and was the
-  // third genuinely not recognised? Without these the privacy result is
-  // unreadable: "the guest did not get Marcus's sentinel" means nothing if the
-  // guest was never identified as the guest.
-  const marcusTurns = out.steps.filter(s => s.who === "Marcus");
-  const guestTurns  = out.steps.filter(s => s.who === "Guest");
-  out.marcus_recognised = marcusTurns.every(s => s.status === "known" && s.profile_id === S.marcusId);
-  out.guest_recognised  = guestTurns.every(s => s.status === "known" && s.profile_id === S.guestId);
-  out.unverified_status = ur.speaker?.status ?? null;
-  out.unverified_is_unverified = UNVERIFIED_OK.includes(out.unverified_status);
-  if (!out.unverified_is_unverified) {
-    out.note = `The third speaker came back "${out.unverified_status}". `
-             + "The privacy check does NOT pass — re-run it with a genuinely "
-             + "unenrolled person, or a real unverified condition.";
-  }
-
-  out.marcus_got_own = mr.reply.includes(M_S);
-  out.guest_got_own = gr.reply.includes(G_S);
-  out.guest_got_marcus = gr.reply.includes(M_S);
-  out.unverified_got_either = ur.reply.includes(M_S) || ur.reply.includes(G_S);
-  out.pass = out.conversation_stable
-             && out.marcus_recognised && out.guest_recognised
-             && out.unverified_is_unverified
-             && out.marcus_got_own && out.guest_got_own
-             && !out.guest_got_marcus && !out.unverified_got_either;
-  return out;
-}
-
-async function permissionFlow() {
-  // `computer.type` — a STANDARD-tier PRODUCTION actuator, not a data-routing
-  // call. memory.remember was the wrong probe: it is not PermissionBroker-gated
-  // at all, so asking it proved nothing about permissions.
-  //
-  // Safe because three independent things must hold before a keystroke could
-  // exist, and none of them do: guarded mode answers needs_confirmation, the
-  // probe never approves (it rejects its own request immediately), execution is
-  // off by default, and no platform adapter ships.
-  const CAP = "computer.type";
-
-  // A. Typed reference — no voice handle at all. Whatever the configured mode
-  //    decides here is the bar; the voice cases must match it exactly. Nothing
-  //    is hardcoded to "needs_confirmation" so a non-default
-  //    NOVA_PERMISSION_MODE still yields a meaningful comparison.
-  const typed = await api("/speaker/permission-probe", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({capability: CAP})});
-
-  // B & C. Real microphone -> /stt speaker=true -> backend-issued handle ->
-  //        backend resolves identity -> the same probe. The browser never says
-  //        who is speaking.
-  const viaVoice = async (label, expectId) => {
-    const spk = await voiceHandle(
-      `${label}: say a short sentence for the permission probe.`, 4);
-    const r = await api("/speaker/permission-probe", {method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({capability: CAP, voice_turn_id: spk?.voice_turn_id ?? null})});
-    return { label, expected_profile_id: expectId,
-             identity: r.identity, tier: r.tier, mode: r.mode,
-             decision: r.decision, executed: r.executed,
-             recognised: r.identity?.status === "known"
-                      && r.identity?.profile_id === expectId };
-  };
-  const marcus = await viaVoice("Marcus", S.marcusId);
-  const guest  = await viaVoice("Guest",  S.guestId);
-
-  const sameDecision = marcus.decision === typed.decision
-                    && guest.decision === typed.decision;
-  const sameTier = marcus.tier === typed.tier && guest.tier === typed.tier;
-  const nothingRan = !typed.executed && !marcus.executed && !guest.executed;
-
-  return {
-    capability: CAP, mode: typed.mode, tier: typed.tier,
-    typed_reference: {decision: typed.decision, tier: typed.tier,
-                      identity: typed.identity, executed: typed.executed},
-    marcus, guest,
-    // Both voice handles must have been recognised as their OWN profiles,
-    // otherwise "the decision did not change" is trivially true and worthless.
-    both_recognised: marcus.recognised && guest.recognised,
-    same_decision: sameDecision, same_tier: sameTier, nothing_executed: nothingRan,
-    execution_enabled: typed.execution_enabled,
-    adapter_installed: typed.adapter_installed,
-    pass: sameDecision && sameTier && nothingRan
-          && marcus.recognised && guest.recognised,
-    note: "PermissionBroker.evaluate() takes no identity argument. Measured, "
-        + "not asserted: all three decisions are compared to the typed reference.",
-  };
-}
-
-async function sttLatencyFlow() {
-  // sttOnly, never voiceTurn: this measures what speaker identification costs
-  // /stt. Routing each sample through /chat as well would bury a ~40 ms
-  // difference under a full LLM turn, and would leave 12 pointless
-  // conversational turns in Nova's memory as a side effect of a benchmark.
-  const off = [], on = [];
-  for (let i = 0; i < 6; i++) {
-    const r = await sttOnly(`Latency ${i+1}/12 (speaker OFF) — say a short sentence.`, 3, false);
-    off.push(r.stt_ms);
-  }
-  for (let i = 0; i < 6; i++) {
-    const r = await sttOnly(`Latency ${i+7}/12 (speaker ON) — say a short sentence.`, 3, true);
-    on.push(r.stt_ms);
-  }
-  const p = (a,q) => pct(a,q);
-  return { stt_off_p50: p(off,.5), stt_off_p95: p(off,.95),
-           stt_on_p50: p(on,.5),  stt_on_p95: p(on,.95),
-           delta_p50: p(on,.5) - p(off,.5), delta_p95: p(on,.95) - p(off,.95),
-           n_off: off.length, n_on: on.length };
+async function runTrialBlock({id, truthId, truthName, phase, count, pool, stepAfter, handoffTitle, handoffBody}) {
+  if (handoffTitle) await handoff(handoffTitle, handoffBody);
+  const conds = planConditions(count);
+  const ok = await runBlock({
+    id, who:truthName, title:`${phase === "V" ? "validation" : "trials"} — speak naturally`,
+    count, seconds: phase === "V" ? DUR.validation : DUR.trial,
+    condFor: i => conds[i],
+    cueOf: i => cueFor(pool, i),
+    doSample: async (blob, i, cond) => {
+      const out = await identify(blob);
+      const row = recordTrial(out, {truthId, truthName, phase, condition:cond, block:id});
+      save();
+      return {note: `${out.status}${out.similarity!=null ? " · "+out.similarity.toFixed(3) : ""}`};
+    },
+  });
+  if (ok && stepAfter != null) { S.step = stepAfter; save(); }
+  return ok;
 }
 
 function render() {
+  if (!HAS_DOM) return;
   const root = $("#steps"); root.innerHTML = "";
   const st = S.step;
+  const plan = {}; blockPlan().forEach(b => plan[b.id] = b);
 
   // 1 preflight
   const p = el("div");
-  p.appendChild(el("div","dim","Check the backend, review existing profiles, and delete any stale ones deliberately."));
+  p.appendChild(el("div","dim","Check the backend, review existing profiles, and delete any stale ones deliberately. The guest does not need to be here yet."));
   const list = el("div", null, "<i class='dim'>press Check above</i>");
   list.id = "proflist"; p.appendChild(list);
   const go = el("button","primary","Start calibration");
-  go.onclick = () => { S.step = 1; save(); };
+  go.onclick = () => { S.step = 1; if (!S.startedAt) S.startedAt = Date.now(); save(); };
   p.appendChild(go);
   root.appendChild(stepCard(1, "Preflight", st===0, st>0, p));
 
   // 2 Marcus enrollment
   const m = el("div");
-  m.appendChild(el("div","dim","Six samples, 4 seconds each, different phrases. At least 5 must survive the quality gate."));
-  m.appendChild(el("div",null,"")).id = "enroll-marcus";
-  const mb = el("button","primary","Enrol Marcus (owner)");
-  mb.onclick = async () => { mb.disabled=true; try { await enrollFlow("Marcus","owner","marcus"); S.step=2; save(); }
-                             catch(e){ alert(e.message); mb.disabled=false; } };
+  m.appendChild(el("div","dim","Six short phrases, 3 seconds each, recorded back to back. At least 5 must survive the quality gate."));
+  m.appendChild(blockStatus("enroll_marcus", 6));
+  const mb = el("button","primary","Enrol Marcus (owner) — one click, 6 samples");
+  mb.onclick = async () => { mb.disabled=true;
+    try { await runEnrollBlock("marcus","Marcus","owner","enroll_marcus",2); }
+    catch(e){ alertBanner(e.message); } finally { mb.disabled=false; render(); } };
   m.appendChild(mb);
   if (S.enroll.marcus) {
     const e = S.enroll.marcus;
@@ -478,36 +919,44 @@ function render() {
 
   // 3 Marcus trials (phase A)
   const a = el("div");
-  a.appendChild(el("div","dim","20 fresh utterances: 4 normal, 4 quiet, 4 loud, 4 near, 4 far."));
-  const a1 = el("div"); a1.id="trials-marcus"; a.appendChild(a1);
+  a.appendChild(el("div","dim","20 fresh utterances: 4 normal, 4 quiet, 4 loud, 4 near, 4 far. Auto-advances; still just Marcus."));
+  a.appendChild(blockStatus("trials_marcus", 20));
   const ab = el("button","primary","Start Marcus trials (20)");
   ab.onclick = async () => { ab.disabled=true;
-    await trialsFlow(S.marcusId,"Marcus","A",20,"trials-marcus"); S.step=3; save(); };
+    try { await runTrialBlock({id:"trials_marcus", truthId:S.marcusId, truthName:"Marcus",
+            phase:"A", count:20, pool:CAL_CUES, stepAfter:3}); }
+    catch(e){ alertBanner(e.message); } finally { ab.disabled=false; render(); } };
   a.appendChild(ab);
   root.appendChild(stepCard(3, "Marcus trials — phase A", st===2, st>2, a));
 
   // 4 unenrolled guest (impostor) trials
   const g = el("div");
-  g.appendChild(el("div","dim","The guest is NOT enrolled yet. These 12 utterances measure how close a real stranger gets to Marcus — the impostor distribution."));
-  const g1 = el("div"); g1.id="trials-impostor"; g.appendChild(g1);
+  g.appendChild(el("div","dim","<b>The guest joins now.</b> They are NOT enrolled yet — these 12 utterances measure how close a real stranger gets to Marcus, which is the impostor evidence the whole threshold rests on."));
+  g.appendChild(blockStatus("trials_guest", 12));
   const gb = el("button","primary","Start impostor trials (12)");
   gb.onclick = async () => { gb.disabled=true;
-    await trialsFlow("__impostor__","Guest (unenrolled)","A",12,"trials-impostor"); S.step=4; save(); };
+    try { await runTrialBlock({id:"trials_guest", truthId:"__impostor__",
+            truthName:"Guest (unenrolled)", phase:"A", count:12, pool:CAL_CUES, stepAfter:4,
+            handoffTitle:"The guest takes over now",
+            handoffBody:"12 recordings, about a minute. They are not enrolled yet — that is the point."}); }
+    catch(e){ alertBanner(e.message); } finally { gb.disabled=false; render(); } };
   g.appendChild(gb);
   root.appendChild(stepCard(4, "Unenrolled guest trials", st===3, st>3, g));
 
   // 5 guest enrollment
   const ge = el("div");
-  ge.appendChild(el("div","dim","Now enrol the guest — six samples, same rules."));
-  ge.appendChild(el("div",null,"")).id = "enroll-guest";
-  const geb = el("button","primary","Enrol guest");
+  ge.appendChild(el("div","dim","Now enrol the guest — six phrases, same rules."));
+  ge.appendChild(blockStatus("enroll_guest", 6));
+  const geb = el("button","primary","Enrol guest — one click, 6 samples");
   geb.onclick = async () => { geb.disabled=true;
     const nm = prompt("Guest's first name?") || "Guest";
-    try { await enrollFlow(nm,"guest","guest");
-          // Relabel the impostor trials now that the guest has an id.
-          S.trials.forEach(t => { if (t.truth === "__impostor__") t.truth = S.guestId; });
-          S.step=5; save(); }
-    catch(e){ alert(e.message); geb.disabled=false; } };
+    try {
+      if (await runEnrollBlock("guest", nm, "guest", "enroll_guest", 5)) {
+        // Relabel the impostor trials now that the guest has an id.
+        S.trials.forEach(t => { if (t.truth === "__impostor__") { t.truth = S.guestId; t.truthName = nm; } });
+        save();
+      }
+    } catch(e){ alertBanner(e.message); } finally { geb.disabled=false; render(); } };
   ge.appendChild(geb);
   if (S.enroll.guest) {
     const e = S.enroll.guest;
@@ -516,16 +965,22 @@ function render() {
   }
   root.appendChild(stepCard(5, "Enrol the guest", st===4, st>4, ge));
 
-  // 6 two-profile trials (phase B)
+  // 6 two-profile trials (phase B) — Marcus block, then guest block
   const b2 = el("div");
-  b2.appendChild(el("div","dim","12 each, varied conditions. These calibrate the margin between two real people."));
-  const b1 = el("div"); b1.id="trials-b"; b2.appendChild(b1);
+  b2.appendChild(el("div","dim","12 each. One handoff in the middle, not one per utterance."));
+  b2.appendChild(blockStatus("phaseb_marcus", 12));
+  b2.appendChild(blockStatus("phaseb_guest", 12));
   const bb = el("button","primary","Start two-profile trials (12 + 12)");
   bb.onclick = async () => { bb.disabled=true;
-    await trialsFlow(S.marcusId,"Marcus","B",12,"trials-b");
-    alert("Now the GUEST speaks for the next 12.");
-    await trialsFlow(S.guestId, S.enroll.guest?.display_name || "Guest","B",12,"trials-b");
-    S.step=6; save(); };
+    try {
+      const gname = S.enroll.guest?.display_name || "Guest";
+      const okm = await runTrialBlock({id:"phaseb_marcus", truthId:S.marcusId, truthName:"Marcus",
+        phase:"B", count:12, pool:CAL_CUES,
+        handoffTitle:"Marcus records 12", handoffBody:"Then the guest records 12."});
+      if (okm) await runTrialBlock({id:"phaseb_guest", truthId:S.guestId, truthName:gname,
+        phase:"B", count:12, pool:CAL_CUES, stepAfter:6,
+        handoffTitle:`${gname} records 12 now`, handoffBody:"Same conditions, fresh sentences."});
+    } catch(e){ alertBanner(e.message); } finally { bb.disabled=false; render(); } };
   b2.appendChild(bb);
   b2.appendChild(trialTable(S.trials));
   root.appendChild(stepCard(6, "Two-profile trials — phase B", st===5, st>5, b2));
@@ -535,14 +990,11 @@ function render() {
   const pb = el("button","primary","Compute proposed calibration");
   pb.onclick = async () => {
     try {
-      const out = await api("/speaker/calibration", {method:"POST",
+      S.proposal = await api("/speaker/calibration", {method:"POST",
         headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({trials: S.trials.map(t => ({
-          truth:t.truth, top_profile_id:t.top_profile_id, top_score:t.top_score,
-          second_score:t.second_score, second_profile_id:t.second_profile_id,
-          status:t.status, condition:t.condition, phase:t.phase})), apply:false})});
-      S.proposal = out; save();
-    } catch(e){ alert(e.message); }
+        body: JSON.stringify({trials: S.trials.map(trialPayload), apply:false})});
+      save();
+    } catch(e){ alertBanner(e.message); }
   };
   pr.appendChild(pb);
   if (S.proposal) {
@@ -556,12 +1008,9 @@ function render() {
         try {
           await api("/speaker/calibration", {method:"POST",
             headers:{"Content-Type":"application/json"},
-            body: JSON.stringify({trials: S.trials.map(t => ({
-              truth:t.truth, top_profile_id:t.top_profile_id, top_score:t.top_score,
-              second_score:t.second_score, second_profile_id:t.second_profile_id,
-              status:t.status, condition:t.condition, phase:t.phase})), apply:true})});
+            body: JSON.stringify({trials: S.trials.map(trialPayload), apply:true})});
           S.applied = true; S.step = 7; save();
-        } catch(e){ alert(e.message); }
+        } catch(e){ alertBanner(e.message); }
       };
       pr.appendChild(ap);
     }
@@ -570,27 +1019,33 @@ function render() {
 
   // 8 validation
   const v = el("div");
-  v.appendChild(el("div","dim","FRESH utterances only — none may reuse a calibration recording. 10 each, varied conditions."));
-  const v1 = el("div"); v1.id="trials-v"; v.appendChild(v1);
+  v.appendChild(el("div","dim","FRESH utterances only — a different cue pool from calibration, and stored separately. 10 each."));
+  v.appendChild(blockStatus("valid_marcus", 10));
+  v.appendChild(blockStatus("valid_guest", 10));
   const vb = el("button","primary","Start validation (10 + 10)");
   vb.onclick = async () => { vb.disabled=true;
-    await trialsFlow(S.marcusId,"Marcus","V",10,"trials-v");
-    alert("Now the GUEST speaks for the next 10.");
-    await trialsFlow(S.guestId, S.enroll.guest?.display_name || "Guest","V",10,"trials-v");
-    S.step=8; save(); };
+    try {
+      const gname = S.enroll.guest?.display_name || "Guest";
+      const okm = await runTrialBlock({id:"valid_marcus", truthId:S.marcusId, truthName:"Marcus",
+        phase:"V", count:10, pool:VAL_CUES,
+        handoffTitle:"Marcus validates — 10 fresh utterances", handoffBody:"None of these may reuse a calibration sentence."});
+      if (okm) await runTrialBlock({id:"valid_guest", truthId:S.guestId, truthName:gname,
+        phase:"V", count:10, pool:VAL_CUES, stepAfter:8,
+        handoffTitle:`${gname} validates — 10 fresh utterances`, handoffBody:"Last of the trial blocks."});
+    } catch(e){ alertBanner(e.message); } finally { vb.disabled=false; render(); } };
   v.appendChild(vb);
   v.appendChild(trialTable(S.validation));
   root.appendChild(stepCard(8, "Fresh validation", st===7, st>7, v));
 
-  // 9 memory attribution through the REAL voice pipeline
+  // 9 memory attribution
   const ms = el("div");
   ms.appendChild(el("div","dim",
-    "Uses the real pipeline: /stt with speaker=true → voice_turn_id → /chat. "
-    + "Marcus stores his sentinel, the guest stores theirs, then each asks for their own."));
-  const msb = el("button","primary","Run memory-attribution check");
+    "The real pipeline: /stt with speaker=true → voice_turn_id → /chat, all five turns in ONE conversation. "
+    + "<b>Needs a third, unenrolled voice for the last turn</b> — or a genuinely unverified condition, which only counts if the backend actually returns one."));
+  const msb = el("button","primary","Run memory-attribution check (5 turns)");
   msb.onclick = async () => { msb.disabled = true;
-    try { S.sentinel = await sentinelFlow(); S.step = 9; save(); }
-    catch(e){ alert(e.message); msb.disabled = false; } };
+    try { const r = await sentinelFlow(); if (r) { S.sentinel = r; S.step = 9; save(); } }
+    catch(e){ alertBanner(e.message); } finally { msb.disabled = false; render(); } };
   ms.appendChild(msb);
   if (S.sentinel) {
     ms.appendChild(el("div", S.sentinel.pass?"ok":"bad",
@@ -602,94 +1057,48 @@ function render() {
   // 10 permission regression
   const pm = el("div");
   pm.appendChild(el("div","dim",
-    "The real PermissionBroker, via ComputerControl, on <b>computer.type</b> — a "
-    + "STANDARD-tier actuator. Asked three ways: typed, as recognised Marcus, as "
-    + "recognised guest. All three decisions must match the typed reference. "
-    + "Nothing can be typed: the probe rejects its own request, execution is off, "
-    + "and no adapter ships."));
-  const pmb = el("button","primary","Run permission regression");
+    "The real PermissionBroker, via ComputerControl, on <b>computer.type</b>. Typed, then Marcus, then guest — "
+    + "all three decisions must match. Nothing can be typed: the probe rejects its own request, execution is off, no adapter ships."));
+  const pmb = el("button","primary","Run permission regression (2 recordings)");
   pmb.onclick = async () => { pmb.disabled = true;
-    try { S.permission = await permissionFlow(); S.step = 10; save(); }
-    catch(e){ alert(e.message); pmb.disabled = false; } };
+    try { const r = await permissionFlow(); if (r) { S.permission = r; S.step = 10; save(); } }
+    catch(e){ alertBanner(e.message); } finally { pmb.disabled = false; render(); } };
   pm.appendChild(pmb);
   if (S.permission) {
     pm.appendChild(el("div", S.permission.pass?"ok":"bad",
-      S.permission.pass ? "Permission regression PASS — identical decisions"
-                        : "Permission regression FAIL"));
+      S.permission.pass ? "Permission regression PASS — identical decisions" : "Permission regression FAIL"));
     pm.appendChild(el("pre", null, JSON.stringify(S.permission, null, 2)));
   }
   root.appendChild(stepCard(10, "Permission regression", st===9, st>9, pm));
 
   // 11 latency
   const lt = el("div");
-  lt.appendChild(el("div","dim","/stt with speaker OFF vs ON, on real microphone audio. 6 each."));
+  lt.appendChild(el("div","dim","/stt only — no /chat inside the number. 6 with speaker OFF, 6 with it ON, same window length so the delta is a fair comparison."));
+  lt.appendChild(blockStatus("latency", 12));
   const ltb = el("button","primary","Measure /stt latency (12 recordings)");
   ltb.onclick = async () => { ltb.disabled = true;
-    try { S.sttLatency = await sttLatencyFlow(); S.statusAfter = await api("/speaker/status"); S.step = 11; save(); }
-    catch(e){ alert(e.message); ltb.disabled = false; } };
+    try { const r = await sttLatencyFlow();
+          if (r) { S.sttLatency = r; S.statusAfter = await api("/speaker/status"); S.step = 11; save(); } }
+    catch(e){ alertBanner(e.message); } finally { ltb.disabled = false; render(); } };
   lt.appendChild(ltb);
   if (S.sttLatency) lt.appendChild(el("pre", null, JSON.stringify(S.sttLatency, null, 2)));
   root.appendChild(stepCard(11, "Latency", st===10, st>10, lt));
 
   // 12 report
   const rep = el("div");
-  const recog = S.validation.length ? confusion(S.validation) : null;
-  const recogPass = recog && recog.swap === 0
-    && Object.keys(recog.total).every(n => (recog.correct[n]||0) / recog.total[n] >= 0.9);
+  const A = computeAcceptance(S);
 
-  // EXACTLY two compatible profiles, and exactly the two this run enrolled.
-  // Checked directly rather than inferred from threshold_calibrated: a third
-  // profile left over from an earlier session changes what every threshold
-  // means, and "calibrated" would not necessarily say so.
-  const compat = (S.statusAfter?.profiles_detail ?? []).filter(p => p.compatible);
-  const compatIds = compat.map(p => p.profile_id).sort();
-  const wantIds = [S.marcusId, S.guestId].filter(Boolean).sort();
-  const roleOf = id => (compat.find(p => p.profile_id === id) || {}).role ?? null;
-  const twoProfiles = {
-    compatible_count: compat.length,
-    compatible_ids: compatIds,
-    expected_ids: wantIds,
-    marcus_role: roleOf(S.marcusId),
-    guest_role: roleOf(S.guestId),
-    exactly_two: compat.length === 2
-                 && wantIds.length === 2
-                 && JSON.stringify(compatIds) === JSON.stringify(wantIds),
-    roles_correct: roleOf(S.marcusId) === "owner" && roleOf(S.guestId) === "guest",
-  };
-  twoProfiles.pass = twoProfiles.exactly_two && twoProfiles.roles_correct;
-
-  // Recognition passing is NOT P5.2 passing. Every required item must have run.
-  const missing = [];
-  if (!(S.enroll.marcus?.meets_p52_bar)) missing.push("Marcus enrollment >=5 samples");
-  if (!(S.enroll.guest?.meets_p52_bar)) missing.push("guest enrollment >=5 samples");
-  if (!S.applied) missing.push("calibration applied");
-  if (!(S.statusAfter?.threshold_calibrated)) missing.push("status threshold_calibrated == true");
-  if (!S.statusAfter) missing.push("post-run /speaker/status");
-  if (!S.validation.length) missing.push("fresh recognition validation");
-  if (!S.sentinel) missing.push("memory attribution");
-  if (!S.permission) missing.push("permission regression");
-  if (!S.sttLatency) missing.push("latency measurement");
-
-  const failed = [];
-  if (recog && !recogPass) failed.push("recognition validation");
-  if (S.sentinel && !S.sentinel.pass) failed.push("memory attribution");
-  if (S.sentinel && !S.sentinel.conversation_stable) failed.push("sentinel conversation id not stable");
-  if (S.sentinel && !S.sentinel.unverified_is_unverified) failed.push("third speaker was recognised — privacy check invalid");
-  if (S.permission && !S.permission.pass) failed.push("permission regression");
-  if (S.statusAfter && !twoProfiles.pass) failed.push("exactly-two-profile requirement");
-
-  const acceptance = failed.length ? "FAIL" : (missing.length ? "NOT COMPLETE" : "PASS");
-
-  if (recog) {
-    rep.appendChild(el("div", recogPass?"ok":"bad",
-      "RECOGNITION VALIDATION: " + (recogPass ? "PASS" : "FAIL")
-      + ` — ${recog.swap} identity swap(s)`));
+  if (A.recog) {
+    rep.appendChild(el("div", A.recogPass?"ok":"bad",
+      "RECOGNITION VALIDATION: " + (A.recogPass ? "PASS" : "FAIL")
+      + ` — ${A.recog.swap} identity swap(s)`));
   }
-  rep.appendChild(el("div", acceptance==="PASS"?"ok":(acceptance==="FAIL"?"bad":"warn"),
-    "P5.2 HUMAN ACCEPTANCE: " + acceptance
-    + (missing.length ? " — still to run: " + missing.join(", ") : "")
-    + (failed.length ? " — failed: " + failed.join(", ") : "")));
+  rep.appendChild(el("div", A.acceptance==="PASS"?"ok":(A.acceptance==="FAIL"?"bad":"warn"),
+    "P5.2 HUMAN ACCEPTANCE: " + A.acceptance
+    + (A.missing.length ? " — still to run: " + A.missing.join(", ") : "")
+    + (A.failed.length ? " — failed: " + A.failed.join(", ") : "")));
 
+  const pg = progress();
   const report = {
     protocol: "V3 P5.2", generated_at: new Date().toISOString(),
     model_id: S.statusAfter?.model_id ?? null,
@@ -701,23 +1110,39 @@ function render() {
     threshold_source: S.statusAfter?.threshold_source ?? null,
     profiles: S.statusAfter?.profiles_detail ?? null,
     enrollment: S.enroll, calibration: S.proposal, applied: S.applied,
-    recognition: recog ? {
-      confusion: recog, identity_swaps: recog.swap,
-      false_accepts: recog.swap, false_rejects: recog.unknown + recog.ambiguous,
-      unknown: recog.unknown, ambiguous: recog.ambiguous,
-      per_speaker: Object.keys(recog.total).map(n =>
-        ({name:n, correct:recog.correct[n]||0, total:recog.total[n]})),
+    sample_counts: A.counts,
+    conditions: (() => { const c = {};
+      S.trials.concat(S.validation).forEach(t => { c[t.condition] = (c[t.condition]||0)+1; });
+      return c; })(),
+    attribution_audit: A.audit,
+    recognition: A.recog ? {
+      confusion: A.recog, identity_swaps: A.recog.swap,
+      false_accepts: A.recog.swap, false_rejects: A.recog.unknown + A.recog.ambiguous,
+      unknown: A.recog.unknown, ambiguous: A.recog.ambiguous,
+      per_speaker: Object.keys(A.recog.total).map(n =>
+        ({name:n, correct:A.recog.correct[n]||0, total:A.recog.total[n]})),
     } : null,
+    score_summary: (() => {
+      const all = S.trials.concat(S.validation);
+      const tops = all.map(t => t.top_score).filter(x => x != null);
+      const secs = all.map(t => t.second_score).filter(x => x != null);
+      return {n: all.length,
+              top_p05: pct(tops,.05), top_p50: pct(tops,.5), top_p95: pct(tops,.95),
+              second_p50: pct(secs,.5), second_p95: pct(secs,.95)};
+    })(),
     memory_attribution: S.sentinel, permission_regression: S.permission,
-    two_profile_requirement: twoProfiles,
+    two_profile_requirement: A.twoProfiles,
     latency: {
       identify_p50: pct(S.latency.map(x=>x.identify_ms), .50),
       identify_p95: pct(S.latency.map(x=>x.identify_ms), .95),
       stt: S.sttLatency,
     },
+    session: {recordings_completed: pg.done, recordings_total: pg.total,
+              elapsed_ms: pg.elapsed},
     trials_collected: S.trials.length,
-    recognition_validation: recog ? (recogPass ? "PASS" : "FAIL") : "NOT RUN",
-    p52_human_acceptance: acceptance,
+    validation_collected: S.validation.length,
+    recognition_validation: A.recog ? (A.recogPass ? "PASS" : "FAIL") : "NOT RUN",
+    p52_human_acceptance: A.acceptance,
   };
   rep.appendChild(el("pre", null, JSON.stringify(report, null, 2)));
   const cp = el("button", null, "Copy report JSON");
@@ -728,33 +1153,28 @@ function render() {
   root.appendChild(stepCard(12, "Final report", st>=11, false, rep));
 }
 
-function pct(a, q) {
-  if (!a.length) return null;
-  const s = a.slice().sort((x,y)=>x-y);
-  return s[Math.max(0, Math.min(s.length-1, Math.round(q*(s.length-1))))];
+if (HAS_DOM) {
+  $("#ping").onclick = async () => {
+    const out = $("#pingout");
+    try {
+      const st = await api("/speaker/status");
+      const pr = await api("/speaker/profiles");
+      out.innerHTML = `<span class="ok">connected</span> · model ${st.model_id||"?"} `
+        + `· calibrated: <b>${st.threshold_calibrated}</b> · margin ${st.margin} (${st.margin_source})`;
+      const box = $("#proflist"); box.innerHTML = "";
+      if (!pr.profiles.length) box.appendChild(el("div","dim","No profiles enrolled."));
+      pr.profiles.forEach(p => {
+        const row = el("div", null,
+          `<span class="pill">${p.role}</span> <b>${p.name||p.display_name}</b> `
+          + `<span class="dim">${p.profile_id} · ${p.sample_count} samples · ${p.status||""}</span> `);
+        const d = el("button","danger","Delete");
+        d.onclick = async () => { if(!confirm(`Delete ${p.name||p.display_name}?`))return;
+          await api("/speaker/profiles/"+p.profile_id, {method:"DELETE"}); $("#ping").click(); };
+        row.appendChild(d);
+        box.appendChild(row);
+      });
+    } catch (e) { out.innerHTML = `<span class="bad">${e.message}</span>`; }
+  };
+  render();
 }
-
-$("#ping").onclick = async () => {
-  const out = $("#pingout");
-  try {
-    const st = await api("/speaker/status");
-    const pr = await api("/speaker/profiles");
-    out.innerHTML = `<span class="ok">connected</span> · model ${st.model_id||"?"} `
-      + `· calibrated: <b>${st.threshold_calibrated}</b> · margin ${st.margin} (${st.margin_source})`;
-    const box = $("#proflist"); box.innerHTML = "";
-    if (!pr.profiles.length) box.appendChild(el("div","dim","No profiles enrolled."));
-    pr.profiles.forEach(p => {
-      const row = el("div", null,
-        `<span class="pill">${p.role}</span> <b>${p.name||p.display_name}</b> `
-        + `<span class="dim">${p.profile_id} · ${p.sample_count} samples · ${p.status||""}</span> `);
-      const d = el("button","danger","Delete");
-      d.onclick = async () => { if(!confirm(`Delete ${p.name||p.display_name}?`))return;
-        await api("/speaker/profiles/"+p.profile_id, {method:"DELETE"}); $("#ping").click(); };
-      row.appendChild(d);
-      box.appendChild(row);
-    });
-  } catch (e) { out.innerHTML = `<span class="bad">${e.message}</span>`; }
-};
-
-render();
 </script>
