@@ -15,7 +15,8 @@ large phase.
 | **P5.1c** | audit only — nine remaining failures reproduced against `78cba4d`, nothing fixed |
 | **P5.1d** | every backend read and write path made speaker-safe, including the ones that run after the turn ends |
 | **P5.1d.1** | read side effects, delimiter-exact namespaces, durable turn attribution, guest lessons applied |
-| **P5.1d.2 (this pass)** | the direct tool surface — the boundary the model could step around by emitting a tool call |
+| **P5.1d.2** | the direct tool surface — the boundary the model could step around by emitting a tool call |
+| **P5.1d.3 (this pass)** | the full persistent-state inventory: durable stores that are not called "memory" |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -601,6 +602,95 @@ The scope checks are not measurable against the I/O they guard.
 | `resolve_write_target` (guest, nested) | 3.24 µs |
 | `entity_belongs_to_speaker` | 0.45 µs |
 | `memory.remember` end to end (owner) | 45.99 ms median |
+
+---
+
+## P5.1d.3 — the state that isn't called "memory"
+
+P5.1d.2 fixed the tools named `memory.*`. The failure mode left over: **a tool
+bypasses speaker privacy because the durable state it touches has a different
+name.** So this pass inventoried every registered built-in from its code, not
+its name, and classified each one.
+
+### The classification
+
+| category | meaning | tools |
+|---|---|---|
+| **speaker-scoped** | real `speaker:<id>` representation | `memory.remember`, `.recall`, `.correct`, `.learn_lesson`, `.remember_person`, `.recall_person` |
+| **owner-private** | Marcus's store, no ownership column → fail closed | `memory.remember_event`, `.timeline`, `.related`, `.path`, `.link`, `.index_folder`, `.synthesize`, `thoughts.note`, `.recall`, `twin.profile`, `executive.brief`, `reminder.create`, `plan.save/status/advance`, `goal.create`, `research.track/list`, `skill.detect/learn/list/get/update/branch/delete/run`, `agent.recall` |
+| **shared / system** | no per-person meaning | `world.recall/learn`, `research.findings`, `agents.roster`, `experiment.*`, `memory.rebuild_index`, `society.consult` |
+| **capability** | PermissionBroker / dev mode decides, never the voice | `code.*`, `project.*`, `self.*`, `shell.exec`, `computer.*`, `vision.look_at_screen` |
+| **ephemeral** | no durable state | `image.generate`, `video.generate` |
+
+`tests/test_speaker_persistent_state_v51d3.py` asserts this table covers the
+live registry exactly. **A tool added later without a classification fails the
+suite** — which is the actual point: the previous three passes each found
+something the one before had missed by omission rather than by error.
+
+### What the inventory caught
+
+Reproduced on `641f499`:
+
+| | before |
+|---|---|
+| `thoughts.note` | P5.1d.2 closed the *reader* and left the *writer* — a guest's text still landed in the store Marcus reads back |
+| `plan.*` | a guest read the owner's plan **and overwrote it** |
+| `goal.create` | a guest and an unknown speaker each created a goal row **plus an enqueued `__decide__` task** — unattended background work started by someone Nova cannot name |
+| `skill.*` | a guest listed, fetched, updated to `"HACKED"`, branched and **deleted** the owner's learned skill |
+| `memory.index_folder` | a guest's folder was indexed straight into the owner document store |
+| `research.track/list` | a guest read and added to the owner's tracking registry |
+| `agent.recall` | specialist notes about Marcus returned to anyone |
+
+And two the completeness check itself surfaced, registered by `RuntimeManager`
+rather than `core/tooling.py`:
+
+* **`memory.synthesize`** reads across the owner's indexed filesystem. Gating
+  the writer and leaving this reader open would have achieved nothing.
+* **`skill.run`** reads *and reveals* a learned workflow's steps.
+
+### The one that was a layer down
+
+`agent.recall` being owner-only is not enough on its own: `AgentSociety` injects
+those same notes into **every specialist prompt**, so a guest could have
+received Marcus's accumulated context inside a deliberation answer without ever
+calling the tool. The notes are now omitted for a non-owner; the council still
+deliberates for them, and the owner's is unchanged.
+
+This is the shape of bug the whole sub-phase keeps finding: the boundary is
+correct at the surface and absent one layer beneath it.
+
+### Two classifications argued from evidence, not names
+
+**`agent.recall` → owner-private.** `agent_remember` has *no production caller*.
+The only note ever written through it in the tree — in
+`tests/test_society_p6.py` — is *"Marcus prefers primary sources over blog
+posts."* The store's designed content is his preferences, so it is his.
+`agents.roster` stays shared: specs and counters, never note content.
+
+**`research.findings` → shared, while `research.track`/`research.list` are
+owner-private.** The distinction is real and worth keeping: the *registry* is
+what Marcus asked Nova to follow — his workflow state. The *findings* are
+sourced world facts, returned as `{summary, source, confidence}` with no
+requester, timing, priority or rationale. A test asserts findings carry no other
+keys, so the split cannot silently erode.
+
+### Deliberately left alone
+
+`experiment.*` is Nova's own A/B testing of prompt variants and ranking — the
+meaning of an experiment does not change with who is speaking, so restricting it
+would be exactly the over-correction the brief warned against.
+
+Capability tools stay governed by `PermissionBroker` and developer mode.
+`vision.look_at_screen` reads Marcus's screen but holds no durable state and
+already requires broker consent per call; gating it on voice would convert a
+consent prompt into an identity check. **Speaker identity is still not
+authentication**, and none of these decisions makes it one.
+
+### Latency
+
+The gate is a property read on a `ContextVar`: **0.17 µs**. Owner tool calls are
+dominated by their own I/O (`skill.list` 17 ms, `thoughts.recall` 16 ms,
+`research.list` 60 ms median) — five orders of magnitude above the check.
 
 ### What the owner can still see
 

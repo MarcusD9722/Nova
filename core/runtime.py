@@ -592,6 +592,13 @@ class RuntimeManager:
             topic = str(args.get("topic") or args.get("query") or "").strip()
             if not topic:
                 return {"ok": False, "error": "missing_topic"}
+            # Reads across the OWNER's indexed filesystem — the same store
+            # memory.index_folder writes and P5.1d.3 made owner-only. Gating the
+            # writer and leaving this reader open would have been pointless.
+            if not current_identity().is_owner:
+                return {"ok": False, "error": "scoped_unavailable", "scope": "documents",
+                        "detail": ("The files I've indexed are Marcus's, so I can't "
+                                   "search through them for someone else.")}
             chunks = await self._memory.search_document_chunks_broad(topic, limit=18)
             if not chunks:
                 return {
@@ -825,6 +832,15 @@ class RuntimeManager:
 
         async def _tool_skill_run(args: dict[str, Any]) -> dict[str, Any]:
             skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
+            # Learned skills are distilled from Marcus's own repeated work and
+            # the store has no ownership column (P5.1d.3). Running one also
+            # reveals its steps, so the reader is gated with the rest of the
+            # family. Permission checks on each step are unchanged and still
+            # apply to him.
+            if not current_identity().is_owner:
+                return {"ok": False, "error": "scoped_unavailable", "scope": "skills",
+                        "detail": ("The skills I've learned are Marcus's own "
+                                   "workflows, so I can't run one from here.")}
             skill = await self._memory.get_skill(skill_id) if skill_id else None
             if not skill:
                 return {"ok": False, "error": "unknown_skill"}
