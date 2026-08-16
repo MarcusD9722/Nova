@@ -73,11 +73,23 @@ with two enrolled people, a guest speaking makes Marcus the runner-up, never the
 top match, so a top-only bound would leave the second profile with no evidence at
 all.
 
+### Genuine scores
+
+Every score a person's own profile earned **while they were speaking** — top or
+runner-up. Dropping a trial because the true speaker ranked second would discard
+exactly the hard cases the threshold exists to handle, and bias the genuine
+distribution upward.
+
 ### Margin
 
-Grid-searched `0.30 → 0.02`, most conservative first. A candidate is rejected
-outright if it produces even one **wrong-person** call. Ambiguity is a better
-answer than a confident mistake.
+Grid-searched `0.30 → 0.02`, most conservative first, simulating the **real
+classifier**: a trial counts as a correct `known` only when the top score clears
+that profile's proposed threshold *and* the gap clears the candidate margin.
+Scoring on the gap alone credited trials the live matcher would have returned as
+`unknown`, so a margin could show ≥90% while the shipped classifier did not.
+
+A candidate producing even one **wrong-person** call is rejected outright.
+Ambiguity beats a confident mistake.
 
 ### If it does not fit
 
@@ -126,6 +138,11 @@ a claim worth making.
 
 ## Threshold precedence
 
+**One resolved policy** (`resolve_policy`) is computed once and handed to
+`match()`. The matcher no longer reads `profile.threshold` on its own — a stored
+threshold survives its calibration going stale, and a number nobody stands
+behind must not keep deciding.
+
 Explicit, and `status()` names which is in force:
 
 ```
@@ -136,8 +153,17 @@ persisted calibration                          calibrated
 DEFAULT_THRESHOLD 0.55 / DEFAULT_MARGIN 0.10   provisional default
 ```
 
-`status()` reports `margin_source` and, per profile, `threshold_source`. There is
-no hidden threshold source.
+`status()` reports `threshold_source`, `margin_source`, and per profile both
+`effective_threshold` (what will actually judge it now) and `stored_threshold`
+(history). There is no hidden threshold source, and `status()` and the matcher
+read the same policy object, so they cannot disagree.
+
+**A stale calibration is inert.** Adding a profile, deleting a covered one, a
+model/revision change, or clearing the record all return every decision to the
+provisional defaults — the stored per-profile numbers stay in SQLite as history
+but stop voting. Invalidation lives in `SpeakerService.enrol()`/`delete()`, not
+in the HTTP router, so a direct non-HTTP caller cannot leave a stale fit
+standing.
 
 `/stt` diagnostics now report the **effective** threshold that actually decided —
 previously they reported the global fallback even when a per-profile value was
@@ -170,3 +196,24 @@ person have completed the harness and the fresh validation set has passed:
 
 An `unknown` or `ambiguous` result counts as a false reject, not a false
 identity. A single swap in either direction is an immediate fail.
+
+### Recognition PASS is not P5.2 PASS
+
+The harness reports two verdicts, and they are not the same thing:
+
+```
+RECOGNITION VALIDATION   PASS | FAIL
+P5.2 HUMAN ACCEPTANCE    NOT COMPLETE | PASS | FAIL
+```
+
+Acceptance requires **all** of: exactly two compatible profiles; ≥5 kept samples
+each; calibration applied; `threshold_calibrated == true`; 0/20 swaps with ≥9/10
+per speaker; the live memory-attribution sentinel; the unverified privacy check;
+the permission regression; and the latency measurement. Anything not yet run
+reads **NOT COMPLETE** — never PASS.
+
+Steps 9–11 cover those: memory attribution through the real
+`/stt → voice_turn_id → /chat` pipeline (Marcus and the guest each retrieve only
+their own sentinel, an unverified turn gets neither), the permission regression,
+and `/stt` latency with speaker OFF vs ON plus the delta. Latency is reported as
+`identify_ms` — the whole `identify()` call — not mislabelled as embedding-only.

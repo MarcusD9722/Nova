@@ -101,12 +101,7 @@ async def delete_profile(profile_id: str) -> dict[str, Any]:
     ok = await _service().delete(profile_id)
     if not ok:
         raise HTTPException(status_code=404, detail="no such profile")
-    # A removed profile invalidates any calibration that covered it: the fit
-    # described a population that no longer exists.
-    try:
-        await _service().calib.clear()
-    except Exception:  # noqa: BLE001
-        pass
+    # SpeakerService.delete() invalidates the calibration centrally.
     return {"ok": True, "deleted": profile_id}
 
 
@@ -136,7 +131,11 @@ async def enroll(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(e)[:300]) from e
 
-    kept = int(result.get("sample_count") or 0)
+    # Top-level `sample_count` is part of the enrollment contract (see
+    # SpeakerService.enrol); the nested profile is the fallback for any older
+    # caller. Reading only the nested one reported every success as 0 kept.
+    kept = int(result.get("sample_count")
+               or (result.get("profile") or {}).get("sample_count") or 0)
     result["min_kept_required"] = MIN_KEPT_SAMPLES
     result["meets_p52_bar"] = kept >= MIN_KEPT_SAMPLES
     if not result["meets_p52_bar"]:
@@ -145,11 +144,8 @@ async def enroll(
         # profile that P5.2 would not stand behind.
         result["note"] = (f"kept {kept} of {len(samples)}; P5.2 requires "
                           f"{MIN_KEPT_SAMPLES}. Re-record the rejected samples.")
-    # Enrolling anyone changes the population the calibration was fitted on.
-    try:
-        await svc.calib.clear()
-    except Exception:  # noqa: BLE001
-        pass
+    # Invalidation lives in SpeakerService.enrol now, so a direct non-HTTP
+    # caller cannot leave a stale fit standing.
     return result
 
 

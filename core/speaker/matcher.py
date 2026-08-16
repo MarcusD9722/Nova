@@ -153,10 +153,20 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def match(embedding: np.ndarray | None, profiles: Iterable[SpeakerProfile],
-          *, thresh: float | None = None, min_margin: float | None = None) -> SpeakerMatch:
-    """Score against every compatible profile and decide honestly."""
+          *, thresh: float | None = None, min_margin: float | None = None,
+          policy: Any = None) -> SpeakerMatch:
+    """Score against every compatible profile and decide honestly.
+
+    `policy` is the resolved effective policy (V3 P5.2 closure). When supplied it
+    is the ONLY source of thresholds — the matcher no longer reads
+    `profile.threshold` on its own, because a stored value survives its
+    calibration going stale and would otherwise keep deciding after nobody
+    stands behind it.
+    """
     thresh = threshold() if thresh is None else thresh
     min_margin = margin() if min_margin is None else min_margin
+    if policy is not None:
+        min_margin = float(policy.margin)
 
     if embedding is None:
         return SpeakerMatch(status=STATUS_UNAVAILABLE, reason="no embedding")
@@ -177,8 +187,15 @@ def match(embedding: np.ndarray | None, profiles: Iterable[SpeakerProfile],
     top_score, top = scored[0]
     second_score, second = (scored[1] if len(scored) > 1 else (None, None))
 
-    # A per-profile threshold wins if calibration produced one.
-    effective = top.threshold if top.threshold is not None else thresh
+    # Precedence lives in the policy, not here. Without one (a direct call in a
+    # test or a tool), fall back to the legacy per-profile behaviour.
+    if policy is not None:
+        effective = policy.threshold_for(top.profile_id)
+        source = policy.threshold_source
+    elif top.threshold is not None:
+        effective, source = top.threshold, "profile"
+    else:
+        effective, source = thresh, "default"
 
     result = SpeakerMatch(
         similarity=top_score, second_best_similarity=second_score,
@@ -188,7 +205,7 @@ def match(embedding: np.ndarray | None, profiles: Iterable[SpeakerProfile],
         # the fallback while deciding on a calibrated per-profile value made the
         # diagnostic describe a decision that was never made.
         threshold=effective,
-        threshold_source=("profile" if top.threshold is not None else "default"),
+        threshold_source=source,
         margin=min_margin,
     )
 

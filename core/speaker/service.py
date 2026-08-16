@@ -38,7 +38,8 @@ from core.speaker import matcher as M
 from core.speaker.backend import (EMBEDDER, MODEL_ID, MODEL_REVISION,
                                   command_quality, enabled)
 from core.speaker.matcher import SpeakerMatch, check_sample
-from core.speaker.calibration import CalibrationStore
+from core.speaker.calibration import (CalibrationStore, calibration_covers,
+                                      resolve_policy)
 from core.speaker.registry import SpeakerProfile, SpeakerRegistry, new_profile_id
 from core.speaker.voice_turns import (VOICE_TURN_MAX, VOICE_TURN_TTL_S,
                                       VOICE_TURNS)
@@ -134,10 +135,9 @@ class SpeakerService:
                                     attempted=True)
 
             profiles = await self.registry.matchable()
-            # A valid calibration supplies the margin; per-profile thresholds
-            # already ride on the profiles themselves (V3 P5.2). Falls back to
-            # the provisional defaults when nothing has been calibrated.
-            result = M.match(emb, profiles, min_margin=await self.effective_margin())
+            # ONE resolved policy for the decision AND its diagnostics, so
+            # status() and matching can never disagree (V3 P5.2 closure).
+            result = M.match(emb, profiles, policy=await self.policy())
             result.attempted = True
             self.stats[result.status] = self.stats.get(result.status, 0) + 1
             return result
@@ -235,9 +235,19 @@ class SpeakerService:
 
         self.stats["enrolments"] += 1
         existing = await self.registry.by_name(name)
+        await self._invalidate_calibration(f"enrolled {profile.profile_id}")
+        # Flat AND nested (V3 P5.2 closure). The router and the browser harness
+        # both read top-level `profile_id` / `sample_count`; only the nested
+        # shape existed, so a successful enrollment reported 0 kept samples and
+        # the harness never learned the profile ids it needs for every later
+        # step. Keeping `profile` too means no existing caller breaks.
         return {
             "ok": True,
             "profile": profile.describe(),
+            "profile_id": profile.profile_id,
+            "display_name": profile.display_name,
+            "role": profile.role,
+            "sample_count": profile.sample_count,
             "rejected": rejected,
             "consistency": round(built.consistency or 0.0, 4),
             "dropped_outliers": built.dropped,
@@ -249,7 +259,10 @@ class SpeakerService:
 
     async def delete(self, profile_id: str) -> bool:
         await self.initialize()
-        return await self.registry.delete(profile_id)
+        ok = await self.registry.delete(profile_id)
+        if ok:
+            await self._invalidate_calibration(f"deleted {profile_id}")
+        return ok
 
     async def profiles(self) -> list[dict[str, Any]]:
         await self.initialize()
@@ -267,12 +280,35 @@ class SpeakerService:
             return None
         return rec
 
+    async def policy(self):
+        """The ONE effective policy: env override -> calibration -> default."""
+        try:
+            profiles = await self.registry.all()
+        except Exception:  # noqa: BLE001
+            profiles = []
+        return resolve_policy(
+            profiles, await self.calibration(),
+            env_threshold=_env_threshold(), env_margin=_env_margin(),
+            default_threshold=M.DEFAULT_THRESHOLD, default_margin=M.DEFAULT_MARGIN,
+        )
+
     async def effective_margin(self) -> float:
-        """Calibrated margin if valid, else the env/provisional default."""
-        rec = await self.calibration()
-        if rec is not None and _env_margin() is None:
-            return float(rec.margin)
-        return M.margin()
+        return (await self.policy()).margin
+
+    async def _invalidate_calibration(self, why: str) -> None:
+        """Enrolling or deleting changes the population the fit described.
+
+        Central, in the PRODUCTION layer rather than the HTTP router: a direct
+        `SpeakerService.enrol()` or `.delete()` must invalidate calibration too,
+        or a legitimate non-HTTP caller leaves a fit standing for a population
+        that no longer exists (V3 P5.2 closure).
+        """
+        try:
+            if await self.calib.load() is not None:
+                await self.calib.clear()
+                logger.info("speaker_calibration_invalidated", reason=why)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("speaker_calibration_invalidate_failed", error=str(e)[:160])
 
     async def status(self) -> dict[str, Any]:
         await self.initialize()
@@ -286,29 +322,16 @@ class SpeakerService:
             profiles = []
 
         rec = await self.calibration()
-        env_margin = _env_margin()
-        # Calibration is only real when it covers every compatible profile: a
-        # newly enrolled speaker makes it honestly stale rather than partly
-        # true, and "partly calibrated" is not a claim worth making (V3 P5.2).
-        compatible = [p for p in profiles if p.compatible]
-        covered = (rec is not None
-                   and compatible
-                   and all(p.profile_id in set(rec.profile_ids) for p in compatible)
-                   and all(p.threshold is not None for p in compatible))
-
-        if env_margin is not None:
-            margin_source = "env override"
-        elif rec is not None:
-            margin_source = "calibrated"
-        else:
-            margin_source = "provisional default"
+        pol = await self.policy()
+        covered = calibration_covers(rec, profiles)
 
         return {
             **EMBEDDER.status(),
             **reg,
-            "threshold": M.threshold(),
-            "margin": await self.effective_margin(),
-            "margin_source": margin_source,
+            "threshold": pol.default_threshold,
+            "threshold_source": pol.threshold_source,
+            "margin": pol.margin,
+            "margin_source": pol.margin_source,
             "threshold_calibrated": bool(covered),
             "calibrated_at": (rec.calibrated_at if rec else None),
             "calibration_protocol": (rec.protocol_version if rec else None),
@@ -321,10 +344,11 @@ class SpeakerService:
                     "profile_id": p.profile_id,
                     "name": p.display_name,
                     "role": p.role,
-                    "calibrated_threshold": p.threshold,
-                    "threshold_source": ("calibrated" if p.threshold is not None
-                                         else ("env override" if _env_threshold() is not None
-                                               else "provisional default")),
+                    # What this profile would ACTUALLY be judged by right now —
+                    # a stored threshold is inert while calibration is invalid.
+                    "effective_threshold": pol.threshold_for(p.profile_id),
+                    "threshold_source": pol.threshold_source,
+                    "stored_threshold": p.threshold,
                     "sample_count": p.sample_count,
                     "consistency": p.consistency,
                     "compatible": p.compatible,

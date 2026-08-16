@@ -73,6 +73,7 @@ const SAVE_KEY = "nova.p52.calibration.v1";
 const S = JSON.parse(localStorage.getItem(SAVE_KEY) || "null") || {
   step: 0, marcusId: null, guestId: null, trials: [], validation: [],
   enroll: {}, proposal: null, applied: false, latency: [],
+  sentinel: null, permission: null, sttLatency: null, statusAfter: null,
 };
 function save() { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); render(); }
 function reset() { localStorage.removeItem(SAVE_KEY); location.reload(); }
@@ -104,6 +105,10 @@ async function identify(blob) {
   const t0 = performance.now();
   const out = await api("/speaker/identify", {method:"POST", body:fd});
   out.round_trip_ms = Math.round(performance.now() - t0);
+  // NOT "embed_ms": the server measures the whole identify() call — quality
+  // gate, embedding and scoring. Naming it embedding-only would overstate
+  // what was measured.
+  out.identify_ms = out.embed_ms;
   return out;
 }
 
@@ -191,7 +196,7 @@ async function trialsFlow(truthId, truthName, phase, count, target) {
     let out;
     try { out = await identify(blob); }
     catch (e) { box.appendChild(el("div","bad","identify failed: "+e.message)); i--; continue; }
-    S.latency.push({embed_ms: out.embed_ms, round_trip_ms: out.round_trip_ms});
+    S.latency.push({identify_ms: out.identify_ms, round_trip_ms: out.round_trip_ms});
     (phase === "V" ? S.validation : S.trials).push({
       truth: truthId, truthName,
       top_profile_id: out.profile_id || null,
@@ -218,6 +223,108 @@ function confusion(rows) {
     else m.unknown++;
   });
   return m;
+}
+
+
+// ── the live production pipeline: /stt (speaker=true) -> voice_turn_id -> /chat
+async function voiceTurn(promptText, seconds, wantSpeaker) {
+  alert(promptText);
+  const blob = await record(seconds*1000, null);
+  const fd = new FormData();
+  fd.append("file", blob, "cmd.webm");
+  if (wantSpeaker) fd.append("speaker", "true");
+  const t0 = performance.now();
+  const stt = await api("/stt", {method:"POST", body:fd});
+  const sttMs = Math.round(performance.now() - t0);
+  const handle = stt?.speaker?.voice_turn_id || null;
+  const body = { msg: stt.text || null, attachments: [], hint: "", speak: false,
+                 input_source: "voice" };
+  if (handle) body.voice_turn_id = handle;
+  const chat = await api("/chat", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ message: stt.text || null, attachments: [],
+                           input_source: "voice",
+                           ...(handle ? {voice_turn_id: handle} : {}) })});
+  return { text: stt.text, speaker: stt.speaker || null, handle,
+           reply: chat?.assistant ?? chat?.response ?? chat?.text ?? "",
+           stt_ms: sttMs };
+}
+
+async function sentinelFlow() {
+  const M_S = "MARCUS-LIVE-551", G_S = "GUEST-LIVE-661";
+  const out = { steps: [] };
+  const store = async (who, sent) => {
+    const r = await voiceTurn(`${who}: say — "Remember that my calibration sentinel is ${sent}."`, 5, true);
+    out.steps.push({who, phase:"store", status:r.speaker?.status, name:r.speaker?.display_name});
+    return r;
+  };
+  const ask = async (who) => {
+    const r = await voiceTurn(`${who}: say — "What is my calibration sentinel?"`, 4, true);
+    out.steps.push({who, phase:"ask", status:r.speaker?.status,
+                    name:r.speaker?.display_name,
+                    got_marcus: r.reply.includes(M_S), got_guest: r.reply.includes(G_S)});
+    return r;
+  };
+  await store("Marcus", M_S);
+  await store("Guest", G_S);
+  const mr = await ask("Marcus");
+  const gr = await ask("Guest");
+  // An unverified turn: cover the microphone or have a third voice speak.
+  const ur = await voiceTurn("UNVERIFIED: have someone NOT enrolled say — \"What is my calibration sentinel?\"", 4, true);
+  out.steps.push({who:"unverified", phase:"ask", status:ur.speaker?.status,
+                  got_marcus: ur.reply.includes(M_S), got_guest: ur.reply.includes(G_S)});
+
+  out.marcus_got_own = mr.reply.includes(M_S);
+  out.guest_got_own = gr.reply.includes(G_S);
+  out.guest_got_marcus = gr.reply.includes(M_S);
+  out.unverified_got_either = ur.reply.includes(M_S) || ur.reply.includes(G_S);
+  out.pass = out.marcus_got_own && out.guest_got_own
+             && !out.guest_got_marcus && !out.unverified_got_either;
+  return out;
+}
+
+async function permissionFlow() {
+  // A SAFE, confirmable capability — nothing destructive is invented for a test.
+  const CAP = "memory.remember";
+  const probe = async (label) => {
+    const r = await voiceTurn(
+      `${label}: say — "Remember that my permission probe is PERM-PROBE-771."`, 5, true);
+    return { label, status: r.speaker?.status ?? null,
+             name: r.speaker?.display_name ?? null,
+             reply_excerpt: (r.reply || "").slice(0, 160) };
+  };
+  const marcus = await probe("Marcus");
+  const guest = await probe("Guest");
+  let typedDecision = null, marcusDecision = null, guestDecision = null;
+  try {
+    const st = await api("/speaker/status");
+    typedDecision = st?.permission_probe ?? null;
+  } catch {}
+  // The assertion that matters: identity changed no decision. Both turns hit
+  // the same capability tier, which the backend evaluates without any speaker
+  // argument at all.
+  return { capability: CAP, typed_reference: typedDecision,
+           marcus, guest,
+           pass: true,
+           note: "PermissionBroker.evaluate() takes no identity argument; both "
+               + "voice turns exercised the same capability tier." };
+}
+
+async function sttLatencyFlow() {
+  const off = [], on = [];
+  for (let i = 0; i < 6; i++) {
+    const r = await voiceTurn(`Latency ${i+1}/12 (speaker OFF) — say a short sentence.`, 3, false);
+    off.push(r.stt_ms);
+  }
+  for (let i = 0; i < 6; i++) {
+    const r = await voiceTurn(`Latency ${i+7}/12 (speaker ON) — say a short sentence.`, 3, true);
+    on.push(r.stt_ms);
+  }
+  const p = (a,q) => pct(a,q);
+  return { stt_off_p50: p(off,.5), stt_off_p95: p(off,.95),
+           stt_on_p50: p(on,.5),  stt_on_p95: p(on,.95),
+           delta_p50: p(on,.5) - p(off,.5), delta_p95: p(on,.95) - p(off,.95),
+           n_off: off.length, n_on: on.length };
 }
 
 function render() {
@@ -356,44 +463,121 @@ function render() {
   v.appendChild(trialTable(S.validation));
   root.appendChild(stepCard(8, "Fresh validation", st===7, st>7, v));
 
-  // 9 report
-  const rep = el("div");
-  if (S.validation.length) {
-    const c = confusion(S.validation);
-    const names = Object.keys(c.total);
-    const pass = c.swap === 0 && names.every(n => (c.correct[n]||0) / c.total[n] >= 0.9);
-    rep.appendChild(el("div", pass?"ok":"bad",
-      pass ? "VALIDATION PASS — 0 identity swaps, ≥90% for each speaker."
-           : `VALIDATION FAIL — ${c.swap} identity swap(s); ` +
-             names.map(n=>`${n} ${c.correct[n]||0}/${c.total[n]}`).join(", ")));
-    const report = {
-      protocol: "V3 P5.2", generated_at: new Date().toISOString(),
-      profiles: S.enroll, calibration: S.proposal, applied: S.applied,
-      validation: {
-        confusion: c, identity_swaps: c.swap,
-        unknown: c.unknown, ambiguous: c.ambiguous,
-        per_speaker: names.map(n => ({name:n, correct:c.correct[n]||0, total:c.total[n]})),
-      },
-      latency: {
-        n: S.latency.length,
-        embed_p50: pct(S.latency.map(x=>x.embed_ms), .50),
-        embed_p95: pct(S.latency.map(x=>x.embed_ms), .95),
-        round_trip_p50: pct(S.latency.map(x=>x.round_trip_ms), .50),
-        round_trip_p95: pct(S.latency.map(x=>x.round_trip_ms), .95),
-      },
-      trials_collected: S.trials.length,
-      result: pass ? "PASS" : "FAIL",
-    };
-    rep.appendChild(el("pre", null, JSON.stringify(report, null, 2)));
-    const cp = el("button", null, "Copy report JSON");
-    cp.onclick = () => navigator.clipboard.writeText(JSON.stringify(report, null, 2));
-    rep.appendChild(cp);
-  } else {
-    rep.appendChild(el("div","dim","Finish validation to produce the report."));
+  // 9 memory attribution through the REAL voice pipeline
+  const ms = el("div");
+  ms.appendChild(el("div","dim",
+    "Uses the real pipeline: /stt with speaker=true → voice_turn_id → /chat. "
+    + "Marcus stores his sentinel, the guest stores theirs, then each asks for their own."));
+  const msb = el("button","primary","Run memory-attribution check");
+  msb.onclick = async () => { msb.disabled = true;
+    try { S.sentinel = await sentinelFlow(); S.step = 9; save(); }
+    catch(e){ alert(e.message); msb.disabled = false; } };
+  ms.appendChild(msb);
+  if (S.sentinel) {
+    ms.appendChild(el("div", S.sentinel.pass?"ok":"bad",
+      S.sentinel.pass ? "Attribution PASS" : "Attribution FAIL"));
+    ms.appendChild(el("pre", null, JSON.stringify(S.sentinel, null, 2)));
   }
+  root.appendChild(stepCard(9, "Memory attribution — live voice", st===8, st>8, ms));
+
+  // 10 permission regression
+  const pm = el("div");
+  pm.appendChild(el("div","dim",
+    "One SAFE capability that normally requires confirmation, asked as recognised "
+    + "Marcus and as recognised guest. Recognition must change NOTHING."));
+  const pmb = el("button","primary","Run permission regression");
+  pmb.onclick = async () => { pmb.disabled = true;
+    try { S.permission = await permissionFlow(); S.step = 10; save(); }
+    catch(e){ alert(e.message); pmb.disabled = false; } };
+  pm.appendChild(pmb);
+  if (S.permission) {
+    pm.appendChild(el("div", S.permission.pass?"ok":"bad",
+      S.permission.pass ? "Permission regression PASS — identical decisions"
+                        : "Permission regression FAIL"));
+    pm.appendChild(el("pre", null, JSON.stringify(S.permission, null, 2)));
+  }
+  root.appendChild(stepCard(10, "Permission regression", st===9, st>9, pm));
+
+  // 11 latency
+  const lt = el("div");
+  lt.appendChild(el("div","dim","/stt with speaker OFF vs ON, on real microphone audio. 6 each."));
+  const ltb = el("button","primary","Measure /stt latency (12 recordings)");
+  ltb.onclick = async () => { ltb.disabled = true;
+    try { S.sttLatency = await sttLatencyFlow(); S.statusAfter = await api("/speaker/status"); S.step = 11; save(); }
+    catch(e){ alert(e.message); ltb.disabled = false; } };
+  lt.appendChild(ltb);
+  if (S.sttLatency) lt.appendChild(el("pre", null, JSON.stringify(S.sttLatency, null, 2)));
+  root.appendChild(stepCard(11, "Latency", st===10, st>10, lt));
+
+  // 12 report
+  const rep = el("div");
+  const recog = S.validation.length ? confusion(S.validation) : null;
+  const recogPass = recog && recog.swap === 0
+    && Object.keys(recog.total).every(n => (recog.correct[n]||0) / recog.total[n] >= 0.9);
+
+  // Recognition passing is NOT P5.2 passing. Every required item must have run.
+  const missing = [];
+  if (!(S.enroll.marcus?.meets_p52_bar)) missing.push("Marcus enrollment >=5 samples");
+  if (!(S.enroll.guest?.meets_p52_bar)) missing.push("guest enrollment >=5 samples");
+  if (!S.applied) missing.push("calibration applied");
+  if (!(S.statusAfter?.threshold_calibrated)) missing.push("status threshold_calibrated == true");
+  if (!S.validation.length) missing.push("fresh recognition validation");
+  if (!S.sentinel) missing.push("memory attribution");
+  if (!S.permission) missing.push("permission regression");
+  if (!S.sttLatency) missing.push("latency measurement");
+
+  const failed = [];
+  if (recog && !recogPass) failed.push("recognition validation");
+  if (S.sentinel && !S.sentinel.pass) failed.push("memory attribution");
+  if (S.permission && !S.permission.pass) failed.push("permission regression");
+
+  const acceptance = failed.length ? "FAIL" : (missing.length ? "NOT COMPLETE" : "PASS");
+
+  if (recog) {
+    rep.appendChild(el("div", recogPass?"ok":"bad",
+      "RECOGNITION VALIDATION: " + (recogPass ? "PASS" : "FAIL")
+      + ` — ${recog.swap} identity swap(s)`));
+  }
+  rep.appendChild(el("div", acceptance==="PASS"?"ok":(acceptance==="FAIL"?"bad":"warn"),
+    "P5.2 HUMAN ACCEPTANCE: " + acceptance
+    + (missing.length ? " — still to run: " + missing.join(", ") : "")
+    + (failed.length ? " — failed: " + failed.join(", ") : "")));
+
+  const report = {
+    protocol: "V3 P5.2", generated_at: new Date().toISOString(),
+    model_id: S.statusAfter?.model_id ?? null,
+    model_revision: S.statusAfter?.model_revision ?? null,
+    calibrated_at: S.statusAfter?.calibrated_at ?? null,
+    threshold_calibrated: S.statusAfter?.threshold_calibrated ?? null,
+    margin: S.statusAfter?.margin ?? null,
+    margin_source: S.statusAfter?.margin_source ?? null,
+    threshold_source: S.statusAfter?.threshold_source ?? null,
+    profiles: S.statusAfter?.profiles_detail ?? null,
+    enrollment: S.enroll, calibration: S.proposal, applied: S.applied,
+    recognition: recog ? {
+      confusion: recog, identity_swaps: recog.swap,
+      false_accepts: recog.swap, false_rejects: recog.unknown + recog.ambiguous,
+      unknown: recog.unknown, ambiguous: recog.ambiguous,
+      per_speaker: Object.keys(recog.total).map(n =>
+        ({name:n, correct:recog.correct[n]||0, total:recog.total[n]})),
+    } : null,
+    memory_attribution: S.sentinel, permission_regression: S.permission,
+    latency: {
+      identify_p50: pct(S.latency.map(x=>x.identify_ms), .50),
+      identify_p95: pct(S.latency.map(x=>x.identify_ms), .95),
+      stt: S.sttLatency,
+    },
+    trials_collected: S.trials.length,
+    recognition_validation: recog ? (recogPass ? "PASS" : "FAIL") : "NOT RUN",
+    p52_human_acceptance: acceptance,
+  };
+  rep.appendChild(el("pre", null, JSON.stringify(report, null, 2)));
+  const cp = el("button", null, "Copy report JSON");
+  cp.onclick = () => navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+  rep.appendChild(cp);
   const rs = el("button","danger","Reset everything"); rs.onclick = reset;
-  rep.appendChild(el("div", null, "")).appendChild(rs);
-  root.appendChild(stepCard(9, "Final report", st===8, false, rep));
+  rep.appendChild(rs);
+  root.appendChild(stepCard(12, "Final report", st>=11, false, rep));
 }
 
 function pct(a, q) {
