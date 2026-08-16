@@ -368,6 +368,92 @@ def seed_decisions() -> list[Decision]:
                         "only for events carrying a scope — ordinary turns never reach it.",
             decided_at="2026-08-14T00:00:00+00:00",
         ),
+        Decision(
+            id="D11",
+            title="Speaker read scope is a positive allow-list at the data layer",
+            decision="A speaker's read scope is decided by may_read_entity() in "
+                     "core/turn_identity.py and applied inside MemoryUnifier.search(), "
+                     "the single point every semantic read passes through. It is an "
+                     "ALLOW-list: shared entities (world, system, capability) are "
+                     "readable by anyone, the owner reads everything, a "
+                     "known guest reads their own namespace plus shared, and anything not "
+                     "positively recognised is refused. The disk cache key includes the "
+                     "speaker AND cached results are re-filtered on the way out.",
+            rationale="P5.1 enforced privacy in grounding only. Measured on 78cba4d: the "
+                      "memory.recall TOOL returned Marcus's private fact to an unknown "
+                      "speaker on request — a boundary enforced only in grounding is one "
+                      "tool call wide, and the model can make that call. An allow-list "
+                      "rather than a deny-list because a personal entity added in a later "
+                      "phase must be private by default rather than public by oversight. "
+                      "'note' is deliberately excluded from shared: it is free-form and "
+                      "routinely holds personal material, and 'not stored under user' is "
+                      "not the same as 'public'.",
+            alternatives=["Instructing the model not to reveal other speakers' data "
+                          "(rejected: a prompt is not a boundary, and the audit measured "
+                          "the model reading around it with a tool call)",
+                          "Filtering at each caller (rejected: a caller that forgot would "
+                          "be a silent leak, and there are three independent read paths)",
+                          "A deny-list of private entities (rejected: fails open for every "
+                          "entity anyone adds later)"],
+            evidence=["tests/test_speaker_privacy_v51d.py: owner sees his own facts; a "
+                      "guest sees theirs plus shared and never his; an unknown speaker "
+                      "sees shared only; a cache warmed by the owner is not replayed to "
+                      "the next speaker; memory.recall refuses an unverified speaker"],
+            subsystem="memory",
+            source_refs=["core/turn_identity.py::may_read_entity",
+                         "memory/unifier.py::_filter_hits_for_scope",
+                         "core/tooling.py::_memory_recall"],
+            constraints="The filter is a no-op for the owner, byte for byte, so pre-P5 "
+                        "behaviour is unchanged. It must stay inside search() rather than "
+                        "moving to callers. The cache key alone is insufficient — cached "
+                        "results are re-filtered, because a key still trusts whatever was "
+                        "stored under it.",
+            decided_at="2026-08-15T00:00:00+00:00",
+        ),
+        Decision(
+            id="D12",
+            title="Identity crosses an async boundary by snapshot, never by inheritance",
+            decision="MemoryIngestEvent carries a TurnIdentity snapshot taken where the "
+                     "turn ran. The ingest worker re-enters it with active_turn() and "
+                     "routes every extracted fact through remap_entity_for(). An event "
+                     "with no identity is treated as legacy owner semantics; an identity "
+                     "that resolves to nobody discards the fact rather than redirecting "
+                     "it.",
+            rationale="P5.1 scoped the live turn with a ContextVar. A ContextVar does not "
+                      "cross a queue. The background extractor writes the DURABLE facts, "
+                      "seconds to minutes after the speaker has gone, on a worker task "
+                      "that never entered active_turn — so it read the typed default and "
+                      "filed every guest's first-person statement under `user`. This is "
+                      "the write that mattered most and the one the synchronous fix "
+                      "missed entirely. None must mean 'write nowhere': turning it back "
+                      "into a default is the exact failure the whole phase exists to "
+                      "prevent.",
+            alternatives=["contextvars.copy_context() into the worker (rejected: the "
+                          "worker is long-lived and processes a queue; there is no single "
+                          "context to copy, and it would bind whichever turn happened to "
+                          "start it)",
+                          "Reading current_identity() in the worker (rejected: this IS "
+                          "the bug — it yields whoever is speaking when the backlog "
+                          "drains, or the default when nobody is)",
+                          "Passing a profile_id string (rejected: the worker would have "
+                          "to re-derive attempted/status/role, i.e. reimplement the "
+                          "attribution matrix in a second place)"],
+            evidence=["tests/test_speaker_ingest_v51d.py: a guest's spouse is filed under "
+                      "speaker:<id> and never under user; an unverified speaker's fact is "
+                      "written NOWHERE (asserted against the facts table, not just "
+                      "Marcus's namespace); the worker ignores an ambient owner identity "
+                      "active while it drains; an identity-less legacy event still writes "
+                      "to user"],
+            subsystem="memory",
+            source_refs=["core/events.py::MemoryIngestEvent.identity",
+                         "core/workers/memory_ingest.py::_handle_ingest",
+                         "core/turn_identity.py::remap_entity_for"],
+            constraints="The snapshot is taken at enqueue in RuntimeManager._finish. The "
+                        "worker must never fall back to current_identity(). Conversation "
+                        "summaries stay unscoped on purpose — they are conversation-level, "
+                        "not person-level — and run outside the active_turn block.",
+            decided_at="2026-08-15T00:00:00+00:00",
+        ),
     ]
 
 

@@ -13,6 +13,8 @@ from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
 from core.conversation_state import ConversationStateStore
 from core.turn_gate import GATE
+from core.turn_identity import (TurnIdentity, active_turn, remap_entity_for,
+                                turn_speaker_label)
 from core.workers.lifecycle import log_worker_error, stop_worker
 from memory.unifier import MemoryUnifier
 
@@ -107,6 +109,15 @@ class MemoryIngestWorker:
             await self._drain_summarize_hints(max_items=1)
 
     async def _handle_ingest(self, ev: MemoryIngestEvent) -> None:
+        # Re-enter the speaker's identity for the whole of this event. It comes
+        # off the event, never off this task's ContextVar: this worker runs long
+        # after the turn ended and would otherwise see the typed default and
+        # quietly write a guest's evening into Marcus's memory.
+        ident = ev.identity or TurnIdentity.typed()
+        with active_turn(ident):
+            await self._ingest_scoped(ev, ident)
+
+    async def _ingest_scoped(self, ev: MemoryIngestEvent, ident: TurnIdentity) -> None:
         user_text = (ev.user_message or "").strip()
         assistant_text = (ev.assistant_message or "").strip()
 
@@ -138,13 +149,21 @@ class MemoryIngestWorker:
                     continue
                 if f.confidence < 0.55:
                     continue
+                # The extractor speaks in first person and always says
+                # entity="user". Decide whose "user" that was before writing.
+                entity = remap_entity_for(f.entity, ident)
+                if entity is None:
+                    logger.debug("memory_extract_suppressed_unverified",
+                                 attribute=str(f.attribute)[:40])
+                    continue
                 # Retire anything this contradicts BEFORE writing it, so the
                 # two never coexist. Skipped for singleton attributes, which
                 # already supersede by key and need no model call.
-                if not self._memory._is_singleton_fact(f.entity, f.attribute):
-                    await self._reconcile(entity=f.entity, attribute=f.attribute, value=f.value)
+                if not self._memory._is_singleton_fact(entity, f.attribute):
+                    await self._reconcile(entity=entity, attribute=f.attribute,
+                                          value=f.value, ident=ident)
                 await self._memory.add_fact(
-                    entity=f.entity, attribute=f.attribute, value=f.value,
+                    entity=entity, attribute=f.attribute, value=f.value,
                     confidence=float(f.confidence),
                     # None lets the unifier's default stand for unremarkable
                     # moments, so identity facts keep their own high floor
@@ -160,12 +179,16 @@ class MemoryIngestWorker:
                 value = str(mf.get("value") or "").strip()
                 conf = float(mf.get("confidence") or 0.7)
                 persist = bool(mf.get("persist", True))
-                if entity and attribute and value and persist:
-                    await self._memory.add_fact(entity=entity, attribute=attribute, value=value, confidence=conf)
+                # Same routing as the extractor. These come from the policy
+                # layer rather than a model, but they describe the same speaker.
+                target = remap_entity_for(entity, ident) if entity else None
+                if target and attribute and value and persist:
+                    await self._memory.add_fact(entity=target, attribute=attribute, value=value, confidence=conf)
             except Exception:
                 continue
 
-    async def _reconcile(self, *, entity: str, attribute: str, value: str) -> None:
+    async def _reconcile(self, *, entity: str, attribute: str, value: str,
+                         ident: TurnIdentity | None = None) -> None:
         """Retire anything the new fact contradicts, before writing it.
 
         Singleton attributes already supersede by key, so this covers the case
@@ -187,9 +210,13 @@ class MemoryIngestWorker:
             return
 
         listed = "\n".join(f"{i + 1}. {c.value[:200]}" for i, c in enumerate(candidates))
+        # Whose beliefs are being reconciled? The prompt used to assert Marcus
+        # unconditionally, which told the judge that a guest's statement was his
+        # and invited it to retire his real facts as "out of date".
+        who = turn_speaker_label(ident or TurnIdentity.typed())
         prompt = (
-            "Marcus just told Nova something new. Decide whether it CONTRADICTS anything she "
-            "already believes, so the outdated belief can be retired.\n\n"
+            f"{who} just told Nova something new. Decide whether it CONTRADICTS anything she "
+            f"already believes about {who}, so the outdated belief can be retired.\n\n"
             f"NEW: {value[:300]}\n\nEXISTING:\n{listed}\n\n"
             "For each existing item choose one:\n"
             "  CONTRADICTS - cannot both be true now; the old one is out of date\n"

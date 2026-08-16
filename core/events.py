@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from core.turn_identity import TurnIdentity
+
 
 @dataclass(frozen=True)
 class MemoryIngestEvent:
@@ -13,6 +15,13 @@ class MemoryIngestEvent:
     assistant_message: str
     timestamp: datetime
     policy_memory_facts: list[dict[str, Any]] = field(default_factory=list)
+    #: Who said `user_message` (V3 P5.1d). Snapshotted where the turn ran,
+    #: because this event is handled later, on a worker task that never entered
+    #: `active_turn` — a ContextVar would read the typed default there and file
+    #: every guest's words under Marcus. Defaults to None so the worker can tell
+    #: "pre-P5.1d event" from "identity resolved to nobody"; None is treated as
+    #: legacy owner semantics, which is what those events actually were.
+    identity: TurnIdentity | None = None
 
 
 @dataclass(frozen=True)

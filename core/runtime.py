@@ -253,6 +253,56 @@ class ChatTurnResult:
     tool_calls: list[dict[str, Any]]
 
 
+
+def _speaker_label() -> str:
+    """How to name whoever is speaking, in prompt text (V3 P5.1d).
+
+    "Marcus is referring to item 2" was hardcoded, so an artifact reference
+    told the model a guest was Marcus.
+    """
+    from core.turn_identity import current_identity
+
+    ident = current_identity()
+    if ident.is_owner:
+        return "Marcus"
+    if ident.is_known_other and ident.display_name:
+        return ident.display_name
+    return "The speaker"
+
+
+def _guest_persona(ident) -> str:
+    """Nova's persona for someone who is not Marcus.
+
+    Still Nova — warm, direct, no help-desk filler. What is removed is
+    everything that belongs to Marcus: his name as the addressee, his children,
+    his wife, and the instruction to react to what *he* said. A guest must not
+    be told they are him, and must not be handed his life as small talk.
+    """
+    if ident.is_known_other and ident.display_name:
+        who = (f"You are speaking with {ident.display_name}, who is NOT Marcus. "
+               f"Address them as {ident.display_name}.")
+    else:
+        who = ("You are speaking with someone whose voice Nova does not "
+               "recognise. Do not assume this is Marcus and do not address them "
+               "as him.")
+    return (
+        "You are Nova — a warm, sharp, local AI assistant. You belong to Marcus, "
+        "but he is not the person speaking right now.\n\n"
+        f"{who}\n\n"
+        "How you talk:\n"
+        "- Talk like a real person. React to what they actually said first.\n"
+        "- Be helpful and direct. Never use help-desk filler ('How can I help "
+        "you', 'Is there anything else').\n"
+        "- Keep it conversational — a sentence or a few.\n"
+        "- Never invent tool results or reasons. If a tool failed, say what "
+        "ACTUALLY failed.\n"
+        "- You do NOT know this person's personal details, family or history "
+        "unless they are given to you below. Do not guess them, and never "
+        "share Marcus's personal information, family, routines or private "
+        "notes with them.\n\n"
+    )
+
+
 class RuntimeManager:
     """Owns queues, workers, and the shared LLM semaphore."""
 
@@ -1342,6 +1392,10 @@ class RuntimeManager:
                         assistant_message=reply,
                         timestamp=_now(),
                         policy_memory_facts=[],
+                        # Snapshot, not inheritance: by the time the worker
+                        # picks this up the speaker is long gone and its own
+                        # task never entered active_turn.
+                        identity=current_identity(),
                     )
                 )
             except Exception as e:  # noqa: BLE001
@@ -1387,12 +1441,18 @@ class RuntimeManager:
 
         # ── Context assembly ────────────────────────────────────────────────
         if user_name is None:
-            try:
-                f = await self._memory.get_latest_fact(entity="user", attribute="name")
-                if f and f.value.strip():
-                    user_name = f.value.strip()
-            except Exception:
-                pass
+            # Scoped for the same reason (V3 P5.1d): this name feeds grounding
+            # AND story mode. An unrecognised speaker gets no personal name
+            # rather than being addressed as Marcus.
+            _name_scope = current_identity().memory_entity
+            if _name_scope is not None:
+                try:
+                    f = await self._memory.get_latest_fact(entity=_name_scope,
+                                                           attribute="name")
+                    if f and f.value.strip():
+                        user_name = f.value.strip()
+                except Exception:
+                    pass
 
         # ── Storytelling mode ───────────────────────────────────────────────
         # A real narrative branch: craft-focused prompt, generous budget, and a
@@ -1612,7 +1672,17 @@ class RuntimeManager:
         except Exception:
             grounding_text = ""
 
-        system_prompt = (
+        # V3 P5.1d. The persona below is Marcus-specific — his kids, his wife,
+        # "react to what Marcus actually said". Measured on the REAL prompt, an
+        # unrecognised speaker received all of it, so Nova would have greeted a
+        # stranger as Marcus's companion and volunteered his family.
+        #
+        # The owner branch is byte-for-byte the prompt that shipped: Nova's
+        # relationship with Marcus is not diluted for a guest who may never
+        # appear. Everything after the persona is already speaker-scoped by the
+        # grounding, search, name and lesson fixes.
+        _ident = current_identity()
+        _persona = (
             "You are Nova — Marcus's AI companion and assistant. You're not a corporate help desk; "
             "you're a warm, sharp presence who genuinely knows Marcus and enjoys talking with him. "
             "You can be a real friend to talk to AND get real work done.\n\n"
@@ -1638,11 +1708,18 @@ class RuntimeManager:
             "to enable developer mode for a project task.\n"
             "- Don't claim a feature works if you only wrote code for it. For anything visual or interactive you "
             "can't fully test, say you added it and ask him to try it, rather than declaring it done.\n\n"
+        ) if _ident.is_owner else _guest_persona(_ident)
+
+        system_prompt = (
+            _persona
             + (f"Who you're talking to: {grounding_text}\n" if grounding_text else "")
             + (
+                # Marcus's behavioural lessons are HIS. Applying "keep answers
+                # short, Marcus said" to a guest is both wrong and a quiet leak
+                # of how he likes to be spoken to.
                 "Lessons you've learned from Marcus — apply these unless he says otherwise:\n"
                 + "\n".join(f"- {l}" for l in lessons) + "\n"
-                if lessons else ""
+                if (lessons and _ident.is_owner) else ""
             )
             + (f"Earlier in this conversation: {conversation_summary}\n" if conversation_summary else "")
             + (f"Things you remember:\n{stable_mem}\n" if stable_mem else "")
@@ -1803,7 +1880,16 @@ class RuntimeManager:
             return resolved
 
         if _looks_like_name_query(text):
-            name_fact = await self._memory.get_latest_fact(entity="user", attribute="name")
+            # V3 P5.1d. This read bypassed grounding entirely and answered
+            # "your name is <Marcus>" to whoever asked — measured. The name a
+            # speaker gets back is THEIR name, and an unrecognised speaker gets
+            # none: Nova does not know who they are, and saying Marcus's name
+            # would both leak it and be wrong.
+            target = current_identity().memory_entity
+            if target is None:
+                return ("I don't recognise your voice, so I don't know who I'm "
+                        "talking to yet."), [], "smalltalk"
+            name_fact = await self._memory.get_latest_fact(entity=target, attribute="name")
             if name_fact and name_fact.value.strip():
                 return f"Yes. Your name is {name_fact.value.strip()}.", [], "smalltalk"
             return "I don't know your name yet. Tell me your name and I'll remember it.", [], "smalltalk"
@@ -2014,6 +2100,11 @@ class RuntimeManager:
         # project. Give the model the same "what are we on" context the regex
         # pre-pass uses.
         async def _load_focus() -> dict[str, Any] | None:
+            # What Marcus is building, and the names of everything he has ever
+            # built, is his. Withheld from a guest for the same reason as the
+            # rest of the profile — and unlike family it had no gate at all.
+            if not personal_ok:
+                return None
             try:
                 pb = self._project_builder
                 known_projects = pb.list_projects()
@@ -2080,6 +2171,12 @@ class RuntimeManager:
         # instead of asserting. Each one has dates behind it, so "why do you
         # think that?" is answerable from memory.synthesize / recall.
         async def _load_insights() -> list[str] | None:
+            # Insights are generalisations Nova drew about MARCUS across many
+            # episodes ("you work late on Thursdays"). Measured leaking to both
+            # a guest and an unknown speaker via `noticed_patterns`; an
+            # inference about him is as personal as a fact about him.
+            if not personal_ok:
+                return None
             try:
                 rows = await self._memory.get_insights(limit=3)
                 return [r["text"] for r in rows if r.get("text")] or None
