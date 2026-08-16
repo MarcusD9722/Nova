@@ -399,11 +399,20 @@ class SQLiteMemoryBackend:
                 # cold_evidence). The DDL lives in memory/episodic_schema.py and
                 # is referenced by BOTH this create block and migration 7, so the
                 # fresh-database schema and the upgrade path cannot drift apart.
+                #
+                # The migration runs FIRST, and that ordering is load-bearing.
+                # EPISODIC_DDL both creates `episodes` AND indexes it on
+                # speaker_entity / privacy_scope. On a database predating P5.1e
+                # the table already exists, so CREATE TABLE IF NOT EXISTS is a
+                # no-op, those columns never appear, and the very next statement
+                # indexes them — boot dies with `no such column: speaker_entity`
+                # and Nova will not start. Migrating first adds the columns to
+                # the old table; on a fresh database the guard inside returns
+                # early (no table yet) and the DDL builds the full schema.
+                # Same order as `turns` above: migrate, THEN index.
+                await self._migrate_episodes_schema(db)
                 for _sql in EPISODIC_DDL:
                     await db.execute(_sql)
-                # AFTER the DDL: the guard inside checks the table exists, and
-                # on a pre-P5.1e database it is this block that creates it.
-                await self._migrate_episodes_schema(db)
 
                 await self._apply_migrations(db)
 
