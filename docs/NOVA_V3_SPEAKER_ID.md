@@ -19,7 +19,8 @@ large phase.
 | **P5.1d.3** | the full persistent-state inventory: durable stores that are not called "memory" |
 | **P5.1d.4** | connected-account plugins, and the last secondary-prompt identity |
 | **P5.1e** | **ACTIVATION** — the live voice path now carries identity, and P4 episodes carry speaker provenance |
-| **P5.1e.1 (this pass)** | off-turn attribution, and actor separated from privacy owner |
+| **P5.1e.1** | off-turn attribution, and actor separated from privacy owner |
+| **P5.1e.2 (this pass)** | episode kind outranks inherited turn context |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -999,6 +1000,90 @@ anything unrecognised falls closed to owner-private. Legacy data is never widene
 **own** root from turn identity — a blind string replace would have rewritten a
 subject that legitimately mentions a *different* speaker. Provenance keeps the
 true entity.
+
+---
+
+## P5.1e.2 — an inherited context is not ownership
+
+P5.1e.1 proved the *off-turn* case: `BUS.publish` with no turn active produced
+`actor=system`, `privacy=user`. It never exercised the case that actually happens
+in production.
+
+`ProjectBuilder.start()` runs **inside** the caller's turn and spawns the build
+with `asyncio.create_task`, which inherits the current context. So under a
+guest's turn:
+
+```
+with active_turn(Alice):
+    await pb.start(...)          # publishes project.started
+    -> create_task(_build)       # child inherits Alice
+       -> project.completed / project.error
+```
+
+Measured on `5e5fcfd`, through the real builder:
+
+```
+{'kind': 'project_event',
+ 'summary': 'Nova started building alice-started-secret-991: a private thing',
+ 'actor_label': 'Alice',  'privacy_scope': 'speaker:p-alice'}   ← and she could read it back
+```
+
+Three episodes, all reclassified as hers — and the summary said *"Nova started
+building…"* while the actor said Alice, the same self-contradiction P5.1e.1 was
+supposed to have ended.
+
+### The fix: order
+
+Both classifiers took `kind` and neither used it. The identity was checked
+**first**, so ambient context won. Now:
+
+```
+privacy:  shared kind? → system
+          system kind? → user          ← before consulting identity
+          otherwise    → the human
+actor:    system kind? → Nova          ← before consulting identity
+          otherwise    → the human
+```
+
+An inherited ContextVar answers *"which turn spawned this task"*. It does not
+answer *"who is the actor"* or *"whose data is this"*, and treating it as though
+it does is the whole bug.
+
+### Narrow on purpose
+
+Only semantic system kinds override. A guest's correction and a guest's selection
+remain hers — asserted alongside, because a fix that discarded inherited identity
+globally would have broken the thing P5.1 exists to provide.
+
+| kind | actor | privacy |
+|---|---|---|
+| `project_event`, `failure`, `project_milestone` | **Nova** | **owner** |
+| `selection`, `memory_corrected`, `tool_result`, … | the speaker | the speaker |
+
+Invariant asserted: `_SHARED_SYSTEM_KINDS ⊆ _SYSTEM_KINDS`, so a future shared
+kind cannot bypass the system classification by omission.
+
+### Project events are owner-private, full stop
+
+The ProjectBuilder data model is global. **Speaker recognition is not project
+authorisation** — a guest asking Nova to build something does not create a
+private guest project filesystem. If per-project ownership is added later it will
+be explicit metadata, not an inference from ContextVar inheritance.
+
+### What was NOT changed
+
+Child-task context propagation. Other background work legitimately wants request
+context, and disabling it globally would trade a narrow misinterpretation for a
+broad behavioural change. `active_turn()` is untouched.
+
+### Migration cleanup
+
+`EPISODIC_SPEAKER_MIGRATION` was dead — defined, never referenced, and unable to
+fire (a fresh DB stamps `latest` without replaying, so its ALTERs could only hit
+a table that already had the columns). It had also drifted, gaining an index over
+a column it never added. Removed rather than repaired: a second migration path
+that nothing calls reads as authoritative and invites the next change to land in
+the wrong place. `_migrate_episodes_schema()` is the single canonical path.
 
 ### What the owner can still see
 

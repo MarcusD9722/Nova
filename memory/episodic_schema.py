@@ -151,20 +151,19 @@ EPISODIC_MIGRATION = (
     EPISODIC_DDL,
 )
 
-#: V3 P5.1e. Adds speaker provenance to an EXISTING episodes table. The DDL
-#: above already carries the columns for a fresh database; this is the in-place
-#: path so nobody has to delete their history to activate voice identity.
-#: Defaults are the migration assumption, stated plainly: every episode written
-#: before live speaker activation was Marcus's, because nothing else could
-#: reach the turn path.
-EPISODIC_SPEAKER_MIGRATION = (
-    8,
-    "V3 P5.1e: episodes.speaker_entity / speaker_label / input_source",
-    [
-        "ALTER TABLE episodes ADD COLUMN speaker_entity TEXT NOT NULL DEFAULT 'user';",
-        "ALTER TABLE episodes ADD COLUMN speaker_label TEXT NOT NULL DEFAULT '';",
-        "ALTER TABLE episodes ADD COLUMN input_source TEXT NOT NULL DEFAULT 'typed';",
-        "CREATE INDEX IF NOT EXISTS idx_episodes_speaker ON episodes(speaker_entity, created_at DESC);",
-    "CREATE INDEX IF NOT EXISTS idx_episodes_privacy ON episodes(privacy_scope, created_at DESC);",
-    ],
-)
+# NOTE: there is deliberately no numbered migration for the speaker/actor/
+# privacy columns (V3 P5.1e.2 cleanup).
+#
+# P5.1e briefly defined one. It could never fire: `_apply_migrations` stamps
+# `latest` without replaying history for a fresh database — whose create block
+# already builds these columns — so a versioned ALTER would only ever run
+# against a table that already had them, which is a duplicate-column error.
+# It was replaced by `SQLiteMemoryBackend._migrate_episodes_schema()`, an
+# idempotent PRAGMA-guarded in-place upgrade, but the dead constant survived and
+# then drifted: P5.1e.1 appended an index over `privacy_scope`, a column that
+# constant never added.
+#
+# Removed rather than repaired. A second migration path that nothing calls is
+# worse than none: it reads as authoritative, and the next person to touch the
+# schema would reasonably update it instead of the code that actually runs.
+# `_migrate_episodes_schema()` is the single canonical upgrade path.
