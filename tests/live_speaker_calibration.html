@@ -283,16 +283,25 @@ async function voiceTurn(promptText, seconds, wantSpeaker, convId) {
 //: question was never asked and the result proves nothing either way.
 const UNVERIFIED_OK = ["unknown", "ambiguous", "unavailable", "too_short"];
 
-// Record a voice turn for the probe only — /stt, no /chat, so the voice_turn_id
-// is still unredeemed and can be spent on the permission probe instead.
-async function voiceHandle(promptText, seconds) {
+// /stt and NOTHING else. Two callers need this: the latency benchmark, which
+// must not have a full LLM turn inside the number it reports, and the
+// permission probe, which needs an UNREDEEMED voice_turn_id (a /chat call would
+// spend it).
+async function sttOnly(promptText, seconds, wantSpeaker) {
   alert(promptText);
   const blob = await record(seconds*1000, null);
   const fd = new FormData();
   fd.append("file", blob, "cmd.webm");
-  fd.append("speaker", "true");
+  if (wantSpeaker) fd.append("speaker", "true");
+  const t0 = performance.now();
   const stt = await api("/stt", {method:"POST", body:fd});
-  return stt?.speaker || null;
+  return { text: stt.text, speaker: stt.speaker || null,
+           stt_ms: Math.round(performance.now() - t0) };
+}
+
+// Record a voice turn for the probe only, leaving the handle unspent.
+async function voiceHandle(promptText, seconds) {
+  return (await sttOnly(promptText, seconds, true)).speaker;
 }
 
 async function sentinelFlow() {
@@ -306,7 +315,11 @@ async function sentinelFlow() {
 
   const turn = async (who, phase, prompt, secs) => {
     const r = await voiceTurn(prompt, secs, true, CID);
-    if (r.conversation_id && r.conversation_id !== CID) out.conversation_stable = false;
+    // STRICT. A missing or null returned id is a FAILURE, not a pass: the
+    // previous `r.conversation_id && ...` guard treated "the server told us
+    // nothing" as "the server agreed", which is exactly the state a silently
+    // ignored conversation_id produces — the bug this check exists to catch.
+    if (r.conversation_id !== CID) out.conversation_stable = false;
     out.steps.push({who, phase, status: r.speaker?.status ?? null,
                     name: r.speaker?.display_name ?? null,
                     profile_id: r.speaker?.profile_id ?? null,
@@ -413,13 +426,17 @@ async function permissionFlow() {
 }
 
 async function sttLatencyFlow() {
+  // sttOnly, never voiceTurn: this measures what speaker identification costs
+  // /stt. Routing each sample through /chat as well would bury a ~40 ms
+  // difference under a full LLM turn, and would leave 12 pointless
+  // conversational turns in Nova's memory as a side effect of a benchmark.
   const off = [], on = [];
   for (let i = 0; i < 6; i++) {
-    const r = await voiceTurn(`Latency ${i+1}/12 (speaker OFF) — say a short sentence.`, 3, false);
+    const r = await sttOnly(`Latency ${i+1}/12 (speaker OFF) — say a short sentence.`, 3, false);
     off.push(r.stt_ms);
   }
   for (let i = 0; i < 6; i++) {
-    const r = await voiceTurn(`Latency ${i+7}/12 (speaker ON) — say a short sentence.`, 3, true);
+    const r = await sttOnly(`Latency ${i+7}/12 (speaker ON) — say a short sentence.`, 3, true);
     on.push(r.stt_ms);
   }
   const p = (a,q) => pct(a,q);

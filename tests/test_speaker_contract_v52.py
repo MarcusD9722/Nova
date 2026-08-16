@@ -446,6 +446,15 @@ async def test_harness_sentinel_shares_one_conversation():
           "and the echoed id is checked, so a silently-ignored one cannot pass")
 
     sent = html[html.index("async function sentinelFlow"):html.index("async function permissionFlow")]
+    code = _code_only(sent)
+
+    # STRICT equality. A null/missing returned id must FAIL, not pass — that is
+    # precisely what a server ignoring conversation_id would produce, so a
+    # truthiness guard would excuse the exact bug being tested for.
+    check("if (r.conversation_id !== CID)" in code,
+          "the id check is strict equality against the requested CID")
+    check("r.conversation_id &&" not in code,
+          "no truthiness guard — a missing id is not 'stable'")
     check(sent.count("await turn(") == 5,
           f"five turns in one conversation ({sent.count('await turn(')})")
     for who in ('"Marcus", "store"', '"Guest", "store"', '"Marcus", "ask"',
@@ -462,6 +471,39 @@ async def test_harness_sentinel_shares_one_conversation():
           "the two enrolled people must be recognised as THEMSELVES")
     check("out.unverified_is_unverified" in sent and "out.pass" in sent,
           "all of which gate the sentinel verdict")
+
+
+async def test_harness_latency_measures_stt_only():
+    check.section("latency: /stt round trip, with no /chat inside it")
+    html = HARNESS.read_text(encoding="utf-8")
+
+    check("async function sttOnly" in html, "an /stt-only helper exists")
+    only = _code_only(html[html.index("async function sttOnly"):
+                           html.index("async function voiceHandle")])
+    check('api("/stt"' in only, "it calls /stt")
+    check('"/chat"' not in only, "and never /chat")
+    check("stt_ms" in only, "returning the /stt round trip")
+    check("speaker" in only, "plus the speaker metadata the probe needs")
+
+    flow = _code_only(html[html.index("async function sttLatencyFlow"):
+                           html.index("function render()")])
+    # Two call sites, each in a loop of 6 — 12 samples total.
+    check(flow.count("await sttOnly(") == 2,
+          f"both sample loops call sttOnly ({flow.count('await sttOnly(')} sites)")
+    check(flow.count("i < 6") == 2, "six samples each side")
+    check(", 3, false)" in flow and ", 3, true)" in flow,
+          "one loop with speaker OFF, one with speaker ON")
+    check("voiceTurn(" not in flow,
+          "no latency sample goes through voiceTurn — /chat is not in the number")
+    check('"/chat"' not in flow, "and /chat appears nowhere in the benchmark")
+    check("n_off" in flow and "n_on" in flow,
+          "and the report states how many samples each side actually got")
+
+    # voiceTurn itself must still do the full pipeline: the sentinel needs it.
+    vt = _code_only(html[html.index("async function voiceTurn"):
+                         html.index("const UNVERIFIED_OK")])
+    check('api("/stt"' in vt and '"/chat"' in vt,
+          "voiceTurn still runs /stt -> /chat for the memory sentinel")
 
 
 async def test_harness_permission_pass_is_measured():
@@ -532,6 +574,7 @@ async def main():
     await test_harness_acceptance_is_two_tier()
     await test_harness_separates_prediction_from_ranking()
     await test_harness_sentinel_shares_one_conversation()
+    await test_harness_latency_measures_stt_only()
     await test_harness_permission_pass_is_measured()
     await test_harness_requires_exactly_two_profiles()
     check.finish()
