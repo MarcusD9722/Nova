@@ -226,3 +226,126 @@ def active_turn(identity: TurnIdentity | None) -> Iterator[TurnIdentity]:
         yield ident
     finally:
         _CURRENT.reset(token)
+
+
+# ── Read scope (V3 P5.1d) ────────────────────────────────────────────────────
+#
+# Blocking writes was only half the boundary. Three independent read paths were
+# measured handing Marcus's private data to an unrecognised speaker:
+#
+#   * `_direct_live_reply` answering "what is my name?" with his name
+#   * `memory.search` surfacing a private fact into the prompt
+#   * the `memory.recall` TOOL returning it when the model asked
+#
+# The last one matters most architecturally: a privacy boundary enforced only in
+# grounding is one tool call wide. So the policy lives here, once, and every
+# reader consults it.
+
+#: Entities any speaker may read. Deliberately tiny and explicit.
+#:
+#: `note` is NOT here. It is free-form and routinely holds personal material —
+#: "not stored under `user`" is not the same as "public", and treating it as
+#: public is exactly how a leak gets rationalised.
+#:
+#: Neither are `project:` / `projects`. They were, briefly, on the theory that a
+#: project is collaborative context. Measuring item E settled it: what Marcus is
+#: building, and the names of everything he has built, is a personal detail a
+#: stranger in the room has no claim on. Only genuinely impersonal knowledge
+#: stays here.
+SHARED_ENTITY_PREFIXES: tuple[str, ...] = (
+    "world",        # general knowledge Nova looked up
+    "system",       # how Nova herself is configured
+    "capability",   # what she can do
+)
+
+
+def is_shared_entity(entity: Any) -> bool:
+    """Is this entity safe for ANY speaker to read?"""
+    e = str(entity or "").strip().lower()
+    if not e:
+        return False
+    return any(e == p.rstrip(":") or e.startswith(p) for p in SHARED_ENTITY_PREFIXES)
+
+
+def may_read_entity(entity: Any, identity: "TurnIdentity | None" = None) -> bool:
+    """May the current speaker see a fact stored under `entity`?
+
+    Conservative by construction: anything not positively recognised as shared,
+    and not the speaker's own namespace, is refused. A new personal entity added
+    later is private by default rather than public by oversight.
+    """
+    ident = identity or current_identity()
+    e = str(entity or "").strip().lower()
+    if is_shared_entity(e):
+        return True
+    own = ident.memory_entity
+    if own is None:
+        # Unverified: shared knowledge only.
+        return False
+    if own == OWNER_ENTITY:
+        # The owner reads everything, exactly as before P5.
+        return True
+    # A known guest reads their OWN namespace and nothing else personal —
+    # including no other guest's.
+    return e == own.lower()
+
+
+def remap_entity_for(entity: Any, identity: "TurnIdentity | None" = None) -> str | None:
+    """Where a fact extracted from THIS speaker's words actually belongs.
+
+    The background extractor emits `entity="user"` for anything phrased in the
+    first person, because for Nova's whole life "user" meant Marcus. Left alone,
+    a guest saying "my wife is a nurse" becomes a durable claim about Marcus's
+    marriage — written minutes later, by a worker, with nobody watching.
+
+        owner        -> unchanged (legacy semantics, byte for byte)
+        known guest  -> "user" becomes THEIR namespace; shared entities pass
+                        through; anything else personal is nested under them
+        unverified   -> None: nothing this speaker said is written anywhere
+
+    None means discard. As everywhere else in this module, it must never be
+    turned back into a default.
+    """
+    ident = identity or current_identity()
+    e = str(entity or "").strip()
+    if not e:
+        return None
+    own = ident.memory_entity
+    if own is None:
+        return None
+    if own == OWNER_ENTITY:
+        return e
+    if e.lower() == OWNER_ENTITY:
+        return own
+    if is_shared_entity(e):
+        # World knowledge and shared project state are not anyone's personal
+        # history, and a recognised person may contribute to them.
+        return e
+    # Their people, their notes, their projects — kept under their own root so
+    # "person:sarah" from a guest never merges with Marcus's Sarah.
+    return f"{own}:{e}"
+
+
+def turn_speaker_label(identity: "TurnIdentity | None" = None) -> str:
+    """How to name the human in an indexed conversation turn.
+
+    Conversation turns were indexed as "Marcus said: ..." unconditionally, which
+    made every guest sentence retrievable as something Marcus had said — a
+    fabricated quote, not merely a misfiled one.
+    """
+    ident = identity or current_identity()
+    if ident.is_owner:
+        return "Marcus"
+    if ident.is_known_other and ident.display_name:
+        return ident.display_name
+    return "An unidentified speaker"
+
+
+def personal_scope_note(identity: "TurnIdentity | None" = None) -> str:
+    """One line for diagnostics/logs describing the active read scope."""
+    ident = identity or current_identity()
+    if ident.is_owner:
+        return "owner: full personal memory"
+    if ident.is_known_other:
+        return f"guest {ident.display_name or ident.profile_id}: own namespace + shared"
+    return "unverified: shared knowledge only"

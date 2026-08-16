@@ -75,7 +75,10 @@ def _now() -> datetime:
 #: Entities whose facts never decay. Being old doesn't make your name less
 #: true, and sinking identity facts would falsely trip the CH1 low-confidence
 #: hedge. Prefix match, so "project:flappy-bird" is covered by "project:".
-_UNDECAYED_ENTITY_PREFIXES = ("user", "lesson", "project:", "projects", "session")
+_UNDECAYED_ENTITY_PREFIXES = ("user", "lesson", "project:", "projects", "session",
+                              # A known speaker's core identity should not decay
+                              # away either (V3 P5.1d).
+                              "speaker:")
 
 
 def _is_undecayed(entity: Any) -> bool:
@@ -167,6 +170,132 @@ def _staleness_factor(
 
     age_days = max(0.0, (_now() - newest).total_seconds() / 86400.0)
     return 0.85 + 0.15 * math.exp(-age_days / max(1.0, effective_half_life))
+
+
+def _read_scope_key() -> str:
+    """Cache-key component identifying WHOSE view of memory this is."""
+    try:
+        from core.turn_identity import current_identity
+    except Exception:  # noqa: BLE001
+        return "owner"
+    ident = current_identity()
+    if ident.is_owner:
+        return "owner"
+    return ident.memory_entity or "unverified"
+
+
+def scoped_entity(base: str) -> str | None:
+    """The current speaker's namespace under `base` — or None if they have none.
+
+    Lessons, mood and wellbeing are all "things Nova learned about the person
+    in front of her", and all three wrote to one global entity. That was fine
+    while only Marcus could speak: a guest snapping "no, stop doing that" would
+    otherwise have become a permanent instruction about how to treat *Marcus*,
+    and a guest's bad evening would have been recorded as his mood.
+
+        owner / typed / legacy voice -> "lesson"                  (unchanged)
+        known guest                  -> "lesson:speaker:p-alice"
+        unverified voice             -> None  (write nothing, read nothing)
+
+    None means nothing: callers return early. They must never fall back to the
+    unscoped base, which is the whole failure this prevents.
+    """
+    try:
+        from core.turn_identity import OWNER_ENTITY, current_identity
+    except Exception:  # noqa: BLE001 - memory must not hard-depend on runtime
+        return base
+    ent = current_identity().memory_entity
+    if ent is None:
+        return None
+    if ent == OWNER_ENTITY:
+        return base
+    return f"{base}:{ent}"
+
+
+def _scope_is_owner() -> bool:
+    """True when this write belongs to Marcus (typed, legacy voice, or owner)."""
+    try:
+        from core.turn_identity import current_identity
+    except Exception:  # noqa: BLE001
+        return True
+    return current_identity().is_owner
+
+
+def _turn_speaker_meta(role: str) -> tuple[str, str]:
+    """(label, owning entity) for a conversation turn about to be indexed.
+
+    Nova's own turns belong to whoever she was answering, so a guest's exchange
+    stays one retrievable unit rather than half of it landing in Marcus's.
+    """
+    try:
+        from core.turn_identity import current_identity, turn_speaker_label
+    except Exception:  # noqa: BLE001
+        return ("Marcus" if role == "user" else "Nova", "user")
+    ident = current_identity()
+    label = "Nova" if role != "user" else turn_speaker_label(ident)
+    return (label, ident.memory_entity or "unverified")
+
+
+def _scope_subject() -> tuple[str, str]:
+    """(name, subject pronoun) for whoever the current trend line is about.
+
+    The owner's wording is unchanged. A guest gets their own name and they/them,
+    because Nova has a voice profile for them, not a stated pronoun.
+    """
+    try:
+        from core.turn_identity import current_identity
+    except Exception:  # noqa: BLE001
+        return ("Marcus", "he")
+    ident = current_identity()
+    if ident.is_owner:
+        return ("Marcus", "he")
+    return (ident.display_name or "They", "they")
+
+
+def _filter_hits_for_scope(hits: list[MemoryHit]) -> list[MemoryHit]:
+    """Drop hits the current speaker may not read.
+
+    Applied at the single point every semantic read passes through, rather than
+    at each of its callers — a caller that forgot would be a silent leak.
+    """
+    try:
+        from core.turn_identity import current_identity, may_read_entity
+    except Exception:  # noqa: BLE001 - memory must not hard-depend on runtime
+        return hits
+
+    ident = current_identity()
+    if ident.is_owner:
+        return hits          # legacy behaviour, byte for byte
+
+    own = ident.memory_entity
+    kept: list[MemoryHit] = []
+    for h in hits:
+        prov = h.provenance or {}
+        table = str(prov.get("table") or "")
+        if table == "facts":
+            if may_read_entity(prov.get("entity"), ident):
+                kept.append(h)
+            continue
+        # An indexed turn now records whose it was, so a recognised guest can
+        # recall their own conversation without seeing any of Marcus's.
+        if str(prov.get("kind") or "") == "turn":
+            spk = str(prov.get("speaker_entity") or "")
+            if own and spk and spk.lower() == own.lower():
+                kept.append(h)
+            continue
+        if table == "turns":
+            # Durable cross-session conversation is personal history. A guest
+            # who has just arrived must not be able to read back what Marcus
+            # said in previous sessions.
+            continue
+        if table in {"people", "events"}:
+            # Marcus's relationships and calendar are his.
+            continue
+        if table == "documents":
+            # Indexed local documents are the owner's filesystem.
+            continue
+        # Chroma and anything unrecognised: withhold rather than guess.
+    return kept
 
 
 class MemoryUnifier:
@@ -271,7 +400,12 @@ class MemoryUnifier:
     def _is_singleton_fact(self, entity: str, attribute: str) -> bool:
         ent = (entity or "").strip().lower()
         attr = (attribute or "").strip().lower()
-        if ent == "user":
+        if ent == "user" or ent.startswith("speaker:"):
+            # V3 P5.1d: a known enrolled speaker is a PERSON, and gets the same
+            # singleton semantics Marcus has. Without this, Alice moving from
+            # Berlin to Dallas left both current — measured — so her memory was
+            # structurally worse than his purely because she is not the owner.
+            # This routes memory; it grants nothing.
             return attr in self._SINGLETON_USER_ATTRS
         if ent == INSIGHT_ENTITY:
             # One belief per topic. Re-deriving "he works late on Thursdays"
@@ -480,13 +614,17 @@ class MemoryUnifier:
                 ),
             ]
             if index_turn and self._chroma is not None:
-                speaker = "Marcus" if role == "user" else "Nova"
+                speaker, owner_ent = _turn_speaker_meta(role)
                 writes.append(
                     self._chroma_upsert_safe(
                         doc_id=f"turn:{turn_id}",
                         text=f"{speaker} said: {content}",
+                        # `speaker_entity` is what lets a read decide whose
+                        # conversation this was. Without it the index is a flat
+                        # pile of sentences with Marcus's name on all of them.
                         metadata={"kind": "turn", "role": role, "created_at": created_at,
-                                  "conversation_id": str(conversation_id)},
+                                  "conversation_id": str(conversation_id),
+                                  "speaker_entity": owner_ent},
                     )
                 )
             await asyncio.gather(*writes)
@@ -498,6 +636,12 @@ class MemoryUnifier:
         # Phase 1.1: observe co-mentions in this turn as graph edges (people
         # mentioned together; people tied to the active project). Cheap and
         # deterministic; failures never block ingest.
+        #
+        # Owner only (V3 P5.1d): this graph is Marcus's social map. A guest
+        # naming two of their own colleagues would otherwise draw an edge
+        # between them in his, and a relationship graph has no undo.
+        if not _scope_is_owner():
+            return turn_id
         try:
             known = await self.known_person_names()
             active_project = None
@@ -1758,13 +1902,20 @@ class MemoryUnifier:
         text = (lesson or "").strip()
         if not text:
             return uuid4()
+        ent = scoped_entity(LESSON_ENTITY)
+        if ent is None:
+            # An unrecognised voice does not get to rewrite how Nova behaves.
+            return uuid4()
         return await self.add_fact(
-            entity=LESSON_ENTITY, attribute=_lesson_topic_slug(topic), value=text[:400], confidence=confidence
+            entity=ent, attribute=_lesson_topic_slug(topic), value=text[:400], confidence=confidence
         )
 
     async def get_lessons(self, limit: int = 12, newest_first: bool = True) -> list[str]:
         """Return recent lesson texts (deduped, order preserved)."""
-        rows = await self.get_facts(entity=LESSON_ENTITY, limit=max(1, int(limit) * 2), newest_first=newest_first)
+        ent = scoped_entity(LESSON_ENTITY)
+        if ent is None:
+            return []
+        rows = await self.get_facts(entity=ent, limit=max(1, int(limit) * 2), newest_first=newest_first)
         out: list[str] = []
         seen: set[str] = set()
         for r in rows:
@@ -1779,7 +1930,10 @@ class MemoryUnifier:
 
     async def lesson_records(self, limit: int = 50) -> list[dict[str, Any]]:
         """Lessons for the UI panel (id/topic/text/created_at)."""
-        rows = await self.get_facts(entity=LESSON_ENTITY, limit=limit, newest_first=True)
+        ent = scoped_entity(LESSON_ENTITY)
+        if ent is None:
+            return []
+        rows = await self.get_facts(entity=ent, limit=limit, newest_first=True)
         return [
             {"id": str(r.id), "topic": r.attribute, "text": r.value, "created_at": r.created_at.isoformat()}
             for r in rows
@@ -1792,7 +1946,10 @@ class MemoryUnifier:
         phrasing, deterministically — no LLM call. Returns lessons removed."""
         import difflib
 
-        rows = await self.get_facts(entity=LESSON_ENTITY, limit=300, newest_first=True)
+        ent = scoped_entity(LESSON_ENTITY)
+        if ent is None:
+            return 0
+        rows = await self.get_facts(entity=ent, limit=300, newest_first=True)
         kept: list[tuple[str, str]] = []  # (normalized full text, lead clause), newest first
         to_delete: list[str] = []         # exact values to purge
 
@@ -1829,7 +1986,7 @@ class MemoryUnifier:
         if not to_delete:
             return 0
         result = await self.purge_facts(
-            entity=LESSON_ENTITY, attribute=None, value_in=to_delete, value_ilike=None,
+            entity=ent, attribute=None, value_in=to_delete, value_ilike=None,
             dry_run=False, limit=len(to_delete) + 10,
         )
         removed = int(result.get("deleted") or 0)
@@ -1844,23 +2001,31 @@ class MemoryUnifier:
         """One mood reading per calendar day (singleton per day; days
         accumulate so a trend can be read back later)."""
         day = day or _now().strftime("%Y-%m-%d")
-        await self.add_fact(entity="mood", attribute=day, value=label, confidence=0.6)
+        ent = scoped_entity("mood")
+        if ent is None:
+            # Whose mood? Nova doesn't know, so she records nobody's.
+            return
+        await self.add_fact(entity=ent, attribute=day, value=label, confidence=0.6)
 
     async def recent_mood_trend(self, days: int = 3) -> str:
         """A short natural-language line summarizing the last few days'
         detected mood, or '' if there's nothing recent to say. Never guesses —
         only reflects what was actually detected."""
-        rows = await self.get_facts(entity="mood", limit=days, newest_first=True)
+        ent = scoped_entity("mood")
+        if ent is None:
+            return ""
+        rows = await self.get_facts(entity=ent, limit=days, newest_first=True)
         if not rows:
             return ""
         labels = [r.value for r in rows if r.value]
         if not labels:
             return ""
+        who, _pron = _scope_subject()
         if len(labels) == 1:
-            return f"Marcus seemed {labels[0]} recently."
+            return f"{who} seemed {labels[0]} recently."
         if len(set(labels)) == 1:
-            return f"Marcus has seemed {labels[0]} the last {len(labels)} days."
-        return f"Marcus's mood recently: {', '.join(labels)} (most recent first)."
+            return f"{who} has seemed {labels[0]} the last {len(labels)} days."
+        return f"{who}'s mood recently: {', '.join(labels)} (most recent first)."
 
     # --- Wellbeing awareness (WB1) --------------------------------------------
 
@@ -1869,25 +2034,37 @@ class MemoryUnifier:
         accumulate). Only meaningful signals get written — an ordinary day
         records nothing, same discipline as record_mood."""
         day = day or _now().strftime("%Y-%m-%d")
-        await self.add_fact(entity="wellbeing", attribute=day, value=label, confidence=0.5)
+        ent = scoped_entity("wellbeing")
+        if ent is None:
+            return
+        await self.add_fact(entity=ent, attribute=day, value=label, confidence=0.5)
 
     async def recent_wellbeing_trend(self, days: int = 5) -> str:
         """A short, gentle natural-language line if a wellbeing pattern shows
         up across recent days — e.g. several late nights in a row. Returns ''
         when there's nothing worth a mention (including: already mentioned
         recently, see should_nudge_wellbeing)."""
-        rows = await self.get_facts(entity="wellbeing", limit=days, newest_first=True)
+        ent = scoped_entity("wellbeing")
+        if ent is None:
+            return ""
+        rows = await self.get_facts(entity=ent, limit=days, newest_first=True)
         labels = [r.value for r in rows if r.value]
         if len(labels) < 2:
             return ""
         if labels[0] == "late_night" and labels.count("late_night") >= 2:
-            return f"Marcus has been up late {labels.count('late_night')} of the last {len(labels)} days he talked to you."
+            who, pron = _scope_subject()
+            return (f"{who} has been up late {labels.count('late_night')} "
+                    f"of the last {len(labels)} days {pron} talked to you.")
         return ""
 
     async def should_nudge_wellbeing(self, *, min_gap_days: int = 3) -> bool:
         """Guard so a wellbeing observation surfaces once, gently — not every
         turn. True if she hasn't nudged about it in the last `min_gap_days`."""
-        last = await self.get_latest_fact(entity="session", attribute="wellbeing_nudged_at")
+        # Scoped so a guest's nudge cannot silence Marcus's for three days.
+        ent = scoped_entity("session")
+        if ent is None:
+            return False
+        last = await self.get_latest_fact(entity=ent, attribute="wellbeing_nudged_at")
         if not last or not last.value:
             return True
         try:
@@ -1899,7 +2076,10 @@ class MemoryUnifier:
         return (_now() - last_dt).days >= min_gap_days
 
     async def mark_wellbeing_nudged(self) -> None:
-        await self.add_fact(entity="session", attribute="wellbeing_nudged_at", value=_now().isoformat(), confidence=1.0)
+        ent = scoped_entity("session")
+        if ent is None:
+            return
+        await self.add_fact(entity=ent, attribute="wellbeing_nudged_at", value=_now().isoformat(), confidence=1.0)
 
     # --- Habit & pattern learning (HP1) ----------------------------------------
 
@@ -2420,10 +2600,19 @@ class MemoryUnifier:
 
         BUS.publish("memory.search", {"query": clip(q, 120)})
 
-        cache_key = f"search:{self._search_gen}:{conversation_id}:{'|'.join(terms) or q_norm}:{limit}"
+        # The cache key includes the READ SCOPE (V3 P5.1d). Without it, Marcus
+        # searches "vault code", his results are cached under a speaker-agnostic
+        # key, and the next guest asking the same question is served his hits
+        # straight from disk — a leak that skips every filter downstream.
+        # Found while verifying the filter: the early return below bypassed it.
+        _scope = _read_scope_key()
+        cache_key = (f"search:{self._search_gen}:{_scope}:{conversation_id}:"
+                     f"{'|'.join(terms) or q_norm}:{limit}")
         cached = await self._diskcache.get(cache_key)
         if isinstance(cached, list) and cached:
-            return [MemoryHit.model_validate(x) for x in cached]
+            # Filtered again on the way out: a cache written before a policy
+            # change must not outlive it.
+            return _filter_hits_for_scope([MemoryHit.model_validate(x) for x in cached])
 
         # ── Gather signals CONCURRENTLY (U1) ─────────────────────────────────
         # recent turns, the per-term LIKE searches, and the semantic (Chroma)
@@ -2527,7 +2716,12 @@ class MemoryUnifier:
                     access_count=row.get("access_count") or 0,
                     last_accessed_at=row.get("last_accessed_at"),
                 )
-            fact_prov = {"backend": "sqlite", "table": "facts"}
+            # V3 P5.1d: carry the ENTITY so read-scope filtering is structural.
+            # Filtering by parsing the rendered "FACT user secret = ..." string
+            # would break the moment the renderer changed, and a privacy filter
+            # that depends on prose formatting is not a filter.
+            fact_prov = {"backend": "sqlite", "table": "facts",
+                         "entity": str(row.get("entity") or "")}
             # #19: carry the trust label into recall so consumers (and the CH1
             # hedge) can tell a settled fact from an assumption. Only attach when
             # actually recorded — legacy rows stay unlabeled rather than pretend.
@@ -2636,7 +2830,16 @@ class MemoryUnifier:
         # snapshots.jsonl — the fastest-growing file in the system, with no code
         # ever reading it back. Dropped: search runs on every chat turn.
 
-        return ranked
+        # ── Read-scope filter (V3 P5.1d) ────────────────────────────────────
+        # `search()` fed "Things you remember" in the prompt AND backed the
+        # memory.recall tool, so it was a side door around grounding privacy:
+        # measured, an unknown speaker could retrieve a private owner fact
+        # through both. Filtering here closes both at once.
+        #
+        # Conservative: anything not positively recognised as shared, and not
+        # the speaker's own namespace, is dropped. Durable conversation turns
+        # count as personal history, not shared context.
+        return _filter_hits_for_scope(ranked)
 
     #: A recalled fact is only reinforced if it actually surfaced strongly.
     #: search() returns up to `limit` hits whether or not they were any good;

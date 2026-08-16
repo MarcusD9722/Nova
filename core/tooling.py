@@ -121,7 +121,25 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": False, "error": "missing_query"}
         # Date-range recall: "what did we talk about last Tuesday" -> pull the
         # actual turns from that day (semantic search alone can't do temporal).
+        # V3 P5.1d: the tool obeys the same read policy as grounding. A privacy
+        # boundary enforced only in the prompt is exactly one tool call wide,
+        # and the model can make that call. Measured: an unknown speaker
+        # retrieved a private owner fact through this tool.
+        from core.turn_identity import current_identity
+
+        _ident = current_identity()
+        if _ident.is_unverified:
+            return {"ok": False, "error": "unverified_speaker",
+                    "results": [],
+                    "detail": ("I don't recognise who I'm speaking with, so I "
+                               "can't look through personal memory.")}
+
         rng = parse_date_range(query)
+        if rng and not _ident.is_owner:
+            # Durable cross-session conversation is the OWNER's history. A guest
+            # asking "what did we talk about last Tuesday" must not receive it.
+            return {"ok": True, "results": [],
+                    "detail": "I can only recall our own conversations together."}
         if rng:
             since, until = rng
             rows = await memory.recall_conversation(

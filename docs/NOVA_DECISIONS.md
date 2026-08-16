@@ -377,3 +377,90 @@ never reach it.
 
 **Revisit if.** Users report Nova naming a choice they had already changed. Check
 the scope (`parent_id`) before touching retrieval ranking.
+
+---
+
+## D11 — Speaker read scope is a positive allow-list at the data layer
+
+**Decided:** 2026-08-15 (V3 P5.1d)
+
+**Decision.** A speaker's read scope is decided by `may_read_entity()` in
+`core/turn_identity.py` and applied inside `MemoryUnifier.search()` — the single
+point every semantic read passes through. It is an **allow-list**: shared
+entities (`world`, `system`, `capability`) are readable
+by anyone; the owner reads everything; a known guest reads their own namespace
+plus shared; anything not positively recognised is refused. The disk cache key
+includes the speaker **and** cached results are re-filtered on the way out.
+
+**Rationale.** P5.1 enforced privacy in grounding only. Measured on `78cba4d`:
+the `memory.recall` **tool** returned Marcus's private fact to an unknown speaker
+on request. A boundary enforced only in grounding is one tool call wide, and the
+model can make that call.
+
+An allow-list rather than a deny-list because a personal entity added in a later
+phase must be private by default rather than public by oversight. `note` is
+deliberately excluded from shared: it is free-form and routinely holds personal
+material, and "not stored under `user`" is not the same as "public".
+
+**Alternatives rejected.** Instructing the model not to reveal other speakers'
+data (a prompt is not a boundary — the audit measured the model reading around
+it with a tool call); filtering at each caller (a caller that forgot would be a
+silent leak, and there are three independent read paths); a deny-list of private
+entities (fails open for every entity anyone adds later).
+
+**Evidence.** `tests/test_speaker_privacy_v51d.py` — the owner sees his own
+facts; a guest sees theirs plus shared and never his; an unknown speaker sees
+shared only; a cache warmed by the owner is not replayed to the next speaker;
+`memory.recall` refuses an unverified speaker.
+
+**Constraint.** The filter is a no-op for the owner, byte for byte, so pre-P5
+behaviour is unchanged. It must stay inside `search()` rather than moving to
+callers. The cache key alone is insufficient — cached results are re-filtered,
+because a key still trusts whatever was stored under it.
+
+**Revisit if.** A guest needs to read something shared that is currently private.
+Add it to `SHARED_ENTITY_PREFIXES` explicitly; do not weaken the default.
+
+---
+
+## D12 — Identity crosses an async boundary by snapshot, never by inheritance
+
+**Decided:** 2026-08-15 (V3 P5.1d)
+
+**Decision.** `MemoryIngestEvent` carries a `TurnIdentity` snapshot taken where
+the turn ran. The ingest worker re-enters it with `active_turn()` and routes
+every extracted fact through `remap_entity_for()`. An event with **no** identity
+is treated as legacy owner semantics; an identity that resolves to **nobody**
+discards the fact rather than redirecting it.
+
+**Rationale.** P5.1 scoped the live turn with a `ContextVar`. A `ContextVar` does
+not cross a queue. The background extractor writes the *durable* facts, seconds
+to minutes after the speaker has gone, on a worker task that never entered
+`active_turn` — so it read the typed default and filed every guest's first-person
+statement under `user`. This is the write that mattered most, and the one the
+synchronous fix missed entirely.
+
+`None` must mean "write nowhere". Turning it back into a default is the exact
+failure the whole phase exists to prevent.
+
+**Alternatives rejected.** `contextvars.copy_context()` into the worker (it is
+long-lived and processes a queue — there is no single context to copy, and it
+would bind whichever turn happened to start it); reading `current_identity()` in
+the worker (this *is* the bug — it yields whoever is speaking when the backlog
+drains, or the default when nobody is); passing a `profile_id` string (the worker
+would have to re-derive attempted/status/role, reimplementing the attribution
+matrix in a second place).
+
+**Evidence.** `tests/test_speaker_ingest_v51d.py` — a guest's spouse is filed
+under `speaker:<id>` and never under `user`; an unverified speaker's fact is
+written NOWHERE (asserted against the `facts` table, not merely against Marcus's
+namespace); the worker ignores an ambient owner identity active while it drains;
+an identity-less legacy event still writes to `user`.
+
+**Constraint.** The snapshot is taken at enqueue in `RuntimeManager._finish`. The
+worker must never fall back to `current_identity()`. Conversation summaries stay
+unscoped on purpose — they are conversation-level, not person-level — and run
+outside the `active_turn` block.
+
+**Revisit if.** Another queue-crossing event grows a personal write. Give it a
+snapshot field too rather than reaching for the ContextVar.

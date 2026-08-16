@@ -8,10 +8,12 @@ large phase.
 | | |
 |---|---|
 | **P5 part 1** | the measured backend decision, the identification subsystem, `/stt` integration |
-| **P5.1 (this pass)** | four pre-flight defects in part 1, each reproduced before being fixed |
+| **P5.1** | four pre-flight defects in part 1, each reproduced before being fixed |
 | **P5.1a** | two remaining unverified-voice holes, both reproduced first |
 | **P5.1b** | the same invariant when the speaker *service itself* fails |
 | **P5.1 main** | live turn carriage, write isolation, read privacy, correction enforcement |
+| **P5.1c** | audit only — nine remaining failures reproduced against `78cba4d`, nothing fixed |
+| **P5.1d (this pass)** | every backend read and write path made speaker-safe, including the ones that run after the turn ends |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -263,6 +265,98 @@ their own view, verified by a test running four speakers in parallel, and the
 Every speaker — typed, owner, guest, unknown — receives the **identical**
 `PermissionBroker` decision, asserted by test. `evaluate()` takes no identity
 argument. Owner role is a memory-routing label, not authority.
+
+---
+
+## P5.1c/d — the read paths, and everything that runs after the turn
+
+P5.1 made the *synchronous* turn safe. An audit (P5.1c) then reproduced nine
+remaining failures against `78cba4d` before a line was changed. Two conclusions
+were uncomfortable enough to be worth stating plainly.
+
+**Blocking writes was only half the boundary.** Three independent read paths
+handed Marcus's private data to an unrecognised speaker: `_direct_live_reply`
+answering "what is my name?" with his name, `memory.search` surfacing a private
+fact into the prompt, and — the one that matters architecturally — the
+`memory.recall` **tool** returning it when the model asked. A privacy boundary
+enforced only in grounding is one tool call wide, and the model can make that
+call. So the policy now lives in `core/turn_identity.py` (`may_read_entity`) and
+every reader consults it, including the filter inside `MemoryUnifier.search()`.
+
+**The write that mattered most happened after the speaker left.** `P5.1` scoped
+the live turn with a `ContextVar`. A `ContextVar` does not cross a queue. The
+background extractor — the path that writes the *durable* facts, seconds to
+minutes later, on a worker task that never entered `active_turn` — read the typed
+default and concluded every guest was Marcus. `MemoryIngestEvent` now carries an
+identity **snapshot** taken where the turn ran, and the worker re-enters it
+explicitly. A test asserts the worker ignores whatever identity is ambient while
+the backlog drains.
+
+### What changed
+
+| Path | Before | Now |
+|---|---|---|
+| `_direct_live_reply` "what is my name?" | Marcus's name, to anyone | speaker's own name, or "I don't recognise your voice" |
+| Production system prompt | Marcus's persona and family names to a stranger | `addressee()` wired; owner-only wording withheld |
+| `memory.search` | every fact, to anyone | `may_read_entity` filter; cache key includes the speaker |
+| `memory.recall` tool | bypassed the boundary entirely | refuses an unverified speaker; no date-range history for guests |
+| `noticed_patterns` (insights) | reached any speaker | owner only |
+| `current_focus` (active project) | reached any speaker | owner only |
+| lessons / mood / wellbeing | one global entity | `lesson:speaker:<id>` etc.; unverified writes nothing |
+| `MemoryIngestEvent` | no identity | identity snapshot, re-entered by the worker |
+| extractor + policy facts | `entity="user"` always | `remap_entity_for`; unverified is discarded, not redirected |
+| reconciliation prompt | "Marcus just told Nova…" | named from the turn's speaker |
+| indexed conversation turns | `"Marcus said: …"` for everyone | speaker's label + `speaker_entity` metadata |
+| relationship graph edges | drawn from any speaker's turn | owner only |
+| `speaker:<id>` facts | no singleton or decay semantics | same person-quality memory Marcus gets |
+
+### The read policy
+
+`may_read_entity` is a positive allow-list, not a deny-list. Shared entities
+(`world`, `system`, `capability`) are readable by anyone;
+the owner reads everything; a known guest reads their own namespace and shared
+knowledge; an unverified speaker gets shared knowledge only. Anything not
+positively recognised is refused, so a personal entity added in a later phase is
+private by default rather than public by oversight.
+
+`note` is deliberately **not** shared. It is free-form and routinely holds
+personal material — "not stored under `user`" is not the same as "public".
+
+Neither are `project:` / `projects`. They were, briefly, on the theory that a
+project is collaborative context. Measuring the grounding signals settled it:
+what Marcus is building, and the names of everything he has built, is a personal
+detail a stranger in the room has no claim on.
+
+### The grounding signals, measured one sentinel at a time
+
+Reading the gate was not enough. A unique sentinel was seeded into each personal
+signal and grounding was built three times:
+
+| | owner | known guest | unknown |
+|---|---|---|---|
+| before | all 6 present | **insights, active project** | **insights, active project** |
+| after | all 6 present | none | none |
+
+`_load_family` and `_load_profile` were already gated; `_load_insights` and
+`_load_focus` never had a gate at all. Insights are generalisations Nova drew
+about Marcus across many episodes — an inference about him is as personal as a
+fact about him. The owner column is asserted too, so a "fix" that simply deletes
+the feature for everybody cannot pass.
+
+### The cache was the second half of the search fix
+
+The first version of the search filter did nothing. `search()` returns early on a
+disk-cache hit, above the filter, and the cache key had no speaker component —
+so Marcus's cached result set was served verbatim to the next guest. Fixed by
+putting the scope in the key *and* re-filtering cached results, because a key
+alone still trusts whatever was stored under it.
+
+### What the owner can still see
+
+A guest's facts are visible to Marcus. This is his machine and his memory, and
+the threat this phase addresses is a guest reaching *his* data, not the reverse.
+Stated here, and asserted by test, so it stays a decision rather than becoming a
+surprise.
 
 ---
 
@@ -561,32 +655,43 @@ Reported honestly rather than as a completed phase.
 * the same for any unexpected fault in the `/stt` speaker helper
 * the handle cache moved out of `SpeakerService` so it outlives it
 
+### Fixed in P5.1 (main body)
+
+* `TurnIdentity` + `active_turn`, carried through `chat_turn_stream`
+* the attribution matrix, enforced in code
+* `memory.correct` routed by identity rather than asked for by prompt
+* speaker-scoped grounding and quick-fact capture
+
+### Fixed in P5.1d
+
+* every backend **read** path scoped: direct replies, production prompt,
+  `memory.search` (and its cache), the `memory.recall` tool
+* the personal grounding signals gated — including `noticed_patterns` and
+  `current_focus`, which had no gate at all
+* lessons, mood and wellbeing given per-speaker namespaces
+* `MemoryIngestEvent` carries an identity snapshot; the background extractor,
+  policy facts and reconciliation all route through `remap_entity_for`
+* conversation turns indexed with the real speaker and a `speaker_entity` tag
+* relationship-graph edges restricted to the owner
+* `speaker:<id>` given the same singleton and no-decay semantics as `user`
+
 ### NOT built — do not assume these work
 
-* **Enrollment HTTP endpoints and frontend UX.** The service can enrol; nothing
-  exposes it over HTTP or in the UI yet, so enrollment is currently programmatic.
-* **Frontend `transcribeBlobDetailed()` wiring.** `/stt` returns speaker metadata;
-  the frontend still collapses the response to a string, so the metadata is
-  discarded before it reaches `/chat`.
-* **`RuntimeManager` identity carriage.** Voice turns do not yet carry
-  `input_source`, `speaker_status` or `speaker_profile_id` into the turn path.
-* **Memory attribution (the critical requirement).** Because identity does not
-  yet reach `RuntimeManager`, an unknown speaker's statements are still handled
-  exactly as before. **Nova does not yet protect Marcus's personal memory from a
-  guest's utterances** — the boundary is designed and documented but not wired.
-* **Episodic speaker provenance.**
+* **Frontend wiring (`A` in the audit).** This is the one that decides whether
+  any of the above runs in the live app. `/stt` returns speaker metadata and
+  `/chat` accepts a `voice_turn_id`, but the frontend still collapses the STT
+  response to a string, never requests `speaker=true`, and sends no handle. So a
+  **live voice turn today resolves to typed/owner semantics** — Nova behaves
+  exactly as she did before P5. Deferred to P5.1e deliberately: the backend had
+  to be safe before the frontend started asserting real identities.
+* **Enrollment HTTP endpoints and UX.** Enrollment is programmatic only.
+* **Episodic speaker provenance.** Episodes and artifacts carry no speaker.
 * **The P5 pipeline benchmark** (`/stt` before/after, parallel execution).
 
-Until the memory-attribution work lands, P5 should be treated as *identification
-without consequence*: Nova can tell who is speaking, and does not yet act on it.
-That ordering is safe — it cannot mis-attribute what it never uses — but it is
-not the finished phase.
-
-**P5.1's main body is still outstanding.** The pre-flight defects are fixed and
-the substrate is now trustworthy enough to build on, but `RuntimeManager` still
-receives no speaker context, so the attribution matrix, `memory.correct`
-protection, speaker-scoped grounding and episodic attribution remain unbuilt.
-A guest's utterances are still handled exactly as Marcus's.
+The ordering is fail-closed rather than half-open: with no handle the backend
+resolves to legacy owner semantics, which is what Nova already did, and the
+guest-safety machinery is exercised only once something actually asserts a
+guest. It is not, however, protection that is currently *running*.
 
 ## Live validation
 
