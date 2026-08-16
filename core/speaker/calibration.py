@@ -181,15 +181,25 @@ def fit_profile_threshold(profile_id: str, display_name: str,
     return fit
 
 
-def fit_margin(trials: Iterable[Trial]) -> tuple[float | None, float, int, str]:
+def fit_margin(trials: Iterable[Trial],
+               thresholds: dict[str, float] | None = None
+               ) -> tuple[float | None, float, int, str]:
     """Choose the top-vs-runner-up margin from two-profile labelled trials.
 
     Returns (margin, correct_rate, wrong_person_count, reason).
 
+    Simulates the REAL classifier, not the gap alone (V3 P5.2 closure): a trial
+    only counts as a correct KNOWN when the top score clears that profile's
+    proposed threshold *and* the gap clears the candidate margin. Scoring on the
+    gap by itself credited trials the live matcher would have returned as
+    `unknown`, so a margin could show >=90% while the shipped classifier did
+    not.
+
     Naming the WRONG person is the failure this exists to prevent, so a
-    candidate that produces even one is rejected outright — an `ambiguous`
-    result is a better answer than a confident mistake.
+    candidate producing even one is rejected outright — `ambiguous` is a better
+    answer than a confident mistake.
     """
+    thresholds = thresholds or {}
     rows = [t for t in trials if t.second_score is not None and t.top_profile_id]
     if len(rows) < 8:
         return (None, 0.0, 0, f"only {len(rows)} two-profile trials; need at least 8")
@@ -203,17 +213,24 @@ def fit_margin(trials: Iterable[Trial]) -> tuple[float | None, float, int, str]:
     best: tuple[float, float] | None = None
     detail = ""
     for cand in reversed(MARGIN_GRID):             # most conservative first
-        wrong = 0
+        wrong = unknown = ambiguous = 0
         per_speaker_ok = True
         rates: list[float] = []
         for truth, group in by_truth.items():
             correct = 0
             for t in group:
+                top_pid = t.top_profile_id
+                thr = thresholds.get(top_pid or "", None)
+                # 1. does the top score clear ITS profile's threshold?
+                if thr is not None and float(t.top_score) < float(thr):
+                    unknown += 1
+                    continue
+                # 2. does the gap clear the candidate margin?
                 gap = float(t.top_score) - float(t.second_score or 0.0)
-                named = t.top_profile_id if gap >= cand else None
-                if named is None:
-                    continue                        # ambiguous — a safe answer
-                if named == truth:
+                if gap < cand:
+                    ambiguous += 1
+                    continue
+                if top_pid == truth:
                     correct += 1
                 else:
                     wrong += 1
@@ -224,7 +241,8 @@ def fit_margin(trials: Iterable[Trial]) -> tuple[float | None, float, int, str]:
         if wrong == 0 and per_speaker_ok:
             best = (cand, min(rates))
             detail = (f"{cand:.2f}: 0 wrong-person calls, "
-                      f">= {min(rates):.0%} correct for every speaker")
+                      f">= {min(rates):.0%} correct for every speaker "
+                      f"({unknown} unknown, {ambiguous} ambiguous)")
             break
 
     if best is None:
@@ -246,8 +264,18 @@ def calibrate(trials: Sequence[Trial],
         return res
 
     for pid in enrolled:
-        genuine = [t.top_score for t in trials
-                   if t.truth == pid and t.top_profile_id == pid]
+        # Every score this person's OWN profile earned while they were speaking
+        # — top or runner-up. Dropping a trial because the true speaker ranked
+        # second discards exactly the hard cases the threshold exists to handle,
+        # and biases the genuine distribution upward (V3 P5.2 closure).
+        genuine = []
+        for t in trials:
+            if t.truth != pid:
+                continue
+            if t.top_profile_id == pid:
+                genuine.append(t.top_score)
+            elif t.second_profile_id == pid and t.second_score is not None:
+                genuine.append(t.second_score)
         # Impostor evidence: every score this profile earned while SOMEBODY
         # ELSE was speaking — whether it ranked top or runner-up.
         #
@@ -269,7 +297,11 @@ def calibrate(trials: Sequence[Trial],
         res.profiles.append(
             fit_profile_threshold(pid, names.get(pid, ""), genuine, impostor))
 
-    margin, rate, wrong, why = fit_margin([t for t in trials if t.phase == "B"])
+    # The margin is fitted against the thresholds that will actually ship.
+    fitted = {p.profile_id: p.threshold for p in res.profiles
+              if p.ok and p.threshold is not None}
+    margin, rate, wrong, why = fit_margin(
+        [t for t in trials if t.phase == "B"], fitted)
     res.margin, res.margin_correct_rate, res.margin_wrong_person = margin, rate, wrong
 
     bad = [p for p in res.profiles if not p.ok]
@@ -390,3 +422,100 @@ class CalibrationStore:
         async with self._conn() as db:
             await db.execute("DELETE FROM speaker_calibration WHERE id=1")
             await db.commit()
+
+
+# ── the ONE effective policy (V3 P5.2 closure) ───────────────────────────────
+
+SOURCE_ENV = "env override"
+SOURCE_CALIBRATED = "calibrated"
+SOURCE_DEFAULT = "provisional default"
+
+
+@dataclass
+class EffectivePolicy:
+    """The thresholds and margin a decision will ACTUALLY use, plus their source.
+
+    Resolved once and handed to `match()`, rather than each layer deciding for
+    itself. Two defects made that necessary:
+
+      * the matcher preferred a stored per-profile threshold over an explicit
+        `NOVA_SPEAKER_THRESHOLD`, inverting the documented precedence;
+      * a profile keeps `threshold` in SQLite after its calibration record has
+        gone stale, so a number nobody stands behind kept deciding.
+
+    So a stored threshold is INERT unless a valid calibration currently covers
+    the whole compatible population. The row may stay — it is useful history —
+    but it does not vote.
+    """
+
+    per_profile: dict[str, float] = field(default_factory=dict)
+    default_threshold: float = 0.55
+    margin: float = 0.10
+    threshold_source: str = SOURCE_DEFAULT
+    margin_source: str = SOURCE_DEFAULT
+    calibrated: bool = False
+
+    def threshold_for(self, profile_id: str | None) -> float:
+        if self.threshold_source == SOURCE_CALIBRATED and profile_id:
+            return float(self.per_profile.get(profile_id, self.default_threshold))
+        return float(self.default_threshold)
+
+
+def calibration_covers(rec: "CalibrationRecord | None", profiles: Sequence[Any]) -> bool:
+    """Does this calibration describe the population Nova has RIGHT NOW?
+
+    EXACT SET EQUALITY, not containment (V3 P5.2 final closure):
+
+        set(rec.profile_ids) == {every current compatible profile id}
+
+    and every one of them carries a fitted threshold.
+
+    Containment was wrong in the direction that matters. A fit over
+    {Marcus, Guest} still "covered" a population of {Marcus} alone, so deleting
+    the guest left Marcus judged by a threshold whose entire justification was
+    the impostor evidence that guest provided. The fit's false-accept bound came
+    from a voice that is no longer enrolled — the number survived the evidence
+    for it.
+
+    This is also the backstop for a failed clear: if `_invalidate_calibration()`
+    cannot delete the row (disk error, locked database), the stale row is still
+    read on the next boot. Set equality makes it INERT rather than trusted, so
+    the failure mode of the delete is a fall back to provisional defaults rather
+    than a silent stale claim. Fail closed.
+    """
+    if rec is None or not rec.valid_for_build:
+        return False
+    compatible = [p for p in profiles if getattr(p, "compatible", False)]
+    if not compatible:
+        return False
+    if set(rec.profile_ids) != {p.profile_id for p in compatible}:
+        return False
+    return all(p.threshold is not None for p in compatible)
+
+
+def resolve_policy(profiles: Sequence[Any], rec: "CalibrationRecord | None",
+                   *, env_threshold: float | None, env_margin: float | None,
+                   default_threshold: float, default_margin: float) -> EffectivePolicy:
+    """env override -> valid calibration -> provisional default. In that order."""
+    covers = calibration_covers(rec, profiles)
+
+    if env_threshold is not None:
+        pol_thresh, thresh_src, per = default_threshold, SOURCE_ENV, {}
+        pol_thresh = float(env_threshold)
+    elif covers:
+        pol_thresh, thresh_src = default_threshold, SOURCE_CALIBRATED
+        per = {p.profile_id: float(p.threshold) for p in profiles
+               if getattr(p, "compatible", False) and p.threshold is not None}
+    else:
+        pol_thresh, thresh_src, per = float(default_threshold), SOURCE_DEFAULT, {}
+
+    if env_margin is not None:
+        margin_val, margin_src = float(env_margin), SOURCE_ENV
+    elif covers and rec is not None:
+        margin_val, margin_src = float(rec.margin), SOURCE_CALIBRATED
+    else:
+        margin_val, margin_src = float(default_margin), SOURCE_DEFAULT
+
+    return EffectivePolicy(per_profile=per, default_threshold=pol_thresh,
+                           margin=margin_val, threshold_source=thresh_src,
+                           margin_source=margin_src, calibrated=bool(covers))

@@ -306,11 +306,31 @@ class SpeakerInfo(BaseModel):
     reason: str | None = None
     #: Was identification actually attempted? False only when the feature is off.
     attempted: bool = False
+    #: The ASSERTED identity — populated only for `known`. Attribution and
+    #: personalisation read this and nothing else below it.
     profile_id: str | None = None
     display_name: str | None = None
     similarity: float | None = None
     second_best_similarity: float | None = None
     threshold: float | None = None
+    #: ── diagnostics (V3 P5.2 final closure) ─────────────────────────────────
+    #:
+    #: `SpeakerMatch.for_response()` already emitted these and Pydantic dropped
+    #: them on the floor: extra keys are ignored by default, so the model object
+    #: was right, the HTTP response was missing fields, and nothing failed
+    #: loudly. The browser calibration harness reads them, which is exactly the
+    #: class of bug this phase exists to stop — correct in Python, lost across
+    #: the serialization boundary.
+    #:
+    #: All non-biometric. No embedding, no centroid, no enrollment vector, ever.
+    threshold_source: str | None = None
+    margin: float | None = None
+    second_best_profile_id: str | None = None
+    second_best_name: str | None = None
+    #: Who merely RANKED FIRST — set even when the answer was `unknown`. This is
+    #: calibration evidence, NOT identity; see core/speaker/matcher.py.
+    top_scored_profile_id: str | None = None
+    top_scored_display_name: str | None = None
     model_id: str | None = None
     #: Short-lived handle the client quotes back on /chat so identity stays
     #: backend-derived. Not a session token and grants nothing.

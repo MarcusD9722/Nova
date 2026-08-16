@@ -1026,6 +1026,16 @@ class RuntimeManager:
         return self._permission_broker
 
     @property
+    def computer(self) -> ComputerControl:
+        """The PRODUCTION computer-control instance, wired to the real broker.
+
+        Exposed so the P5.2 permission probe exercises the shipped object rather
+        than constructing its own — a probe against a broker built for the test
+        proves the test, not Nova.
+        """
+        return self._computer
+
+    @property
     def cloud(self) -> CloudRuntime:
         return self._cloud
 
