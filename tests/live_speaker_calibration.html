@@ -158,13 +158,64 @@ const VAL_CUES = [
 //: back recognised, the privacy question was never asked.
 const UNVERIFIED_OK = ["unknown", "ambiguous", "unavailable", "too_short"];
 
-/** Even, deterministic spread across the five acoustic conditions.
- *  20 -> exactly 4 each, which is what P5.2 requires for Phase A. */
+/** Even, deterministic spread across the five acoustic conditions — GROUPED.
+ *
+ *  20 -> exactly 4 each, which is what P5.2 requires for Phase A.
+ *
+ *  Grouped, not round-robin. Round-robin preserves the counts but makes a human
+ *  physically move toward and away from the microphone on every single sample,
+ *  which is slower and produces worse `near`/`far` audio than settling into a
+ *  position for four takes. The counts are identical either way; only the human
+ *  cost differs, and that is the whole point of this workflow.
+ */
 function planConditions(count, conds) {
   conds = conds || CONDITION_NAMES;
+  const per = Math.floor(count / conds.length);
+  const extra = count % conds.length;
   const out = [];
-  for (let i = 0; i < count; i++) out.push(conds[i % conds.length]);
+  conds.forEach((c, idx) => {
+    const n = per + (idx < extra ? 1 : 0);
+    for (let k = 0; k < n; k++) out.push(c);
+  });
   return out;
+}
+
+// ── who speaks, in the two multi-person blocks ──────────────────────────────
+// Pure data so the handoff rule below can be tested without a browser.
+const SENTINEL_STEPS = [
+  {who:"Marcus", phase:"store", secs:5.0,
+   cue:'Marcus: say — "Remember that my calibration sentinel is MARCUS-LIVE-551."'},
+  {who:"Guest", phase:"store", secs:5.0,
+   cue:'Guest: say — "Remember that my calibration sentinel is GUEST-LIVE-661."'},
+  {who:"Marcus", phase:"ask", secs:4.0,
+   cue:'Marcus: say — "What is my calibration sentinel?"'},
+  {who:"Guest", phase:"ask", secs:4.0,
+   cue:'Guest: say — "What is my calibration sentinel?"'},
+  // `who` is the identity KEY the result analysis matches on; `label` is what a
+  // human is shown. Keeping them separate stops a wording change from silently
+  // breaking `steps.find(s => s.who === "unverified")`.
+  {who:"unverified", label:"a third, unenrolled person", phase:"ask", secs:4.0,
+   cue:'A THIRD, unenrolled person: say — "What is my calibration sentinel?"'},
+];
+
+const PERMISSION_STEPS = [
+  {who:"Marcus", secs:3.0}, {who:"Guest", secs:3.0},
+];
+
+/** Display name for a step. */
+function stepLabel(step) { return (step && (step.label || step.who)) || ""; }
+
+/** Who must take over before sample `i`, or null if the speaker is unchanged.
+ *
+ *  Both multi-person blocks record automatically WITHIN one speaker, but a
+ *  change of human is not something to spring on a room mid-countdown: the
+ *  wrong person answers, the turn is attributed to them, and the privacy or
+ *  permission result is quietly meaningless. Every change gets a deliberate
+ *  Continue.
+ */
+function handoffBeforeIndex(steps, i) {
+  if (!steps || i <= 0 || i >= steps.length) return null;
+  return steps[i].who !== steps[i-1].who ? steps[i].who : null;
 }
 
 /** Rotate through a cue pool. Separate pools per phase keep the audio fresh. */
@@ -195,6 +246,60 @@ function totalRecordings(plan) {
 /** Where a trial is stored. Validation NEVER shares storage with calibration:
  *  the fit must not be able to see the audio it will later be judged on. */
 function storeFor(phase) { return phase === "V" ? "validation" : "trials"; }
+
+// ── enrollment is deliberately NOT resumable ────────────────────────────────
+//
+// Trials are safe to resume: each one is uploaded and scored the moment it is
+// recorded, so `S.blocks[id].done` and the stored rows describe the same thing.
+//
+// Enrollment is not. Its six clips are held as in-memory Blobs until all six
+// exist and go up in ONE multipart request — and audio is never persisted, by
+// design. So a Stop or a refresh at 3/6 destroys three recordings while leaving
+// `done: 3` on disk. Resuming would record only three more and upload a
+// half-enrollment while the UI showed 6/6. The count would be a lie about audio
+// that no longer exists.
+//
+// The fix is not to persist the audio. It is to refuse to resume.
+const ENROLL_BLOCKS = {enroll_marcus:"marcus", enroll_guest:"guest"};
+
+/** Did the SERVER actually complete this enrollment? Block progress is only
+ *  meaningful once the upload succeeded and a profile came back. */
+function enrollmentComplete(e) { return !!(e && e.ok && e.profile_id); }
+
+/** Complete AND at the P5.2 bar. Only this may advance the protocol. */
+function enrollmentAcceptable(e) {
+  return enrollmentComplete(e) && e.meets_p52_bar === true;
+}
+
+/** Run at load: drop enrollment progress whose audio cannot exist any more.
+ *  Returns the block ids that were reset, so the human is TOLD rather than
+ *  quietly restarted. */
+function reconcileEnrollment(S) {
+  const reset = [];
+  Object.keys(ENROLL_BLOCKS).forEach(blockId => {
+    const done = (S.blocks[blockId] || {}).done || 0;
+    if (done > 0 && !enrollmentComplete((S.enroll || {})[ENROLL_BLOCKS[blockId]])) {
+      S.blocks[blockId] = {done: 0};
+      reset.push(blockId);
+    }
+  });
+  return reset;
+}
+
+/** ONE state transition per processed sample.
+ *
+ *  The row and the block index must become durable together. Previously the row
+ *  was pushed and saved inside the sample handler, and the index was incremented
+ *  and saved after it returned — a reload in between persisted the row with the
+ *  index one behind, so resuming re-recorded an index that already had a row and
+ *  the trial was counted twice. Both changes now happen here, and exactly one
+ *  save follows.
+ */
+function commitSample(S, {blockId, nextIndex, row, store}) {
+  if (row) (store === "validation" ? S.validation : S.trials).push(row);
+  S.blocks[blockId] = {done: nextIndex};
+  return S;
+}
 
 /** The advance rule, isolated so it can be proven.
  *  Only a genuinely processed sample moves the index; a retry or an error
@@ -322,7 +427,10 @@ function freshState() {
 const P52 = {
   DUR, GAP_MS, LEAD_IN_S, LEAD_NEXT_S, CONDITION_NAMES, CONDITION_HINT,
   ENROLL_PHRASES, CAL_CUES, VAL_CUES, UNVERIFIED_OK,
+  SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS,
   planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
+  handoffBeforeIndex, stepLabel, enrollmentComplete, enrollmentAcceptable,
+  reconcileEnrollment, commitSample,
   confusion, pct, auditTruth, computeAcceptance, freshState,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = P52;
@@ -486,12 +594,18 @@ async function waitWhilePaused(ctx) {
  * SAME index — a failed sample is never silently skipped, and never counted.
  */
 async function runBlock(spec) {
-  const {id, who, title, count, seconds, secondsOf, condFor, cueOf, doSample} = spec;
+  const {id, who, title, count, seconds, secondsOf, condFor, cueOf, doSample,
+         handoffBefore, resumable = true} = spec;
   const secsAt = i => (secondsOf ? secondsOf(i) : seconds);
   RUN.paused = false; RUN.retry = false; RUN.abort = false; RUN.active = true;
   if (!S.startedAt) { S.startedAt = Date.now(); }
+  // A non-resumable block always starts clean: its samples are only real while
+  // they are in memory, so persisted progress from a previous attempt describes
+  // audio that no longer exists.
+  if (!resumable) { S.blocks[id] = {done:0}; save(); }
   let i = (S.blocks[id] || {}).done || 0;
   const started = i;
+  let handoffShownFor = -1;
 
   while (i < count) {
     const cond = condFor ? condFor(i) : null;
@@ -499,6 +613,16 @@ async function runBlock(spec) {
     const ctx = {who, title, cue, condition:cond, blockDone:i, blockTotal:count};
     await waitWhilePaused(ctx);
     if (RUN.abort) break;
+
+    // A different human takes over here. Wait for a deliberate Continue — the
+    // countdown must not start while the previous speaker is still sitting
+    // there. Shown once per index, so a retry does not re-ask.
+    if (handoffBefore && handoffShownFor !== i) {
+      const h = handoffBefore(i);
+      if (h) { await handoff(h.title, h.body, h.cta); }
+      handoffShownFor = i;
+      if (RUN.abort) break;
+    }
 
     // Countdown: a full 3-2-1 at the top of a block, one beat between samples.
     const lead = (i === started) ? LEAD_IN_S : LEAD_NEXT_S;
@@ -522,11 +646,12 @@ async function runBlock(spec) {
     }
 
     stageRender({...ctx, state:"processing…"});
-    let outcome = "error", detail = "";
+    let outcome = "error", detail = "", result = null;
     try {
       const ok = await doSample(blob, i, cond, cue);
       outcome = (ok === false) ? "error" : "ok";
-      if (ok && ok.note) detail = ok.note;
+      result = (ok && typeof ok === "object") ? ok : null;
+      if (result && result.note) detail = result.note;
     } catch (e) {
       detail = e.message || String(e);
     }
@@ -538,8 +663,14 @@ async function runBlock(spec) {
       continue;                            // SAME index. Never skipped.
     }
 
+    // ONE state transition, ONE save. The row and the advanced index become
+    // durable together, so a reload can never find a stored row with the block
+    // index still behind it — which would re-record that index and double-count
+    // the trial.
     i = advance(i, "ok");
-    S.blocks[id] = {done:i};
+    commitSample(S, {blockId:id, nextIndex:i,
+                     row: result ? result.row : null,
+                     store: result ? result.store : null});
     S.paceMs = (S.paceMs||[]).concat(Date.now() - t0).slice(-40);
     save();
     stageRender({...ctx, blockDone:i,
@@ -566,7 +697,9 @@ async function identify(blob) {
   return out;
 }
 
-function recordTrial(out, {truthId, truthName, phase, condition, block}) {
+/** Build the trial row. Deliberately does NOT store or save it: `runBlock`
+ *  commits the row and the block index together, in one save. */
+function buildTrialRow(out, {truthId, truthName, phase, condition, block}) {
   S.latency.push({identify_ms: out.identify_ms, round_trip_ms: out.round_trip_ms});
   const row = {
     truth: truthId, truthName, block, phase, condition,
@@ -585,9 +718,9 @@ function recordTrial(out, {truthId, truthName, phase, condition, block}) {
     status: out.status || "", threshold: out.threshold ?? null,
   };
   // Validation is stored SEPARATELY from calibration. The fit must never see
-  // the audio it will later be judged against.
-  (storeFor(phase) === "validation" ? S.validation : S.trials).push(row);
-  return row;
+  // the audio it will later be judged against — `storeFor` decides which array
+  // `commitSample` pushes into.
+  return {row, store: storeFor(phase)};
 }
 
 async function enrolBatch(name, role, key, blocks) {
@@ -640,18 +773,8 @@ async function sttOnly(blob, wantSpeaker) {
 
 // ── composite flows ─────────────────────────────────────────────────────────
 
-const SENTINEL_STEPS = [
-  {who:"Marcus",     phase:"store", secs:DUR.sentinelStore,
-   cue:'Marcus: say — "Remember that my calibration sentinel is MARCUS-LIVE-551."'},
-  {who:"Guest",      phase:"store", secs:DUR.sentinelStore,
-   cue:'Guest: say — "Remember that my calibration sentinel is GUEST-LIVE-661."'},
-  {who:"Marcus",     phase:"ask",   secs:DUR.sentinelAsk,
-   cue:'Marcus: say — "What is my calibration sentinel?"'},
-  {who:"Guest",      phase:"ask",   secs:DUR.sentinelAsk,
-   cue:'Guest: say — "What is my calibration sentinel?"'},
-  {who:"unverified", phase:"ask",   secs:DUR.sentinelAsk,
-   cue:'A THIRD, unenrolled person: say — "What is my calibration sentinel?"'},
-];
+// SENTINEL_STEPS and PERMISSION_STEPS live in PART 1: they are pure data, and
+// the handoff rule that reads them has to be testable without a browser.
 
 async function sentinelFlow() {
   const M_S = "MARCUS-LIVE-551", G_S = "GUEST-LIVE-661";
@@ -660,18 +783,26 @@ async function sentinelFlow() {
   const out = { steps: [], conversation_id: CID, conversation_stable: true };
   const replies = [];
 
-  // ATOMIC. The five turns accumulate their results in memory, so a reload
-  // partway through would resume at turn 4 with no record of turns 1-3 and
-  // silently report an incomplete sentinel as complete. Five recordings is a
-  // cheap thing to redo; a wrong privacy verdict is not.
-  S.blocks.sentinel = {done:0}; save();
-
+  // ATOMIC (`resumable:false` below). The five turns accumulate their results
+  // in memory, so a reload partway through would resume at turn 4 with no
+  // record of turns 1-3 and silently report an incomplete sentinel as complete.
+  // Five recordings is a cheap thing to redo; a wrong privacy verdict is not.
   await runBlock({
     id:"sentinel", who:"one turn each — Marcus, guest, then a third voice",
     title:"memory attribution (live pipeline)",
-    count:SENTINEL_STEPS.length,
+    count:SENTINEL_STEPS.length, resumable:false,
     secondsOf: i => SENTINEL_STEPS[i].secs,
     cueOf: i => SENTINEL_STEPS[i].cue,
+    // Four real speaker changes in five turns. Each one waits for a Continue.
+    handoffBefore: i => {
+      if (!handoffBeforeIndex(SENTINEL_STEPS, i)) return null;
+      const next = stepLabel(SENTINEL_STEPS[i]);
+      return {title: `Next to speak: ${next}`,
+              body: `${stepLabel(SENTINEL_STEPS[i-1])} is done. Hand the microphone `
+                  + `over — recording starts after Continue.<br><br>`
+                  + `<span class="dim">${SENTINEL_STEPS[i].cue}</span>`,
+              cta: `${next} is ready`};
+    },
     doSample: async (blob, i) => {
       const spec = SENTINEL_STEPS[i];
       const r = await chatTurn(blob, CID);
@@ -725,11 +856,16 @@ async function permissionFlow() {
 
   const voices = [];
   const who = [{label:"Marcus", id:S.marcusId}, {label:"Guest", id:S.guestId}];
-  S.blocks.permission = {done:0}; save();   // atomic, same reason as the sentinel
-  const done = await runBlock({
+  const done = await runBlock({   // resumable:false — atomic, as for the sentinel
     id:"permission", who:"Marcus, then the guest", title:"permission probe",
-    count:2, seconds:DUR.permission,
+    count:2, seconds:DUR.permission, resumable:false,
     cueOf: i => `${who[i].label}: say any short sentence.`,
+    handoffBefore: i => {
+      const next = handoffBeforeIndex(PERMISSION_STEPS, i);
+      return next ? {title: `Next to speak: ${next}`,
+                     body: "Marcus is done. Hand over — recording starts after Continue.",
+                     cta: `${next} is ready`} : null;
+    },
     doSample: async (blob, i) => {
       const spk = await sttOnly(blob, true);
       const r = await api("/speaker/permission-probe", {method:"POST",
@@ -842,19 +978,51 @@ function trialPayload(t) {
 }
 
 async function runEnrollBlock(key, name, role, id, stepAfter) {
+  // The six clips exist ONLY in this array, and audio is never persisted. So
+  // this block is non-resumable: any interruption before the upload succeeds
+  // means the recordings are gone and all six must be re-taken. `resumable:
+  // false` makes runBlock start from 0 and ignore any stale progress.
   const kept = [];
   const ok = await runBlock({
-    id, who:name, title:"enrollment — read each phrase aloud", count:6, seconds:DUR.enroll,
+    id, who:name, title:"enrollment — read each phrase aloud", count:6,
+    seconds:DUR.enroll, resumable:false,
     cueOf: i => ENROLL_PHRASES[i],
     doSample: async (blob) => { kept.push(blob); return {note:"held for upload"}; },
   });
-  if (!ok) return false;
+  if (!ok || kept.length < 6) {
+    // Stopped part-way. Do not leave progress claiming samples that no longer
+    // exist anywhere.
+    S.blocks[id] = {done:0}; save();
+    alertBanner(`${name}'s enrollment was interrupted at ${kept.length} of 6. `
+      + "Enrollment clips are held in memory and never written to disk, so those "
+      + "recordings are gone — <b>all six must be recorded again</b>.");
+    return false;
+  }
   stageShow(`<div class="who">${name}</div><div class="cue">Enrolling…</div>
              <div class="state dim">Uploading 6 samples; audio is discarded after embedding.</div>`);
-  const out = await enrolBatch(name, role, key, kept);
+  let out;
+  try { out = await enrolBatch(name, role, key, kept); }
+  catch (e) { out = {ok:false, error: e.message || String(e)}; }
   stageHide();
-  if (!out.ok) { S.blocks[id] = {done:0}; save();
-                 alertBanner(`Enrollment failed: ${out.error||"unknown"}`); return false; }
+
+  if (!out.ok) {
+    S.blocks[id] = {done:0}; save();
+    alertBanner(`Enrollment failed: ${out.error||"unknown"}. All six clips must be re-recorded.`);
+    return false;
+  }
+  if (!out.meets_p52_bar) {
+    // The SERVER may already hold a profile built from too few kept samples.
+    // Do not advance, and do not quietly delete it either — deleting a profile
+    // is the human's explicit decision, in preflight.
+    S.blocks[id] = {done:0}; save();
+    alertBanner(
+      `<b>${name}'s enrollment is below the P5.2 bar</b>: only ${out.sample_count} of 6 `
+      + `samples survived the quality gate (5 required). ${out.note||""}<br>`
+      + `A profile <code>${out.profile_id}</code> WAS created on the backend. Re-record `
+      + "the enrollment, or delete that profile from Preflight first — the harness "
+      + "will not proceed with a sub-P5.2 enrollment.");
+    return false;
+  }
   S.step = stepAfter; save();
   return true;
 }
@@ -875,9 +1043,10 @@ async function runTrialBlock({id, truthId, truthName, phase, count, pool, stepAf
     cueOf: i => cueFor(pool, i),
     doSample: async (blob, i, cond) => {
       const out = await identify(blob);
-      const row = recordTrial(out, {truthId, truthName, phase, condition:cond, block:id});
-      save();
-      return {note: `${out.status}${out.similarity!=null ? " · "+out.similarity.toFixed(3) : ""}`};
+      const built = buildTrialRow(out, {truthId, truthName, phase, condition:cond, block:id});
+      // Handed back, NOT stored here — runBlock commits row + index atomically.
+      return {row: built.row, store: built.store,
+              note: `${out.status}${out.similarity!=null ? " · "+out.similarity.toFixed(3) : ""}`};
     },
   });
   if (ok && stepAfter != null) { S.step = stepAfter; save(); }
@@ -1154,6 +1323,20 @@ function render() {
 }
 
 if (HAS_DOM) {
+  // Recover from an interrupted enrollment BEFORE anything is rendered. The
+  // clips behind that progress no longer exist, so the count would otherwise
+  // let a half-enrollment upload as if it were six samples.
+  const wiped = reconcileEnrollment(S);
+  if (wiped.length) {
+    save();
+    setTimeout(() => alertBanner(
+      `An earlier enrollment (${wiped.join(", ")}) was interrupted before it `
+      + "reached the backend. Enrollment audio is held in memory and never "
+      + "written to disk, so those clips are gone and that block has been reset "
+      + "to 0 of 6. <b>Those six recordings must be taken again</b> — nothing "
+      + "was uploaded, and no profile was created."), 0);
+  }
+
   $("#ping").onclick = async () => {
     const out = $("#pingout");
     try {
