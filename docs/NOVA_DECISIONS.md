@@ -599,3 +599,66 @@ only the four exact shapes P5.1d could write; an `endswith` rule read
 
 **Revisit if.** `people`, `events` or the graph gain per-person ownership. Then
 the `_owner_only` refusals become scoped reads, one call site at a time.
+
+---
+
+## D15 - Persistent-state tools are classified, and the classification is tested
+
+**Decided:** 2026-08-15 (V3 P5.1d.3)
+
+**Decision.** Every registered built-in tool carries an explicit classification -
+speaker-scoped, owner-private, shared/system, capability-governed, or ephemeral -
+recorded in `tests/test_speaker_persistent_state_v51d3.py::_CLASSIFICATION` and
+asserted against the live router. A tool added without one fails the suite.
+
+Owner-private stores fail closed for non-owners at the data layer via
+`_owner_only`. Capability tools stay governed by `PermissionBroker` and developer
+mode, never by voice.
+
+**Rationale.** P5.1d.2 fixed the tools named `memory.*`. The failure mode left
+over was structural: a tool bypasses speaker privacy because the durable state it
+touches has a different name. Measured on `641f499` - a guest overwrote the
+owner's saved plan; created a goal row *and* an enqueued `__decide__` task, i.e.
+unattended background work started by someone Nova cannot name; updated and
+**deleted** his learned skill; indexed a folder into his document store; read and
+extended his research registry.
+
+Two more were found only because the completeness check compared the inventory
+against the live registry: `memory.synthesize` and `skill.run` are registered by
+`RuntimeManager`, not `core/tooling.py`, and both read owner-private stores.
+
+And one was a layer below the tool surface entirely: `AgentSociety` injects
+`agent_recall` notes into every specialist prompt, so a guest could receive
+Marcus's accumulated context inside a deliberation answer without ever calling
+`agent.recall`.
+
+Each of the three preceding passes missed something by omission rather than
+error, which is why the inventory is now a test rather than a document.
+
+**Alternatives rejected.** Auditing by tool name (rejected: `plan`, `goal`,
+`skill` and `thoughts` hold personal state and none is called "memory");
+restricting capability tools by speaker (rejected: that is exactly
+"voice = authentication", which D14 and the phase brief both forbid); building
+guest-scoped plan/goal/skill/document stores in this pass (rejected: four
+half-built parallel stores, when fail-closed is safe and reversible);
+classifying `agent.recall` from its name (rejected: it was classified from
+evidence - `agent_remember` has no production caller and the only note in the
+tree is "Marcus prefers primary sources over blog posts").
+
+**Evidence.** `tests/test_speaker_persistent_state_v51d3.py` - the inventory
+covers the live registry exactly; a 22-tool sweep confirms every owner-private
+tool refuses both a guest and an unknown speaker; the owner's plan, skill store
+and document index are byte-for-byte intact after the attempts; guest
+`goal.create` adds zero goal rows and zero tasks, asserted against both tables;
+`society.consult` still deliberates for a guest but carries none of Marcus's
+notes, while the owner's still does; `research.findings` returns only
+`{summary, source, confidence}`.
+
+**Constraint.** The classification table must be updated when a tool is added -
+the suite fails otherwise, and that failure is the feature. Fail-closed refusals
+stay *data* refusals with a sentence Nova can say aloud, never permission errors.
+`experiment.*` and `agents.roster` are deliberately shared and must not be
+restricted merely because a guest can call them.
+
+**Revisit if.** Plans, goals, skills or documents gain per-person ownership. Each
+`_owner_only` call site then becomes a scoped read, one at a time.

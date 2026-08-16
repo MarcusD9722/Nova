@@ -567,6 +567,61 @@ def seed_decisions() -> list[Decision]:
                         "never return.",
             decided_at="2026-08-15T00:00:00+00:00",
         ),
+        Decision(
+            id="D15",
+            title="Persistent-state tools are classified, and the classification is tested",
+            decision="Every registered built-in tool carries an explicit classification - "
+                     "speaker-scoped, owner-private, shared/system, capability-governed, or "
+                     "ephemeral - recorded in test_speaker_persistent_state_v51d3.py and "
+                     "asserted against the live router. A tool added without one FAILS the "
+                     "suite. Owner-private stores fail closed for non-owners at the data "
+                     "layer via _owner_only; capability tools stay governed by "
+                     "PermissionBroker and developer mode, never by voice.",
+            rationale="P5.1d.2 fixed the tools named memory.*. The failure mode left over "
+                      "was structural: a tool bypasses speaker privacy because the durable "
+                      "state it touches has a different NAME. Measured on 641f499 - a guest "
+                      "overwrote the owner's saved plan; created a goal row AND an enqueued "
+                      "__decide__ task (unattended background work started by someone Nova "
+                      "cannot name); updated and DELETED his learned skill; indexed a folder "
+                      "into his document store; read and extended his research registry. Two "
+                      "more were found only because the completeness check compared the "
+                      "inventory against the live registry: memory.synthesize and skill.run "
+                      "are registered by RuntimeManager, not core/tooling.py. And one was a "
+                      "layer below the tool surface entirely: AgentSociety injects "
+                      "agent_recall notes into every specialist prompt, so a guest could "
+                      "receive Marcus's context inside a deliberation answer without ever "
+                      "calling agent.recall. Each preceding pass missed something by "
+                      "omission, which is why the inventory is now a test.",
+            alternatives=["Auditing by tool name (rejected: plan, goal, skill and thoughts "
+                          "hold personal state and none is called 'memory')",
+                          "Restricting capability tools by speaker (rejected: that is "
+                          "'voice = authentication', which D14 and the brief forbid)",
+                          "Building guest-scoped plan/goal/skill/document stores in this "
+                          "pass (rejected: four half-built parallel stores, when fail-closed "
+                          "is safe and reversible)",
+                          "Classifying agent.recall from its name (rejected: classified from "
+                          "evidence - agent_remember has no production caller and the only "
+                          "note in the tree is 'Marcus prefers primary sources')"],
+            evidence=["tests/test_speaker_persistent_state_v51d3.py: the inventory covers "
+                      "the live registry exactly; a 22-tool sweep confirms every "
+                      "owner-private tool refuses a guest and an unknown speaker; the "
+                      "owner's plan, skill store and document index are intact after the "
+                      "attempts; guest goal.create adds zero goal rows and zero tasks, "
+                      "asserted against both tables; society.consult still deliberates for a "
+                      "guest but carries none of Marcus's notes; research.findings returns "
+                      "only {summary, source, confidence}"],
+            subsystem="memory",
+            source_refs=["tests/test_speaker_persistent_state_v51d3.py::_CLASSIFICATION",
+                         "core/tooling.py::_owner_only",
+                         "core/orchestrator/society.py::deliberate"],
+            constraints="The classification table must be updated when a tool is added - the "
+                        "suite fails otherwise, and that failure is the feature. Fail-closed "
+                        "refusals stay DATA refusals with a sentence Nova can say aloud, "
+                        "never permission errors. experiment.* and agents.roster are "
+                        "deliberately shared and must not be restricted merely because a "
+                        "guest can call them.",
+            decided_at="2026-08-15T00:00:00+00:00",
+        ),
     ]
 
 

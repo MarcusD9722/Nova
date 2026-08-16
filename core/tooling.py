@@ -431,6 +431,14 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         topic = str(args.get("topic") or "general").strip()
         if not content:
             return {"ok": False, "error": "missing_content"}
+        # The ThoughtStore is Nova's private notebook about Marcus. P5.1d.2
+        # made thoughts.recall owner-only but left this writer open, so a
+        # guest's text still landed in the store he later reads back
+        # (measured). A one-sided gate is not a gate.
+        refused = _owner_only("thoughts", detail=(
+            "Those notes are my own thinking about Marcus and his work, so I keep them to that."))
+        if refused is not None:
+            return refused
         tid = await memory.note_thought(kind, content, topic=topic)
         if not tid:
             return {"ok": False, "error": "thoughts_disabled"}
@@ -491,6 +499,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             horizon = int(args.get("horizon_days") or 90)
         except (TypeError, ValueError):
             horizon = 90
+        # One global plan store, no ownership column. Measured: a guest
+        # overwrote the owner's saved plan outright.
+        refused = _owner_only("plans", detail=(
+            "Long-term plans here are Marcus\u2019s, so I won\u2019t write one from this conversation."))
+        if refused is not None:
+            return refused
         plan = build_plan(vision, horizon_days=horizon, milestones=milestones, items=items)
         await memory.save_plan(goal_id, plan)
         return {"ok": True, "goal_id": goal_id, "milestones": len(plan["milestones"]),
@@ -501,6 +515,10 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         goal_id = str(args.get("goal_id") or args.get("goal") or args.get("id") or "").strip()
         if not goal_id:
             return {"ok": False, "error": "missing_goal_id"}
+        refused = _owner_only("plans", detail=(
+            "That plan is Marcus\u2019s, so it isn\u2019t mine to walk through with someone else."))
+        if refused is not None:
+            return refused
         plan = await memory.load_plan(goal_id)
         if plan is None:
             return {"ok": False, "error": "no_plan", "note": f"No plan saved for goal '{goal_id}' yet."}
@@ -511,6 +529,10 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         goal_id = str(args.get("goal_id") or args.get("goal") or args.get("id") or "").strip()
         if not goal_id:
             return {"ok": False, "error": "missing_goal_id"}
+        refused = _owner_only("plans", detail=(
+            "That plan is Marcus\u2019s, so I won\u2019t move it forward from here."))
+        if refused is not None:
+            return refused
         summary = await memory.advance_plan(goal_id)
         if summary is None:
             return {"ok": False, "error": "no_plan"}
@@ -520,12 +542,23 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         topic = str(args.get("topic") or args.get("subject") or "").strip()
         if not topic:
             return {"ok": False, "error": "missing_topic"}
+        # The tracking REGISTRY is what Marcus asked Nova to follow - his
+        # workflow state. The findings it produces are sourced world facts
+        # and stay shared; see research.findings.
+        refused = _owner_only("research_registry", detail=(
+            "The list of topics I follow is Marcus\u2019s, so I won\u2019t add to it from this conversation."))
+        if refused is not None:
+            return refused
         if await memory.track_research_topic(topic):
             return {"ok": True, "tracking": topic,
                     "note": "I'll keep an eye on this and save findings (with sources) as I learn them. Enable NOVA_RESEARCH for automatic periodic updates."}
         return {"ok": False, "error": "invalid_topic"}
 
     async def _research_list(args: dict[str, Any]) -> dict[str, Any]:
+        refused = _owner_only("research_registry", detail=(
+            "The topics I keep an eye on are Marcus\u2019s, so that list isn\u2019t mine to share."))
+        if refused is not None:
+            return refused
         topics = await memory.list_research_topics()
         return {"ok": True, "topics": topics}
 
@@ -554,6 +587,16 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         topic = str(args.get("topic") or "").strip() or None
         if not agent_id:
             return {"ok": False, "error": "missing_agent_id"}
+        # Classified owner-private from evidence, not from the word 'agent':
+        # agent_remember has no production caller, and the only note ever
+        # written through it - in tests/test_society_p6.py - is
+        # 'Marcus prefers primary sources over blog posts.' The store's
+        # designed content is his preferences. agents.roster stays shared:
+        # it returns specialist specs and counters, never user content.
+        refused = _owner_only("agent_memory", detail=(
+            "Those are a specialist\u2019s notes about working with Marcus, so I keep them to that."))
+        if refused is not None:
+            return refused
         notes = await memory.agent_recall(agent_id, topic=topic)
         return {"ok": True, "agent_id": agent_id, "notes": notes}
 
@@ -592,6 +635,11 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         return {"ok": True, "experiments": await memory.list_experiments()}
 
     async def _skill_detect(args: dict[str, Any]) -> dict[str, Any]:
+        # detect reads his repeated tool-usage history directly.
+        refused = _owner_only("skills", detail=(
+            "Learned workflows come from Marcus\u2019s own repeated work, so that\u2019s his to look at."))
+        if refused is not None:
+            return refused
         candidate = await memory.detect_learnable_workflow()
         if not candidate:
             return {"ok": True, "found": False, "note": "No repeated workflow detected yet — patterns build up as you work."}
@@ -603,15 +651,32 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         steps = args.get("steps") if isinstance(args.get("steps"), list) else []
         if not name or not steps:
             return {"ok": False, "error": "missing_name_or_steps"}
+        refused = _owner_only("skills", detail=(
+            "The skills I\u2019ve learned are Marcus\u2019s workflows, so I won\u2019t add to them from here."))
+        if refused is not None:
+            return refused
         skill_id = await memory.learn_skill(name, [str(s) for s in steps])
         if not skill_id:
             return {"ok": False, "error": "not_learned"}
         return {"ok": True, "skill_id": skill_id, "learned": name}
 
+    #: Every learned skill is distilled from Marcus's own repeated work, and the
+    #: store has no ownership column. The mutators matter most: measured on
+    #: `641f499`, a guest updated a skill's steps to "HACKED" and then DELETED
+    #: it. A half-scoped guest skill store is explicitly out of scope here.
+    _SKILL_SCOPE_DETAIL = ("The skills I’ve learned are Marcus’s own workflows, "
+                           "so they aren’t mine to go through or change here.")
+
     async def _skill_list(args: dict[str, Any]) -> dict[str, Any]:
+        refused = _owner_only("skills", detail=_SKILL_SCOPE_DETAIL)
+        if refused is not None:
+            return refused
         return {"ok": True, "skills": await memory.list_skills()}
 
     async def _skill_get(args: dict[str, Any]) -> dict[str, Any]:
+        refused = _owner_only("skills", detail=_SKILL_SCOPE_DETAIL)
+        if refused is not None:
+            return refused
         skill = await memory.get_skill(str(args.get("skill_id") or args.get("id") or "").strip())
         if skill is None:
             return {"ok": False, "error": "not_found"}
@@ -620,6 +685,9 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     async def _skill_update(args: dict[str, Any]) -> dict[str, Any]:
         skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
         steps = args.get("steps") if isinstance(args.get("steps"), list) else []
+        refused = _owner_only("skills", detail=_SKILL_SCOPE_DETAIL)
+        if refused is not None:
+            return refused
         updated = await memory.update_skill(skill_id, [str(s) for s in steps])
         if updated is None:
             return {"ok": False, "error": "not_found_or_empty"}
@@ -630,6 +698,9 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         new_name = str(args.get("new_name") or args.get("name") or "").strip()
         if not new_name:
             return {"ok": False, "error": "missing_new_name"}
+        refused = _owner_only("skills", detail=_SKILL_SCOPE_DETAIL)
+        if refused is not None:
+            return refused
         new_id = await memory.branch_skill(skill_id, new_name)
         if not new_id:
             return {"ok": False, "error": "not_found"}
@@ -637,6 +708,9 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
 
     async def _skill_delete(args: dict[str, Any]) -> dict[str, Any]:
         skill_id = str(args.get("skill_id") or args.get("id") or "").strip()
+        refused = _owner_only("skills", detail=_SKILL_SCOPE_DETAIL)
+        if refused is not None:
+            return refused
         return {"ok": await memory.delete_skill(skill_id), "skill_id": skill_id}
 
     _INDEX_SKIP_DIR_NAMES = {
@@ -663,6 +737,15 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": False, "error": "not_a_directory", "path": str(folder)}
         if str(folder).lower().startswith(_INDEX_SYSTEM_PREFIXES):
             return {"ok": False, "error": "refusing_to_index_system_directory"}
+
+        # Indexed documents become part of the filesystem memory that semantic
+        # search treats as Marcus's, and the document store has no ownership
+        # column. Measured: a guest's folder was indexed straight into it.
+        refused = _owner_only("documents", detail=(
+            "The files I’ve indexed are Marcus’s, so I won’t add a folder to "
+            "that index from this conversation."))
+        if refused is not None:
+            return refused
 
         max_files = max(1, min(int(args.get("max_files") or 200), 500))
         scanned = indexed = skipped_unchanged = failed = 0
@@ -807,6 +890,16 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         project = str(args.get("project") or "general").strip() or "general"
         if not objective:
             return {"ok": False, "error": "missing_objective"}
+        # A goal is a row in Marcus's goal table AND an enqueued __decide__ task
+        # the AgentSupervisor will act on autonomously, across sessions, when
+        # nobody is present. Measured: a guest and an unknown speaker each
+        # created both. That is owner-state contamination plus unattended work
+        # started by someone Nova may not even be able to name.
+        refused = _owner_only("goals", detail=(
+            "Long-running goals here are Marcus’s, and I work on them in the "
+            "background for him, so I won’t start one from this conversation."))
+        if refused is not None:
+            return refused
         gid = await memory.create_goal(
             project_name=project, title=(title or objective[:60]), objective=objective, success_criteria=success
         )
@@ -1031,10 +1124,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "world.learn": ("Save a durable GENERAL-knowledge fact to the world model with its source, so you don't "
                          "have to re-search it later. Use after learning something from the web. A source is "
                          "REQUIRED — never store world knowledge unsourced. args: {subject, predicate, object, source}"),
-        "thoughts.note": ("Record one of your own private internal thoughts to revisit later — an idea, an "
-                           "unresolved question, a potential improvement, an interesting discovery, a future plan. "
-                           "These persist across sessions and are private. kinds: idea|question|unresolved|"
-                           "improvement|discovery|failed_experiment|future_plan. args: {content, kind?, topic?}"),
+        "thoughts.note": ("Record one of your own private internal thoughts about your work with Marcus, "
+                           "to revisit later — an idea, an unresolved question, a potential improvement, an "
+                           "interesting discovery, a future plan. This notebook is his; there is no per-guest "
+                           "one, so it is unavailable when someone else is speaking. kinds: idea|question|"
+                           "unresolved|improvement|discovery|failed_experiment|future_plan. "
+                           "args: {content, kind?, topic?}"),
         "thoughts.recall": ("Surface your own internal thoughts — use ONLY when the speaker asks what "
                              "you've been thinking about / pondering / your ideas. Never volunteer these "
                              "unprompted. args: {topic?, kind?}"),
@@ -1050,22 +1145,27 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                        "dated action items (cadence once|daily|weekly|monthly). Compose the plan yourself from the "
                        "goal, then persist it here. args: {goal_id, vision, milestones:[{title,target_date,risk}], "
                        "items:[{title,cadence,due,milestone_id?}], horizon_days?}"),
-        "plan.status": ("Show a goal's plan and progress (milestones/items done, % complete, at-risk, overdue). "
-                         "args: {goal_id}"),
+        "plan.status": ("Show a goal's plan and progress (milestones/items done, % complete, at-risk, "
+                         "overdue). Plans belong to Marcus \u2014 there is no per-guest plan store, so this "
+                         "is unavailable when someone else is speaking. args: {goal_id}"),
         "plan.advance": ("Roll a plan forward: missed recurring items move to their next occurrence instead of "
                           "becoming overdue, and open milestones past their target date are flagged at-risk. Run "
                           "this when catching up on a goal. args: {goal_id}"),
         "research.track": ("Start tracking a research topic Marcus wants Nova to follow over time (AI, GPUs, "
-                            "snowboarding, a framework, ...). Findings accrue into the world model with sources. "
-                            "args: {topic}"),
-        "research.list": ("List the research topics Nova is currently tracking and when each was last checked. args: {}"),
+                            "snowboarding, a framework, ...). Findings accrue into the world model with "
+                            "sources. The tracking list is Marcus\u2019s own, so this is unavailable when "
+                            "someone else is speaking. args: {topic}"),
+        "research.list": ("List the research topics Nova is tracking for Marcus and when each was last "
+                          "checked. This registry is his; the FINDINGS it produces are sourced public "
+                          "facts and stay available to anyone via research.findings. args: {}"),
         "research.findings": ("Show what Nova has learned about a tracked research topic — each finding with its "
                                "source citation. args: {topic}"),
         "agents.roster": ("List Nova's council of specialist agents (Chief Engineer, Research Scientist, "
                            "Psychologist, coaches, ...) with how experienced/confident each has become. Use when "
                            "Marcus asks who's on the team or about a specialist. args: {}"),
-        "agent.recall": ("Recall a specific specialist's own accumulated notes/learning history. "
-                          "args: {agent_id, topic?}"),
+        "agent.recall": ("Recall a specific specialist's accumulated notes about working with Marcus \u2014 "
+                          "these can hold his preferences and context, so they are his. Use agents.roster "
+                          "for the neutral list of specialists. args: {agent_id, topic?}"),
         "experiment.record": ("Start a safe A/B experiment to compare approaches (prompt variants, retrieval, "
                                "ranking, scheduling, ...). args: {name, hypothesis?}"),
         "experiment.trial": ("Log one trial's measured metrics for a variant (accuracy, reliability, latency_s, "
@@ -1073,18 +1173,21 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "experiment.analyze": ("Compare an experiment's variants and get a ranked RECOMMENDATION. It never applies a "
                                 "change — adopting a variant is always your call. args: {experiment_id}"),
         "experiment.list": ("List recorded experiments and their trial counts. args: {}"),
-        "skill.detect": ("Check whether Marcus has repeated a multi-step workflow enough to be worth learning. "
-                          "If so, OFFER to learn it (never auto-learn). args: {}"),
+        "skill.detect": ("Check whether Marcus has repeated a multi-step workflow enough to be worth "
+                          "learning, by reading his own tool-usage history. If so, OFFER to learn it "
+                          "(never auto-learn). args: {}"),
         "skill.learn": ("Save an approved repeated workflow as a reusable skill (after Marcus says yes). Steps may "
                          "contain {parameters}. args: {name, steps:[...]}"),
-        "skill.list": ("List learned workflow skills. args: {}"),
+        "skill.list": ("List the workflow skills Nova has learned from Marcus\u2019s own repeated work. "
+                        "These are his workflows \u2014 there is no per-guest skill store. args: {}"),
         "skill.get": ("Show a learned skill's steps, version, and parameters. args: {skill_id}"),
         "skill.update": ("Edit a skill's steps (bumps its version, keeps history). args: {skill_id, steps:[...]}"),
         "skill.branch": ("Fork a skill into a new variant workflow. args: {skill_id, new_name}"),
         "skill.delete": ("Delete a learned skill. args: {skill_id}"),
-        "memory.index_folder": ("Index a folder's files/photos into memory so Marcus can later ask about them "
-                                 "('where's that PDF about the mortgage', 'photos from the beach trip'). "
-                                 "args: {path, max_files?}. Skips files already indexed and unchanged."),
+        "memory.index_folder": ("Index a folder's files/photos into Marcus\u2019s document memory so he can later "
+                                 "ask about them ('where's that PDF about the mortgage', 'photos from the beach "
+                                 "trip'). The index is his, so this is unavailable when someone else is "
+                                 "speaking. args: {path, max_files?}. Skips files already indexed and unchanged."),
         "image.generate": ("Generate an image from a text description on the local image-generation GPU. "
                            "args: {prompt, width?, height?}. If the service isn't running or the second GPU "
                            "isn't installed yet, this honestly reports that — never claim an image was made "
@@ -1096,7 +1199,9 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                             "time, ask them — never guess one."),
         "goal.create": ("Start tracking a real multi-step objective that spans multiple sessions (e.g. 'help me "
                         "learn Spanish', 'plan the Hawaii trip'). You'll advance it in the background and report "
-                        "progress. Use for ongoing goals, NOT one-shot tasks. args: {objective, title?, success_criteria?, project?}"),
+                        "progress. These are Marcus\u2019s goals and run unattended for him, so this is "
+                        "unavailable when someone else is speaking. Use for ongoing goals, NOT one-shot "
+                        "tasks. args: {objective, title?, success_criteria?, project?}"),
         "self.list_code": ("List source files — Nova's OWN codebase by default, or one of Marcus's registered "
                             "external projects when 'project' is given. args: {subdir?, limit?, project?}. Requires developer mode."),
         "self.read_code": ("Read a source file — Nova's OWN code by default, or a registered external project's "

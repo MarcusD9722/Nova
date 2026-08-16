@@ -210,9 +210,21 @@ class AgentSociety:
         if not contributors and coordinator:
             contributors, coordinator = [coordinator], None
 
+        # A specialist's prior notes are accumulated observations about working
+        # with Marcus — his preferences, his context. Injecting them into the
+        # prompt would put that content into an answer given to whoever is in
+        # the room, which is how `agent.recall` being owner-only gets undone one
+        # layer down (V3 P5.1d.3). The council still deliberates for a guest; it
+        # just does so without his private context.
+        try:
+            from core.turn_identity import current_identity
+            _notes_ok = current_identity().is_owner
+        except Exception:  # noqa: BLE001
+            _notes_ok = True
+
         contributions: list[dict] = []
         for spec in contributors:
-            notes = await self._memory.agent_recall(spec.id, limit=3)
+            notes = await self._memory.agent_recall(spec.id, limit=3) if _notes_ok else []
             note_line = ("\nYour prior notes on similar topics: " + " | ".join(notes)) if notes else ""
             prompt = (
                 f"You are Nova's {spec.name} ({spec.specialization}). Reasoning style: {spec.reasoning_style}. "
