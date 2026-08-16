@@ -37,8 +37,17 @@ START MARCUS PHASE A
 ```
 
 You click once to start a block, and once more at each **speaker handoff** —
-which is a full-width inline banner, not a dialog. There are no `alert()`s left
-anywhere in the harness.
+which is a full-width inline banner naming who speaks next, not a dialog. There
+are no `alert()`s left anywhere in the harness.
+
+Handoffs gate **every** change of human, including the ones *inside* a block:
+the sentinel alternates Marcus → guest → Marcus → guest → third person, and each
+of those four changes waits for a deliberate Continue before the countdown
+starts. Recording only auto-advances *within* one speaker.
+
+Acoustic conditions are **grouped**, not alternated — four `near` takes in a row,
+then four `far`. Same counts, but you settle into a position instead of moving on
+every single sample.
 
 **Pause**, **Retry this sample** and **Stop block** are always available. A
 retried or failed sample repeats the *same index*: nothing is silently skipped,
@@ -63,10 +72,24 @@ refresh does not cost completed utterances — a block resumes at the sample it
 reached, and the step list shows `13 / 20 recorded — resume to finish`. **Audio
 is never saved**: each sample is recorded, uploaded, embedded, and discarded.
 
-Two exceptions are deliberate. The **sentinel** and **permission** blocks restart
-from the beginning, because their results accumulate in memory and a half-resumed
-run would report an incomplete privacy check as a complete one. Five recordings
-is a cheap thing to redo; a wrong privacy verdict is not.
+Three blocks are deliberate **non-resumable** exceptions:
+
+| block | why it cannot resume |
+|---|---|
+| **enrollment** (both) | Its six clips are held as in-memory `Blob`s until all six exist and go up in **one** request — and audio is never persisted. A Stop or refresh at 3/6 destroys three recordings while leaving `done: 3` on disk. Resuming would upload a half-enrollment while the UI showed 6/6. |
+| **sentinel** | Its five results accumulate in memory; a half-resumed run would report an incomplete privacy check as a complete one. |
+| **permission** | Same — two results, in memory. |
+
+For enrollment the harness does not merely decline to resume: on load it
+**reconciles**, resetting any enrollment block whose progress is not backed by a
+completed server enrollment, and telling you plainly that those six clips are
+gone and must be recorded again. The fix is refusing to resume, *not* persisting
+the audio.
+
+If `/speaker/enroll` succeeds but the profile is **below the P5.2 bar** (fewer
+than 5 of 6 clips survived the quality gate), the harness stops there. It does
+not advance, and it does not silently delete the profile the backend just
+created — it names the profile id and leaves deletion to you, in Preflight.
 
 If `localStorage` is unavailable (an opaque origin, a locked-down profile) the
 harness still runs — it just loses resume.

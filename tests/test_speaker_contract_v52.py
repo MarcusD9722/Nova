@@ -456,13 +456,17 @@ async def test_harness_sentinel_shares_one_conversation():
     check("r.conversation_id &&" not in code,
           "no truthiness guard — a missing id is not 'stable'")
     # The five turns are data now (SENTINEL_STEPS), driven by the batch engine.
-    steps = html[html.index("const SENTINEL_STEPS"):html.index("async function sentinelFlow")]
+    # Behaviour is proven by executing it in tests/test_calibration_harness_v52.py;
+    # this only pins the declared order.
+    steps = html[html.index("const SENTINEL_STEPS"):html.index("const PERMISSION_STEPS")]
     check(steps.count('who:"') == 5, f"five sentinel turns ({steps.count('who:')})")
     flat = re.sub(r"\s+", " ", steps)
-    for who, phase in (('Marcus', 'store'), ('Guest', 'store'),
-                       ('Marcus', 'ask'), ('Guest', 'ask'), ('unverified', 'ask')):
-        check(f'who:"{who}", phase:"{phase}"' in flat,
-              f"including: {who} / {phase}")
+    order = re.findall(r'who:"([^"]+)"', flat)
+    check(order == ["Marcus", "Guest", "Marcus", "Guest", "unverified"],
+          f"in the required order ({order})")
+    phases = re.findall(r'phase:"([^"]+)"', flat)
+    check(phases == ["store", "store", "ask", "ask", "ask"],
+          f"two stores then three asks ({phases})")
     check("MARCUS-LIVE-551" in steps and "GUEST-LIVE-661" in steps,
           "each speaker stores their own sentinel")
     check("chatTurn(blob, CID)" in code,

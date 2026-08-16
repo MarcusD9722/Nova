@@ -106,12 +106,21 @@ async def test_sample_counts_are_unchanged():
 
 
 async def test_condition_distribution():
-    check.section("2: 4 each of five conditions across Marcus phase A")
+    check.section("2/G: 4 each of five conditions, and GROUPED not round-robin")
     out = _node("""
       const tally = n => { const c = {};
         P52.planConditions(n).forEach(x => c[x] = (c[x]||0)+1); return c; };
       out.a20 = tally(20); out.b12 = tally(12); out.v10 = tally(10);
       out.names = P52.CONDITION_NAMES;
+      out.seq20 = P52.planConditions(20);
+      out.seq10 = P52.planConditions(10);
+      out.seq12 = P52.planConditions(12);
+      // Grouped means each condition occupies ONE contiguous run.
+      const runs = seq => { const r = []; seq.forEach(x =>
+        { if (!r.length || r[r.length-1][0] !== x) r.push([x,1]); else r[r.length-1][1]++; });
+        return r; };
+      out.runs20 = runs(out.seq20); out.runs10 = runs(out.seq10);
+      out.runs12 = runs(out.seq12);
     """)
     check(out["names"] == ["normal", "quiet", "loud", "near", "far"],
           "the five conditions are unchanged")
@@ -121,6 +130,21 @@ async def test_condition_distribution():
           f"phase B 12 covers all five conditions ({out['b12']})")
     check(all(v == 2 for v in out["v10"].values()) and len(out["v10"]) == 5,
           f"validation 10 -> 2 of each ({out['v10']})")
+
+    # GROUPED: exactly five runs, one per condition. Round-robin would give 20.
+    check(len(out["runs20"]) == 5,
+          f"phase A is grouped — 5 contiguous runs, not {len(out['runs20'])}")
+    check(out["runs20"] == [[c, 4] for c in out["names"]],
+          f"and each run is 4 long ({out['runs20']})")
+    check(out["runs10"] == [[c, 2] for c in out["names"]],
+          f"validation is grouped 2 each ({out['runs10']})")
+    check(len(out["runs12"]) == 5,
+          f"phase B is grouped too ({out['runs12']})")
+    # The 12 distribution must match what round-robin produced: 3,3,2,2,2.
+    check([n for _, n in out["runs12"]] == [3, 3, 2, 2, 2],
+          f"with the same counts as before, only grouped ({out['runs12']})")
+    check(out["seq20"][:5] != out["names"],
+          "the sequence is NOT round-robin — a human does not move on every take")
 
 
 # ── 3. the batch engine's index rules ────────────────────────────────────────
@@ -220,6 +244,190 @@ async def test_handoff_cannot_mislabel_a_speaker():
 
 
 # ── 5. autosave / resume ─────────────────────────────────────────────────────
+
+async def test_enrollment_cannot_resume_across_a_reload():
+    check.section("A/B: interrupted enrollment resets to 0 — its audio is gone")
+    out = _node("""
+      // A. 3 of 6 recorded, then a reload. No completed server enrollment.
+      const s = P52.freshState();
+      s.blocks.enroll_marcus = {done: 3};
+      out.beforeA = s.blocks.enroll_marcus.done;
+      out.wipedA = P52.reconcileEnrollment(s);
+      out.afterA = s.blocks.enroll_marcus.done;
+
+      // B. the upload SUCCEEDED — progress is real and must survive.
+      const t = P52.freshState();
+      t.blocks.enroll_marcus = {done: 6};
+      t.enroll.marcus = {ok:true, profile_id:"p-marcus", sample_count:6,
+                         meets_p52_bar:true};
+      out.wipedB = P52.reconcileEnrollment(t);
+      out.afterB = t.blocks.enroll_marcus.done;
+
+      // C. ok=true but BELOW the P5.2 bar: complete, so progress stands, but it
+      //    must not count as acceptable.
+      const u = P52.freshState();
+      u.blocks.enroll_guest = {done: 6};
+      u.enroll.guest = {ok:true, profile_id:"p-guest", sample_count:4,
+                        meets_p52_bar:false};
+      out.wipedC = P52.reconcileEnrollment(u);
+      out.completeC = P52.enrollmentComplete(u.enroll.guest);
+      out.acceptableC = P52.enrollmentAcceptable(u.enroll.guest);
+
+      // D. both blocks stale at once.
+      const v = P52.freshState();
+      v.blocks.enroll_marcus = {done: 5}; v.blocks.enroll_guest = {done: 2};
+      out.wipedD = P52.reconcileEnrollment(v).sort();
+      out.afterD = [v.blocks.enroll_marcus.done, v.blocks.enroll_guest.done];
+
+      // E. trials are NOT touched — they are genuinely resumable.
+      const w = P52.freshState();
+      w.blocks.trials_marcus = {done: 13};
+      P52.reconcileEnrollment(w);
+      out.trialsUntouched = w.blocks.trials_marcus.done;
+    """)
+    check(out["beforeA"] == 3, "fixture really had 3 of 6 persisted")
+    check(out["afterA"] == 0,
+          f"an interrupted enrollment resets to 0, not {out['afterA']} — the "
+          "blobs were never persisted, so they cannot be resumed")
+    check(out["wipedA"] == ["enroll_marcus"], "and the reset is reported, not silent")
+    check(out["afterB"] == 6 and out["wipedB"] == [],
+          "a COMPLETED enrollment keeps its progress")
+    check(out["wipedC"] == [], "a below-bar enrollment still reached the server")
+    check(out["completeC"] is True and out["acceptableC"] is False,
+          "but complete != acceptable — 4 of 6 is not the P5.2 bar")
+    check(out["wipedD"] == ["enroll_guest", "enroll_marcus"]
+          and out["afterD"] == [0, 0], "both blocks reset when both are stale")
+    check(out["trialsUntouched"] == 13,
+          "trial progress is untouched — those samples were uploaded when recorded")
+
+
+async def test_below_bar_enrollment_does_not_advance():
+    check.section("C: a sub-P5.2 enrollment cannot advance the protocol")
+    out = _node(_complete_state_js() + """
+      const s = base();
+      s.enroll.marcus = {ok:true, profile_id:"p-marcus", sample_count:4,
+                         meets_p52_bar:false};
+      const r = P52.computeAcceptance(s);
+      out.acceptance = r.acceptance; out.missing = r.missing;
+      out.acceptable = P52.enrollmentAcceptable(s.enroll.marcus);
+    """)
+    check(out["acceptable"] is False, "4 of 6 is not acceptable")
+    check(out["acceptance"] != "PASS",
+          f"and the gate does not pass ({out['acceptance']})")
+    check(any("Marcus enrollment" in m for m in out["missing"]),
+          f"naming the enrollment as the blocker ({out['missing']})")
+
+    # The UI path must refuse to advance too, and must not delete the profile.
+    html = HARNESS.read_text(encoding="utf-8")
+    fn = html[html.index("async function runEnrollBlock"):
+              html.index("function alertBanner")]
+    check("meets_p52_bar" in fn, "runEnrollBlock inspects the bar")
+    # The sub-bar branch must return BEFORE the line that advances the step.
+    bar_at = fn.index("!out.meets_p52_bar")
+    step_at = fn.index("S.step = stepAfter")
+    check(bar_at < step_at, "the bar is checked before the step would advance")
+    branch = fn[bar_at:step_at]
+    check("return false" in branch,
+          "and the sub-bar branch returns false without advancing")
+    check("S.step" not in branch,
+          "nothing in that branch touches the step counter")
+    check("DELETE" not in fn and "profiles/" not in fn,
+          "and no profile is silently deleted — that stays the human's decision")
+    check("resumable:false" in fn or "resumable: false" in fn,
+          "the enrollment block is declared non-resumable")
+
+
+async def test_speaker_handoffs_gate_every_change():
+    check.section("D/E: a deliberate Continue before every speaker change")
+    out = _node("""
+      const S = P52.SENTINEL_STEPS, P = P52.PERMISSION_STEPS;
+      out.sentinelWho = S.map(s => s.who);
+      out.sentinelHandoffs = S.map((_, i) => P52.handoffBeforeIndex(S, i));
+      out.permWho = P.map(s => s.who);
+      out.permHandoffs = P.map((_, i) => P52.handoffBeforeIndex(P, i));
+      out.labels = S.map(s => P52.stepLabel(s));
+    """)
+    check(out["sentinelWho"] == ["Marcus", "Guest", "Marcus", "Guest", "unverified"],
+          f"five sentinel turns across three people ({out['sentinelWho']})")
+    # Index 0 has no predecessor; 1-4 are all genuine changes.
+    check(out["sentinelHandoffs"][0] is None, "no handoff before the first turn")
+    check(out["sentinelHandoffs"][1] == "Guest", "Marcus -> Guest is gated")
+    check(out["sentinelHandoffs"][2] == "Marcus", "Guest -> Marcus is gated")
+    check(out["sentinelHandoffs"][3] == "Guest", "Marcus -> Guest is gated")
+    check(out["sentinelHandoffs"][4] == "unverified",
+          "Guest -> the third, unenrolled person is gated")
+    check(sum(1 for h in out["sentinelHandoffs"] if h) == 4,
+          "all four speaker changes require a Continue")
+    check(out["permHandoffs"][1] == "Guest",
+          "and the permission probe gates Marcus -> Guest")
+    check(out["labels"][4] == "a third, unenrolled person",
+          "the banner names the third person in words, while `who` stays the key")
+
+    # The engine must actually consume it, before the countdown.
+    html = HARNESS.read_text(encoding="utf-8")
+    eng = html[html.index("async function runBlock"):html.index("// ── per-sample")]
+    check("handoffBefore" in eng, "runBlock takes a handoffBefore hook")
+    check(eng.index("handoffBefore") < eng.index("const lead ="),
+          "and awaits it BEFORE the countdown starts")
+    check("await handoff(" in eng, "through the inline banner, not an alert")
+    check("handoffShownFor" in eng, "shown once per index, so a retry does not re-ask")
+
+
+async def test_trial_persistence_is_atomic():
+    check.section("F: the row and the block index commit together")
+    out = _node("""
+      const s = P52.freshState();
+      // Ten successful samples, committed the way runBlock does it.
+      for (let i = 0; i < 10; i++) {
+        s.blocks.trials_marcus = s.blocks.trials_marcus || {done:0};
+        const next = P52.advance(s.blocks.trials_marcus.done, "ok");
+        P52.commitSample(s, {blockId:"trials_marcus", nextIndex:next,
+                             row:{block:"trials_marcus", truth:"p-marcus", i},
+                             store:"trials"});
+        // After EVERY commit the two must agree — this is the state a reload
+        // could observe, and the old code had a window where it did not.
+        if (s.trials.length !== s.blocks.trials_marcus.done) { out.desync = i; break; }
+      }
+      out.rows = s.trials.length; out.done = s.blocks.trials_marcus.done;
+
+      // Validation routes to the other array, and to its own block counter.
+      const v = P52.freshState();
+      P52.commitSample(v, {blockId:"valid_guest", nextIndex:1,
+                           row:{block:"valid_guest", truth:"p-guest"},
+                           store:P52.storeFor("V")});
+      out.valRows = v.validation.length; out.valTrials = v.trials.length;
+      out.valDone = v.blocks.valid_guest.done;
+
+      // A commit with no row (enrollment, latency) still advances the index.
+      const e = P52.freshState();
+      P52.commitSample(e, {blockId:"latency", nextIndex:3, row:null, store:null});
+      out.latDone = e.blocks.latency.done; out.latRows = e.trials.length;
+    """)
+    check("desync" not in out,
+          f"row count and block index never diverge ({out.get('desync')})")
+    check(out["rows"] == 10 and out["done"] == 10,
+          f"10 rows, block index 10 ({out['rows']} / {out['done']})")
+    check(out["valRows"] == 1 and out["valTrials"] == 0,
+          "validation rows go to the validation array, never the calibration one")
+    check(out["valDone"] == 1, "with its own block counter")
+    check(out["latDone"] == 3 and out["latRows"] == 0,
+          "a row-less commit still advances the index")
+
+    # And the sample handler must not save on its own any more.
+    html = HARNESS.read_text(encoding="utf-8")
+    build = html[html.index("function buildTrialRow"):html.index("async function enrolBatch")]
+    check("save()" not in build,
+          "buildTrialRow does not save — one save follows the atomic commit")
+    check(".push(row)" not in build,
+          "and does not store the row itself")
+    # Just the sample handler's body, not the block-level code after it: one
+    # save at the end of a whole block is fine, a save PER SAMPLE is the bug.
+    rt = html[html.index("async function runTrialBlock"):html.index("function render()")]
+    body = rt[rt.index("doSample: async (blob, i, cond)"):rt.index("return {row:")]
+    check("save()" not in body,
+          "the trial sample handler does not save — runBlock's single commit does")
+    check(".push(" not in body, "and does not push the row itself")
+
 
 async def test_autosave_shape_is_non_audio_and_resumable():
     check.section("5: reload preserves progress, and never audio")
@@ -396,6 +604,10 @@ async def main():
     await test_pause_resume_cannot_duplicate_or_skip()
     await test_validation_never_shares_storage_with_calibration()
     await test_handoff_cannot_mislabel_a_speaker()
+    await test_enrollment_cannot_resume_across_a_reload()
+    await test_below_bar_enrollment_does_not_advance()
+    await test_speaker_handoffs_gate_every_change()
+    await test_trial_persistence_is_atomic()
     await test_autosave_shape_is_non_audio_and_resumable()
     await test_acceptance_bars_are_unchanged()
     await test_incomplete_run_is_not_complete_not_pass()
