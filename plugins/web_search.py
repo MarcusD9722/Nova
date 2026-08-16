@@ -35,6 +35,7 @@ def _strip_html(html: str) -> str:
         "Search the web using DuckDuckGo. Returns up to 8 result snippets with titles and URLs. "
         "args: {query, max_results?}. Use for questions needing up-to-date information."
     ),
+    data_scope="shared",
 )
 async def web_search(args: dict) -> dict:
     query = str(args.get("query") or args.get("q") or "").strip()
@@ -86,6 +87,7 @@ async def web_search(args: dict) -> dict:
         "Fetch the plain-text content of a web page by URL. "
         "args: {url, max_chars?}. Use to read a page found via web.search."
     ),
+    data_scope="shared",
 )
 async def web_fetch(args: dict) -> dict:
     url = str(args.get("url") or "").strip()

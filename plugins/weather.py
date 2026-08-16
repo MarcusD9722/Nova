@@ -17,6 +17,7 @@ def _require(key: str) -> str:
 @tool(
     name="weather.current",
     description="Get live current weather for a city OR coordinates. args: {city} or {lat, lon}, optional {units}",
+    data_scope="shared",
 )
 async def current_weather(args: dict) -> dict:
     api_key = _require("OPENWEATHER_API_KEY")

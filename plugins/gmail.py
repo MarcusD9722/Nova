@@ -36,7 +36,10 @@ async def _get_message_headers(client: httpx.AsyncClient, token: str, message_id
 
 @tool(
     name="email.recent",
-    description="List recent emails — sender, subject, snippet (read-only, no body). args: {limit?, unread_only?}",
+    description=("List recent emails from MARCUS'S connected Gmail account — sender, subject, "
+                 "snippet (read-only, no body). This is his mailbox; there is no per-speaker "
+                 "account. args: {limit?, unread_only?}"),
+    data_scope="owner_private",
 )
 async def email_recent(args: dict) -> dict:
     limit = max(1, min(int(args.get("limit") or 10), 25))
@@ -68,8 +71,9 @@ async def email_recent(args: dict) -> dict:
 
 @tool(
     name="email.draft_reply",
-    description=("Create a Gmail DRAFT reply to a specific email — never sends; Marcus reviews and sends it "
-                  "himself from Gmail. args: {message_id, body}"),
+    description=("Create a DRAFT reply in MARCUS'S connected Gmail account — never sends; he "
+                  "reviews and sends it himself from Gmail. args: {message_id, body}"),
+    data_scope="owner_private",
 )
 async def email_draft_reply(args: dict) -> dict:
     message_id = str(args.get("message_id") or "").strip()
