@@ -181,6 +181,25 @@ The whole P5.1 boundary exists to prevent the second. So the fit optimises for
 `unknown` and `ambiguous` are *successful* outcomes of a system that is unsure —
 counted as rejects, never as errors.
 
+### The candidate range
+
+Scores are **true cosine similarities** between L2-normalised ECAPA embeddings
+(`matcher.cosine`), so the metric is bounded **[-1, 1]** — not [0, 1].
+
+The grid is **0.00 → 1.00 at 0.01 resolution** (101 candidates). It used to be
+0.30 → 0.90, which was an unexamined guess carried over from synthetic fixtures
+whose scores happened to be high. Real speech is not obliged to agree with it,
+and the first human run proved it does not — see *Attempt 1* below.
+
+The lower bound of 0.00 is a deliberate floor rather than the metric's true
+minimum. A cosine threshold at or below zero cannot express an identity claim:
+it admits vectors with no directional agreement with the centroid at all, which
+for 192-d unit vectors is roughly half of everything. The empirical bars ("no
+impostor in *this* sample cleared it") cannot protect against that, because the
+sample is a couple of dozen utterances and the runtime population is every voice
+that ever speaks. If no non-negative threshold satisfies both bars, the honest
+answer is that the two voices are not separable, and the fit **fails closed**.
+
 ### Per-profile threshold
 
 Walks `0.90 → 0.30` and takes the **first** value with zero impostor accepts and
@@ -375,9 +394,49 @@ a replay.
 
 ---
 
+## P5.2 HUMAN CALIBRATION ATTEMPT 1 — INCOMPLETE / FITTER RANGE DEFECT
+
+**2026-08-16. Marcus + Leslie. Stopped at step 7 (proposed calibration).**
+
+This was **not** a speaker-model failure and **not** a successful calibration.
+The recordings were fine; the fitter could not express the answer.
+
+| | Marcus | Leslie |
+|---|---|---|
+| genuine n | 32 | 12 |
+| impostor n | 23 | 12 |
+| genuine min | 0.1092 | 0.3194 |
+| genuine p05 | 0.2405 | 0.3853 |
+| genuine median | 0.55495 | 0.53485 |
+| impostor max | 0.2001 | 0.1503 |
+| separation | **+0.0404** | +0.235 |
+| fitted threshold | **null** | 0.38 |
+| genuine accept rate | — | 0.9167 |
+| false accepts | — | 0 |
+| result | **FAILED** | PASS |
+
+Shared margin fitted at **0.29**, correct rate 0.9167, zero wrong-person calls.
+
+Marcus's separation was **positive**: a threshold near 0.21–0.25 satisfied both
+bars. The fitter never evaluated anything below **0.30**, so it returned no
+threshold — and then reported *"the distributions overlap"*, which was false and
+would have sent a person to re-record forty perfectly good utterances.
+
+Both faults are fixed: the candidate range now spans the metric's usable range,
+and the failure diagnostic is derived from the data instead of asserted whenever
+no candidate was found. `tests/test_speaker_calibration_v52.py` pins this exact
+dataset, and proves the old floor would still fail on it.
+
+**Attempt 1 produced no calibration and no accuracy figure. A fresh run is
+required from step 1** — thresholds are fitted from the trials of a single
+session, and the prior session's scores were not retained.
+
+---
+
 ## Status of this phase
 
-**Implementation: complete. Human calibration: NOT RUN.**
+**Implementation: complete. Human calibration: NOT RUN (attempt 1 incomplete,
+see above).**
 
 No live accuracy figure exists, and none may be quoted until Marcus and a second
 person have completed the harness and the fresh validation set has passed:
