@@ -326,6 +326,141 @@ async def test_denied_system_episode_has_no_side_effects():
 
 # ── §7. honesty about what is actually shared ────────────────────────────────
 
+async def test_child_tasks_inherit_turn_context():
+    check.section("8A: a child task INHERITS the turn — this is why kind must win")
+    from core.turn_identity import active_turn, current_identity_or_none
+
+    seen = {}
+
+    async def child():
+        await asyncio.sleep(0)          # force a real suspension point
+        i = current_identity_or_none()
+        seen["who"] = None if i is None else i.memory_entity
+
+    with active_turn(ALICE()):
+        task = asyncio.create_task(child())
+    await task
+    check(seen["who"] == "speaker:p-alice",
+          f"a task created inside Alice's turn still sees Alice after awaiting "
+          f"({seen['who']})")
+    check(current_identity_or_none() is None, "while the parent scope has exited")
+    # Not a bug in itself — other background work legitimately wants request
+    # context. The bug was reading it as episode OWNERSHIP.
+
+
+async def test_system_kind_overrides_inherited_identity():
+    check.section("9: every _SYSTEM_KINDS episode is Nova's, whoever's turn it was")
+    from core.workers.episodic_ingest import (_SHARED_SYSTEM_KINDS, _SYSTEM_KINDS,
+                                              _actor_fields, _privacy_for)
+
+    check(_SHARED_SYSTEM_KINDS <= _SYSTEM_KINDS,
+          "a shared kind cannot bypass the system classification")
+
+    for kind in sorted(_SYSTEM_KINDS):
+        for label, ident in (("Alice's turn", ALICE()), ("Marcus's turn", OWNER()),
+                             ("an unknown turn", UNKNOWN()), ("no turn", None)):
+            actor, actor_label, _src = _actor_fields(ident, kind)
+            check(actor == "system" and actor_label == "Nova",
+                  f"{kind} under {label}: actor is Nova")
+            check(_privacy_for(ident, kind) == "user",
+                  f"{kind} under {label}: privacy is owner-private")
+
+    # And the override is NARROW — human kinds still follow the human.
+    for kind in ("selection", "memory_corrected", "tool_result", ""):
+        check(_privacy_for(ALICE(), kind) == "speaker:p-alice",
+              f"a {kind or '(blank)'} episode under Alice is still hers")
+        check(_actor_fields(ALICE(), kind)[0] == "speaker:p-alice",
+              f"and she is still its actor ({kind or 'blank'})")
+    check(_privacy_for(UNKNOWN(), "selection") == "unverified",
+          "an unattributed human episode stays unverified")
+
+
+async def test_real_project_builder_under_a_guest_turn():
+    check.section("8B-E: the REAL ProjectBuilder, started inside Alice's turn")
+    import aiosqlite
+
+    from core.event_bus import BUS
+    from core.turn_identity import active_turn, current_identity_or_none
+
+    PROJ = "alice-started-secret-991"
+
+    async with boot() as nova:
+        rt = nova.runtime
+        pb = getattr(rt, "_project_builder", None)
+        check(pb is not None, "the production ProjectBuilder is reachable")
+        if pb is None:
+            return
+
+        child_saw = {}
+
+        async def fake_build(slug, brief):
+            # Stands in for the expensive LLM/file work. Everything that matters
+            # here — create_task, the inherited context, the published events —
+            # is the real production shape.
+            await asyncio.sleep(0)
+            i = current_identity_or_none()
+            child_saw["who"] = None if i is None else i.memory_entity
+            BUS.publish("project.completed", {"project": slug, "name": slug})
+            BUS.publish("project.error", {"project": slug, "error": f"{slug} build failed"})
+
+        pb._build = fake_build
+        with active_turn(ALICE()):
+            await pb.start(name=PROJ, brief="a private thing")
+        await asyncio.sleep(1.5)
+        await rt._promoter.stop()
+        if rt._episodic_q is not None:
+            await asyncio.wait_for(rt._episodic_q.join(), timeout=30)
+
+        check(child_saw.get("who") == "speaker:p-alice",
+              f"the build child really did inherit Alice ({child_saw.get('who')})")
+
+        got = await rows(nova.memory._sqlite._db_path)
+        proj = [r for r in got if r["kind"] == "project_event"]
+        fails = [r for r in got if r["kind"] == "failure"]
+        check(len(proj) >= 2, f"project.started and .completed both promoted ({len(proj)})")
+        check(len(fails) >= 1, f"and the error became a failure episode ({len(fails)})")
+
+        for r in proj + fails:
+            check(r["actor_entity"] == "system" and r["actor_label"] == "Nova",
+                  f"{r['kind']}: actor is Nova, not Alice ({r['actor_entity']})")
+            check(r["privacy_scope"] == "user",
+                  f"{r['kind']}: privacy is owner-private ({r['privacy_scope']})")
+        check(not any("Alice" in r["summary"] for r in proj + fails),
+              "and no summary claims she did it")
+
+        # E: recall matrix + zero side effects on the denied path.
+        from memory.episodes import EpisodicStore
+        from memory.episodic_recall import retrieve
+        store = EpisodicStore(Path(nova.memory._sqlite._db_path))
+        reads = {"n": 0}
+        orig = store.cold.get
+        store.cold.get = lambda r: (reads.__setitem__("n", reads["n"] + 1), orig(r))[1]  # type: ignore[assignment]
+
+        async def counters():
+            async with aiosqlite.connect(str(nova.memory._sqlite._db_path)) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT SUM(access_count) c, MAX(COALESCE(last_accessed_at,'')) t "
+                    "FROM episodes WHERE kind IN ('project_event','failure')")
+                r = await cur.fetchone()
+                return (r["c"] or 0, r["t"] or "")
+
+        n0, t0 = await counters()
+        for label, who in (("Alice", ALICE()), ("an unknown speaker", UNKNOWN())):
+            with active_turn(who):
+                res = await retrieve(store, PROJ, limit=10, hydrate=True)
+            check(PROJ not in res.prompt_text,
+                  f"{label} cannot retrieve the project she started")
+        n1, t1 = await counters()
+        check(n1 == n0 and t1 == t0,
+              f"and the denied reads changed no counters ({n0}->{n1})")
+        check(reads["n"] == 0, f"and hydrated nothing ({reads['n']} cold reads)")
+
+        with active_turn(OWNER()):
+            res = await retrieve(store, PROJ, limit=10)
+        check(PROJ in res.prompt_text, "while the owner still retrieves it")
+
+
 async def test_shared_system_scope_is_empty_by_design():
     check.section("7: no current producer emits genuinely shared system history")
     from core.workers.episodic_ingest import (_SHARED_SYSTEM_KINDS, _privacy_for,
@@ -370,6 +505,9 @@ async def main():
     await test_real_bus_path_actor_and_privacy()
     await test_read_matrix_uses_privacy_not_actor()
     await test_denied_system_episode_has_no_side_effects()
+    await test_child_tasks_inherit_turn_context()
+    await test_system_kind_overrides_inherited_identity()
+    await test_real_project_builder_under_a_guest_turn()
     await test_shared_system_scope_is_empty_by_design()
     await test_permissions_unchanged()
     check.finish()

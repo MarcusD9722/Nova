@@ -33,8 +33,20 @@ from core.events import EpisodicPersistEvent
 from core.turn_identity import OWNER_ENTITY
 
 
-#: Episode kinds Nova produces with no human in the room. The actor is `system`
-#: — but see `_privacy_for` before concluding anything about who may read them.
+#: Episode kinds that describe something NOVA did, not something a human said.
+#:
+#: These override any ambient identity, and that override is the whole point
+#: (V3 P5.1e.2). `ProjectBuilder.start()` runs inside the caller's turn and
+#: spawns the build with `asyncio.create_task`, which inherits the current
+#: context — so under a guest's turn the child task, and every event it
+#: published, carried her identity. Measured: `project.started`,
+#: `project.completed` and a build `failure` were all persisted with
+#: `privacy_scope="speaker:p-alice"`, and she could read the project back.
+#:
+#: An inherited ContextVar answers "which turn spawned this task". It does not
+#: answer "who is the actor" or "whose data is this", and treating it as though
+#: it does is what produced a row saying "Nova started building …" with
+#: `actor_label="Alice"`.
 _SYSTEM_KINDS: frozenset[str] = frozenset({
     "project_event", "failure", "project_milestone",
 })
@@ -61,7 +73,12 @@ def _actor_fields(identity, kind: str = "") -> tuple[str, str, str]:
 
     Provenance only. It decides how the summary reads and never decides who may
     read it; `_privacy_for` answers that separately.
+
+    ORDER MATTERS: the KIND is checked before the identity. A semantic system
+    event is Nova's regardless of whose turn happened to spawn the task.
     """
+    if str(kind) in _SYSTEM_KINDS:
+        return ("system", "Nova", "system")
     if identity is None:
         # No human turn was in scope. Before P5.1e.1 this returned typed Marcus,
         # so a background build was persisted as `speaker_label="Marcus"` beside
@@ -83,15 +100,30 @@ def _privacy_for(identity, kind: str = "") -> str:
     The separation matters most in one direction: a system-actor episode about
     Marcus's project is his, not everyone's. Nova executing the build does not
     make its contents impersonal.
+
+    ORDER MATTERS, and getting it wrong was the P5.1e.2 bug: this checked the
+    identity FIRST, so a guest's inherited turn context made her the owner of
+    Marcus's project build.
+
+    Speaker recognition is not project authorisation. A guest asking Nova to
+    build something does not create a private guest project — the ProjectBuilder
+    data model is global, and until it has explicit per-project ownership every
+    project event belongs to the owner.
     """
+    k = str(kind)
+    # 1. Explicitly impersonal (currently nothing — see _SHARED_SYSTEM_KINDS).
+    if k in _SHARED_SYSTEM_KINDS:
+        return SHARED_SCOPE
+    # 2. Semantic system events: owner-private, whoever's turn spawned them.
+    if k in _SYSTEM_KINDS:
+        return OWNER_ENTITY
+    # 3. Everything else is human-originated and follows the speaker.
     if identity is not None:
         ent = identity.memory_entity
         if ent is not None:
             return ent
         return "unverified"
-    # No human present. Shared ONLY if this kind is explicitly on the list,
-    # which is currently empty by design. Everything else is the owner's.
-    return SHARED_SCOPE if str(kind) in _SHARED_SYSTEM_KINDS else OWNER_ENTITY
+    return OWNER_ENTITY
 
 
 def _speaker_fields(identity) -> tuple[str, str, str]:
