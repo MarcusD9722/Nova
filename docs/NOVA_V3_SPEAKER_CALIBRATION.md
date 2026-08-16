@@ -18,13 +18,58 @@ suite deliberately cannot mark it passed.
 3. Set the backend URL (and the API token, if `NOVA_API_TOKEN` is configured).
 4. Press **Check**, then work down the twelve steps.
 
-Allow ~30–40 minutes with both people present for the whole run. Steps 1–8 are
-recognition; 9–11 are the acceptance checks that make the result mean something;
-12 is the report.
+Steps 1–8 are recognition; 9–11 are the acceptance checks that make the result
+mean something; 12 is the report.
+
+### Guided batches — one click per block, not per utterance
+
+The run is **107 recordings**. Clicking through them one at a time, each behind a
+modal dialog, was most of the old workflow's cost — the audio itself is a small
+fraction of it. So a block now runs itself:
+
+```
+START MARCUS PHASE A
+  3 · 2 · 1
+  QUIET 1/4    "Name three cities you have visited."
+  ● RECORDING
+  processing…  ✓ captured · known · 0.871
+  QUIET 2/4    …
+```
+
+You click once to start a block, and once more at each **speaker handoff** —
+which is a full-width inline banner, not a dialog. There are no `alert()`s left
+anywhere in the harness.
+
+**Pause**, **Retry this sample** and **Stop block** are always available. A
+retried or failed sample repeats the *same index*: nothing is silently skipped,
+and nothing is counted twice. A cough does not cost you the batch.
+
+The stage shows whose turn it is, the acoustic condition, the prompt, a block
+progress bar, an overall `n / 107` count, elapsed time, and an estimate of the
+time remaining **computed from your actual observed pace** — not a promise.
+
+### Who needs to be there, and when
+
+- **Marcus alone** for steps 1–3.
+- **The guest joins at step 4** and is needed through step 10. They do not need
+  to be present from the beginning.
+- **A third, unenrolled voice** is needed for exactly **one recording** — the
+  final turn of the step 9 sentinel. See the fallback below.
+
+### Recovery
 
 The harness autosaves *non-audio* progress to `localStorage`, so an accidental
-refresh does not cost twenty utterances. **Audio is never saved** — each sample
-is recorded, uploaded, embedded, and discarded.
+refresh does not cost completed utterances — a block resumes at the sample it
+reached, and the step list shows `13 / 20 recorded — resume to finish`. **Audio
+is never saved**: each sample is recorded, uploaded, embedded, and discarded.
+
+Two exceptions are deliberate. The **sentinel** and **permission** blocks restart
+from the beginning, because their results accumulate in memory and a half-resumed
+run would report an incomplete privacy check as a complete one. Five recordings
+is a cheap thing to redo; a wrong privacy verdict is not.
+
+If `localStorage` is unavailable (an opaque origin, a locked-down profile) the
+harness still runs — it just loses resume.
 
 ---
 
@@ -45,13 +90,53 @@ is recorded, uploaded, embedded, and discarded.
 | 11 | one person | 12 recordings, `/stt` only | what identification costs, off vs on |
 | 12 | — | copy the JSON report | the artefact to hand back |
 
-**Step 9 needs a third voice** — someone not enrolled, for the unverified turn.
-It can be the same session; just have a third person say one sentence. If no
-third person is available, an unverified condition also works (a deliberately
-poor or too-short recording), as long as `/stt` genuinely returns something
-other than `known`.
+**The evidence counts above are unchanged** by the guided-batch rewrite, and
+`tests/test_calibration_harness_v52.py` asserts every one of them against the
+harness's own plan. The redesign removes human interaction overhead — clicks,
+dialogs, handoffs, fixed waits — and nothing else. It is intended to cut
+substantially into the previous manual 30–40 minute workflow; the harness
+reports measured progress rather than promising a duration.
 
-Every trial utterance must be **new speech**, not an enrollment phrase.
+**Latency stays 6 OFF + 6 ON.** Speaker-ON `/stt` timings do exist elsewhere in
+the session (the sentinel turns), and they are measured on the same code path —
+but those recordings are 4–5 s and `/stt` scales with audio length through
+Whisper, so pooling them against a 2.5 s OFF control would bias the delta.
+Unlike inputs are not a control, so they are not reused.
+
+**Step 9 needs a third voice** for exactly one recording — someone not enrolled,
+for the unverified turn. If no third person is available, a genuinely unverified
+acoustic condition also works (a deliberately poor or too-short recording), but
+**only** if `/stt` actually returns something other than `known`. The harness
+checks this and fails the privacy result rather than accepting a `known` third
+speaker, because in that case the question was never asked.
+
+### Recording windows, and why the phrases got shorter
+
+| what | window |
+|---|---|
+| enrollment | 3.0 s |
+| calibration trials (phase A / B) | 3.0 s |
+| validation | 3.0 s |
+| permission voice probes | 3.0 s |
+| `/stt` latency probes | 2.5 s (OFF and ON identical) |
+| sentinel — store | 5.0 s |
+| sentinel — ask | 4.0 s |
+
+`MediaRecorder` records a **fixed window**, so shortening it without shortening
+the prompt would simply truncate speech mid-word and hand ECAPA a clipped
+sample. The enrollment phrases were rewritten to ~8 words (~2.5 s) to match. The
+sentinel keeps its longer windows because those utterances carry a token that
+must not be clipped.
+
+3.0 s still leaves 2× margin over the backend's 1.5 s enrollment floor
+(`matcher.MIN_SAMPLE_S`) — near the floor is not the operating point.
+
+Every trial utterance must be **new speech**, not an enrollment phrase. The
+harness rotates prompts from two **disjoint** pools, so a calibration sentence
+cannot become a validation sentence. Trials and validation are also stored
+separately, so the fit can never see the audio it will later be judged against.
+One trial is always one genuinely new utterance — recordings are never sliced
+into several samples.
 
 ---
 
