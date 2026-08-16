@@ -11,6 +11,7 @@ from plugins.registry import tool
         "Get the current local date and time from the system clock. "
         "Use this whenever the user asks what time or date it is."
     ),
+    data_scope="shared",
 )
 async def system_time(args: dict) -> dict:
     now_local = datetime.now().astimezone()

@@ -16,7 +16,8 @@ large phase.
 | **P5.1d** | every backend read and write path made speaker-safe, including the ones that run after the turn ends |
 | **P5.1d.1** | read side effects, delimiter-exact namespaces, durable turn attribution, guest lessons applied |
 | **P5.1d.2** | the direct tool surface — the boundary the model could step around by emitting a tool call |
-| **P5.1d.3 (this pass)** | the full persistent-state inventory: durable stores that are not called "memory" |
+| **P5.1d.3** | the full persistent-state inventory: durable stores that are not called "memory" |
+| **P5.1d.4 (this pass)** | connected-account plugins, and the last secondary-prompt identity |
 
 The scope table at the end says exactly what remains, and nothing here is
 reported as finished when it is not.
@@ -691,6 +692,94 @@ authentication**, and none of these decisions makes it one.
 The gate is a property read on a `ContextVar`: **0.17 µs**. Owner tool calls are
 dominated by their own I/O (`skill.list` 17 ms, `thoughts.recall` 16 ms,
 `research.list` 60 ms median) — five orders of magnitude above the check.
+
+---
+
+## P5.1d.4 — connected accounts, and the last secondary prompt
+
+Two blockers remained after the persistent-state inventory. Both reproduced on
+`71fc0eb`.
+
+### The completeness invariant excluded the riskiest tools
+
+P5.1d.3's classification test began:
+
+```python
+builtins = registered - plugin_names      # ← subtracted, then declared complete
+```
+
+Production loads connected-account plugins into the *same* `ToolRouter`. So the
+"every tool is classified" claim was true only of the set it had already
+narrowed to — and the excluded set was Gmail, Calendar and Discord.
+
+Measured, with transports mocked and every external call counted:
+
+| | guest / unknown, before |
+|---|---|
+| `email.recent` | his unread subjects **and** snippets, 1 OAuth token + 2 HTTP |
+| `email.draft_reply` | a draft created in **his** mailbox |
+| `calendar.today` / `.upcoming` | his events **with locations** |
+| `discord.read` | his channel history |
+| `discord.send` | a message **sent as his bot** |
+
+### `data_scope` is required metadata
+
+`ToolSpec` gained `data_scope`, and `@tool(...)` takes it **keyword-only with no
+default**. Omitting it is a `TypeError` at import time; an invalid value is a
+`ValueError` at registration. The failure being closed is a *future* integration
+inheriting public access to somebody's private account by saying nothing.
+
+| scope | meaning | tools |
+|---|---|---|
+| `owner_private` | a connected account of Marcus's installation, no per-speaker mapping | `email.recent`, `email.draft_reply`, `calendar.today`, `calendar.upcoming`, `discord.read`, `discord.send` |
+| `shared` | public or system information — an API key pays for the service, it does not make the answer his | `system.time`, `weather.current`, `web.search`, `web.fetch`, `maps.geocode`, `maps.place_search`, `maps.directions`, `maps.places_nearby` |
+
+Enforcement is one wrapper applied where plugin specs become router functions,
+and it is deliberately the **outermost** layer: a refused call performs **zero**
+OAuth token retrieval, zero HTTP, zero drafts, zero sends. Refusing after the
+token fetch would still have touched his credentials. Asserted by counters, not
+by reading the error string.
+
+The completeness test no longer subtracts anything:
+
+```
+live router  ==  built-in classifications  ∪  plugin data_scopes
+```
+
+### The coordinator still called everyone Marcus
+
+Suppressing the private specialist notes (P5.1d.3) closed one channel. The
+coordinator's synthesis prompt was a second, independent one — it said, for
+every speaker:
+
+> Synthesize this into one clear, cohesive answer for Marcus…
+
+Now resolved server-side from `TurnIdentity`: **Marcus** for the owner
+(unchanged), the guest's own name for a known speaker, *"the current speaker"*
+for anyone unrecognised. A non-owner's prompt never contains "Marcus".
+
+The tests capture the **exact** prompt delivered to the society LLM, and force a
+multi-specialist route first — with one contributor the coordinator never runs
+and the assertion would pass vacuously.
+
+### What this does NOT claim
+
+`ToolRouter` does **not** generically invoke `PermissionBroker` for plugins.
+That is broader external-actuator hardening and belongs to P8. P5.1d.4 ensures
+only that **a guest cannot reach Marcus-connected account state** — a data-scope
+boundary, not an authorisation one. A test asserts the absence, so the
+distinction stays honest rather than drifting into an implied guarantee.
+
+| | provided by |
+|---|---|
+| speaker data-scope on plugins | **P5** (this) |
+| generic actuator permission coverage | later P8 hardening |
+
+### Latency
+
+The guard is a property read on a `ContextVar` — **0.16 µs**. A refused
+`email.recent` returns in 55.7 µs median, *faster* than the unwrapped
+`system.time` control at 72.2 µs, because it does no work at all.
 
 ### What the owner can still see
 

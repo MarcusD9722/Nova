@@ -622,6 +622,57 @@ def seed_decisions() -> list[Decision]:
                         "guest can call them.",
             decided_at="2026-08-15T00:00:00+00:00",
         ),
+        Decision(
+            id="D16",
+            title="Plugin data scope is required metadata, enforced outside the plugin",
+            decision="Every plugin ToolSpec carries a REQUIRED data_scope of 'shared' or "
+                     "'owner_private'. @tool takes it keyword-only with NO default - "
+                     "omitting it is a TypeError at import time, an invalid value a "
+                     "ValueError at registration. Owner-private plugins are wrapped where "
+                     "specs become router functions, so a non-owner is refused BEFORE the "
+                     "plugin body runs: zero OAuth token retrieval, zero HTTP, zero drafts, "
+                     "zero sends. The live-router completeness test no longer subtracts "
+                     "plugin names.",
+            rationale="P5.1d.3 declared the router classification-complete after "
+                      "SUBTRACTING every plugin name, so the claim was true only of the set "
+                      "it had already narrowed to - and the excluded set was exactly the "
+                      "tools reaching Marcus's connected accounts. Measured on 71fc0eb with "
+                      "transports mocked and calls counted: a guest and an unknown speaker "
+                      "each received his unread mail subjects and snippets, his calendar "
+                      "events with locations, and his Discord history, and could create a "
+                      "draft in his mailbox and send a message as his bot. The guard is the "
+                      "OUTERMOST layer on purpose: refusing inside the plugin, or after the "
+                      "token fetch, would still have touched his credentials. "
+                      "Required-with-no-default matters more than the six current "
+                      "classifications - the failure being closed is a FUTURE integration "
+                      "silently inheriting public access to somebody's private account.",
+            alternatives=["Ad-hoc current_identity() checks inside each plugin (rejected: "
+                          "nine files each free to forget, and the check would sit after "
+                          "the token fetch)",
+                          "Defaulting data_scope to 'shared' (rejected: that IS the bug - a "
+                          "new plugin must be triaged, not assumed public)",
+                          "Defaulting to 'owner_private' (safer but silently breaks public "
+                          "tools and teaches authors to ignore the field)",
+                          "Routing plugin calls through PermissionBroker here (rejected: "
+                          "generic actuator hardening is P8; conflating it with data scope "
+                          "would make a voice match an authorisation level)"],
+            evidence=["tests/test_speaker_plugins_v51d4.py: owner behaviour unchanged with "
+                      "identical request patterns (1 token + 2 HTTP for email.recent, draft "
+                      "created); guest and unknown refused on all six with every external "
+                      "counter at zero; the eight public tools still execute for both; "
+                      "omitting data_scope raises; an invalid value raises; permissions "
+                      "identical across four identities and five capabilities"],
+            subsystem="tools",
+            source_refs=["plugins/registry.py::tool",
+                         "plugins/registry.py::DATA_SCOPES",
+                         "core/tooling.py::_scope_guarded"],
+            constraints="DATA-scope boundary only. ToolRouter still does not generically "
+                        "broker plugin calls through PermissionBroker; a test asserts that "
+                        "absence so the limitation stays honest. Generic external-actuator "
+                        "permission coverage is later P8 work and must not be claimed as "
+                        "delivered by P5.",
+            decided_at="2026-08-15T00:00:00+00:00",
+        ),
     ]
 
 

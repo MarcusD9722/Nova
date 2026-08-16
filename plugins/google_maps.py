@@ -49,7 +49,8 @@ def _haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> flo
     return radius_m * (2 * math.atan2(math.sqrt(aa), math.sqrt(1 - aa)))
 
 
-@tool(name="maps.geocode", description="Geocode an address to coordinates. args: {address}")
+@tool(name="maps.geocode", description="Geocode an address to coordinates. args: {address}",
+      data_scope="shared")
 async def geocode(args: dict) -> dict:
     api_key = _require("GOOGLE_MAPS_API_KEY")
     address = str(args.get("address") or "").strip()
@@ -104,6 +105,7 @@ async def geocode(args: dict) -> dict:
         "Search for a specific place, company, or address using Google Places Text Search. "
         "Useful for queries like 'Where is GXO Logistics?'. args: {query, limit?}"
     ),
+    data_scope="shared",
 )
 async def place_search(args: dict[str, Any]) -> dict[str, Any]:
     api_key = _require("GOOGLE_MAPS_API_KEY")
@@ -161,6 +163,7 @@ async def place_search(args: dict[str, Any]) -> dict[str, Any]:
         "Get turn-by-turn directions between two places using Google Maps Directions API. "
         "args: {origin, destination, mode?} where mode is driving|walking|bicycling|transit."
     ),
+    data_scope="shared",
 )
 async def directions(args: dict) -> dict:
     api_key = _require("GOOGLE_MAPS_API_KEY")
@@ -236,6 +239,7 @@ async def directions(args: dict) -> dict:
         "Find nearby places around a latitude/longitude using Google Places Nearby Search. "
         "args: {query, lat, lng, limit?}. Useful for nearest gas stations, restaurants, and similar."
     ),
+    data_scope="shared",
 )
 async def places_nearby(args: dict[str, Any]) -> dict[str, Any]:
     api_key = _require("GOOGLE_MAPS_API_KEY")

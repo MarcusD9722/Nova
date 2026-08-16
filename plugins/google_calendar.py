@@ -44,7 +44,10 @@ async def _list_events(*, time_min: datetime, time_max: datetime, max_results: i
     return [_fmt_event(item) for item in (data.get("items") or [])]
 
 
-@tool(name="calendar.today", description="Get today's calendar events (read-only). args: {}")
+@tool(name="calendar.today",
+      description=("Get today's events from MARCUS'S connected primary Google Calendar "
+                   "(read-only). args: {}"),
+      data_scope="owner_private")
 async def calendar_today(args: dict) -> dict:
     now = datetime.now().astimezone()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -53,7 +56,10 @@ async def calendar_today(args: dict) -> dict:
     return {"date": start.strftime("%Y-%m-%d"), "events": events, "count": len(events)}
 
 
-@tool(name="calendar.upcoming", description="Get upcoming calendar events over the next N days (read-only). args: {days?}")
+@tool(name="calendar.upcoming",
+      description=("Get upcoming events over the next N days from MARCUS'S connected primary "
+                   "Google Calendar (read-only). args: {days?}"),
+      data_scope="owner_private")
 async def calendar_upcoming(args: dict) -> dict:
     days = max(1, min(int(args.get("days") or 7), 30))
     now = datetime.now().astimezone()

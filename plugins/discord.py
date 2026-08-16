@@ -14,7 +14,10 @@ def _require(key: str) -> str:
     return val
 
 
-@tool(name="discord.send", description="Send a message to the Discord channel. args: {content, channel_id?}")
+@tool(name="discord.send",
+      description=("Send a message through MARCUS'S configured Discord bot, to his channel. "
+                   "args: {content, channel_id?}"),
+      data_scope="owner_private")
 async def send_message(args: dict) -> dict:
     token = _require("DISCORD_BOT_TOKEN")
     default_channel = os.getenv("DISCORD_CHANNEL_ID", "").strip()
@@ -40,7 +43,10 @@ async def send_message(args: dict) -> dict:
     return {"id": data.get("id"), "channel_id": channel_id, "content": data.get("content")}
 
 
-@tool(name="discord.read", description="Read recent messages from the Discord channel. args: {limit?, channel_id?}")
+@tool(name="discord.read",
+      description=("Read recent messages from MARCUS'S configured Discord channel. "
+                   "args: {limit?, channel_id?}"),
+      data_scope="owner_private")
 async def read_messages(args: dict) -> dict:
     token = _require("DISCORD_BOT_TOKEN")
     default_channel = os.getenv("DISCORD_CHANNEL_ID", "").strip()

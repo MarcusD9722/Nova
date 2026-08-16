@@ -187,9 +187,13 @@ async def test_every_tool_is_classified():
     check.section("1: every registered built-in has an explicit classification")
     async with boot() as nova:
         registered = set(nova.runtime._router.list_tools())
-        # Plugins register dynamically and are governed separately.
+        # P5.1d.4: plugins are NO LONGER subtracted. Subtracting them meant the
+        # "complete" invariant excluded exactly the tools that reach Marcus's
+        # connected Gmail, Calendar and Discord — the completeness claim was
+        # true only of the set it had already narrowed to.
         import plugins.registry as preg
-        plugin_names = set(preg.REGISTRY.get_tools().keys())
+        specs = preg.REGISTRY.get_tools()
+        plugin_names = set(specs)
         builtins = registered - plugin_names
 
         missing = sorted(builtins - set(_CLASSIFICATION))
@@ -199,6 +203,16 @@ async def test_every_tool_is_classified():
         stale = sorted(set(_CLASSIFICATION) - builtins - {"shell.exec"})
         check(not stale, f"the inventory has no entries for tools that no longer exist ({stale})")
         check(len(builtins) >= 45, f"the registry is the real one ({len(builtins)} tools)")
+
+        # Every plugin carries an explicit scope, and the two sets together
+        # cover the live router exactly — no tool falls between them.
+        unscoped = sorted(n for n, s in specs.items()
+                          if s.data_scope not in preg.DATA_SCOPES)
+        check(not unscoped, f"every plugin ToolSpec declares a data_scope ({unscoped})")
+        uncovered = sorted(registered - set(_CLASSIFICATION) - plugin_names)
+        check(not uncovered,
+              f"EVERY tool in the live router is covered by one of the two "
+              f"classifications ({uncovered})")
 
 
 # ── the owner-private sweep ──────────────────────────────────────────────────

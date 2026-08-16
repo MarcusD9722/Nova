@@ -117,6 +117,25 @@ def _stems(text: str) -> set[str]:
     return {w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words}
 
 
+def _addressee() -> str:
+    """Who the council's synthesis is being written for (V3 P5.1d.4).
+
+    Owner keeps the original wording exactly. A known guest is named. Anyone
+    unrecognised gets neutral phrasing rather than a guess — and in no case is
+    a non-owner described as Marcus.
+    """
+    try:
+        from core.turn_identity import current_identity
+    except Exception:  # noqa: BLE001
+        return "Marcus"
+    ident = current_identity()
+    if ident.is_owner:
+        return "Marcus"
+    if ident.is_known_other and ident.display_name:
+        return ident.display_name
+    return "the current speaker"
+
+
 def select_specialists(query: str, *, max_participants: int = 3) -> list[str]:
     """Executive routing (deterministic core): score each specialist by keyword
     overlap with the query, return the top matches (ids). The coordinator is
@@ -241,10 +260,18 @@ class AgentSociety:
         used_coordinator = False
         if coordinator and len(contributions) >= 2:
             joined = "\n".join(f"- {c['agent']}: {c['text']}" for c in contributions)
+            # Who the answer is FOR. Hardcoding "Marcus" told the coordinator a
+            # guest's question was his — measured on `71fc0eb`, every speaker's
+            # synthesis prompt said "answer for Marcus". Suppressing the private
+            # notes (above) was not enough on its own: the addressee is a second,
+            # independent way the same prompt asserts the wrong person.
+            #
+            # Server-side from TurnIdentity, never a client-supplied name.
             prompt = (
                 f"You are Nova's {coordinator.name}. {coordinator.persona}\n\n"
                 f"Question: {query}\nSpecialist input:\n{joined}\n\n"
-                "Synthesize this into one clear, cohesive answer for Marcus — not a list of who said what. "
+                f"Synthesize this into one clear, cohesive answer for {_addressee()} — "
+                "not a list of who said what. "
                 "Resolve any disagreement and recommend a direction."
             )
             synthesis = await self._one_call(prompt, max_tokens=400)

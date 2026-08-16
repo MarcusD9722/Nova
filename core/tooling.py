@@ -42,8 +42,47 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     with contextlib.suppress(Exception):
         import plugins.init  # noqa: F401
 
-    plugin_tools = {name: spec.fn for name, spec in REGISTRY.get_tools().items()}
-    plugin_descriptions = {name: spec.description for name, spec in REGISTRY.get_tools().items()}
+    def _scope_guarded(name: str, fn: Any) -> Any:
+        """Wrap an owner-private plugin so a non-owner is refused BEFORE it runs.
+
+        V3 P5.1d.4. Plugins reach connected accounts belonging to Marcus's
+        installation — his Gmail, his primary Calendar, his Discord bot — and
+        there is no per-speaker account mapping. Measured on `71fc0eb`: a guest
+        and an unknown speaker both received his unread mail, his calendar
+        events with locations, his Discord history, and could create a Gmail
+        draft and send a Discord message.
+
+        The guard is deliberately the OUTERMOST layer, so a refused call does
+        no OAuth token retrieval, no HTTP request, and produces no external
+        side effect. Refusing after the token fetch would still have touched
+        his credentials.
+
+        This routes DATA. It is not authorisation: PermissionBroker is
+        untouched, and a recognised owner gains nothing he did not already have.
+        """
+        async def guarded(args: dict[str, Any]) -> Any:
+            from core.turn_identity import current_identity
+
+            ident = current_identity()
+            if not ident.is_owner:
+                who = ident.display_name if ident.is_known_other else None
+                return {
+                    "ok": False, "error": "scoped_unavailable", "scope": "connected_account",
+                    "tool": name,
+                    "detail": ("That's connected to Marcus's own account, so I can't "
+                               "reach it from this conversation."),
+                    "speaker": who or "unidentified speaker",
+                }
+            return await fn(args)
+
+        return guarded
+
+    _plugin_specs = REGISTRY.get_tools()
+    plugin_tools = {
+        name: (_scope_guarded(name, spec.fn) if spec.data_scope == "owner_private" else spec.fn)
+        for name, spec in _plugin_specs.items()
+    }
+    plugin_descriptions = {name: spec.description for name, spec in _plugin_specs.items()}
 
     async def _scaffold_project(args: dict[str, Any]) -> dict[str, Any]:
         name = str(args.get("name") or "").strip()
