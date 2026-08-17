@@ -479,8 +479,10 @@ async def test_harness_sentinel_shares_one_conversation():
           "and the oracle is derived from the actual /stt transcript")
     check("${SENTINELS.marcus}" in steps and "${SENTINELS.guest}" in steps,
           "and the spoken cues interpolate exactly those tokens")
-    check("chatTurn(blob, CID)" in code,
-          "and every turn goes through the full /stt -> /chat pipeline with that CID")
+    check("chatFromStt(s, CID)" in code,
+          "and every turn is redeemed through /chat with that CID")
+    check("sttTurn(blob)" in code,
+          "after a single transcription that can be validated first")
 
     # The unverified turn must actually BE unverified.
     check("UNVERIFIED_OK" in html, "allowed unverified statuses are named")
@@ -517,11 +519,17 @@ async def test_harness_latency_measures_stt_only():
     check("n_off" in flow and "n_on" in flow,
           "and the report states how many samples each side actually got")
 
-    # chatTurn must still do the full pipeline: the sentinel needs it.
-    vt = _code_only(html[html.index("async function chatTurn"):
-                         html.index("async function sttOnly")])
-    check('api("/stt"' in vt and '"/chat"' in vt,
-          "chatTurn still runs /stt -> /chat for the memory sentinel")
+    # The full pipeline still exists for the sentinel — but SPLIT, so that a
+    # transcript can be validated between /stt and /chat.
+    st = _code_only(html[html.index("async function sttTurn"):
+                         html.index("function PostChatError")])
+    # Just chatFromStt's own body — sttOnly sits between it and the next marker.
+    cf = _code_only(html[html.index("async function chatFromStt"):
+                         html.index("/** /stt and NOTHING else")])
+    check('api("/stt"' in st and '"/chat"' not in st,
+          "sttTurn transcribes and stops there")
+    check('"/chat"' in cf and 'api("/stt"' not in cf,
+          "chatFromStt redeems that result without re-transcribing")
 
 
 async def test_harness_permission_pass_is_measured():

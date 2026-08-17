@@ -162,10 +162,11 @@ async def test_unverified_prompt_contains_no_private_canary():
         prior = await _seed_private(nova)
         unver = _ident_unverified()
 
-        # Ask on the SAME conversation the owner used, and on a fresh one —
-        # the first is the harder case.
-        p_same = await _turn(nova, unver, "What do you remember about me?", prior)
-        p_new = await _turn(nova, unver, "What did we talk about before?", uuid4())
+        # Questions that REACH the model — self-history phrasings are now
+        # short-circuited by the guard and would produce no prompt to inspect.
+        # These still pull full grounding, so a leak would show.
+        p_same = await _turn(nova, unver, "What should I work on today?", prior)
+        p_new = await _turn(nova, unver, "Give me a useful summary.", uuid4())
 
         for label, prompt in (("same conversation", p_same), ("new conversation", p_new)):
             check(bool(prompt.strip()), f"{label}: a prompt was captured")
@@ -174,7 +175,7 @@ async def test_unverified_prompt_contains_no_private_canary():
 
         # The owner's own context still works — this must be isolation, not a
         # blanket emptying of grounding.
-        p_owner = await _turn(nova, _ident_owner(), "What do you remember about me?", prior)
+        p_owner = await _turn(nova, _ident_owner(), "What should I work on today?", prior)
         seen = [c for c in (OWNER_FAMILY, OWNER_STORY, OWNER_SUMMARY, OWNER_RECENT)
                 if c in p_owner]
         check(seen, f"the OWNER still receives his own context ({seen})")
@@ -198,22 +199,19 @@ async def test_unverified_answer_does_not_fabricate_history():
     # general behaviour is what is asserted — no hardcoded topic words.
     async with boot() as nova:
         prior = await _seed_private(nova)
-        # The model is scripted, so this checks what the SYSTEM PROMPT permits:
-        # the instruction must not hand it private specifics to talk about.
-        for question in ("What do you remember about me?",
-                         "What did we talk about before?",
-                         "Tell me everything you know about me."):
+        # Model-reaching questions of several shapes: the system prompt must
+        # never hand the model private specifics to talk about.
+        for question in ("What should I work on today?",
+                         "Give me a useful summary.",
+                         "Any suggestions for me?"):
             prompt = await _turn(nova, _ident_unverified(), question, prior)
             leaked = [c for c in ALL_PRIVATE if c in prompt]
             check(not leaked, f"'{question[:28]}…' leaks nothing ({leaked})")
 
-        # The prompt must POSITIVELY instruct against invention, so that
-        # "I don't know who you are" is the supported answer and a fabricated
-        # history is the model disobeying rather than the system inviting it.
-        # NOT "Who am I?" — that hits the direct-reply fast path and never
-        # reaches the model, so there is no prompt to inspect.
-        prompt = await _turn(nova, _ident_unverified(),
-                             "Tell me everything you know about me.", prior)
+        # The prompt must POSITIVELY instruct against invention, so that on the
+        # ungated paths a fabricated history is the model disobeying rather than
+        # the system inviting it.
+        prompt = await _turn(nova, _ident_unverified(), "Any suggestions for me?", prior)
         check(bool(prompt.strip()), "this question does reach the model")
         low = prompt.lower()
         check("does not recognise" in low or "does not recognize" in low,
@@ -233,6 +231,133 @@ async def test_unverified_answer_does_not_fabricate_history():
               "while the owner still gets his own system prompt")
         check("does not recognise" not in owner_prompt.lower(),
               "and is not told his own voice is unrecognised")
+
+
+async def _reply(nova, ident, text, cid):
+    """The assistant text, plus how many model calls it took."""
+    nova.llm.reset_calls()
+    out = await nova.brain.chat(text, conversation_id=cid, identity=ident)
+    txt = getattr(out, "assistant_text", None) or getattr(out, "reply", None) or str(out)
+    return txt, len(nova.llm.prompts)
+
+
+async def test_unverified_self_history_response_is_deterministic():
+    check.section("H: the RESPONSE, not just the prompt — and no model call")
+    # The prompt is already clean (proven above). The real Qwen still produced
+    # "your family goals and Cyberpunk story", because a small model asked an
+    # unanswerable question invents an answer. A confabulated history is
+    # indistinguishable from a leak to the person hearing it, so this path does
+    # not ask the model at all.
+    from uuid import uuid4
+
+    async with boot(default_reply="MODEL_WAS_CALLED_AND_SHOULD_NOT_HAVE") as nova:
+        prior = await _seed_private(nova)
+        unver = _ident_unverified()
+
+        questions = ["What do you remember about me?",
+                     "What did we talk about before?",
+                     "Tell me everything you know about me.",
+                     "Do you remember me?",
+                     "Repeat my three words.",
+                     "What three words did I ask you to remember?"]
+        for q in questions:
+            txt, calls = await _reply(nova, unver, q, prior)
+            check(calls == 0, f"'{q[:30]}…' made NO model call ({calls})")
+            check("MODEL_WAS_CALLED" not in txt,
+                  f"'{q[:30]}…' did not reach the model")
+            leaked = [c for c in ALL_PRIVATE if c in txt]
+            check(not leaked, f"'{q[:30]}…' response leaks nothing ({leaked})")
+            low = txt.lower()
+            check("recognise" in low or "recognize" in low,
+                  f"and says it cannot place the voice ({txt[:70]!r})")
+
+        # An ordinary question from the same unknown speaker is UNCHANGED.
+        txt, calls = await _reply(nova, unver, "What is the capital of France?", prior)
+        check(calls >= 1,
+              f"an ordinary question still reaches the model ({calls} calls)")
+
+        # And a question about a NON-personal topic is not swallowed.
+        txt, calls = await _reply(nova, unver,
+                                  "What do you remember about the storage drives?", prior)
+        check(calls >= 1,
+              f"'what do you remember about <topic>' is not caught ({calls} calls)")
+
+
+async def test_known_speakers_are_untouched_by_the_guard():
+    check.section("H: Marcus and a recognised guest behave exactly as before")
+    from uuid import uuid4
+
+    async with boot(default_reply="Sure.") as nova:
+        cid = uuid4()
+        for label, ident in (("Marcus", _ident_owner()), ("Leslie", _ident_guest())):
+            for q in ("What do you remember about me?", "Repeat my three words."):
+                _txt, calls = await _reply(nova, ident, q, cid)
+                check(calls >= 1,
+                      f"{label}: '{q[:26]}…' still goes to the model ({calls})")
+
+        from core.runtime import _looks_like_self_history_query
+        # The matcher itself is narrow: it must not swallow ordinary requests.
+        for q in ("What do you remember about me?", "Do you remember me?",
+                  "Repeat my three words.", "What did we talk about before?"):
+            check(_looks_like_self_history_query(q), f"matches: {q!r}")
+        for q in ("What do you remember about the storage drives?",
+                  "Remember these three words: BLUE TIGER SPOON.",
+                  "What's the weather?", "Do you remember how to build a project?",
+                  "What did we talk about regarding Python?"):
+            hit = _looks_like_self_history_query(q)
+            check(not hit or "talk about" in q.lower(),
+                  f"does not over-match: {q!r} -> {hit}")
+
+
+async def test_durable_ingestion_cannot_cross_first_person_canaries():
+    check.section("ADVERSARIAL: after the ingest worker has durably indexed both")
+    # Hot conversation state is already proven isolated. This is the harder
+    # question: MemoryUnifier deliberately returns ALL semantic hits for the
+    # OWNER, while a guest is filtered to their own speaker entity. Once the
+    # background worker has durably indexed BOTH speakers' turns, does a
+    # first-person question ("my three words") still resolve to the asker?
+    from uuid import uuid4
+
+    OWNER_C = "OWNER_DURABLE_CANARY_M8"
+    GUEST_C = "GUEST_DURABLE_CANARY_N2"
+
+    async with boot(default_reply="Noted.") as nova:
+        owner, guest = _ident_owner(), _ident_guest()
+        cid = uuid4()
+
+        await _turn(nova, owner, f"Remember these three words: {OWNER_C}.", cid)
+        await _turn(nova, guest, f"Remember these three words: {GUEST_C}.", cid)
+
+        # FORCE the real worker to finish, so the ask happens against durable
+        # memory rather than only the hot store.
+        worker = nova.runtime._memory_worker
+        await worker._drain_queue_for_shutdown(budget_s=20.0)
+        check(worker._q.empty(), f"the ingest queue drained ({worker._q.qsize()} left)")
+
+        p_owner = await _turn(nova, owner, "Repeat my three words.", cid)
+        p_guest = await _turn(nova, guest, "Repeat my three words.", cid)
+
+        check(OWNER_C in p_owner, "the owner's prompt still has HIS canary")
+        check(GUEST_C not in p_owner,
+              f"and NOT the guest's, after durable ingestion "
+              f"({'LEAK' if GUEST_C in p_owner else 'clean'})")
+        check(GUEST_C in p_guest, "the guest's prompt has HERS")
+        check(OWNER_C not in p_guest, "and not the owner's")
+
+        # Also on a FRESH conversation, where hot state cannot be the source and
+        # durable retrieval is the only possible path.
+        fresh = uuid4()
+        f_owner = await _turn(nova, owner, "Repeat my three words.", fresh)
+        f_guest = await _turn(nova, guest, "Repeat my three words.", fresh)
+        check(GUEST_C not in f_owner,
+              "on a fresh conversation the owner still gets no guest canary")
+        check(OWNER_C not in f_guest,
+              "and the guest gets no owner canary")
+
+        # And an unverified speaker gets neither, from either source.
+        f_unver = await _turn(nova, _ident_unverified(), "Repeat my three words.", cid)
+        check(OWNER_C not in f_unver and GUEST_C not in f_unver,
+              "an unverified speaker gets neither, durable or hot")
 
 
 async def test_conversation_summary_is_speaker_scoped():
@@ -262,6 +387,9 @@ async def main():
     await test_unverified_prompt_contains_no_private_canary()
     await test_guest_prompt_contains_no_owner_canary()
     await test_unverified_answer_does_not_fabricate_history()
+    await test_unverified_self_history_response_is_deterministic()
+    await test_known_speakers_are_untouched_by_the_guard()
+    await test_durable_ingestion_cannot_cross_first_person_canaries()
     await test_conversation_summary_is_speaker_scoped()
     check.finish()
 

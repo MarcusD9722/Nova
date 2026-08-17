@@ -158,6 +158,12 @@ const VAL_CUES = [
 //: back recognised, the privacy question was never asked.
 const UNVERIFIED_OK = ["unknown", "ambiguous", "unavailable", "too_short"];
 
+//: Bump whenever step 9's protocol changes in a way that invalidates earlier
+//: evidence. localStorage keeps `S.sentinel`, so without this a PASS produced
+//: by an older, flawed step 9 would be loaded by newer code and satisfy
+//: acceptance without ever being re-run. Old or missing revision can never pass.
+const STEP9_EVIDENCE_REVISION = "p52-step9-atomic-v1";
+
 /** Even, deterministic spread across the five acoustic conditions — GROUPED.
  *
  *  20 -> exactly 4 each, which is what P5.2 requires for Phase A.
@@ -212,7 +218,8 @@ const SENTINELS = {
 };
 
 //: Words that mean the parse grabbed the carrier phrase instead of the payload.
-const CANARY_STOPWORDS = ["REMEMBER", "THESE", "THREE", "WORDS", "THE", "ARE", "IS"];
+const CANARY_STOPWORDS = ["REMEMBER", "THESE", "THREE", "WORDS", "THE", "ARE",
+                          "IS", "AND", "A", "AN", "MY"];
 
 /**
  * Pull the three remembered words out of a REAL /stt transcript.
@@ -226,12 +233,50 @@ const CANARY_STOPWORDS = ["REMEMBER", "THESE", "THREE", "WORDS", "THE", "ARE", "
 function extractCanary(sttText) {
   const t = canonTokens(sttText);
   const at = t.lastIndexOf("WORDS");
-  let picked = (at >= 0 && t.length >= at + 4) ? t.slice(at + 1, at + 4) : t.slice(-3);
+  let picked;
+  if (at >= 0) {
+    picked = t.slice(at + 1, at + 4);          // the payload after the anchor
+  } else if (t.length === 3) {
+    // FAIL CLOSED. Without the anchor, accept only when the ENTIRE transcript
+    // is the three words. Taking the last three tokens of an arbitrary longer
+    // sentence would happily "extract" a canary from "...so I went to the shop
+    // yesterday", and the run would then be measured against nonsense.
+    picked = t;
+  } else {
+    return null;
+  }
   if (picked.length !== 3) return null;
   if (picked.some(w => w.length < 2)) return null;
   if (picked.some(w => CANARY_STOPWORDS.indexOf(w) >= 0)) return null;
   if (new Set(picked).size !== 3) return null;     // "blue blue tiger" is a misparse
   return picked.join(" ");
+}
+
+//: The ASK must also be transcribed recognisably, or the turn tests Whisper
+//: rather than memory. Deterministic and strict: a first-person recall request
+//: for the three words. No classifier, no model call, no fuzzy matching.
+const ASK_PATTERNS = [
+  ["REPEAT", "MY", "THREE", "WORDS"],
+  ["WHAT", "ARE", "MY", "THREE", "WORDS"],
+  ["WHAT", "WERE", "MY", "THREE", "WORDS"],
+  ["SAY", "MY", "THREE", "WORDS"],
+  ["TELL", "ME", "MY", "THREE", "WORDS"],
+];
+
+/** Is this transcript recognisably "repeat my three words"? */
+function isAskTranscript(sttText) {
+  const t = canonTokens(sttText);
+  if (!t.length) return false;
+  // Every pattern must appear as an in-order subsequence, AND the essential
+  // tokens must all be present — so "what are my words" (no THREE) is rejected
+  // rather than nearly-accepted.
+  if (t.indexOf("THREE") < 0 || t.indexOf("WORDS") < 0) return false;
+  if (t.indexOf("MY") < 0) return false;      // first-person; not "your words"
+  return ASK_PATTERNS.some(pat => {
+    let i = 0;
+    for (const tok of t) { if (tok === pat[i]) i++; if (i === pat.length) return true; }
+    return false;
+  });
 }
 
 /** Uppercase alphanumeric tokens. Deterministic; no fuzzy or semantic matching. */
@@ -256,13 +301,19 @@ function canonTokens(s) {
  */
 function containsSentinel(reply, sentinel) {
   const r = canonTokens(reply), s = canonTokens(sentinel);
-  if (!s.length || r.length < s.length) return false;
-  for (let i = 0; i + s.length <= r.length; i++) {
-    let hit = true;
-    for (let j = 0; j < s.length; j++) {
-      if (r[i + j] !== s[j]) { hit = false; break; }
+  if (!s.length || !r.length || r.length < s.length) return false;
+  for (let i = 0; i < r.length; i++) {
+    let ri = i, si = 0;
+    while (si < s.length && ri < r.length) {
+      if (r[ri] === s[si]) { ri++; si++; }
+      // ONE deterministic concession to grammar: a natural answer is "blue,
+      // tiger, AND spoon". `AND` is skipped only BETWEEN expected words, never
+      // at the start or end, and never in place of one. Word identity and
+      // order stay exact — this is not fuzzy matching and admits no wrong word.
+      else if (r[ri] === "AND" && si > 0 && si < s.length) { ri++; }
+      else break;
     }
-    if (hit) return true;
+    if (si === s.length) return true;
   }
   return false;
 }
@@ -476,18 +527,41 @@ function computeAcceptance(S) {
   if (!S.applied) missing.push("calibration applied");
   if (!(S.statusAfter && S.statusAfter.threshold_calibrated)) missing.push("status threshold_calibrated == true");
   if (!S.statusAfter) missing.push("post-run /speaker/status");
+  // `threshold_calibrated` only says a valid RECORD covers the profiles. It does
+  // NOT say calibration is the policy actually deciding: NOVA_SPEAKER_THRESHOLD
+  // or NOVA_SPEAKER_MARGIN silently outrank it. Validating steps 8-11 against an
+  // env override would measure a policy that is not the calibrated one.
+  const tSrc = S.statusAfter && S.statusAfter.threshold_source;
+  const mSrc = S.statusAfter && S.statusAfter.margin_source;
+  if (S.statusAfter && tSrc !== "calibrated")
+    missing.push(`threshold_source is "${tSrc}", not "calibrated"`);
+  if (S.statusAfter && mSrc !== "calibrated")
+    missing.push(`margin_source is "${mSrc}", not "calibrated"`);
   if (counts.valid_marcus < need.valid_marcus) missing.push("Marcus validation");
   if (counts.valid_guest < need.valid_guest) missing.push("guest validation");
   if (!S.sentinel) missing.push("memory attribution");
+  else if (S.sentinel.evidence_revision !== STEP9_EVIDENCE_REVISION)
+    // Evidence from an older step-9 protocol. It cannot be trusted and cannot
+    // be upgraded — it has to be re-run.
+    missing.push(`memory attribution re-run (evidence is `
+               + `"${S.sentinel.evidence_revision || "unversioned"}", `
+               + `needs "${STEP9_EVIDENCE_REVISION}")`);
   if (!S.permission) missing.push("permission regression");
   if (!S.sttLatency) missing.push("latency measurement");
-  else if (!S.sttLatency.n_off || !S.sttLatency.n_on) missing.push("latency OFF/ON samples");
+  // EXACTLY 6 + 6. "Some samples" is not the benchmark; a partial run would
+  // give a P50/P95 nobody agreed to.
+  else if (S.sttLatency.n_off !== 6 || S.sttLatency.n_on !== 6)
+    missing.push(`latency needs exactly 6+6 (have ${S.sttLatency.n_off}+${S.sttLatency.n_on})`);
 
   const failed = [];
   if (recog && !recogPass) failed.push("recognition validation");
   if (S.sentinel && !S.sentinel.pass) failed.push("memory attribution");
   if (S.sentinel && !S.sentinel.conversation_stable) failed.push("sentinel conversation id not stable");
   if (S.sentinel && !S.sentinel.unverified_is_unverified) failed.push("third speaker was recognised — privacy check invalid");
+  if (S.sentinel && S.sentinel.marcus_got_guest) failed.push("Marcus received the guest's canary");
+  if (S.sentinel && S.sentinel.guest_got_marcus) failed.push("the guest received Marcus's canary");
+  if (S.sentinel && S.sentinel.store_cross_leak) failed.push("a STORE reply disclosed the other speaker's canary");
+  if (S.sentinel && S.sentinel.canaries_parsed === false) failed.push("a store canary never parsed");
   if (S.permission && !S.permission.pass) failed.push("permission regression");
   if (S.statusAfter && !twoProfiles.pass) failed.push("exactly-two-profile requirement");
   if (!audit.ok) failed.push("speaker/truth attribution mismatch");
@@ -514,7 +588,8 @@ const P52 = {
   DUR, GAP_MS, LEAD_IN_S, LEAD_NEXT_S, CONDITION_NAMES, CONDITION_HINT,
   ENROLL_PHRASES, CAL_CUES, VAL_CUES, UNVERIFIED_OK,
   SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS, SENTINELS, CANARY_STOPWORDS,
-  canonTokens, containsSentinel, extractCanary,
+  STEP9_EVIDENCE_REVISION, ASK_PATTERNS,
+  canonTokens, containsSentinel, extractCanary, isAskTranscript,
   planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
   handoffBeforeIndex, stepLabel, enrollmentComplete, enrollmentAcceptable,
   reconcileEnrollment, commitSample,
@@ -741,6 +816,21 @@ async function runBlock(spec) {
       if (result && result.note) detail = result.note;
     } catch (e) {
       detail = e.message || String(e);
+      // POST-DISPATCH failure. The backend may already have committed the turn,
+      // so this block's conversation can no longer be called clean. Retrying
+      // the sample would build the rest of the run on top of it. Abort instead;
+      // the next explicit invocation mints a fresh conversation and starts over.
+      if (e && e.postChat) {
+        RUN.abort = true;
+        RUN.aborted_reason = detail;
+        stageRender({...ctx, state:
+          `<span class="bad">aborted: ${detail}</span><br>`
+          + `<span class="dim">The backend may already have recorded that turn, so `
+          + `this conversation is no longer clean. Run step 9 again — it will use `
+          + `a new conversation.</span>`});
+        await sleep(2500);
+        break;
+      }
     }
 
     if (outcome !== "ok") {
@@ -826,23 +916,49 @@ async function enrolBatch(name, role, key, blocks) {
 // Takes an already-recorded blob, because the batch engine owns recording. The
 // memory sentinel is the ONLY caller: it is the one check that has to prove
 // attribution through the real turn path, not just the classifier.
-async function chatTurn(blob, convId) {
+// SPLIT ON PURPOSE. The old chatTurn() ran /stt and immediately /chat, so an
+// unparseable STORE transcript had ALREADY entered the conversation before
+// extractCanary rejected it — and the retry then left that rejected turn
+// sitting in the supposedly clean conversation.
+//
+// Now every validation happens between the two calls: transcribe once, decide,
+// and only then redeem THAT handle with THAT text.
+async function sttTurn(blob) {
   const fd = new FormData();
   fd.append("file", blob, "cmd.webm");
   fd.append("speaker", "true");
   const t0 = performance.now();
   const stt = await api("/stt", {method:"POST", body:fd});
-  const sttMs = Math.round(performance.now() - t0);
-  const handle = stt?.speaker?.voice_turn_id || null;
-  const chat = await api("/chat", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ message: stt.text || null, attachments: [],
-                           input_source: "voice",
-                           ...(convId ? {conversation_id: convId} : {}),
-                           ...(handle ? {voice_turn_id: handle} : {}) })});
-  return { text: stt.text, speaker: stt.speaker || null, handle,
+  return { text: stt?.text ?? "", speaker: stt?.speaker || null,
+           handle: stt?.speaker?.voice_turn_id || null,
+           stt_ms: Math.round(performance.now() - t0) };
+}
+
+//: Thrown once /chat has been dispatched. The backend may already have recorded
+//: the turn, so the client cannot prove zero side effects — the conversation is
+//: no longer clean and the whole run must be abandoned rather than retried.
+function PostChatError(message) {
+  const e = new Error(message);
+  e.postChat = true;
+  return e;
+}
+
+/** Redeem exactly this /stt result through /chat, once. Never re-transcribes. */
+async function chatFromStt(sttResult, convId) {
+  let chat;
+  try {
+    chat = await api("/chat", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ message: sttResult.text || null, attachments: [],
+                             input_source: "voice",
+                             ...(convId ? {conversation_id: convId} : {}),
+                             ...(sttResult.handle ? {voice_turn_id: sttResult.handle} : {}) })});
+  } catch (e) {
+    throw PostChatError(`/chat failed after dispatch: ${e.message}`);
+  }
+  return { text: sttResult.text, speaker: sttResult.speaker, handle: sttResult.handle,
            reply: chat?.assistant ?? chat?.response ?? chat?.text ?? "",
-           conversation_id: chat?.conversation_id ?? null, stt_ms: sttMs };
+           conversation_id: chat?.conversation_id ?? null, stt_ms: sttResult.stt_ms };
 }
 
 /** /stt and NOTHING else — for the latency benchmark, which must not have an
@@ -908,24 +1024,35 @@ async function sentinelFlow() {
     },
     doSample: async (blob, i) => {
       const spec = SENTINEL_STEPS[i];
-      const r = await chatTurn(blob, CID);
+
+      // ── 1. TRANSCRIBE. No /chat yet. ──────────────────────────────────────
+      const s = await sttTurn(blob);
+
+      // ── 2. VALIDATE, still before /chat. A rejection here costs one /stt and
+      //       leaves the conversation untouched. ─────────────────────────────
+      let pendingCanary = null;
+      if (spec.canaryFor) {
+        pendingCanary = extractCanary(s.text);
+        if (!pendingCanary) {
+          throw new Error(`could not read three words from "${(s.text||"").slice(0,70)}" `
+                        + `— nothing was sent to Nova; say the cue again, clearly`);
+        }
+      } else if (!isAskTranscript(s.text)) {
+        throw new Error(`that did not transcribe as "repeat my three words" `
+                      + `("${(s.text||"").slice(0,70)}") — nothing was sent to Nova; `
+                      + `say it again`);
+      }
+
+      // ── 3. COMMIT. From here the backend may have recorded the turn, so any
+      //       failure aborts the whole run instead of retrying into a dirty
+      //       conversation (chatFromStt throws a postChat error). ────────────
+      const r = await chatFromStt(s, CID);
+      if (pendingCanary) observed[spec.canaryFor] = pendingCanary;
+
       // STRICT. A missing or null returned id is a FAILURE, not a pass: that is
       // exactly what a server ignoring conversation_id produces.
       if (r.conversation_id !== CID) out.conversation_stable = false;
       replies[i] = r.reply;
-
-      // On a STORE turn the expected answer is set from the REAL transcript. If
-      // it cannot be parsed cleanly, fail this sample so runBlock re-records
-      // the SAME index — guessing here would fail the memory test for a
-      // transcription reason, which is the trap this whole change removes.
-      if (spec.canaryFor) {
-        const got = extractCanary(r.text);
-        if (!got) {
-          throw new Error(`could not read three words from "${(r.text||"").slice(0,70)}" `
-                        + `— say the cue again, clearly`);
-        }
-        observed[spec.canaryFor] = got;
-      }
       // RAW EVIDENCE. Run 2 reported a memory failure and kept neither the STT
       // text nor the reply, so there was no way to tell a real failure from a
       // transcription mismatch without recording the whole thing again. These
@@ -966,22 +1093,47 @@ async function sentinelFlow() {
   // ONE comparison function for the positive checks and the privacy checks
   // alike. Anything that makes "Marcus got his own" easier to satisfy must
   // make "the guest got Marcus's" easier to DETECT by exactly the same amount.
+  // RECOMPUTED, now that BOTH observed canaries exist. The per-step flags
+  // recorded during the run were evaluated when the guest's canary might still
+  // have been null, so they were vacuous for the earlier turns. Every
+  // speaker-visible reply is re-examined against the FINAL canaries.
+  out.canaries_parsed = !!(observed.marcus && observed.guest);
+  out.visibility = out.steps.map((st, i) => ({
+    who: st.who, phase: st.phase,
+    sees_marcus: containsSentinel(replies[i], observed.marcus),
+    sees_guest: containsSentinel(replies[i], observed.guest),
+  }));
+  out.steps.forEach((st, i) => {
+    st.got_marcus = out.visibility[i].sees_marcus;
+    st.got_guest = out.visibility[i].sees_guest;
+  });
+
+  // Cross-disclosure on ANY reply, including the two STORE turns — not only
+  // the final asks.
+  out.store_cross_leak =
+       (out.visibility[0] && out.visibility[0].sees_guest)      // Marcus store saw hers
+    || (out.visibility[1] && out.visibility[1].sees_marcus);    // Guest store saw his
+
   // Every check — positive AND privacy — uses the OBSERVED canaries, so the
   // oracle is what production actually received.
-  out.canaries_parsed = !!(observed.marcus && observed.guest);
   out.marcus_got_own = containsSentinel(replies[2], observed.marcus);
   out.guest_got_own = containsSentinel(replies[3], observed.guest);
   out.guest_got_marcus = containsSentinel(replies[3], observed.marcus);
+  // The missing half of the symmetry: Marcus must not receive HERS either.
+  out.marcus_got_guest = containsSentinel(replies[2], observed.guest);
   out.unverified_got_either = containsSentinel(replies[4], observed.marcus)
                            || containsSentinel(replies[4], observed.guest);
   out.sentinels = {marcus: M_S, guest: G_S};
+  out.evidence_revision = STEP9_EVIDENCE_REVISION;
   out.comparison = "canonical uppercase alphanumeric tokens, consecutive match; "
                  + "no fuzzy or edit-distance matching; same rule for positive "
                  + "and privacy checks";
   out.pass = out.conversation_stable && out.canaries_parsed
              && out.marcus_recognised && out.guest_recognised
-             && out.unverified_is_unverified && out.marcus_got_own && out.guest_got_own
-             && !out.guest_got_marcus && !out.unverified_got_either;
+             && out.unverified_is_unverified
+             && out.marcus_got_own && out.guest_got_own
+             && !out.marcus_got_guest && !out.guest_got_marcus
+             && !out.unverified_got_either && !out.store_cross_leak;
   return out;
 }
 
@@ -1318,7 +1470,26 @@ function render() {
           await api("/speaker/calibration", {method:"POST",
             headers:{"Content-Type":"application/json"},
             body: JSON.stringify({trials: S.trials.map(trialPayload), apply:true})});
-          S.applied = true; S.step = 7; save();
+          S.applied = true;
+          // CHECK THE EFFECTIVE POLICY NOW, not at the report. `calibrated`
+          // only means a valid record exists; NOVA_SPEAKER_THRESHOLD or
+          // NOVA_SPEAKER_MARGIN silently outrank it. Discovering that after
+          // steps 8-11 would mean validating a policy nobody calibrated.
+          const st = await api("/speaker/status");
+          S.statusAfter = st; save();
+          if (st.threshold_source !== "calibrated" || st.margin_source !== "calibrated") {
+            alertBanner(
+              `<b>Calibration applied, but it is NOT the effective policy.</b><br>`
+              + `threshold_source = <code>${st.threshold_source}</code>, `
+              + `margin_source = <code>${st.margin_source}</code>.<br>`
+              + `An environment override is in force. <b>Stop here</b>: unset `
+              + `<code>NOVA_SPEAKER_THRESHOLD</code> / <code>NOVA_SPEAKER_MARGIN</code>, `
+              + `restart the backend, press Check, then continue. Validating steps 8-11 `
+              + `now would measure a policy that is not the calibrated one.`);
+          } else {
+            S.step = 7;
+          }
+          save();
         } catch(e){ alertBanner(e.message); }
       };
       pr.appendChild(ap);
@@ -1353,7 +1524,25 @@ function render() {
     + "<b>Needs a third, unenrolled voice for the last turn</b> — or a genuinely unverified condition, which only counts if the backend actually returns one."));
   const msb = el("button","primary","Run memory-attribution check (5 turns)");
   msb.onclick = async () => { msb.disabled = true;
-    try { const r = await sentinelFlow(); if (r) { S.sentinel = r; S.step = 9; save(); } }
+    // The previous result is cleared BEFORE the run, not after: an aborted or
+    // failed retry must never leave an earlier PASS on screen masquerading as
+    // this run's evidence. Steps 1-8 state is untouched.
+    S.sentinel = null; save();
+    try {
+      const r = await sentinelFlow();
+      if (r) {
+        S.sentinel = r;
+        // ONLY a passing gate advances the workflow. A failure keeps the human
+        // on step 9 — but the JSON stays visible so it can be copied.
+        if (r.pass) S.step = 9;
+        save();
+        if (!r.pass) alertBanner("Step 9 FAILED — staying on step 9. The full "
+          + "diagnostics are below and can be copied.");
+      } else {
+        alertBanner("Step 9 was aborted. Nothing from it counts; run it again "
+          + "and it will use a fresh conversation.");
+      }
+    }
     catch(e){ alertBanner(e.message); } finally { msb.disabled = false; render(); } };
   ms.appendChild(msb);
   if (S.sentinel) {
@@ -1370,7 +1559,16 @@ function render() {
     + "all three decisions must match. Nothing can be typed: the probe rejects its own request, execution is off, no adapter ships."));
   const pmb = el("button","primary","Run permission regression (2 recordings)");
   pmb.onclick = async () => { pmb.disabled = true;
-    try { const r = await permissionFlow(); if (r) { S.permission = r; S.step = 10; save(); } }
+    S.permission = null; save();      // same rule: no stale PASS may survive
+    try {
+      const r = await permissionFlow();
+      if (r) {
+        S.permission = r;
+        if (r.pass) S.step = 10;
+        save();
+        if (!r.pass) alertBanner("Permission regression FAILED — staying on step 10.");
+      }
+    }
     catch(e){ alertBanner(e.message); } finally { pmb.disabled = false; render(); } };
   pm.appendChild(pmb);
   if (S.permission) {

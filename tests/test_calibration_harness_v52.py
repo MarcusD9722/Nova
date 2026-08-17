@@ -588,11 +588,11 @@ async def test_step9_canary_comes_from_the_real_transcript():
     html = HARNESS.read_text(encoding="utf-8")
     flow = _code_only(html[html.index("async function sentinelFlow"):
                            html.index("async function permissionFlow")])
-    check("extractCanary(r.text)" in flow, "the canary is read from the /stt text")
+    check("extractCanary(s.text)" in flow, "the canary is read from the /stt text")
     check("throw new Error" in flow,
           "and a failed parse throws, so runBlock re-records the SAME index")
-    check("observed[spec.canaryFor] = got" in flow,
-          "the observed canary is stored per speaker")
+    check("observed[spec.canaryFor] = pendingCanary" in flow,
+          "the observed canary is stored per speaker, only after /chat succeeds")
     # And every verdict compares against `observed`, never the cue card.
     for field in ("marcus_got_own", "guest_got_own", "guest_got_marcus",
                   "unverified_got_either"):
@@ -606,6 +606,179 @@ async def test_step9_canary_comes_from_the_real_transcript():
           "and an unparsed canary fails the run rather than passing vacuously")
     for field in ("intended_canary", "observed_stt_canary"):
         check(field in flow, f"the report records `{field}`")
+
+
+async def test_store_is_atomic_with_respect_to_chat():
+    check.section("A/B/C: validate BEFORE /chat; abort after it")
+    html = HARNESS.read_text(encoding="utf-8")
+    flow = _code_only(html[html.index("async function sentinelFlow"):
+                           html.index("async function permissionFlow")])
+
+    # A. The pipeline is split, and validation sits between the halves.
+    check("async function sttTurn" in html and "async function chatFromStt" in html,
+          "the pipeline is split into /stt and /chat primitives")
+    check("chatTurn(" not in flow,
+          "the fused /stt->/chat call is gone from the sentinel flow")
+    stt_at = flow.index("await sttTurn(blob)")
+    extract_at = flow.index("extractCanary(s.text)")
+    ask_at = flow.index("isAskTranscript(s.text)")
+    chat_at = flow.index("await chatFromStt(")
+    check(stt_at < extract_at < chat_at,
+          "the store canary is validated between /stt and /chat")
+    check(stt_at < ask_at < chat_at,
+          "the ask transcript is validated between /stt and /chat too")
+    check("throw new Error" in flow[extract_at:chat_at],
+          "a rejection throws BEFORE any /chat call is made")
+
+    # Exactly one transcription per sample: no re-running Whisper on audio that
+    # already succeeded.
+    check(flow.count("await sttTurn(") == 1, "audio is transcribed exactly once")
+    check(flow.count("await chatFromStt(") == 1, "and redeemed at most once")
+
+    # The handle and text forwarded are THE ones /stt returned — the browser
+    # never asserts identity.
+    prim = _code_only(html[html.index("async function chatFromStt"):
+                           html.index("// ── composite flows")])
+    check("sttResult.text" in prim and "sttResult.handle" in prim,
+          "chatFromStt forwards exactly the /stt text and handle")
+    # The browser may pass the opaque handle through; it must never assert WHO.
+    body = prim[prim.index("JSON.stringify({"):prim.index("})});") + 5]
+    for forged in ("profile_id", "display_name", "role", "speaker_status"):
+        check(forged not in body,
+              f"and the /chat body never asserts {forged} from the browser")
+    check("voice_turn_id: sttResult.handle" in body,
+          "identity travels only as the backend-issued handle")
+
+    # B. Post-dispatch failure aborts the whole run.
+    check("function PostChatError" in html and "e.postChat = true" in html,
+          "a /chat failure is tagged as post-dispatch")
+    check("throw PostChatError(" in prim, "and chatFromStt raises it")
+    eng = _code_only(html[html.index("async function runBlock"):
+                          html.index("// ── per-sample")])
+    check("e.postChat" in eng and "RUN.abort = true" in eng,
+          "runBlock ABORTS on a post-dispatch failure instead of retrying")
+    check("aborted_reason" in eng, "and records why")
+    # An aborted sentinel returns nothing usable.
+    check("if (out.steps.length < SENTINEL_STEPS.length) return null" in flow,
+          "an incomplete sentinel run yields no result at all")
+
+
+async def test_step9_evidence_revision_and_gating():
+    check.section("K/L: stale evidence rejected; a failed gate does not advance")
+    html = HARNESS.read_text(encoding="utf-8")
+
+    out = _node(_complete_state_js() + """
+      const REV = P52.STEP9_EVIDENCE_REVISION;
+      out.rev = REV;
+      const miss = s => P52.computeAcceptance(s).missing.join(" | ");
+      const fail = s => P52.computeAcceptance(s).failed.join(" | ");
+
+      let s = base(); s.sentinel.evidence_revision = "p52-step9-OLD";
+      out.oldRev = miss(s);
+      s = base(); delete s.sentinel.evidence_revision;
+      out.noRev = miss(s);
+
+      // I: effective source must be calibrated, not merely present.
+      s = base(); s.statusAfter.threshold_source = "env override";
+      out.envThresh = miss(s);
+      s = base(); s.statusAfter.margin_source = "env override";
+      out.envMargin = miss(s);
+      s = base(); s.statusAfter.threshold_source = "provisional default";
+      out.provThresh = miss(s);
+      s = base(); s.statusAfter.margin_source = "provisional default";
+      out.provMargin = miss(s);
+
+      // J: exactly 6 + 6.
+      out.latency = {};
+      for (const [off, on] of [[6,6],[5,6],[6,5],[7,6],[6,7],[1,1],[0,0]]) {
+        const t = base(); t.sttLatency = {n_off:off, n_on:on};
+        out.latency[off + "+" + on] = miss(t);
+      }
+
+      // E: the symmetric privacy verdict.
+      out.sym = {};
+      for (const f of ["marcus_got_guest", "guest_got_marcus", "store_cross_leak"]) {
+        const t = base(); t.sentinel[f] = true;
+        out.sym[f] = fail(t);
+      }
+      const t = base(); t.sentinel.canaries_parsed = false;
+      out.unparsed = fail(t);
+      out.clean = P52.computeAcceptance(base()).acceptance;
+    """)
+    check(out["rev"] == "p52-step9-atomic-v1", f"revision constant ({out['rev']})")
+    check("re-run" in out["oldRev"], f"an OLD revision demands a re-run ({out['oldRev']})")
+    check("unversioned" in out["noRev"], f"and a missing one too ({out['noRev']})")
+
+    check("threshold_source" in out["envThresh"],
+          f"an env threshold override blocks acceptance ({out['envThresh']})")
+    check("margin_source" in out["envMargin"],
+          f"an env margin override blocks acceptance ({out['envMargin']})")
+    check("threshold_source" in out["provThresh"], "as does a provisional threshold")
+    check("margin_source" in out["provMargin"], "and a provisional margin")
+
+    check(out["latency"]["6+6"] == "", "6+6 is complete")
+    for combo in ("5+6", "6+5", "7+6", "6+7", "1+1", "0+0"):
+        check("latency" in out["latency"][combo],
+              f"{combo} is rejected ({out['latency'][combo]})")
+
+    for field, msg in out["sym"].items():
+        check(msg, f"{field} fails the run ({msg})")
+    check(out["unparsed"], f"an unparsed canary fails ({out['unparsed']})")
+    check(out["clean"] == "PASS", f"and a clean run still passes ({out['clean']})")
+
+    # L: a failing gate must not advance the step counter.
+    ui = _code_only(html[html.index("const msb = el(\"button\""):
+                         html.index("root.appendChild(stepCard(10")])
+    check("if (r.pass) S.step = 9;" in ui,
+          "step 9 advances ONLY on a pass")
+    check("S.sentinel = null; save();" in ui,
+          "and the previous result is cleared before the run, not after")
+    pm = _code_only(html[html.index("const pmb = el(\"button\""):
+                         html.index("root.appendChild(stepCard(11")])
+    check("if (r.pass) S.step = 10;" in pm, "step 10 advances only on a pass")
+    check("S.permission = null; save();" in pm, "and clears its stale result too")
+
+
+async def test_ask_and_glue_grammar():
+    check.section("C/D/F: ask validation, fail-closed parsing, list grammar")
+    out = _node("""
+      const A = P52.isAskTranscript, E = P52.extractCanary,
+            c = (r,s) => P52.containsSentinel(r,s), M = "BLUE TIGER SPOON";
+      out.ask_ok = ["Repeat my three words.", "What are my three words?",
+                    "What were my three words", "Tell me my three words",
+                    "Say my three words"].map(A);
+      out.ask_bad = ["what are my words", "repeat the three words",
+                     "tell me about the weather", "repeat my three sentences",
+                     "", "what are your three words"].map(A);
+      out.parse_bad = ["so I went to the shop yesterday morning",
+                       "I think the answer is blue tiger spoon",
+                       "Remember these three words and the",
+                       "the words are blue tiger"].map(E);
+      out.parse_ok = [E("Remember these three words blue tiger soon."),
+                      E("blue tiger spoon")];
+      out.glue_ok = ["BLUE TIGER SPOON", "blue, tiger, and spoon",
+                     "BLUE AND TIGER AND SPOON",
+                     "Your words were blue, tiger, and spoon."].map(r => c(r, M));
+      out.glue_bad = ["BLUE TIGER FORK", "BLUE FORK SPOON", "SPOON TIGER BLUE",
+                      "BLUE TIGER GREEN SPOON", "BLUE TIGER",
+                      "AND AND AND"].map(r => c(r, M));
+      out.leak_glue = c("Marcus's words were blue, tiger, and spoon", M);
+      out.stopwords = P52.CANARY_STOPWORDS;
+    """)
+    check(all(out["ask_ok"]), f"every valid ask phrasing is accepted ({out['ask_ok']})")
+    check(not any(out["ask_bad"]),
+          f"malformed asks are rejected BEFORE /chat ({out['ask_bad']})")
+    check(all(p is None for p in out["parse_bad"]),
+          f"fail-closed: no canary from arbitrary sentences ({out['parse_bad']})")
+    check(out["parse_ok"] == ["BLUE TIGER SOON", "BLUE TIGER SPOON"],
+          f"while the two legitimate shapes parse ({out['parse_ok']})")
+    check(all(out["glue_ok"]), f"list grammar matches ({out['glue_ok']})")
+    check(not any(out["glue_bad"]),
+          f"but no wrong word, order or extra word does ({out['glue_bad']})")
+    check(out["leak_glue"] is True,
+          "and a list-grammar leak in a guest reply is still caught")
+    for w in ("AND", "A", "AN", "MY", "THE", "IS", "ARE", "THREE", "WORDS", "REMEMBER", "THESE"):
+        check(w in out["stopwords"], f"{w} is rejected as a payload word")
 
 
 async def test_sentinel_comparison_is_symmetric():
@@ -694,10 +867,17 @@ def _complete_state_js() -> str:
           validation: trials("valid_marcus",M,"Marcus",10,"V")
             .concat(trials("valid_guest",G,"Guest",10,"V")),
           applied:true,
-          statusAfter:{threshold_calibrated:true, profiles_detail:[
+          statusAfter:{threshold_calibrated:true,
+                       // The EFFECTIVE policy must be the calibrated one, not
+                       // merely a record that exists behind an env override.
+                       threshold_source:"calibrated", margin_source:"calibrated",
+                       profiles_detail:[
             {profile_id:M, role:"owner", compatible:true},
             {profile_id:G, role:"guest", compatible:true}]},
-          sentinel:{pass:true, conversation_stable:true, unverified_is_unverified:true},
+          sentinel:{pass:true, conversation_stable:true, unverified_is_unverified:true,
+                    canaries_parsed:true, marcus_got_guest:false,
+                    guest_got_marcus:false, store_cross_leak:false,
+                    evidence_revision: P52.STEP9_EVIDENCE_REVISION},
           permission:{pass:true},
           sttLatency:{n_off:6, n_on:6},
         };
@@ -831,6 +1011,9 @@ async def main():
     await test_sentinel_canonicalization()
     await test_step9_mints_a_fresh_conversation_per_run()
     await test_step9_canary_comes_from_the_real_transcript()
+    await test_store_is_atomic_with_respect_to_chat()
+    await test_step9_evidence_revision_and_gating()
+    await test_ask_and_glue_grammar()
     await test_sentinel_comparison_is_symmetric()
     await test_sentinel_turns_carry_raw_evidence()
     await test_autosave_shape_is_non_audio_and_resumable()
