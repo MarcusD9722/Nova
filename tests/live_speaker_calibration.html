@@ -456,11 +456,24 @@ function dependentEvidence(S, profileId) {
 }
 
 /**
- * Drop every piece of browser evidence whose scores depended on this profile.
+ * Drop browser evidence when a profile is deleted or replaced.
  *
- * Correctness beats resume: a trial row whose top/second scores were computed
- * against a deleted centroid is not evidence about anything that still exists.
- * Earlier, genuinely independent progress is left alone.
+ * DELIBERATELY COARSER THAN `staleLineage`, and the two are answering different
+ * questions:
+ *
+ *   staleLineage   a DIAGNOSTIC over completed blocks. Replacing the guest
+ *                  leaves Phase A's *scores* untouched, because Phase A was
+ *                  scored against Marcus's centroid alone.
+ *   this function  what the RUN can safely continue from. Phase A's guest rows
+ *                  carry `truth = G` after the step-5 association, so once G is
+ *                  gone those rows identify a profile that no longer exists.
+ *                  Keeping the Marcus half would also leave `trials_marcus`
+ *                  partially complete with no coherent way to resume it.
+ *
+ * So any trial set that TOUCHES the deleted profile — by score or by truth — is
+ * discarded whole. Correctness beats aggressive resume: re-recording is cheap
+ * and unreproducible evidence is not. This is a deliberate choice, not an
+ * accident of the implementation, and the tests assert exactly this behaviour.
  */
 function invalidateForProfile(S, profileId) {
   const dropped = [];
@@ -1689,6 +1702,34 @@ async function runTrialBlock({id, truthId, truthName, phase, count, pool, stepAf
       + `<br><br>Reset and run one clean calibration.`);
     return false;
   }
+
+  // LINEAGE BEFORE THE FIRST SAMPLE, not after the block completes. Rows and
+  // block progress are persisted sample-by-sample, so a block interrupted at
+  // 10/20 previously held ten saved rows with NO lineage stamp — and a resume
+  // after a profile change could add ten more against a different population
+  // before anything noticed. An existing partial stamp is VERIFIED, never
+  // overwritten: reinterpreting the first ten rows under the new population is
+  // exactly the relabelling this whole change forbids.
+  const existing = (S.lineage || {})[id];
+  if (existing) {
+    const same = existing.build === build
+              && JSON.stringify(existing.centroids) === JSON.stringify(curIds);
+    if (!same) {
+      alertBanner(
+        `<b>Blocked — this block was started against a different set of `
+        + `profiles.</b><br>`
+        + `started against <code>${(existing.centroids||[]).join(", ")}</code> `
+        + `(${existing.build})<br>now <code>${curIds.join(", ")}</code> (${build})`
+        + `<br><br>Its ${(S.blocks[id]||{}).done || 0} recorded samples cannot be `
+        + `reinterpreted. Reset and run one clean calibration — nothing new was `
+        + `recorded.`);
+      return false;
+    }
+  } else {
+    recordLineage(S, id, curIds, build);
+    save();                                   // durable BEFORE the mic opens
+  }
+
   if (handoffTitle) await handoff(handoffTitle, handoffBody);
   const conds = planConditions(count);
   const ok = await runBlock({
@@ -1704,10 +1745,8 @@ async function runTrialBlock({id, truthId, truthName, phase, count, pool, stepAf
               note: `${out.status}${out.similarity!=null ? " · "+out.similarity.toFixed(3) : ""}`};
     },
   });
-  // Honest lineage: the centroids these scores were ACTUALLY measured against.
-  // For Phase A that is Marcus alone, and relabelling the impostor rows' truth
-  // later does not change it.
-  if (ok) { recordLineage(S, id, curIds, build); save(); }
+  // The lineage stamped before the first sample stands unchanged; completing
+  // the block is not a second chance to reinterpret it.
   if (ok && stepAfter != null) { S.step = stepAfter; save(); }
   return ok;
 }

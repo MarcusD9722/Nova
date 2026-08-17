@@ -696,11 +696,32 @@ async def _state(nova, db):
     return {p["profile_id"]: p["stored_threshold"] for p in st["profiles_detail"]}, st
 
 
-async def test_apply_is_one_transaction_at_both_failure_boundaries():
-    check.section("ONE transaction: neither half can survive alone")
-    from core.speaker import calibration as C
+async def _trigger(db, target_id: str, on: bool):
+    """A real SQLite BEFORE-UPDATE trigger that aborts writes to ONE profile.
 
-    # D. No prior calibration; fail the SECOND THRESHOLD write.
+    This is how the second-threshold-write boundary is reached: the profile
+    stays present so the router's generation check passes and
+    `apply_atomically()` is entered, the FIRST update succeeds inside the
+    transaction, and the second one aborts. Deleting the profile instead would
+    be caught by validation and return 409 without ever entering the
+    transaction — which is exactly what the previous version of this test did.
+    """
+    import aiosqlite
+    async with aiosqlite.connect(str(db)) as raw:
+        if on:
+            await raw.execute(
+                f"CREATE TRIGGER IF NOT EXISTS p52_block_update "
+                f"BEFORE UPDATE OF threshold ON speaker_profiles "
+                f"WHEN NEW.profile_id = '{target_id}' "
+                f"BEGIN SELECT RAISE(ABORT, 'p52 simulated write failure'); END")
+        else:
+            await raw.execute("DROP TRIGGER IF EXISTS p52_block_update")
+        await raw.commit()
+
+
+async def test_second_threshold_write_failure_rolls_the_transaction_back():
+    check.section("the SECOND threshold UPDATE fails INSIDE the transaction")
+    # A. no prior calibration.
     async with boot() as nova:
         speak_as = _install_fakes(nova)
         m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
@@ -708,25 +729,187 @@ async def test_apply_is_one_transaction_at_both_failure_boundaries():
         M, G = m["profile_id"], g["profile_id"]
         db = nova.state.speaker.registry._db_path
 
-        # A real failure mode, not a stub: the second profile disappears from
-        # the registry mid-apply, so its UPDATE matches zero rows.
-        import aiosqlite
-        async with aiosqlite.connect(str(db)) as raw:
-            await raw.execute("DELETE FROM speaker_profiles WHERE profile_id=?", (G,))
-            await raw.commit()
+        await _trigger(db, G, True)
+        try:
+            r = await nova.http.post("/speaker/calibration",
+                                     json={"trials": _trials_for(M, G), "apply": True})
+        finally:
+            await _trigger(db, G, False)
 
-        r = await nova.http.post("/speaker/calibration",
-                                 json={"trials": _trials_for(M, G), "apply": True})
-        check(r.status_code in (409, 500), f"it fails ({r.status_code})")
+        check(r.status_code == 500,
+              f"the TRANSACTION failed, not validation — 500 not 409 ({r.status_code})")
+        check("409" not in str(r.status_code), "409 would mean it never got that far")
+        check('"applied":true' not in r.text.replace(" ", ""),
+              "and applied is never true")
+
+        thresholds, st = await _state(nova, db)
+        check(thresholds.get(M) is None,
+              f"after a RESTART the FIRST profile's threshold rolled back "
+              f"({thresholds.get(M)})")
+        check(thresholds.get(G) is None, f"and the second ({thresholds.get(G)})")
+        check(st["threshold_calibrated"] is False, "nothing is calibrated")
+        check(await SpeakerServiceCal(db) is None, "and no record exists")
+
+    # B. a VALID calibration A already exists.
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+        db = nova.state.speaker.registry._db_path
+
+        ok = await nova.http.post("/speaker/calibration",
+                                  json={"trials": _trials_for(M, G), "apply": True})
+        check(ok.json().get("applied") is True, "calibration A applied")
+        before, _ = await _state(nova, db)
+        rec_a = await SpeakerServiceCal(db)
+
+        await _trigger(db, G, True)
+        try:
+            r = await nova.http.post(
+                "/speaker/calibration",
+                json={"trials": _trials_for(M, G, n=16), "apply": True})
+        finally:
+            await _trigger(db, G, False)
+
+        check(r.status_code == 500, f"calibration B fails in-transaction ({r.status_code})")
+        after, st = await _state(nova, db)
+        check(after == before,
+              f"after a RESTART both thresholds are EXACTLY A's ({before} vs {after})")
+        rec_b = await SpeakerServiceCal(db)
+        check(rec_b is not None
+              and abs(rec_b.margin - rec_a.margin) < 1e-12
+              and sorted(rec_b.profile_ids) == sorted(rec_a.profile_ids),
+              "and the record is exactly A's")
+        check(st["threshold_calibrated"] is True
+              and st["threshold_source"] == "calibrated",
+              "the runtime is still coherently on calibration A")
+
+
+async def test_population_change_during_apply_is_caught_in_transaction():
+    check.section("a profile enrolled between validation and commit aborts apply")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+        db = nova.state.speaker.registry._db_path
+        from core.speaker import calibration as C
+
+        # The router validated {M,G}. A third profile appears before the
+        # transaction's population assertion.
+        real = C.apply_atomically
+        async def racing(dbp, *, thresholds, record, _fail_between=None):
+            import aiosqlite, json as _j
+            import numpy as _np
+            vec = _j.dumps([float(x) for x in _vec(7)])
+            async with aiosqlite.connect(str(dbp)) as raw:
+                await raw.execute(
+                    "INSERT INTO speaker_profiles (profile_id, display_name, role,"
+                    " model_id, model_revision, embedding_dim, centroid, samples,"
+                    " sample_count, consistency, threshold, created_at, updated_at)"
+                    " SELECT 'spk-RACER', 'Racer', 'guest', model_id, model_revision,"
+                    " embedding_dim, ?, '[]', 6, 0.9, NULL, created_at, updated_at"
+                    " FROM speaker_profiles WHERE profile_id=?", (vec, M))
+                await raw.commit()
+            return await real(dbp, thresholds=thresholds, record=record,
+                              _fail_between=_fail_between)
+        C.apply_atomically = racing        # type: ignore[assignment]
+        try:
+            r = await nova.http.post("/speaker/calibration",
+                                     json={"trials": _trials_for(M, G), "apply": True})
+        finally:
+            C.apply_atomically = real      # type: ignore[assignment]
+
+        check(r.status_code == 500,
+              f"apply fails rather than writing a record that will not cover "
+              f"({r.status_code})")
+        check("population changed" in r.text,
+              f"saying why ({r.text[:150]})")
         check('"applied":true' not in r.text.replace(" ", ""),
               "and never claims applied")
         thresholds, st = await _state(nova, db)
-        check(thresholds.get(M) is None,
-              f"after a RESTART Marcus's threshold is untouched ({thresholds.get(M)})")
-        check(st["threshold_calibrated"] is False, "and nothing is calibrated")
-        cal = await SpeakerServiceCal(db)
-        check(cal is None, "no calibration record was written")
+        check(thresholds.get(M) is None and thresholds.get(G) is None,
+              f"no threshold was written ({thresholds})")
+        check(await SpeakerServiceCal(db) is None, "and no record")
+        check(st["threshold_calibrated"] is False, "runtime uncalibrated")
 
+
+async def test_real_56_row_staged_p52_evidence_is_accepted():
+    check.section("3: the REAL staged 56-row shape, over HTTP")
+    # Phase A is scored against Marcus ALONE — the guest is not enrolled yet.
+    # The rows carry truth=G only after the legitimate post-enrolment
+    # association, and their ranks stay M/none because that is what was scored.
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        M = m["profile_id"]
+
+        rows = []
+        for i in range(20):                      # Marcus genuine, phase A
+            rows.append({"truth": M, "top_profile_id": M, "top_score": 0.88 - i * 0.004,
+                         "second_profile_id": None, "second_score": None,
+                         "status": "known", "condition": "normal", "phase": "A"})
+        for i in range(12):                      # the guest, UNENROLLED, phase A
+            rows.append({"truth": "__impostor__", "top_profile_id": M,
+                         "top_score": 0.18 - i * 0.004,
+                         "second_profile_id": None, "second_score": None,
+                         "status": "unknown", "condition": "normal", "phase": "A"})
+
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        G = g["profile_id"]
+        # The legitimate association performed when the guest is enrolled: the
+        # TRUTH becomes the guest; the SCORING ranks are untouched.
+        for r in rows:
+            if r["truth"] == "__impostor__":
+                r["truth"] = G
+
+        for i in range(12):                      # phase B, both enrolled
+            rows.append({"truth": M, "top_profile_id": M, "top_score": 0.86 - i * 0.004,
+                         "second_profile_id": G, "second_score": 0.12,
+                         "status": "known", "condition": "normal", "phase": "B"})
+        for i in range(12):
+            rows.append({"truth": G, "top_profile_id": G, "top_score": 0.84 - i * 0.004,
+                         "second_profile_id": M, "second_score": 0.10,
+                         "status": "known", "condition": "normal", "phase": "B"})
+        check(len(rows) == 56, f"56 rows, the real count ({len(rows)})")
+
+        prop = (await nova.http.post("/speaker/calibration",
+                                     json={"trials": rows, "apply": False})).json()
+        check(prop["generation_ok"] is True,
+              f"staged phase-A + phase-B evidence is generation-clean "
+              f"({prop.get('generation_problems')})")
+        check(prop["fit_covers_current_profiles"] is True,
+              "and the fit covers both current profiles")
+        check(prop.get("ok") is True, f"the fit succeeds ({prop.get('reason')})")
+        check(sorted(p["profile_id"] for p in prop["profiles"]) == sorted([M, G]),
+              "fitting exactly the two current profiles")
+
+        ap = await nova.http.post("/speaker/calibration",
+                                  json={"trials": rows, "apply": True})
+        check(ap.status_code == 200 and ap.json().get("applied") is True,
+              f"and it APPLIES ({ap.status_code}, {ap.json().get('reason')})")
+
+        st = (await nova.http.get("/speaker/status")).json()
+        check(st["threshold_calibrated"] is True
+              and st["threshold_source"] == "calibrated"
+              and st["margin_source"] == "calibrated",
+              f"runtime calibrated ({st['threshold_source']}/{st['margin_source']})")
+
+        db = nova.state.speaker.registry._db_path
+        _thr, st2 = await _state(nova, db)
+        check(st2["threshold_calibrated"] is True
+              and st2["threshold_source"] == "calibrated"
+              and st2["margin_source"] == "calibrated",
+              "and still calibrated after a restart")
+
+
+async def test_record_write_failure_rolls_the_transaction_back():
+    check.section("the RECORD write fails INSIDE the transaction")
+    from core.speaker import calibration as C
+
+    # A DIFFERENT boundary from the threshold one: the thresholds are written
+    # inside the transaction and the record write then fails.
     # B/C. A VALID calibration A exists; calibration B fails at the RECORD half.
     async with boot() as nova:
         speak_as = _install_fakes(nova)
@@ -883,7 +1066,10 @@ async def main():
     await test_calibration_endpoint_distinguishes_record_from_usable()
     await test_current_generation_applies_and_survives_restart()
     await test_enrolment_invalidates_and_stale_cannot_be_recreated()
-    await test_apply_is_one_transaction_at_both_failure_boundaries()
+    await test_second_threshold_write_failure_rolls_the_transaction_back()
+    await test_record_write_failure_rolls_the_transaction_back()
+    await test_population_change_during_apply_is_caught_in_transaction()
+    await test_real_56_row_staged_p52_evidence_is_accepted()
     await test_calibration_effective_vs_covers_under_env_override()
     await test_proposal_requires_full_fit_coverage()
     await test_permission_evaluate_takes_no_identity()

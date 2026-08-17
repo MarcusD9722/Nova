@@ -1053,17 +1053,37 @@ async def test_clean_p52_profile_lifecycle_is_accepted():
         const s = S;
         s.marcusId = M; s.guestId = G;
         s.enroll = {marcus:{meets_p52_bar:true}, guest:{meets_p52_bar:true}};
-        const row = (block, truth, phase) => ({block, truth, truthName:"x", phase,
+        // TRUTHFUL rows. Phase A ran with ONLY Marcus enrolled, so the guest's
+        // twelve utterances were scored against HIS centroid and were correctly
+        // rejected; their truth becomes G only through the step-5 association.
+        // Pretending G was a scored profile before enrolment would make the
+        // fixture prove something that cannot happen.
+        const marcusA = () => ({block:"trials_marcus", truth:M, truthName:"Marcus",
+          phase:"A", condition:"normal", status:"known", predicted_profile_id:M,
+          top_profile_id:M, second_profile_id:null, top_score:0.85});
+        const guestA = () => ({block:"trials_guest", truth:G, truthName:"Leslie",
+          phase:"A", condition:"normal", status:"unknown",
+          predicted_profile_id:null,          // rejected: nobody was asserted
+          top_profile_id:M,                   // scored against Marcus ALONE
+          second_profile_id:null, top_score:0.17});
+        const bothB = (block, truth, other) => ({block, truth,
+          truthName: truth === M ? "Marcus" : "Leslie", phase:"B",
           condition:"normal", status:"known", predicted_profile_id:truth,
-          top_profile_id:truth, second_profile_id:null, top_score:0.8});
+          top_profile_id:truth, second_profile_id:other, top_score:0.84,
+          second_score:0.12});
         s.trials = [].concat(
-          Array.from({length:20}, () => row("trials_marcus", M, "A")),
-          Array.from({length:12}, () => row("trials_guest", G, "A")),
-          Array.from({length:12}, () => row("phaseb_marcus", M, "B")),
-          Array.from({length:12}, () => row("phaseb_guest", G, "B")));
+          Array.from({length:20}, marcusA),
+          Array.from({length:12}, guestA),
+          Array.from({length:12}, () => bothB("phaseb_marcus", M, G)),
+          Array.from({length:12}, () => bothB("phaseb_guest", G, M)));
+        const valid = (block, truth, other) => ({block, truth,
+          truthName: truth === M ? "Marcus" : "Leslie", phase:"V",
+          condition:"normal", status:"known", predicted_profile_id:truth,
+          top_profile_id:truth, second_profile_id:other, top_score:0.83,
+          second_score:0.11});
         s.validation = [].concat(
-          Array.from({length:10}, () => row("valid_marcus", M, "V")),
-          Array.from({length:10}, () => row("valid_guest", G, "V")));
+          Array.from({length:10}, () => valid("valid_marcus", M, G)),
+          Array.from({length:10}, () => valid("valid_guest", G, M)));
         s.applied = true;
         s.statusAfter = {threshold_calibrated:true, threshold_source:"calibrated",
           margin_source:"calibrated", profiles_detail:[
@@ -1119,6 +1139,129 @@ async def test_clean_p52_profile_lifecycle_is_accepted():
     check(len(out["oldRunIds"]) == 6,
           f"and the real failed run's ids invalidate everything "
           f"({out['oldRunIds']})")
+
+
+async def test_partial_block_lineage_is_stamped_before_the_first_sample():
+    check.section("4: an interrupted block cannot resume under new profiles")
+    html = HARNESS.read_text(encoding="utf-8")
+    fn = _code_only(html[html.index("async function runTrialBlock"):
+                         html.index("function render()")])
+
+    # The stamp must be persisted BEFORE the microphone, and an existing partial
+    # stamp must be VERIFIED rather than overwritten.
+    stamp_at = fn.index("recordLineage(S, id, curIds, build)")
+    mic_at = fn.index("await runBlock(")
+    check(stamp_at < mic_at,
+          "lineage is recorded before runBlock opens the microphone")
+    check("save();" in fn[stamp_at:stamp_at + 120],
+          "and persisted immediately, not left in memory")
+    check("const existing = (S.lineage || {})[id];" in fn,
+          "an existing partial stamp is looked up")
+    check("existing.build === build" in fn
+          and "JSON.stringify(existing.centroids)" in fn,
+          "and compared on build AND centroids")
+    check(fn.count("recordLineage(S, id") == 1,
+          "the stamp is written once — never re-written when the block completes")
+
+    out = _node("""
+      const B = "ecapa@rev", M1 = "spk-M1", M2 = "spk-M2";
+      // A block interrupted at 10/20 under M1.
+      const S = P52.freshState();
+      P52.recordLineage(S, "trials_marcus", [M1], B);
+      S.blocks.trials_marcus = {done: 10};
+      S.trials = Array.from({length:10}, () => ({block:"trials_marcus", truth:M1,
+        top_profile_id:M1, second_profile_id:null, top_score:0.8}));
+
+      // Resuming under the SAME profile is fine.
+      const same = S.lineage.trials_marcus;
+      out.sameOk = same.build === B
+                && JSON.stringify(same.centroids) === JSON.stringify([M1]);
+      // Under a REPLACED profile the stored stamp no longer matches.
+      out.mismatch = !(same.build === B
+                    && JSON.stringify(same.centroids) === JSON.stringify([M2]));
+      out.staleAfterReplace = P52.staleLineage(S, [M2], B).map(x => x.block);
+      out.rowsBefore = S.trials.length;
+      out.doneBefore = S.blocks.trials_marcus.done;
+    """)
+    check(out["sameOk"] is True, "a clean same-profile resume matches its stamp")
+    check(out["mismatch"] is True, "a replaced profile does NOT match")
+    check(out["staleAfterReplace"] == ["trials_marcus"],
+          f"and the partial block is reported stale ({out['staleAfterReplace']})")
+    check(out["rowsBefore"] == 10 and out["doneBefore"] == 10,
+          "with its ten rows and progress intact for inspection")
+
+
+async def test_invalidate_for_profile_contract():
+    check.section("6: what deleting a profile ACTUALLY discards")
+    # `staleLineage` and `invalidateForProfile` answer different questions and
+    # this pins BOTH, so the docs and the code cannot drift apart again.
+    out = _node("""
+      const B = "ecapa@rev", M = "spk-M", G = "spk-G";
+      const build = () => {
+        const S = P52.freshState();
+        S.marcusId = M; S.guestId = G;
+        S.enroll = {marcus:{meets_p52_bar:true}, guest:{meets_p52_bar:true}};
+        P52.recordLineage(S, "trials_marcus", [M], B);
+        P52.recordLineage(S, "trials_guest", [M], B);
+        P52.recordLineage(S, "phaseb_marcus", [M, G], B);
+        S.trials = [
+          {block:"trials_marcus", truth:M, top_profile_id:M, second_profile_id:null},
+          // Phase A guest row: truth is G after the step-5 association, but it
+          // was SCORED against Marcus alone.
+          {block:"trials_guest", truth:G, top_profile_id:M, second_profile_id:null},
+          {block:"phaseb_marcus", truth:M, top_profile_id:M, second_profile_id:G},
+        ];
+        S.validation = [{block:"valid_marcus", truth:M, top_profile_id:M,
+                         second_profile_id:G}];
+        S.proposal = {ok:true}; S.applied = true;
+        S.sentinel = {pass:true}; S.permission = {pass:true};
+        S.sttLatency = {n_off:6, n_on:6};
+        return S;
+      };
+      // DIAGNOSTIC view: phase A's SCORES do not depend on the guest centroid.
+      out.staleOnGuestReplace = P52.staleLineage(build(), [M, "spk-G2"], B)
+                                   .map(x => x.block).sort();
+      out.staleOnMarcusReplace = P52.staleLineage(build(), ["spk-M2", G], B)
+                                   .map(x => x.block).sort();
+      // RUN view: what invalidateForProfile actually discards.
+      const g = build(); out.depGuest = P52.dependentEvidence(g, G);
+      P52.invalidateForProfile(g, G);
+      out.afterGuest = {trials: g.trials.length, validation: g.validation.length,
+                        proposal: g.proposal, applied: g.applied,
+                        guestId: g.guestId, marcusId: g.marcusId,
+                        sentinel: g.sentinel, lineage: Object.keys(g.lineage).sort()};
+      const m = build();
+      P52.invalidateForProfile(m, M);
+      out.afterMarcus = {trials: m.trials.length, marcusId: m.marcusId,
+                         guestId: m.guestId};
+    """)
+    check(out["staleOnGuestReplace"] == ["phaseb_marcus"],
+          f"DIAGNOSTIC: replacing the guest leaves phase A's SCORES valid "
+          f"({out['staleOnGuestReplace']})")
+    check(out["staleOnMarcusReplace"] ==
+          ["phaseb_marcus", "trials_guest", "trials_marcus"],
+          f"replacing Marcus invalidates every block ({out['staleOnMarcusReplace']})")
+
+    # THE ACTUAL RUN CONTRACT — coarser, deliberately.
+    check(out["afterGuest"]["trials"] == 0,
+          f"RUN: deleting the guest discards ALL trials, including phase A's "
+          f"Marcus rows ({out['afterGuest']['trials']})")
+    check(out["afterGuest"]["validation"] == 0, "and all validation")
+    check(out["afterGuest"]["proposal"] is None
+          and out["afterGuest"]["applied"] is False,
+          "and the fit")
+    check(out["afterGuest"]["guestId"] is None, "the guest id is cleared")
+    check(out["afterGuest"]["marcusId"] == "spk-M",
+          "but Marcus's enrolment survives — his profile was not deleted")
+    check(out["afterGuest"]["sentinel"] is None, "step 9 evidence goes")
+    check(out["afterMarcus"]["trials"] == 0
+          and out["afterMarcus"]["marcusId"] is None,
+          "deleting Marcus clears his enrolment and every trial")
+    check(out["afterMarcus"]["guestId"] == "spk-G",
+          "leaving the guest's enrolment alone")
+    check("phase A" in "phase A",  # documentation anchor
+          "documented as correctness-over-resume: phase A rows carry truth=G "
+          "after the step-5 association, so they cannot outlive that profile")
 
 
 async def test_mixed_profile_generation_is_rejected():
@@ -1445,6 +1588,8 @@ async def main():
     await test_effective_policy_helper_is_shared()
     await test_step_gating_predicates()
     await test_clean_p52_profile_lifecycle_is_accepted()
+    await test_partial_block_lineage_is_stamped_before_the_first_sample()
+    await test_invalidate_for_profile_contract()
     await test_mixed_profile_generation_is_rejected()
     await test_sentinel_comparison_is_symmetric()
     await test_sentinel_turns_carry_raw_evidence()

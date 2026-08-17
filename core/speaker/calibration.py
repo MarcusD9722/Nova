@@ -548,13 +548,50 @@ async def apply_atomically(db_path: Path, *, thresholds: dict[str, float],
     the second half and assert nothing survived. It is never passed in
     production.
     """
-    async with aiosqlite.connect(str(db_path)) as db:
+    expected = set(thresholds)
+    # isolation_level=None disables Python's implicit transaction handling, so
+    # BEGIN IMMEDIATE / COMMIT below are the only transaction boundaries.
+    async with aiosqlite.connect(str(db_path), isolation_level=None) as db:
+        db.row_factory = aiosqlite.Row
         # DDL first, outside the unit of work: CREATE TABLE commits implicitly
         # in SQLite and would otherwise end the transaction early.
         for sql in CALIBRATION_DDL:
             await db.execute(sql)
-        await db.commit()
         try:
+            # IMMEDIATE takes the write lock now, so the population cannot change
+            # between the check below and the commit.
+            await db.execute("BEGIN IMMEDIATE")
+
+            # THE POPULATION, RE-READ UNDER THE LOCK. The router validated a
+            # snapshot taken before this call; a profile enrolled in between
+            # would leave the record naming {M,G} while the registry holds
+            # {M,G,H}, and the runtime would immediately report it as not
+            # covering. Narrow race, same invariant.
+            #
+            # The CANONICAL compatibility rule is applied here in Python rather
+            # than approximated in SQL — `SpeakerProfile.compatible` also checks
+            # the centroid's dimension, and a weaker second definition is
+            # exactly the kind of drift this whole change exists to prevent.
+            async with db.execute(
+                "SELECT profile_id, model_id, model_revision, embedding_dim, "
+                "centroid FROM speaker_profiles") as cur:
+                rows = await cur.fetchall()
+            live = set()
+            for r in rows:
+                try:
+                    cen = json.loads(r["centroid"] or "[]")
+                except Exception:  # noqa: BLE001
+                    cen = []
+                if (r["model_id"] == MODEL_ID
+                        and r["model_revision"] == MODEL_REVISION
+                        and int(r["embedding_dim"]) == EMBEDDING_DIM
+                        and len(cen) == EMBEDDING_DIM):
+                    live.add(r["profile_id"])
+            if live != expected:
+                raise RuntimeError(
+                    f"the enrolled population changed during apply: "
+                    f"expected {sorted(expected)}, found {sorted(live)}")
+
             for pid, value in thresholds.items():
                 cur = await db.execute(
                     "UPDATE speaker_profiles SET threshold=?, updated_at=? "
@@ -575,9 +612,12 @@ async def apply_atomically(db_path: Path, *, thresholds: dict[str, float],
                  json.dumps(list(record.profile_ids)),
                  json.dumps(record.metrics, default=str), record.calibrated_at),
             )
-            await db.commit()
+            await db.execute("COMMIT")
         except Exception:
-            await db.rollback()
+            try:
+                await db.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
             raise
     logger.info("speaker_calibration_applied_atomically",
                 profiles=len(thresholds), margin=record.margin)

@@ -844,7 +844,7 @@ their *truth* once the guest is enrolled does not change that.
 |---|---|
 | guest enrolled at step 5 | **nothing** — the designed progression |
 | Marcus replaced | everything |
-| guest replaced | Phase B and validation only; Phase A survives |
+| guest replaced | Phase B and validation — see the two views below |
 | model build changed | everything |
 | ids from the failed run | everything |
 
@@ -886,3 +886,38 @@ current ids — beside **mixed** thresholds, with `threshold_calibrated` reporti
 true. A transaction does not enter that state. Both failure boundaries are
 tested, and the assertions are made against a **freshly constructed service**,
 because only what survives a restart counts.
+
+
+### Two views, deliberately different
+
+`staleLineage()` is a **diagnostic** over completed blocks: replacing the guest
+leaves Phase A's *scores* valid, because Phase A was scored against Marcus's
+centroid alone.
+
+`invalidateForProfile()` decides what the **run** can continue from, and is
+deliberately coarser: Phase A's guest rows carry `truth = G` after the step-5
+association, so once that profile is gone they identify something that no longer
+exists — and keeping only the Marcus half would leave `trials_marcus` partially
+complete with no coherent way to resume it. **Deleting either profile therefore
+discards all trial and validation evidence.** Correctness over resume;
+re-recording is cheap, unreproducible evidence is not. Both behaviours are
+asserted, so the code and this page cannot drift apart.
+
+### Lineage is stamped before the first sample
+
+Rows and block progress persist sample-by-sample, so a block interrupted at
+10/20 used to hold ten saved rows with no lineage stamp — and a resume after a
+profile change could add ten more against a different population before anything
+noticed. The stamp is now written and saved **before the microphone opens**, and
+an existing partial stamp is **verified, never overwritten**: reinterpreting
+those first ten rows under a new population is the relabelling this design
+forbids.
+
+### The population cannot change under the transaction
+
+`apply_atomically()` opens `BEGIN IMMEDIATE`, re-reads the profile table **under
+the write lock**, and applies the canonical `SpeakerProfile.compatible` rule in
+Python — including the centroid-dimension check that cannot be expressed safely
+in SQL. If the live set is not exactly the fitted set the transaction aborts, so
+a profile enrolled between the router's validation and the commit cannot produce
+a record that fails to cover the moment it lands.
