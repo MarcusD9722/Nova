@@ -703,14 +703,24 @@ class MemoryUnifier:
                 raise RuntimeError(
                     f"staged {staged} records but expected {expected}; refusing to promote")
 
-            promoted = await self._chroma.commit_staged_rebuild()
+            # `expected` is re-checked inside the promotion, under the lock, and
+            # again after the swap through a fresh handle.
+            promoted = await self._chroma.commit_staged_rebuild(expected)
         except Exception as e:  # noqa: BLE001
             await self._chroma.abort_staged_rebuild()
             logger.warning("semantic_rebuild_aborted", error=str(e)[:200], **counts)
             # No snapshot is appended: a failed rebuild must leave no trace that
             # says it succeeded.
+            #
+            # And the reason must not ASSERT that the old index survived — an
+            # earlier version said "previous index kept" unconditionally, which was
+            # false in the one path where promotion had already destroyed it. Ask
+            # the backend what is actually there instead of claiming.
+            kept = await self._chroma.authoritative_state()
             return {**empty, "complete": False,
-                    "reason": f"rebuild aborted, previous index kept: {str(e)[:200]}",
+                    "reason": f"rebuild aborted ({kept['summary']}): {str(e)[:200]}",
+                    "previous_index_kept": bool(kept["live_present"]),
+                    "live_records": kept["live_count"],
                     "attempted": counts}
 
         await self._json.append_snapshot(
@@ -728,9 +738,13 @@ class MemoryUnifier:
         # Index substantive turns semantically so anything said is recallable
         # later (not just what got distilled into a structured fact). Skip short
         # greetings/acks to keep the index signal-rich. Best-effort; never blocks.
+        # The length rule lives in `semantic_records`, not here. Two copies of
+        # `>= 25` — one live, one in the rebuild — is exactly the drift that module
+        # exists to prevent, and a rebuild that indexed a different set of turns
+        # than live would change the corpus without changing any record.
         index_turn = (
             os.getenv("NOVA_INDEX_TURNS", "1").strip().lower() not in {"0", "false", "no", "off"}
-            and len((content or "").strip()) >= 25
+            and semantic_records.turn_is_indexable(content)
         )
 
         # Whose turn this is, resolved once and written to all three stores so

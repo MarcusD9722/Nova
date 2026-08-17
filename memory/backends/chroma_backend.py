@@ -213,6 +213,10 @@ class ChromaMemoryBackend:
         #: writes go to staging and a skip becomes a raise.
         self._staging: Any | None = None
         self._writing_staged = False
+        #: Observability for the two repair paths, so a test (and /status) can tell
+        #: "it worked" from "it silently did nothing".
+        self._recovered_from_backup = 0
+        self._rolled_back = 0
 
     # ── honest state, for /status ─────────────────────────────────────────────
     def semantic_status(self) -> dict[str, Any]:
@@ -247,6 +251,11 @@ class ChromaMemoryBackend:
             "writes_skipped": self._skipped_writes,
             "queries_skipped": self._skipped_queries,
             "last_skip_reason": self._last_skip_reason or None,
+            # Promotion repairs. Non-zero means a rebuild was interrupted and the
+            # old index was put back — worth surfacing rather than hiding, since it
+            # is the difference between "nothing happened" and "we recovered".
+            "promotions_rolled_back": self._rolled_back,
+            "recovered_from_backup": self._recovered_from_backup,
         }
 
     def _note_skip(self, kind: str, exc: Exception) -> None:
@@ -272,6 +281,13 @@ class ChromaMemoryBackend:
 
         emb = _SemanticEmbeddingFunction(dim=SEMANTIC_DIM)
         self._emb = emb
+
+        # Crash residue from an interrupted promotion is recovered BEFORE the live
+        # collection is opened — otherwise `get_or_create_collection` would happily
+        # manufacture an EMPTY live collection while a complete backup sat next to
+        # it, and the emptiness would look like a legitimate cold start.
+        self._recover_interrupted_promotion()
+
         # The space identity is recorded ON the collection so it can be audited
         # and so a future mismatch is discoverable rather than inferred.
         self._collection = self._client.get_or_create_collection(
@@ -390,6 +406,61 @@ class ChromaMemoryBackend:
     def _staging_name(self) -> str:
         return f"{self._collection_name}__staging"
 
+    def _backup_name(self) -> str:
+        return f"{self._collection_name}__backup"
+
+    def _existing_names(self) -> set[str]:
+        assert self._client is not None
+        return {c.name for c in self._client.list_collections()}
+
+    def _recover_interrupted_promotion(self) -> None:
+        """Repair a promotion that a crash interrupted. Called before opening live.
+
+        The swap is: live -> backup, staging -> live, verify, delete backup. A
+        process death can only leave three states, and each has one right answer:
+
+          live absent, backup present   -> the rename to live never happened (or
+                                           was rolled back); restore the backup.
+                                           This is the state that MUST NOT become
+                                           a fresh empty collection.
+          live present, backup present  -> live only exists again after the second
+                                           rename succeeded, so live is the NEW
+                                           index and the backup is stale.
+          neither present               -> nothing was ever promoted; a normal
+                                           cold start.
+
+        Staging is deliberately left alone: `begin_staged_rebuild()` drops a stale
+        one, and touching it here could destroy an in-flight build.
+        """
+        assert self._client is not None
+        try:
+            names = self._existing_names()
+        except Exception:  # noqa: BLE001
+            return
+
+        live, backup = self._collection_name, self._backup_name()
+        if backup not in names:
+            return
+
+        if live in names:
+            try:
+                self._client.delete_collection(backup)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # live is gone and a backup exists: put it back rather than inventing an
+        # empty index.
+        try:
+            self._client.get_collection(backup, embedding_function=self._emb) \
+                .modify(name=live)
+            self._recovered_from_backup += 1
+        except Exception:  # noqa: BLE001
+            # Leave the backup in place. An operator (or the next boot) can still
+            # find it; silently deleting the only complete copy is the one
+            # unacceptable outcome.
+            pass
+
     async def begin_staged_rebuild(self) -> None:
         """Start writing into a fresh staging collection instead of the live one."""
         async with self._lock:
@@ -428,30 +499,158 @@ class ChromaMemoryBackend:
             except Exception:
                 pass
 
-    async def commit_staged_rebuild(self) -> int:
-        """Promote staging to authoritative. Returns the promoted record count.
+    async def commit_staged_rebuild(self, expected: int | None = None,
+                                    _fail_at: str = "") -> int:
+        """Promote staging to authoritative, with rollback. Returns the count.
 
-        The live collection is deleted and staging is RENAMED into its place, so
-        there is no window in which records are half-copied. If the rename fails
-        the live collection is recreated empty rather than left missing — empty is
-        recoverable from SQLite, absent is a crash on next read.
+        The first version of this DELETED the live collection and then renamed
+        staging into its place. If the rename failed in between, the previous
+        authoritative index was already destroyed, `_ensure()` manufactured an
+        empty one, and the rebuild still reported "previous index kept" — false in
+        exactly the case where truth mattered most. Worse, the caller's
+        `abort_staged_rebuild()` would then delete the only complete copy.
+
+        The old index is now PRESERVED, never deleted, until the new one is in
+        place and verified:
+
+            live    -> backup          (nothing destroyed)
+            staging -> live
+            verify: reopen live, count matches `expected`
+            delete backup             (only now)
+
+        Any failure after the first step restores backup -> live. The verification
+        reopens the collection through a fresh handle rather than trusting the
+        rename's return, because "the rename didn't raise" is not the same claim as
+        "the data is readable under the new name".
+
+        `_fail_at` is a test seam: "after_backup" and "after_rename" inject a
+        failure exactly at the two boundaries that matter.
         """
         async with self._lock:
             if self._client is None or self._staging is None:
                 raise RuntimeError("commit_staged_rebuild called without a staged rebuild")
+
+            live, backup = self._collection_name, self._backup_name()
             count = int(await asyncio.to_thread(self._staging.count))
+            if expected is not None and count != int(expected):
+                raise RuntimeError(
+                    f"staging holds {count} records but {expected} were written; "
+                    f"refusing to promote")
+
+            names = await asyncio.to_thread(self._existing_names)
+            # A backup here is residue; recovery at open time already decided it
+            # was stale, and keeping it would block this swap.
+            if backup in names:
+                try:
+                    await asyncio.to_thread(self._client.delete_collection, backup)
+                except Exception:  # noqa: BLE001
+                    pass
+                names.discard(backup)
+
+            had_live = live in names
+            backed_up = False
             try:
-                await asyncio.to_thread(self._client.delete_collection, self._collection_name)
-            except Exception:
-                pass
-            try:
-                await asyncio.to_thread(self._staging.modify, name=self._collection_name)
-            finally:
+                if had_live:
+                    old = await asyncio.to_thread(
+                        self._client.get_collection, live, embedding_function=self._emb)
+                    await asyncio.to_thread(old.modify, name=backup)
+                    backed_up = True
+
+                if _fail_at == "after_backup":
+                    raise RuntimeError("injected failure after the old index was "
+                                       "preserved, before staging became live")
+
+                await asyncio.to_thread(self._staging.modify, name=live)
+
+                if _fail_at == "after_rename":
+                    raise RuntimeError("injected failure after staging became live, "
+                                       "before verification")
+
+                # Verify through a NEW handle, then drop the backup.
+                self._collection = None
+                probe = await asyncio.to_thread(
+                    self._client.get_collection, live, embedding_function=self._emb)
+                got = int(await asyncio.to_thread(probe.count))
+                if got != count:
+                    raise RuntimeError(
+                        f"promoted collection reopened with {got} records, "
+                        f"expected {count}")
+
+                if backed_up:
+                    try:
+                        await asyncio.to_thread(self._client.delete_collection, backup)
+                    except Exception:  # noqa: BLE001
+                        # Harmless: recovery at next open sees live+backup and
+                        # drops the stale one.
+                        pass
                 self._writing_staged = False
                 self._staging = None
                 self._collection = None
                 await asyncio.to_thread(self._ensure)
-            return count
+                return count
+            except Exception:
+                await asyncio.to_thread(self._rollback_promotion, backed_up)
+                self._writing_staged = False
+                self._staging = None
+                self._collection = None
+                raise
+
+    def _rollback_promotion(self, backed_up: bool) -> None:
+        """Undo a failed promotion: whatever happens, the OLD index comes back."""
+        assert self._client is not None
+        live, backup = self._collection_name, self._backup_name()
+        try:
+            names = self._existing_names()
+        except Exception:  # noqa: BLE001
+            return
+        if not backed_up or backup not in names:
+            return
+        # If the staging rename already claimed `live`, that half-promoted
+        # collection is the thing to discard — the backup is authoritative.
+        if live in names:
+            try:
+                self._client.delete_collection(live)
+            except Exception:  # noqa: BLE001
+                return   # never leave the backup as the only copy AND delete it
+        try:
+            self._client.get_collection(backup, embedding_function=self._emb) \
+                .modify(name=live)
+            self._rolled_back += 1
+        except Exception:  # noqa: BLE001
+            pass   # the backup survives; open-time recovery restores it
+
+    async def authoritative_state(self) -> dict[str, Any]:
+        """What is ACTUALLY there right now — for reporting, not for asserting.
+
+        A caller that has just failed a rebuild needs to tell Marcus whether his
+        index survived. It must not answer that from an assumption; this reads the
+        store.
+        """
+        async with self._lock:
+            await asyncio.to_thread(self._ensure)
+            assert self._client is not None
+            try:
+                names = await asyncio.to_thread(self._existing_names)
+            except Exception as e:  # noqa: BLE001
+                return {"live_present": False, "live_count": 0, "backup_present": False,
+                        "summary": f"could not inspect the semantic store: {str(e)[:120]}"}
+            live_present = self._collection_name in names
+            backup_present = self._backup_name() in names
+            count = 0
+            if live_present:
+                try:
+                    count = int(await asyncio.to_thread(self._collection.count))
+                except Exception:  # noqa: BLE001
+                    count = -1
+            if live_present:
+                summary = f"previous index kept, {count} records"
+            elif backup_present:
+                summary = ("the previous index is present as a BACKUP and will be "
+                           "restored on next open")
+            else:
+                summary = "no semantic index is present; a rebuild from SQLite is needed"
+            return {"live_present": live_present, "live_count": count,
+                    "backup_present": backup_present, "summary": summary}
 
     async def staged_count(self) -> int:
         async with self._lock:

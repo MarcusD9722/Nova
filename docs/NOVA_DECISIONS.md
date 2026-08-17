@@ -1031,3 +1031,89 @@ registered itself: the live router reports 140s for `project.delete` and 25s for
 `admin`, approval deletes to `.trash` exactly once with a truthful result, restore
 returns the exact file contents, a denial leaves the project untouched, and the
 audit ends `approved, approved, rejected` with nothing pending.
+
+### D18 addendum 2 (2026-08-17, review round 2)
+
+Two blockers and two precision items. Both blockers were defects in the round-1
+fixes themselves.
+
+**A revision override must BE a commit sha, not merely avoid four names.**
+`embedding_revision()` blacklisted `main`/`master`/`latest`/`head`/`none` and
+accepted anything else, so `dev`, `release/2026`, `refs/heads/main` and `abc1234`
+all became the vector-space identity â€” and every one of them can point at
+different weights tomorrow while the string inside `semantic_space_id()` never
+changes. A deny-list on names cannot express "cannot move"; the rule is now an
+allow-list on FORM: `\A[0-9a-fA-F]{40}\Z`, canonicalized to lowercase so one
+commit spelled in two cases is one collection. An invalid override is refused with
+a warning and the pinned default stands.
+
+**Promotion must not destroy the old index before the new one exists.** Round 1's
+`commit_staged_rebuild()` deleted the live collection and THEN renamed staging into
+its place. A failure in between destroyed the previous authoritative index,
+`_ensure()` manufactured an empty replacement, and the rebuild still reported
+"previous index kept" â€” false in exactly the case where the claim mattered. Worse,
+the caller's `abort_staged_rebuild()` would then delete the only complete copy.
+Round 1 fixed mid-POPULATION failure and left the promotion boundary itself
+unguarded, which is the same lesson as always: the boundary was correct one layer
+up and absent one layer down.
+
+The swap is now:
+
+    live    -> backup          (nothing is destroyed)
+    staging -> live
+    verify: reopen live through a fresh handle, count == expected
+    delete backup             (only now)
+
+Any failure after the first step restores `backup -> live`. Verification reopens
+the collection rather than trusting the rename's return, because "the rename did
+not raise" is a different claim from "the data is readable under the new name".
+
+Process death is recovered at open time, before the live collection is touched,
+from the only three states a crash can leave: live absent + backup present ->
+restore the backup (the state that must never become a fresh empty collection);
+live present + backup present -> live is the newer one, drop the stale backup;
+neither -> a normal cold start. Staging is deliberately not touched during
+recovery, since `begin_staged_rebuild()` drops a stale one and an in-flight build
+must survive.
+
+The failure REPORT no longer asserts survival. `rebuild_semantic_index()` asks
+`authoritative_state()` what is actually in the store and reports
+`previous_index_kept` and `live_records` from that, rather than printing a fixed
+string that happened to be true in most paths.
+
+**Turn indexability has one owner.** `TURN_MIN_INDEX_CHARS` lived in
+`semantic_records` while `ingest_turn` still carried its own `>= 25`. Two copies of
+a rule is precisely what that module exists to prevent, and a drift there would
+change which turns are indexed without changing any record. The live path now calls
+`turn_is_indexable()`.
+
+**Document `created_at` is intentionally volatile, and the wording now says so.**
+`document_chunks` in SQLite does not persist the Chroma metadata `created_at`, so
+live stamps when it wrote and a rebuild stamps when it rebuilt. Verified that
+nothing anywhere reads `created_at` out of Chroma metadata, so it carries no
+behaviour and a migration to persist it would be aesthetics. The honest claim is
+therefore: **IDs and embedded text are identical; metadata structure is identical
+except for intentionally volatile document `created_at`** â€” not "byte-identical
+metadata", which the equality test would contradict by filtering that one field.
+
+**Evidence.** `tests/test_semantic_vector_space_p10.py`, 257 checks. The override
+matrix covers main/master/latest/head/none/dev/release/release-2026/refs-heads-main/
+abc1234/39-char/41-char/non-hex/UUID-shaped/HEAD~1/v1.5/whitespace, each proven not
+to move the collection off the safe identity, plus valid upper and lower case and a
+distinct alternate sha. Promotion failure is injected at BOTH boundaries and proves
+the previous count, ID set and content unchanged, no half-promoted record, no
+residue, a fresh backend and a fresh `MemoryUnifier` seeing the old index, no
+success snapshot, an honest `previous_index_kept`, and a clean rebuild succeeding
+afterwards. Crash residue is proven recoverable in both directions. Turn
+indexability is checked at n-1/n/n+1 from the exported constant, end to end,
+with the live threshold asserted absent from `ingest_turn` by a function-scoped AST
+check.
+
+**Mutation testing.** 11 round-2 mutations, all 11 caught â€” including a faithful
+re-introduction of the destroy-first promotion, which fails with "the previous
+COUNT is unchanged (0 vs 5)". Three of my own static checks were found broken by
+the same tokenizer trap in one session: `_code_only()` newline-joins tokens, so
+`">= 25"`, `"revision = embedding_revision"` and `"semantic_records.fact_record"`
+are not substrings of it. Every static assertion in this suite now reads the AST,
+and the function-scoped variant exists because a module-wide check could not tell
+the live path from the rebuild.

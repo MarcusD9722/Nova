@@ -9,6 +9,7 @@ embedding so memory keeps working — semantic quality degrades, nothing breaks.
 """
 
 import os
+import re
 import threading
 from typing import Any
 
@@ -31,8 +32,15 @@ EMBED_DIM = 384
 #: this pin exists to prevent. "main" and "latest" are not identities; a commit is.
 _DEFAULT_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 
-#: Loose labels a caller might set that do NOT identify a fixed vector space.
-_UNPINNED_REVISIONS = {"", "main", "master", "latest", "head", "none"}
+#: A revision is a full 40-character hex commit sha, or it is not a revision.
+#:
+#: The first version of this check blacklisted a handful of names
+#: (main/master/latest/head/none) and accepted everything else, which is the wrong
+#: shape: `dev`, `release/2026`, `refs/heads/main` and `abc1234` all sailed
+#: through, and every one of them can move. A moving ref that keeps its STRING
+#: while its weights change is precisely the hole the revision exists to close, so
+#: the rule is an allow-list on form, not a deny-list on names.
+_SHA40_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 
 _lock = threading.Lock()
 _model: Any | None = None
@@ -94,21 +102,38 @@ def embedding_model_id() -> str:
     return os.getenv("NOVA_EMBED_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
 
 
+def revision_is_valid(value: str | None) -> bool:
+    """True only for a full 40-hex commit sha.
+
+    Not a branch, not a tag, not a short sha, not `refs/heads/anything`. Anything
+    that can point at different weights tomorrow while spelling the same today is
+    invalid by construction.
+    """
+    return bool(_SHA40_RE.match((value or "").strip()))
+
+
 def embedding_revision() -> str:
     """The pinned model repository commit. THE authoritative revision value.
 
-    An override that is not a fixed commit is refused rather than honoured: a
-    caller setting NOVA_EMBED_REVISION=main would silently re-open exactly the
-    hole this closes. Overriding to a real commit is fine and yields its own
-    collection, because `semantic_space_id()` includes this.
+    Always a lowercase 40-hex sha. An override is honoured only if it IS one:
+    `NOVA_EMBED_REVISION=main` (or `dev`, or `release/2026`, or a short sha) is
+    refused with a warning and the pinned default is used, because accepting it
+    would let weights change underneath an unchanged `semantic_space_id()`.
+
+    Overriding to a real, different commit is fine and yields its own collection,
+    since the space identity includes this value.
     """
     raw = (os.getenv("NOVA_EMBED_REVISION", "") or "").strip()
-    if raw and raw.lower() not in _UNPINNED_REVISIONS:
-        return raw
-    if raw:
-        logger.warning("embedding_revision_override_ignored", requested=raw,
-                       using=_DEFAULT_REVISION,
-                       reason="a moving ref is not a vector-space identity")
+    if not raw:
+        return _DEFAULT_REVISION
+    if revision_is_valid(raw):
+        # Canonical lowercase: the same commit spelled in two cases must not
+        # produce two collection names for one vector space.
+        return raw.lower()
+    logger.warning("embedding_revision_override_refused", requested=raw[:80],
+                   using=_DEFAULT_REVISION,
+                   reason="not a 40-character hex commit sha; a value that can "
+                          "move is not a vector-space identity")
     return _DEFAULT_REVISION
 
 

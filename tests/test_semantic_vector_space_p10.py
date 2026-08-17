@@ -29,6 +29,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 REPO = Path(__file__).resolve().parent.parent
@@ -117,6 +118,66 @@ def _from_pretrained_kwargs(path: Path) -> list[set[str]]:
                 and node.func.attr == "from_pretrained"):
             calls.append({k.arg for k in node.keywords if k.arg})
     return calls
+
+
+def _function_facts(path: Path, func: str) -> dict[str, Any]:
+    """What ONE function's body actually contains: int literals and called names.
+
+    Scoped to the function, because a module-wide check cannot tell the live path
+    from the rebuild — both legitimately mention `turn_is_indexable`, so a
+    module-level "is it referenced?" passes even after the live caller reverts to
+    its own hard-coded threshold. Mutation testing caught exactly that.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func:
+            ints, names = set(), set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, int) \
+                        and not isinstance(sub.value, bool):
+                    ints.add(sub.value)
+                elif isinstance(sub, ast.Attribute):
+                    names.add(sub.attr)
+                elif isinstance(sub, ast.Name):
+                    names.add(sub.id)
+            return {"found": True, "ints": ints, "names": names}
+    return {"found": False, "ints": set(), "names": set()}
+
+
+def _from_pretrained_revision_exprs(path: Path) -> list[str]:
+    """The SOURCE of each `from_pretrained(..., revision=<expr>)` argument.
+
+    Comparing the expressions is how "both loads use the same resolved value" is
+    checked. A text search cannot do it: `_code_only()` newline-joins tokens, so
+    `revision = embedding_revision()` is no longer one string — which is how the
+    first version of this check failed against correct code.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "from_pretrained"):
+            for k in node.keywords:
+                if k.arg == "revision":
+                    out.append(ast.unparse(k.value))
+    return out
+
+
+async def _dump_backend(be) -> dict[str, dict]:
+    """Every record in a backend's LIVE collection: id -> {text, metadata}."""
+    import asyncio as _a
+
+    await _a.to_thread(be._ensure)
+    got = await _a.to_thread(be._collection.get, include=["documents", "metadatas"])
+    ids = got.get("ids") or []
+    docs = got.get("documents") or []
+    metas = got.get("metadatas") or []
+    return {ids[i]: {"text": docs[i], "metadata": metas[i] or {}}
+            for i in range(len(ids))}
 
 
 async def _dump_collection(unifier) -> dict[str, dict]:
@@ -708,6 +769,371 @@ async def test_staged_rebuild_defences_individually():
           f"and no longer demolishes the live collection with reset() ({sorted(used)})")
 
 
+async def test_revision_override_must_be_a_commit_sha():
+    """Review round 2, blocker 1: the override was a deny-list, not a rule.
+
+    The first version blacklisted main/master/latest/head/none and accepted
+    everything else, so `dev`, `release/2026`, `refs/heads/main` and `abc1234` all
+    became the vector-space identity — and every one of them can point at different
+    weights tomorrow while the STRING in `semantic_space_id()` never changes. That
+    is the persistence invariant this PR exists to close, reopened by the escape
+    hatch. The rule is now an allow-list on FORM: a full 40-hex commit sha.
+    """
+    check.section("NOVA_EMBED_REVISION must be a 40-hex commit sha")
+    from memory import embeddings as emb
+    from memory.backends import chroma_backend as cb
+
+    pinned = emb._DEFAULT_REVISION
+    safe_sid, safe_name = cb.semantic_space_id(), cb.semantic_collection_name()
+    check(emb.revision_is_valid(pinned), f"the pinned default is valid ({pinned})")
+
+    invalid = ["main", "master", "latest", "head", "none",
+               "dev", "release", "release/2026", "refs/heads/main",
+               "abc1234", "a" * 39, "a" * 41,
+               "z" * 40, "g" * 40, "5c38ec7c-405e-c4b4-4b94-cc5a9bb96e73",
+               "HEAD~1", "v1.5", " ", "\t"]
+    prev = os.environ.get("NOVA_EMBED_REVISION")
+    try:
+        for bad in invalid:
+            os.environ["NOVA_EMBED_REVISION"] = bad
+            got = emb.embedding_revision()
+            label = repr(bad) if bad.strip() else repr(bad)
+            check(got == pinned,
+                  f"{label} is REFUSED and the pinned default stands ({got[:12]}…)")
+            check(cb.semantic_space_id() == safe_sid
+                  and cb.semantic_collection_name() == safe_name,
+                  f"and {label} never moves the collection away from the safe identity")
+            check(not emb.revision_is_valid(bad), f"{label} fails the form check")
+
+        # Valid, in both cases, canonicalized to lowercase.
+        upper = pinned.upper()
+        os.environ["NOVA_EMBED_REVISION"] = upper
+        check(emb.embedding_revision() == pinned,
+              f"a valid UPPERCASE sha is accepted and lowercased ({upper[:8]}… -> "
+              f"{emb.embedding_revision()[:8]}…)")
+        check(cb.semantic_collection_name() == safe_name,
+              "so the same commit in two cases is ONE collection, not two")
+
+        os.environ["NOVA_EMBED_REVISION"] = pinned
+        check(emb.embedding_revision() == pinned, "a valid lowercase sha is accepted")
+
+        os.environ["NOVA_EMBED_REVISION"] = f"  {pinned}  "
+        check(emb.embedding_revision() == pinned, "surrounding whitespace is trimmed")
+
+        # A DIFFERENT valid sha must be honoured and must relocate the collection.
+        alt = "b" * 40
+        os.environ["NOVA_EMBED_REVISION"] = alt
+        check(emb.embedding_revision() == alt,
+              f"a different valid sha IS honoured ({alt[:8]}…)")
+        alt_name = cb.semantic_collection_name()
+        check(alt_name != safe_name,
+              f"and produces its own collection ({safe_name} vs {alt_name})")
+        check(alt in cb.semantic_space_id(), "carried in the space id")
+    finally:
+        if prev is None:
+            os.environ.pop("NOVA_EMBED_REVISION", None)
+        else:
+            os.environ["NOVA_EMBED_REVISION"] = prev
+
+    check(cb.semantic_collection_name() == safe_name,
+          "and the identity is back to the pinned one afterwards")
+
+    # Tokenizer and model must still take the SAME resolved value.
+    loads = _from_pretrained_kwargs(REPO / "memory" / "embeddings.py")
+    check(len(loads) == 2 and all("revision" in kw for kw in loads),
+          f"both loads still pinned ({loads})")
+    exprs = _from_pretrained_revision_exprs(REPO / "memory" / "embeddings.py")
+    check(len(exprs) == 2 and len(set(exprs)) == 1,
+          f"both loads take the SAME resolved expression, so they cannot "
+          f"diverge ({exprs})")
+    check(exprs and "embedding_revision" not in exprs[0],
+          f"resolved once into a variable rather than called twice ({exprs[:1]})")
+
+
+async def test_turn_indexability_has_one_owner():
+    """Review round 2, small fix 3: the live threshold was a second copy of 25."""
+    check.section("turn indexability: one rule, live and rebuild")
+    from memory import semantic_records as sr
+    from memory.unifier import MemoryUnifier
+
+    n = sr.TURN_MIN_INDEX_CHARS
+    check(isinstance(n, int) and n > 0, f"the threshold is exported ({n})")
+    # Expectations come from the CONSTANT, not from a hard-coded 25.
+    below, at, above = "x" * (n - 1), "y" * n, "z" * (n + 1)
+    check(sr.turn_is_indexable(below) is False, f"{n - 1} chars is not indexable")
+    check(sr.turn_is_indexable(at) is True, f"{n} chars is indexable")
+    check(sr.turn_is_indexable(above) is True, f"{n + 1} chars is indexable")
+
+    # The LIVE path specifically must not carry its own copy of the number.
+    # Scoped to `ingest_turn`: a module-wide check passes even when live reverts,
+    # because the rebuild legitimately mentions the helper too (found by mutation).
+    live = _function_facts(REPO / "memory" / "unifier.py", "ingest_turn")
+    check(live["found"], "ingest_turn was located in the source")
+    check("turn_is_indexable" in live["names"],
+          f"ingest_turn asks semantic_records for the rule ({sorted(live['names'])[:6]}…)")
+    check(n not in live["ints"],
+          f"and carries NO copy of the threshold {n} itself "
+          f"(int literals present: {sorted(live['ints'])})")
+
+    # And live and rebuild must AGREE at every boundary, observed end to end.
+    with _tmp() as td:
+        m = MemoryUnifier(Path(td))
+        await m.initialize()
+        conv = uuid4()
+        ids = {}
+        for label, text in (("below", below), ("at", at), ("above", above)):
+            ids[label] = str(await m.ingest_turn(conv, "user", text))
+
+        live = await _dump_collection(m)
+        live_turns = {i for i in live if i.startswith("turn:")}
+        res = await m.rebuild_semantic_index()
+        check(res.get("complete") is True, f"rebuild completed ({res})")
+        rebuilt = await _dump_collection(m)
+        rebuilt_turns = {i for i in rebuilt if i.startswith("turn:")}
+
+        check(live_turns == rebuilt_turns,
+              f"live and rebuild index the SAME set of turns "
+              f"(live={sorted(live_turns)} rebuilt={sorted(rebuilt_turns)})")
+        check(f"turn:{ids['below']}" not in live_turns
+              and f"turn:{ids['below']}" not in rebuilt_turns,
+              f"the {n - 1}-char turn is in neither")
+        check(f"turn:{ids['at']}" in live_turns and f"turn:{ids['at']}" in rebuilt_turns,
+              f"the {n}-char turn is in both")
+        check(f"turn:{ids['above']}" in live_turns
+              and f"turn:{ids['above']}" in rebuilt_turns,
+              f"the {n + 1}-char turn is in both")
+
+
+async def test_promotion_is_failure_atomic():
+    """Review round 2, blocker 2: promotion destroyed the old index first.
+
+    The previous `commit_staged_rebuild` deleted the live collection and THEN
+    renamed staging into its place. A failure in between destroyed the previous
+    authoritative index, `_ensure()` manufactured an empty one, and the rebuild
+    still said "previous index kept" — false precisely where truth mattered. The
+    caller's `abort_staged_rebuild()` would then delete the only complete copy.
+    """
+    check.section("promotion: rollback-safe, restart-recoverable")
+    from memory.backends.chroma_backend import ChromaMemoryBackend
+
+    # ── the successful swap, and its cleanup ────────────────────────────────
+    with _tmp() as td:
+        be = ChromaMemoryBackend(Path(td) / "chroma")
+        for i in range(4):
+            await be.upsert_text(f"old{i}", f"original record number {i}", {"g": "1"})
+        check(await be.count() == 4, "a healthy live index of 4")
+
+        await be.begin_staged_rebuild()
+        for i in range(3):
+            await be.upsert_text(f"new{i}", f"rebuilt record number {i}", {"g": "2"})
+        promoted = await be.commit_staged_rebuild(3)
+        live = await _dump_backend(be)
+        check(promoted == 3 and set(live) == {"new0", "new1", "new2"},
+              f"the new generation is authoritative ({sorted(live)})")
+        names = sorted(c.name for c in be._client.list_collections())
+        check(names == [be._collection_name],
+              f"and NO backup or staging residue is left ({names})")
+
+    # ── failure AFTER the backup, BEFORE staging becomes live ───────────────
+    for fail_at in ("after_backup", "after_rename"):
+        with _tmp() as td:
+            be = ChromaMemoryBackend(Path(td) / "chroma")
+            for i in range(5):
+                await be.upsert_text(f"keep{i}", f"precious original record {i}",
+                                     {"g": "1"})
+            before = await _dump_backend(be)
+            before_ids, before_n = set(before), len(before)
+            check(before_n == 5, f"[{fail_at}] a healthy index of {before_n}")
+
+            await be.begin_staged_rebuild()
+            for i in range(2):
+                await be.upsert_text(f"replacement{i}", f"replacement record {i}",
+                                     {"g": "2"})
+            raised = ""
+            try:
+                await be.commit_staged_rebuild(2, _fail_at=fail_at)
+            except Exception as e:  # noqa: BLE001
+                raised = str(e)
+            await be.abort_staged_rebuild()
+
+            check(bool(raised), f"[{fail_at}] promotion raised ({raised[:60]}…)")
+            after = await _dump_backend(be)
+            check(len(after) == before_n,
+                  f"[{fail_at}] the previous COUNT is unchanged "
+                  f"({len(after)} vs {before_n})")
+            check(set(after) == before_ids,
+                  f"[{fail_at}] the previous ID SET is unchanged "
+                  f"({sorted(set(after) ^ before_ids) or 'identical'})")
+            check(all(after[i]["text"] == before[i]["text"] for i in before_ids),
+                  f"[{fail_at}] and the previous CONTENT is unchanged")
+            check(not any(i.startswith("replacement") for i in after),
+                  f"[{fail_at}] no half-promoted record leaked in ({sorted(after)})")
+
+            st = await be.authoritative_state()
+            check(st["live_present"] is True and st["live_count"] == before_n,
+                  f"[{fail_at}] the backend reports the index as kept ({st['summary']})")
+            check(be._rolled_back >= 1,
+                  f"[{fail_at}] the rollback actually ran ({be._rolled_back})")
+            names = sorted(c.name for c in be._client.list_collections())
+            check(names == [be._collection_name],
+                  f"[{fail_at}] and no backup/staging residue remains ({names})")
+
+            # A FRESH backend must see the same thing.
+            be2 = ChromaMemoryBackend(Path(td) / "chroma")
+            fresh = await _dump_backend(be2)
+            check(set(fresh) == before_ids,
+                  f"[{fail_at}] a fresh backend sees the previous index "
+                  f"({len(fresh)} records)")
+            hits = await be2.query("precious original record", limit=5)
+            check(hits and all(h["id"] in before_ids for h in hits),
+                  f"[{fail_at}] and it is queryable ({[h['id'] for h in hits][:3]})")
+
+            # And a clean rebuild still works afterwards.
+            await be2.begin_staged_rebuild()
+            await be2.upsert_text("finally", "a clean rebuild after the failure",
+                                  {"g": "3"})
+            n = await be2.commit_staged_rebuild(1)
+            check(n == 1 and set(await _dump_backend(be2)) == {"finally"},
+                  f"[{fail_at}] a clean promotion still succeeds afterwards")
+
+
+async def test_rebuild_reports_promotion_failure_truthfully():
+    """The same boundary, through the FULL rebuild, checking what it tells Marcus.
+
+    The backend test above proves the data survives. This proves the report about
+    it is true — which is the half that was previously false: the old code said
+    "previous index kept" unconditionally, including in the one path where
+    promotion had already destroyed the index.
+    """
+    check.section("a failed promotion is reported truthfully by rebuild")
+    from memory.unifier import MemoryUnifier
+
+    for fail_at in ("after_backup", "after_rename"):
+        with _tmp() as td:
+            m = MemoryUnifier(Path(td))
+            await m.initialize()
+            for i in range(4):
+                await m.add_fact(entity="user", attribute=f"a{i}",
+                                 value=f"value number {i}", confidence=0.9)
+            await m.upsert_person(name="Leslie", attributes={"role": "wife"})
+            before = await _dump_collection(m)
+            before_ids = set(before)
+            check(len(before_ids) == 5, f"[{fail_at}] a healthy index of {len(before_ids)}")
+
+            # Inject at the promotion boundary only — population succeeds fully.
+            be = m._chroma
+            real_commit = be.commit_staged_rebuild
+
+            async def failing(expected=None, _fail_at="", _f=fail_at, _rc=real_commit):
+                return await _rc(expected, _fail_at=_f)
+
+            be.commit_staged_rebuild = failing
+            try:
+                res = await m.rebuild_semantic_index()
+            finally:
+                be.commit_staged_rebuild = real_commit
+
+            check(res.get("complete") is False,
+                  f"[{fail_at}] the rebuild reports incomplete ({res.get('complete')})")
+            reason = str(res.get("reason") or "")
+            check("aborted" in reason and "injected failure" in reason,
+                  f"[{fail_at}] the reason carries the underlying failure "
+                  f"({reason[:120]})")
+            check(res.get("previous_index_kept") is True,
+                  f"[{fail_at}] and it says the previous index was kept "
+                  f"({res.get('previous_index_kept')})")
+            check(res.get("live_records") == len(before_ids),
+                  f"[{fail_at}] backed by a real count read from the store "
+                  f"({res.get('live_records')} of {len(before_ids)})")
+            check("previous index kept" in reason,
+                  f"[{fail_at}] the claim comes from the store, not a constant string")
+
+            after = await _dump_collection(m)
+            check(set(after) == before_ids,
+                  f"[{fail_at}] and the index really is unchanged ({len(after)})")
+
+            snaps = [x for x in (await _read_snapshots(m) or [])
+                     if x.get("kind") == "semantic_index_rebuild"]
+            check(not any(x.get("complete") for x in snaps),
+                  f"[{fail_at}] no snapshot claims success ({len(snaps)})")
+
+            m2 = MemoryUnifier(Path(td))
+            await m2.initialize()
+            fresh = await _dump_collection(m2)
+            check(set(fresh) == before_ids,
+                  f"[{fail_at}] a fresh MemoryUnifier sees it too ({len(fresh)})")
+
+            res2 = await m2.rebuild_semantic_index()
+            check(res2.get("complete") is True,
+                  f"[{fail_at}] and a clean rebuild afterwards succeeds ({res2})")
+            check(set(await _dump_collection(m2)) == before_ids,
+                  f"[{fail_at}] restoring the same records from SQLite")
+
+
+async def test_crash_residue_is_recovered_not_ignored():
+    """live missing + backup present must restore, never invent an empty index."""
+    check.section("restart recovery after an interrupted promotion")
+    from memory.backends.chroma_backend import ChromaMemoryBackend
+
+    with _tmp() as td:
+        be = ChromaMemoryBackend(Path(td) / "chroma")
+        for i in range(4):
+            await be.upsert_text(f"survivor{i}", f"record that must survive {i}",
+                                 {"g": "1"})
+        ids = set(await _dump_backend(be))
+        check(len(ids) == 4, "a healthy index of 4")
+
+        # Simulate a process death between "live -> backup" and "staging -> live":
+        # the live name is gone and only the backup holds the data.
+        import asyncio as _a
+        await _a.to_thread(be._ensure)
+        live_name, backup_name = be._collection_name, be._backup_name()
+        col = await _a.to_thread(be._client.get_collection, live_name,
+                                 embedding_function=be._emb)
+        await _a.to_thread(col.modify, name=backup_name)
+        names = sorted(c.name for c in be._client.list_collections())
+        check(names == [backup_name],
+              f"the crash state is set up: live absent, backup present ({names})")
+
+        # A fresh backend opening this store must RESTORE the backup, not create
+        # an empty live collection beside it.
+        be2 = ChromaMemoryBackend(Path(td) / "chroma")
+        recovered = await _dump_backend(be2)
+        check(set(recovered) == ids,
+              f"the backup was restored as live ({len(recovered)} of 4)")
+        check(be2._recovered_from_backup == 1,
+              f"and the recovery is counted, not silent ({be2._recovered_from_backup})")
+        names = sorted(c.name for c in be2._client.list_collections())
+        check(names == [live_name], f"with no residue ({names})")
+        st = be2.semantic_status()
+        check(st["recovered_from_backup"] == 1,
+              "status surfaces the recovery for /status")
+
+        hits = await be2.query("record that must survive", limit=5)
+        check(hits and all(h["id"] in ids for h in hits),
+              f"and the restored index is queryable ({[h['id'] for h in hits][:3]})")
+
+    # The other crash state: live AND backup both present means the second rename
+    # succeeded, so the backup is stale and must be dropped, never restored over
+    # the newer index.
+    with _tmp() as td:
+        be = ChromaMemoryBackend(Path(td) / "chroma")
+        await be.upsert_text("newgen", "the newer promoted record", {"g": "2"})
+        import asyncio as _a
+        await _a.to_thread(be._ensure)
+        stale = await _a.to_thread(
+            be._client.get_or_create_collection, be._backup_name(),
+            embedding_function=be._emb, metadata={"hnsw:space": "cosine"})
+        await _a.to_thread(stale.add, ids=["stalerec"], documents=["a stale backup record"],
+                           metadatas=[{"g": "0"}])
+        be3 = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(be3)
+        check(set(got) == {"newgen"},
+              f"live wins over a stale backup ({sorted(got)})")
+        names = sorted(c.name for c in be3._client.list_collections())
+        check(names == [be3._collection_name], f"and the stale backup is dropped ({names})")
+
+
 async def test_semantic_status_reports_the_real_load_error():
     """Review finding 5: load_error was structurally always null.
 
@@ -791,6 +1217,11 @@ async def main():
     await test_case_e_legacy_collection_is_not_the_index()
     await test_case_f_equal_dimensions_are_not_compatible()
     await test_revision_is_part_of_the_space_identity()
+    await test_revision_override_must_be_a_commit_sha()
+    await test_turn_indexability_has_one_owner()
+    await test_promotion_is_failure_atomic()
+    await test_rebuild_reports_promotion_failure_truthfully()
+    await test_crash_residue_is_recovered_not_ignored()
     await test_live_and_rebuilt_records_are_identical()
     await test_a_failed_rebuild_never_becomes_authoritative()
     await test_staged_rebuild_defences_individually()

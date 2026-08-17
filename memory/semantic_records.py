@@ -24,6 +24,17 @@ It was not. Hence this module: the claim is now structural rather than asserted.
 Metadata `created_at` is deliberately NOT set here. For facts, people, events and
 turns it is the row's own creation time, which a rebuild must preserve; passing it
 in keeps that explicit at both call sites.
+
+DOCUMENT CHUNKS ARE THE ONE EXCEPTION, and the honest statement is narrower than
+"identical": `document_chunks` in SQLite does not persist the Chroma metadata
+`created_at`, so live indexing stamps the moment it wrote and a rebuild stamps the
+moment it rebuilt. IDs and embedded text are identical; metadata structure is
+identical; that one document field is intentionally volatile. Nothing reads it —
+verified: no code anywhere reads `created_at` out of Chroma metadata — so it
+carries no behaviour, and adding a migration to persist it would be aesthetics.
+The equality test filters exactly this field and nothing else, which is why the
+claim in the docs is "identical except for intentionally volatile document
+`created_at`" rather than "byte-identical metadata".
 """
 
 from dataclasses import dataclass, field
