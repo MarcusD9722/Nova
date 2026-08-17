@@ -538,6 +538,81 @@ The unverified system prompt already states the voice is not recognised, that
 Nova does not know this person's details, and that it must not guess. The model
 disobeyed. `tests/test_step9_privacy_v52.py` pins all of it.
 
+## Step 9, final closure
+
+Everything below was closed in one pass so the defects stop arriving one at a
+time.
+
+**The store turn is atomic with respect to `/chat`.** The pipeline is split into
+`sttTurn()` and `chatFromStt()`. A sample is transcribed **once**, validated, and
+only then redeemed — so a rejected transcript costs one `/stt` call and **zero**
+`/chat` calls, and leaves nothing in the conversation. Previously the rejected
+turn had already been committed before `extractCanary` saw it.
+
+**A post-dispatch failure aborts the whole run.** Once `/chat` has been sent the
+client cannot prove the backend recorded nothing, so retrying would build the
+rest of the run on a possibly-dirty conversation. `chatFromStt` raises a tagged
+error, `runBlock` aborts, and the next invocation starts over with a new
+conversation. Pre-`/chat` failures — STT, canary parse, ask validation — still
+retry the same sample safely.
+
+**Ask transcripts are validated too.** `isAskTranscript()` requires a
+first-person three-word recall request (`MY` + `THREE` + `WORDS` plus a
+repeat/recall form). A mangled question is re-recorded before `/chat`, so the
+turn cannot fail for a Whisper reason.
+
+**`extractCanary` fails closed.** With the carrier anchor it takes the three
+payload tokens after it; without the anchor it accepts **only** when the entire
+transcript is exactly three usable tokens. It no longer takes the last three
+words of an arbitrary sentence.
+
+**The privacy verdict is symmetric.** `marcus_got_guest` is checked as well as
+`guest_got_marcus`, both STORE replies are examined for cross-disclosure, and
+the whole per-step visibility matrix is **recomputed after all five turns** —
+the flags recorded during the run were vacuous for the early turns, when the
+second canary did not yet exist.
+
+**List grammar, not fuzzy matching.** "Blue, tiger, and spoon" matches; `AND` is
+skipped only *between* expected words. `BLUE TIGER FORK`, `BLUE FORK SPOON`,
+`SPOON TIGER BLUE` and `BLUE TIGER GREEN SPOON` all still fail, and the same
+comparator backs leak detection.
+
+**Evidence has a revision.** `STEP9_EVIDENCE_REVISION = "p52-step9-atomic-v1"`.
+A stored PASS from an older step-9 protocol can never satisfy acceptance — it
+must be re-run. Starting step 9 (or the permission regression) clears the
+previous result **first**, so an aborted retry cannot leave a stale PASS on
+screen.
+
+**A failed gate does not advance.** Step 9 advances only on `pass`; likewise
+step 10. Failed diagnostics stay visible and copyable.
+
+**The effective policy must be the calibrated one.** `threshold_calibrated` only
+means a valid record covers the profiles — `NOVA_SPEAKER_THRESHOLD` or
+`NOVA_SPEAKER_MARGIN` silently outrank it. Acceptance now requires
+`threshold_source === "calibrated"` **and** `margin_source === "calibrated"`, and
+the harness checks this **immediately after applying calibration** so nobody
+spends steps 8–11 validating a policy that is not the calibrated one.
+
+**Latency requires exactly 6 + 6.** Any other count is incomplete.
+
+## The unverified self-history guard
+
+An unverified speaker asking about their own history now gets a deterministic
+answer with **no model call at all**:
+
+> "I don't recognise your voice, so I can't connect you to any personal history."
+
+The prompt for those turns was already clean — measured, repeatedly. The 9B model
+invented "your family goals and Cyberpunk story" anyway, and a confabulated
+history is indistinguishable from a leak to the person hearing it. The fix is
+therefore not more filtering (there is nothing left to filter) but not asking the
+model a question whose only truthful answer is "I don't know who you are".
+
+Deliberately narrow: **only** unverified speakers, **only** first-person
+self-history phrasings. "What do you remember about the storage drives?" and
+every ordinary question still go through the normal path, and a recognised
+Marcus or guest never reaches this branch.
+
 ## The sentinel comparison
 
 Sentinels are letter-only, three-word, phonetically distinct phrases:

@@ -186,6 +186,38 @@ def _looks_like_name_query(text: str) -> bool:
     return bool(_NAME_QUERY_RE.search(text or ""))
 
 
+#: First-person questions about the SPEAKER'S OWN history with Nova (V3 P5.2).
+#: Deterministic and deliberately narrow — no classifier, no model call. Each
+#: alternative requires a first-person reference to the speaker, so "what do you
+#: remember about the storage drives" is untouched and reaches the normal path.
+_SELF_HISTORY_RE = re.compile(
+    r"\b("
+    r"what\s+(do\s+)?you\s+(remember|know)\s+about\s+me"
+    r"|(do\s+)?you\s+remember\s+me"
+    r"|what\s+did\s+we\s+(talk|discuss|speak)\s+about"
+    r"|what\s+have\s+we\s+(talked|discussed|spoken)\s+about"
+    r"|tell\s+me\s+(everything\s+)?(what\s+)?you\s+know\s+about\s+me"
+    r"|what\s+do\s+you\s+know\s+about\s+me"
+    r"|(repeat|what\s+(are|were))\s+my\s+(three\s+)?words"
+    r"|what\s+(three\s+)?words\s+did\s+i\s+(ask|tell|give)"
+    r"|my\s+(calibration\s+)?sentinel"
+    r"|what\s+do\s+you\s+remember\s+of\s+(me|mine)"
+    r"|our\s+(previous|prior|earlier|last)\s+(chat|chats|conversation|conversations)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_self_history_query(text: str) -> bool:
+    """Is this speaker asking what Nova remembers about THEM?
+
+    Used only to short-circuit UNVERIFIED turns, where the only truthful answer
+    is that Nova cannot say. See `_direct_live_reply` for why this is answered
+    deterministically rather than by the model.
+    """
+    return bool(_SELF_HISTORY_RE.search(text or ""))
+
+
 def _extract_user_name(text: str) -> str | None:
     raw = (text or "").strip()
     if not raw:
@@ -1980,6 +2012,30 @@ class RuntimeManager:
         resolved = await self._navigation.resolve_pending(text, current_location=current_location)
         if resolved is not None:
             return resolved
+
+        # V3 P5.2 step 9. An unidentified speaker asking about THEIR OWN prior
+        # history gets a deterministic answer, with no model call at all.
+        #
+        # The prompt for these turns is already clean — measured, in
+        # tests/test_step9_privacy_v52.py: zero private canaries reach it from
+        # facts, lessons, thoughts, episodes, the rolling summary or prior
+        # conversation state, and the system prompt explicitly forbids guessing.
+        # The 9B model invented "your family goals and Cyberpunk story" anyway.
+        #
+        # So the fix is not more filtering — there is nothing left to filter —
+        # it is not asking the model a question whose only truthful answer is
+        # "I don't know who you are". A confabulated personal history is
+        # indistinguishable from a leak to the person hearing it, and Nova
+        # cannot be trusted to be vague on demand.
+        #
+        # Deliberately NARROW: only an unverified speaker, only first-person
+        # self-history questions. Every other question an unknown speaker asks
+        # goes through the normal path unchanged, and a recognised Marcus or
+        # guest never reaches this branch.
+        if current_identity().is_unverified and _looks_like_self_history_query(text):
+            return ("I don't recognise your voice, so I can't connect you to any "
+                    "personal history. If you tell me what you need, I'm happy to "
+                    "help with it right now."), [], "smalltalk"
 
         if _looks_like_name_query(text):
             # V3 P5.1d. This read bypassed grounding entirely and answered
