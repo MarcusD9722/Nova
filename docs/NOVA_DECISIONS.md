@@ -785,3 +785,130 @@ payload actually contains, one kind at a time.
 **Revisit if.** A genuinely impersonal system event appears (a capability became
 available, with no owner content). Add that kind explicitly; do not relax the
 default.
+
+## D18 - A persistent vector collection holds exactly one vector space, and an unavailable embedder fails closed
+
+**Decided:** 2026-08-17 (V3 P10 pre-flight)
+
+**Decision.** `memory/backends/chroma_backend.py` produces a bge vector or raises
+`SemanticUnavailable`. There is no per-call fallback to another embedder anywhere
+on the persistent path. Callers degrade by SKIPPING semantic work and counting it,
+never by substituting: writes are dropped (SQLite already holds the record),
+queries return no semantic hits, and lexical/recent recall are untouched.
+
+The collection name encodes the SPACE, not the dimension:
+`nova_sem_bge_<blake2b(backend|model|algorithm|dimension)>`, with the full identity
+also written to the collection metadata so it can be audited rather than inferred.
+The legacy `nova_memory_v2` collection is never read, never written, and
+deliberately not deleted.
+
+**Rationale.** The old code fell back to `_HashEmbeddingFunction` per call and said
+why in its own docstring: "Both produce 384-dim vectors, so they share a collection
+safely enough for graceful degradation." That premise is false and it was measured
+- for the same text, `cosine(BGE(t), HASH(t)) = -0.0162`. The two spaces are
+orthogonal; equal dimensionality only means the vectors fit in the same table.
+
+The failure was silent and permanent. With bge-written documents in the collection,
+a hash-embedded query for "how do I bake a loaf of bread" returned a document about
+SQLite first, with no error raised. A hash-embedded WRITE was accepted into the same
+collection, and once bge came back that document could never be retrieved by any
+semantic query again. Nothing in the system could detect either case, because a
+wrong ranking and a correct ranking have identical shapes.
+
+Equal dimensions are not equal vector spaces. That sentence is the whole decision.
+
+**Alternatives rejected.** Keeping the fallback but tagging rows with their space
+(rejected: a query still needs ONE space, so tagged rows in the wrong space are
+just invisible rows with extra bookkeeping); one collection per space with
+automatic migration (rejected: re-embedding is a rebuild, and rebuild already
+exists - see below); deleting `nova_memory_v2` to guarantee cleanliness (rejected:
+it is historical data, and destroying it to make a test green is the wrong trade);
+raising from `upsert_text`/`query` instead of skipping (rejected: a bge outage
+would then break memory writes entirely, when SQLite is the source of truth and
+only recall quality needs to degrade).
+
+**Also fixed here.** `rebuild_semantic_index()` was named "rebuild" while restoring
+only facts, people and events. Substantive TURNS and DOCUMENT CHUNKS are written to
+Chroma live and were silently omitted, so a rebuild produced a quietly incomplete
+index - the same class of failure as the fallback, one layer up. Both are fully
+present in SQLite, so both are now reconstructed with the ids and text shapes live
+indexing uses (`all_turns()` / `all_document_chunks()`). A rebuild also SKIPS
+entirely when the model is unavailable: an empty collection is recoverable, a
+half-built one is a false claim about coverage.
+
+**Evidence.** `tests/test_semantic_vector_space_p10.py` - the same text embeds
+orthogonally under the two embedders; a degraded write is skipped rather than
+substituted and zero vectors enter the collection; a degraded query returns `[]`
+rather than a wrong ranking; the new collection starts empty and does not adopt
+legacy rows; the legacy collection still exists afterwards; a rebuild restores
+what was skipped. `tests/test_chroma_backend.py::test_semantic_fails_closed` is
+the inverted form of an assertion that used to read "it degrades to the hash
+embedder instead of raising" - that test passed for exactly as long as the
+corruption was live, so it is inverted rather than deleted.
+
+**Constraint.** Anything that changes what a vector MEANS - backend, model,
+normalisation, pooling - must change `semantic_space_id()`. Never widen the
+identity check to "the dimensions match".
+
+**Revisit if.** A second embedding backend is genuinely wanted. Give it its own
+collection; do not share one.
+
+## D19 - One authoritative timeout per tool, owned by the registration
+
+**Decided:** 2026-08-17 (V3 P10 pre-flight)
+
+**Decision.** `ToolRouter` holds a per-tool execution budget declared at
+`register(..., timeout_s=)`, and a DECLARED budget overrides whatever a call site
+passes. Permission-blocking tools (`project.delete`, `project.restore`,
+`project.purge`) declare `PERMISSION_TOOL_TIMEOUT_S`, which is DERIVED as
+`HUMAN_DECISION_TIMEOUT_S + PERMISSION_EXECUTION_ALLOWANCE_S` (120 + 20 = 140s)
+rather than written down twice. Ordinary tools keep an ordinary default. The agent
+loop passes no timeout at all.
+
+`PermissionBroker` cleans up on cancellation as well as on its own timeout, and
+`resolve()` audits what actually happened rather than what was clicked.
+
+**Rationale.** The live contract was contradictory: the agent loop called
+`router.execute(call, timeout_s=25.0)` while `_gate` waited
+`await_decision(..., timeout_s=120.0)`. So the outer timeout cancelled the inner
+handshake at 25s, four fifths of the way through a window Nova had already
+advertised to Marcus. Three separate lies followed from one number: the tool
+returned `ok=False, error=""` (an empty string, because `asyncio.TimeoutError`
+carries no message); the request stayed in `_pending`, so the UI kept offering an
+Approve button for another 95 seconds; and clicking it wrote `approved` to the
+permission audit for an action that could no longer run.
+
+That last one is the serious one. A permission audit whose "approved" does not
+mean "a live request was approved" is not an audit. It would equally have hidden a
+deletion that DID happen.
+
+The timeout had to be per-tool because the call site cannot know: `Agent.run` is a
+generic loop, and the fact that a tool waits on a human is a property of the tool.
+Deriving the permission budget from the broker's own constant is what stops the
+25/120 pair from re-forming later as, say, 140/150.
+
+**Alternatives rejected.** Raising every tool to 140s (rejected: a hung web search
+would then block a turn for over two minutes); special-casing tool names inside
+`Agent.run` (rejected: the router already has the metadata, and the brief forbids
+it); keeping 25s and shortening the approval window to ~20s (rejected: that is a
+worse product - Marcus gets 20 seconds to read a delete confirmation); returning
+False from `await_decision` on cancellation (rejected: that reports "denied" when
+nobody decided, which is the same class of lie as the audit bug).
+
+**Evidence.** `tests/test_permission_handshake_p10.py` - 83 checks over the cases
+A-H the brief specified, with timing scaled 100x (old boundary 0.25s, window
+0.6-1.2s, budget 1.4s). Case B is the one that matters: an approval arriving AFTER
+the old boundary and BEFORE the window closes now executes exactly once, with
+exactly one `approved` audit entry and nothing left pending. Cancellation, late
+approval, late rejection, duplicate approval and unknown-id all audit distinctly
+and return False. Case H proves a permission approval and an execution failure are
+reported separately. The registrations are read from the AST, and the source
+assertions strip comments so prose about the fix cannot satisfy a check for it.
+
+**Constraint.** Any tool that can block on a human MUST declare its budget at
+registration. `HUMAN_DECISION_TIMEOUT_S` in `core/permissions.py` is the only
+place the approval window is written.
+
+**Revisit if.** A tool needs to wait on something slower than a human (a long
+build, an external job). Give it its own declared budget; do not reuse the
+permission constant for it.

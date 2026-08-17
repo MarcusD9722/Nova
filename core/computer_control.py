@@ -20,7 +20,7 @@ import os
 from typing import Any
 
 from core.logging_setup import get_logger
-from core.permissions import PermissionBroker
+from core.permissions import HUMAN_DECISION_TIMEOUT_S, PermissionBroker
 
 logger = get_logger(__name__)
 
@@ -68,7 +68,8 @@ class ComputerControl:
             return {"ok": False, "error": str(e)[:200]}
 
     async def act(self, kind: str, *, target: str = "", details: dict[str, Any] | None = None,
-                  wait_for_confirm: bool = True, confirm_timeout_s: float = 120.0) -> dict[str, Any]:
+                  wait_for_confirm: bool = True,
+                  confirm_timeout_s: float = HUMAN_DECISION_TIMEOUT_S) -> dict[str, Any]:
         """Propose an action. It runs ONLY if permission clears AND execution is
         enabled AND an adapter exists — otherwise it's an honest dry run."""
         details = dict(details or {})

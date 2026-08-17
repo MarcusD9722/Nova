@@ -71,7 +71,15 @@ async def permissions_resolve(req: PermissionResolveRequest) -> dict:
     if STATE.runtime is None:
         raise HTTPException(status_code=503, detail="Not ready")
     ok = STATE.runtime.permission_broker.resolve(req.request_id, bool(req.approved))
-    return {"resolved": ok, "request_id": req.request_id, "approved": bool(req.approved)}
+    # `approved` echoes the CLICK; `applied` says whether it did anything. The old
+    # shape returned approved=true for a request that had already timed out, so
+    # the UI could report a deletion that never ran.
+    out = {"resolved": ok, "applied": ok, "request_id": req.request_id,
+           "approved": bool(req.approved)}
+    if not ok:
+        out["note"] = ("That request was no longer waiting (it timed out, was "
+                       "withdrawn, or was already answered) — nothing was executed.")
+    return out
 
 
 class DevInspectRequest(BaseModel):
