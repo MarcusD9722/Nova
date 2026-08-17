@@ -467,15 +467,16 @@ async def test_harness_sentinel_shares_one_conversation():
     phases = re.findall(r'phase:"([^"]+)"', flat)
     check(phases == ["store", "store", "ask", "ask", "ask"],
           f"two stores then three asks ({phases})")
-    # Letter-only sentinels: a voice pipeline transcribes the store utterance
-    # BEFORE storing it, and STT renders a hyphenated digit-bearing token as
-    # words — which is what made run 2 report a memory failure that had not
-    # happened. The tokens live in SENTINELS and the cues interpolate them.
-    tokens = html[html.index("const SENTINELS"):html.index("function canonTokens")]
-    check("COBALT ORCHARD PINE" in tokens and "SILVER HARBOR LANTERN" in tokens,
-          "each speaker stores their own letter-only sentinel")
+    # The cue is only a prompt for the human — the EXPECTED answer comes from
+    # the real transcript (see extractCanary). Predetermined phrases proved
+    # unreliable twice over: ORCHARD->ORCHID, HARBOR->HARBOUR, sentinel->sensor.
+    tokens = html[html.index("const SENTINELS = {"):html.index("const CANARY_STOPWORDS")]
+    check("BLUE TIGER SPOON" in tokens and "GREEN ROCKET CHAIR" in tokens,
+          "each speaker is cued with three simple words")
     check(not any(c.isdigit() for c in tokens),
           "with no digits for STT to spell out")
+    check("function extractCanary" in html,
+          "and the oracle is derived from the actual /stt transcript")
     check("${SENTINELS.marcus}" in steps and "${SENTINELS.guest}" in steps,
           "and the spoken cues interpolate exactly those tokens")
     check("chatTurn(blob, CID)" in code,

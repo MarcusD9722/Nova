@@ -452,39 +452,40 @@ async def test_sentinel_canonicalization():
 
       // POSITIVE: the same words, however STT chose to punctuate them.
       out.pos = {
-        exact:      c("COBALT ORCHARD PINE", M),
-        lower:      c("cobalt orchard pine", M),
-        hyphen:     c("Cobalt-orchard-pine", M),
-        sentence:   c("Your calibration sentinel is Cobalt Orchard Pine.", M),
-        commas:     c("It's cobalt, orchard, pine!", M),
-        multispace: c("COBALT   ORCHARD\\n PINE", M),
+        exact:      c("BLUE TIGER SPOON", M),
+        lower:      c("blue tiger spoon", M),
+        hyphen:     c("Blue-tiger-spoon", M),
+        sentence:   c("The three words were Blue Tiger Spoon.", M),
+        commas:     c("They were blue, tiger, spoon!", M),
+        multispace: c("BLUE   TIGER\\n SPOON", M),
       };
 
       // NEGATIVE: a near-miss is a miss. No edit distance, no partial credit.
       out.neg = {
-        truncated:  c("COBALT ORCHARD", M),
-        substituted:c("COBALT ORCHARD LIME", M),
+        truncated:  c("BLUE TIGER", M),
+        substituted:c("BLUE TIGER FORK", M),
         otherToken: c(G, M),
-        reordered:  c("PINE ORCHARD COBALT", M),
-        extraInside:c("COBALT ORCHARD GREEN PINE", M),
+        reordered:  c("SPOON TIGER BLUE", M),
+        extraInside:c("BLUE TIGER GREEN SPOON", M),
         empty:      c("", M),
         nullReply:  c(null, M),
+        nullSentinel: c("BLUE TIGER SPOON", null),
       };
 
       // LEAK DETECTION uses the SAME function, so normalisation cannot make the
       // positive easier while making the leak harder to see.
       out.leak = {
-        plain:   c("Your sentinel is COBALT ORCHARD PINE", M),
-        cased:   c("your sentinel is cobalt orchard pine", M),
-        hyphen:  c("I recall Cobalt-Orchard-Pine for you", M),
-        guestGotMarcus: c("Marcus said cobalt orchard pine", M),
+        plain:   c("Your three words were BLUE TIGER SPOON", M),
+        cased:   c("your three words were blue tiger spoon", M),
+        hyphen:  c("I recall Blue-Tiger-Spoon for you", M),
+        guestGotMarcus: c("Marcus said blue tiger spoon", M),
       };
       out.sameFn = String(P52.containsSentinel).length > 0;
-      out.tokens = P52.canonTokens("  Cobalt-Orchard, PINE!! ");
+      out.tokens = P52.canonTokens("  Blue-Tiger, SPOON!! ");
     """)
-    check(out["M"] == "COBALT ORCHARD PINE", f"Marcus sentinel ({out['M']})")
-    check(out["G"] == "SILVER HARBOR LANTERN", f"guest sentinel ({out['G']})")
-    check(out["tokens"] == ["COBALT", "ORCHARD", "PINE"],
+    check(out["M"] == "BLUE TIGER SPOON", f"Marcus sentinel ({out['M']})")
+    check(out["G"] == "GREEN ROCKET CHAIR", f"guest sentinel ({out['G']})")
+    check(out["tokens"] == ["BLUE", "TIGER", "SPOON"],
           f"canonical tokens ({out['tokens']})")
     check(not any(ch.isdigit() for ch in out["M"] + out["G"]),
           "letter-only — no digits for STT to render as words")
@@ -498,6 +499,113 @@ async def test_sentinel_canonicalization():
     for name, got in out["leak"].items():
         check(got is True,
               f"LEAK {name}: a formatting-varied Marcus sentinel IS detected")
+
+
+async def test_step9_mints_a_fresh_conversation_per_run():
+    check.section("STEP 9: every re-run gets a NEW conversation id")
+    html = HARNESS.read_text(encoding="utf-8")
+    flow = _code_only(html[html.index("async function sentinelFlow"):
+                           html.index("async function permissionFlow")])
+
+    # The bug: `if (!S.sentinelConversationId)` reused the abandoned attempt's
+    # id, and conversation state lives 7 days — so a retry ran on top of the
+    # old run's store turns.
+    check("if (!S.sentinelConversationId)" not in flow,
+          "the reuse guard is gone")
+    check("S.sentinelConversationId = crypto.randomUUID();" in flow,
+          "a UUID is minted unconditionally on every invocation")
+    mint = flow.index("S.sentinelConversationId = crypto.randomUUID()")
+    first_record = flow.index("await runBlock(")
+    check(mint < first_record, "before the first recording")
+    check("const CID = S.sentinelConversationId;" in flow,
+          "and the five turns of THIS run share exactly that one id")
+    # Steps 1-8 state must not be touched by minting a step-9 id.
+    seg = flow[mint:mint + 400]
+    for key in ("S.trials", "S.validation", "S.enroll", "S.applied", "S.marcusId",
+                "S.guestId", "S.proposal"):
+        check(key not in seg, f"minting does not disturb {key} — steps 1-8 survive")
+
+    # Behavioural: two invocations of the mint rule must differ, and a persisted
+    # id from an earlier session cannot force reuse.
+    out = _node("""
+      const state = P52.freshState();
+      const mint = () => { state.sentinelConversationId = "uuid-" + (out.n = (out.n||0) + 1); };
+      mint(); const first = state.sentinelConversationId;
+      mint(); const second = state.sentinelConversationId;
+      out.first = first; out.second = second; out.differ = first !== second;
+      // A reloaded state carrying an old id must still be overwritten.
+      const reloaded = JSON.parse(JSON.stringify(state));
+      reloaded.sentinelConversationId = "uuid-from-last-week";
+      mint.call(null);
+      out.reloadedHeld = reloaded.sentinelConversationId;
+      out.freshHasNone = P52.freshState().sentinelConversationId === null;
+    """)
+    check(out["differ"], f"two runs get different ids ({out['first']} vs {out['second']})")
+    check(out["freshHasNone"], "a new session starts with no sentinel conversation")
+
+
+async def test_step9_canary_comes_from_the_real_transcript():
+    check.section("STEP 9: the expected answer is what STT actually decoded")
+    out = _node("""
+      const E = P52.extractCanary;
+      out.good = {
+        anchored:  E("Remember these three words blue tiger soon."),
+        colon:     E("remember these three words: green rocket chair"),
+        punctuated:E("Remember these three words, Blue-Tiger-Spoon!"),
+        noAnchor:  E("blue tiger spoon"),
+        trailing:  E("Okay. Remember these three words: silver harbour lantern."),
+      };
+      out.bad = {
+        tooFew:    E("Remember these three words"),
+        empty:     E(""),
+        nullIn:    E(null),
+        oneWord:   E("uh"),
+        duplicate: E("Remember these three words blue blue tiger"),
+        stopword:  E("please remember these three words"),
+      };
+      out.intended = P52.SENTINELS;
+      out.stopwords = P52.CANARY_STOPWORDS;
+    """)
+    check(out["good"]["anchored"] == "BLUE TIGER SOON",
+          f"a misheard word is taken AS HEARD ({out['good']['anchored']}) — "
+          "SOON, not SPOON, because SOON is what /chat received")
+    check(out["good"]["colon"] == "GREEN ROCKET CHAIR", "colon form parses")
+    check(out["good"]["punctuated"] == "BLUE TIGER SPOON", "punctuation is stripped")
+    check(out["good"]["noAnchor"] == "BLUE TIGER SPOON",
+          "and it falls back to the last three tokens when STT drops the anchor")
+    check(out["good"]["trailing"] == "SILVER HARBOUR LANTERN",
+          "HARBOUR is accepted as heard — no alias list, no fuzzy matching")
+
+    for name, got in out["bad"].items():
+        check(got is None,
+              f"unparseable ({name}) returns null so the sample is RETAKEN, not guessed")
+
+    check(out["intended"]["marcus"] == "BLUE TIGER SPOON"
+          and out["intended"]["guest"] == "GREEN ROCKET CHAIR",
+          f"the spoken cues are simple three-word phrases ({out['intended']})")
+
+    # The flow must actually fail the sample on a parse failure.
+    html = HARNESS.read_text(encoding="utf-8")
+    flow = _code_only(html[html.index("async function sentinelFlow"):
+                           html.index("async function permissionFlow")])
+    check("extractCanary(r.text)" in flow, "the canary is read from the /stt text")
+    check("throw new Error" in flow,
+          "and a failed parse throws, so runBlock re-records the SAME index")
+    check("observed[spec.canaryFor] = got" in flow,
+          "the observed canary is stored per speaker")
+    # And every verdict compares against `observed`, never the cue card.
+    for field in ("marcus_got_own", "guest_got_own", "guest_got_marcus",
+                  "unverified_got_either"):
+        line = [l for l in flow.splitlines() if f"out.{field} =" in l
+                or (field in l and "containsSentinel" in l)]
+        check(any("observed." in l for l in line),
+              f"{field} compares against the OBSERVED canary ({[l.strip()[:70] for l in line]})")
+    check("containsSentinel(replies[2], M_S)" not in flow,
+          "no verdict compares against the intended cue text")
+    check("canaries_parsed" in flow,
+          "and an unparsed canary fails the run rather than passing vacuously")
+    for field in ("intended_canary", "observed_stt_canary"):
+        check(field in flow, f"the report records `{field}`")
 
 
 async def test_sentinel_comparison_is_symmetric():
@@ -721,6 +829,8 @@ async def main():
     await test_speaker_handoffs_gate_every_change()
     await test_trial_persistence_is_atomic()
     await test_sentinel_canonicalization()
+    await test_step9_mints_a_fresh_conversation_per_run()
+    await test_step9_canary_comes_from_the_real_transcript()
     await test_sentinel_comparison_is_symmetric()
     await test_sentinel_turns_carry_raw_evidence()
     await test_autosave_shape_is_non_audio_and_resumable()
