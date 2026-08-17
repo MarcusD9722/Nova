@@ -409,13 +409,24 @@ class MemoryUnifier:
         """
         if self._chroma is None:
             return {"enabled": False, "reason": "chroma disabled for this instance"}
-        return {
+        out = {
             "enabled": True,
             "degraded": self._chroma_failures > 0,
             "writes_ok": self._chroma_writes,
             "failures": self._chroma_failures,
             "last_error": self._chroma_last_error or None,
         }
+        # Vector-space identity and skip counters (P10 pre-flight). `degraded`
+        # must also be true when the embedding model is simply unavailable —
+        # nothing is failing in that case, semantic work is being SKIPPED, and
+        # the old shape could not express the difference.
+        try:
+            sem = self._chroma.semantic_status()
+            out["semantic"] = sem
+            out["degraded"] = bool(out["degraded"] or sem.get("degraded"))
+        except Exception as e:  # noqa: BLE001
+            out["semantic"] = {"error": str(e)[:200]}
+        return out
 
     def set_query_expander(self, expander: Any | None) -> None:
         """Install an `async (query, terms) -> list[str]` term expander."""
@@ -562,19 +573,48 @@ class MemoryUnifier:
         except Exception:
             chroma_count = 0
 
-        # If there is nothing stable to index, don't touch Chroma.
-        stable_total = int(sqlite_counts.get("facts", 0)) + int(sqlite_counts.get("people", 0)) + int(sqlite_counts.get("events", 0))
+        # If there is nothing to index, don't touch Chroma. Turns and document
+        # chunks count too now that the rebuild covers them — otherwise a store
+        # holding only conversation history would never rebuild its index.
+        stable_total = (int(sqlite_counts.get("facts", 0))
+                        + int(sqlite_counts.get("people", 0))
+                        + int(sqlite_counts.get("events", 0)))
         if stable_total <= 0:
-            return
+            try:
+                extra = (len(await self._sqlite.all_turns(limit=1))
+                         + len(await self._sqlite.all_document_chunks(limit=1)))
+            except Exception:  # noqa: BLE001
+                extra = 0
+            if extra <= 0:
+                return
 
         # Only rebuild when Chroma looks empty.
         if chroma_count <= 0:
             await self.rebuild_semantic_index()
 
     async def rebuild_semantic_index(self) -> dict[str, int]:
-        """Rebuild Chroma documents from SQLite facts/people/events."""
+        """Rebuild the semantic index from SQLite, the authoritative store.
+
+        Covers EVERY record class this system indexes semantically. The name
+        said "rebuild" long before it did: facts, people and events were
+        restored, but substantive TURNS and DOCUMENT CHUNKS — both written to
+        Chroma live and both fully present in SQLite — were silently left out,
+        so a rebuild produced a quietly incomplete index (P10 pre-flight).
+
+        Skips entirely when the embedding model is unavailable: an empty
+        collection is recoverable, a half-built one is a lie about coverage.
+        """
         if self._chroma is None:
-            return {"facts": 0, "people": 0, "events": 0}
+            return {"facts": 0, "people": 0, "events": 0, "turns": 0, "documents": 0}
+        try:
+            from memory import embeddings as _emb
+            if not _emb.embedding_available():
+                logger.warning("semantic_rebuild_skipped_model_unavailable")
+                return {"facts": 0, "people": 0, "events": 0, "turns": 0,
+                        "documents": 0, "skipped": 1}
+        except Exception:  # noqa: BLE001
+            return {"facts": 0, "people": 0, "events": 0, "turns": 0,
+                    "documents": 0, "skipped": 1}
         await self._sqlite.initialize()
         await self._json.initialize()
 
@@ -617,10 +657,51 @@ class MemoryUnifier:
                 metadata={"kind": "event", "date": str(row["date"]), "created_at": str(row.get("created_at") or "")},
             )
 
+        # TURNS. Indexed live by `ingest_turn` under the same rule used there,
+        # so a rebuilt index matches what a live run would have produced.
+        turn_n = 0
+        try:
+            min_len = 25
+            for row in await self._sqlite.all_turns(limit=None):
+                content = str(row.get("content") or "")
+                if len(content.strip()) < min_len:
+                    continue
+                turn_n += 1
+                await self._chroma.upsert_text(
+                    doc_id=str(row["id"]),
+                    text=content,
+                    metadata={"kind": "turn", "role": str(row.get("role") or ""),
+                              "conversation_id": str(row.get("conversation_id") or ""),
+                              "speaker_entity": str(row.get("speaker_entity") or "user"),
+                              "created_at": str(row.get("created_at") or "")},
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("semantic_rebuild_turns_failed", error=str(e)[:200])
+
+        # DOCUMENT CHUNKS, with the same ids and text shape `index_document`
+        # writes, so a rebuild is indistinguishable from live indexing.
+        doc_n = 0
+        try:
+            for row in await self._sqlite.all_document_chunks(limit=None):
+                path = str(row.get("path") or "")
+                idx = int(row.get("chunk_index") or 0)
+                doc_n += 1
+                await self._chroma.upsert_text(
+                    doc_id=f"doc:{path}#{idx}",
+                    text=f"FILE {Path(path).name} (part {idx + 1}): {row.get('text') or ''}",
+                    metadata={"kind": "document", "path": path, "chunk_index": idx,
+                              "created_at": _now().isoformat()},
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("semantic_rebuild_documents_failed", error=str(e)[:200])
+
         await self._json.append_snapshot(
-            {"kind": "semantic_index_rebuild", "facts": fact_n, "people": person_n, "events": event_n, "ts": _now().isoformat()}
+            {"kind": "semantic_index_rebuild", "facts": fact_n, "people": person_n,
+             "events": event_n, "turns": turn_n, "documents": doc_n,
+             "ts": _now().isoformat()}
         )
-        return {"facts": fact_n, "people": person_n, "events": event_n}
+        return {"facts": fact_n, "people": person_n, "events": event_n,
+                "turns": turn_n, "documents": doc_n}
 
     async def ingest_turn(self, conversation_id: UUID, role: str, content: str) -> UUID:
         await self.initialize()
