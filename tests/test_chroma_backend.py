@@ -99,11 +99,13 @@ async def test_semantic_fails_closed() -> None:
         batch_raised = False
     check(batch_raised, "the batch path fails closed too — no partial writes")
 
-    # The hash embedder still exists and still works: it is used for the
-    # in-memory tool-selector cache, which is a fresh non-persistent space every
-    # boot. It just may never reach the persistent collection.
+    # The class is kept and still works, but it now has NO production caller —
+    # verified: nothing outside this module and the test suite constructs it. It
+    # is retained deliberately, as the negative reference the vector-space tests
+    # measure bge against. Deleting it would remove the only thing that can
+    # demonstrate the two spaces are orthogonal.
     check(len(h.embed_query("anything")) == 384,
-          "the hash embedder itself is untouched (still used off the persistent path)")
+          "the hash embedder still works, but nothing in production constructs it")
     check(s.name() == "nova-semantic-bge-normalized-cls-v1",
           f"the semantic embedder names its vector space ({s.name()})")
     emb_mod.embedding_available = _real_available

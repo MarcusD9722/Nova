@@ -16,6 +16,15 @@ __all__ = ["ChromaMemoryBackend"]
 class _HashEmbeddingFunction:
     """Deterministic lightweight embedding without external ML deps.
 
+    NO LONGER USED IN PRODUCTION. It was the per-call fallback for
+    `_SemanticEmbeddingFunction`, which was a corruption — see that class. Nothing
+    outside this module and the test suite constructs it any more.
+
+    It is kept, rather than deleted, because it is the negative reference the
+    vector-space tests measure bge against: it is the only thing that can
+    demonstrate that two 384-dim embedders are orthogonal. If it ever acquires a
+    caller again, that caller must own its own non-persistent space.
+
     Chroma embedding functions are expected to implement:
       - embed_documents(list[str]) -> list[list[float]]
       - embed_query(str) -> list[float]
