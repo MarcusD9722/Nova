@@ -197,10 +197,42 @@ function planConditions(count, conds) {
 //
 // So: letter-only, three-word, phonetically distinct phrases that STT can
 // transcribe without inventing punctuation, and a canonicalizing comparison.
+// Human run 2 proved that no predetermined phrase is a reliable oracle:
+// ORCHARD -> ORCHID, HARBOR -> HARBOUR, "sentinel" -> "sensor". Chasing
+// STT-safe words is unwinnable, and adding ORCHID/HARBOUR aliases would only
+// paper over whichever word breaks next.
+//
+// So the CUE is only a prompt for the human. The EXPECTED ANSWER is whatever
+// STT actually decoded, because that is what /chat received and therefore all
+// Nova could possibly remember. This separates STT quality — not what step 9
+// measures — from speaker-scoped memory attribution, which is.
 const SENTINELS = {
-  marcus: "COBALT ORCHARD PINE",
-  guest:  "SILVER HARBOR LANTERN",
+  marcus: "BLUE TIGER SPOON",
+  guest:  "GREEN ROCKET CHAIR",
 };
+
+//: Words that mean the parse grabbed the carrier phrase instead of the payload.
+const CANARY_STOPWORDS = ["REMEMBER", "THESE", "THREE", "WORDS", "THE", "ARE", "IS"];
+
+/**
+ * Pull the three remembered words out of a REAL /stt transcript.
+ *
+ * Anchors on the carrier phrase ("...three words: X Y Z"), falling back to the
+ * last three tokens when STT drops the anchor. Returns null when it cannot get
+ * a clean three-token payload — the caller must then FAIL that store sample and
+ * re-record it rather than guess, because a wrong expected answer would fail
+ * the memory test for a transcription reason all over again.
+ */
+function extractCanary(sttText) {
+  const t = canonTokens(sttText);
+  const at = t.lastIndexOf("WORDS");
+  let picked = (at >= 0 && t.length >= at + 4) ? t.slice(at + 1, at + 4) : t.slice(-3);
+  if (picked.length !== 3) return null;
+  if (picked.some(w => w.length < 2)) return null;
+  if (picked.some(w => CANARY_STOPWORDS.indexOf(w) >= 0)) return null;
+  if (new Set(picked).size !== 3) return null;     // "blue blue tiger" is a misparse
+  return picked.join(" ");
+}
 
 /** Uppercase alphanumeric tokens. Deterministic; no fuzzy or semantic matching. */
 function canonTokens(s) {
@@ -237,20 +269,19 @@ function containsSentinel(reply, sentinel) {
 
 // ── who speaks, in the two multi-person blocks ──────────────────────────────
 // Pure data so the handoff rule below can be tested without a browser.
+const ASK_CUE = 'say — "What three words did I ask you to remember?"';
 const SENTINEL_STEPS = [
-  {who:"Marcus", phase:"store", secs:5.0,
-   cue:`Marcus: say — "Remember that my calibration sentinel is ${SENTINELS.marcus}."`},
-  {who:"Guest", phase:"store", secs:5.0,
-   cue:`Guest: say — "Remember that my calibration sentinel is ${SENTINELS.guest}."`},
-  {who:"Marcus", phase:"ask", secs:4.0,
-   cue:'Marcus: say — "What is my calibration sentinel?"'},
-  {who:"Guest", phase:"ask", secs:4.0,
-   cue:'Guest: say — "What is my calibration sentinel?"'},
+  {who:"Marcus", phase:"store", secs:5.0, canaryFor:"marcus",
+   cue:`Marcus: say — "Remember these three words: ${SENTINELS.marcus}."`},
+  {who:"Guest", phase:"store", secs:5.0, canaryFor:"guest",
+   cue:`Guest: say — "Remember these three words: ${SENTINELS.guest}."`},
+  {who:"Marcus", phase:"ask", secs:4.0, cue:`Marcus: ${ASK_CUE}`},
+  {who:"Guest", phase:"ask", secs:4.0, cue:`Guest: ${ASK_CUE}`},
   // `who` is the identity KEY the result analysis matches on; `label` is what a
   // human is shown. Keeping them separate stops a wording change from silently
   // breaking `steps.find(s => s.who === "unverified")`.
   {who:"unverified", label:"a third, unenrolled person", phase:"ask", secs:4.0,
-   cue:'A THIRD, unenrolled person: say — "What is my calibration sentinel?"'},
+   cue:`A THIRD, unenrolled person: ${ASK_CUE}`},
 ];
 
 const PERMISSION_STEPS = [
@@ -482,8 +513,8 @@ function freshState() {
 const P52 = {
   DUR, GAP_MS, LEAD_IN_S, LEAD_NEXT_S, CONDITION_NAMES, CONDITION_HINT,
   ENROLL_PHRASES, CAL_CUES, VAL_CUES, UNVERIFIED_OK,
-  SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS, SENTINELS,
-  canonTokens, containsSentinel,
+  SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS, SENTINELS, CANARY_STOPWORDS,
+  canonTokens, containsSentinel, extractCanary,
   planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
   handoffBeforeIndex, stepLabel, enrollmentComplete, enrollmentAcceptable,
   reconcileEnrollment, commitSample,
@@ -833,10 +864,26 @@ async function sttOnly(blob, wantSpeaker) {
 // the handoff rule that reads them has to be testable without a browser.
 
 async function sentinelFlow() {
-  const M_S = SENTINELS.marcus, G_S = SENTINELS.guest;
-  if (!S.sentinelConversationId) { S.sentinelConversationId = crypto.randomUUID(); save(); }
+  // A FRESH conversation for EVERY invocation. `if (!S.sentinelConversationId)`
+  // meant a step-9 retry reused the abandoned attempt's id — and conversation
+  // state lives for seven days, so the old attempt's store turns were still
+  // sitting in each speaker's scope. Run 2's replies quoted `guest live 661`,
+  // a token from the previous attempt that nobody said during this one. Retries
+  // were not independent trials.
+  //
+  // Minted here, before the first recording, and persisted so the five turns of
+  // THIS run share it. Steps 1-8 are untouched by this.
+  S.sentinelConversationId = crypto.randomUUID();
+  save();
   const CID = S.sentinelConversationId;
-  const out = { steps: [], conversation_id: CID, conversation_stable: true };
+
+  const M_S = SENTINELS.marcus, G_S = SENTINELS.guest;
+  // What STT actually decoded for each speaker's store turn — the only thing
+  // Nova could possibly have been asked to remember. Filled in during the run.
+  const observed = {marcus: null, guest: null};
+  const out = { steps: [], conversation_id: CID, conversation_stable: true,
+                intended_canary: {marcus: M_S, guest: G_S},
+                observed_stt_canary: observed };
   const replies = [];
 
   // ATOMIC (`resumable:false` below). The five turns accumulate their results
@@ -866,6 +913,19 @@ async function sentinelFlow() {
       // exactly what a server ignoring conversation_id produces.
       if (r.conversation_id !== CID) out.conversation_stable = false;
       replies[i] = r.reply;
+
+      // On a STORE turn the expected answer is set from the REAL transcript. If
+      // it cannot be parsed cleanly, fail this sample so runBlock re-records
+      // the SAME index — guessing here would fail the memory test for a
+      // transcription reason, which is the trap this whole change removes.
+      if (spec.canaryFor) {
+        const got = extractCanary(r.text);
+        if (!got) {
+          throw new Error(`could not read three words from "${(r.text||"").slice(0,70)}" `
+                        + `— say the cue again, clearly`);
+        }
+        observed[spec.canaryFor] = got;
+      }
       // RAW EVIDENCE. Run 2 reported a memory failure and kept neither the STT
       // text nor the reply, so there was no way to tell a real failure from a
       // transcription mismatch without recording the whole thing again. These
@@ -880,8 +940,10 @@ async function sentinelFlow() {
                       assistant_reply: r.reply ?? null,
                       stt_tokens: canonTokens(r.text).join(" "),
                       reply_tokens: canonTokens(r.reply).join(" "),
-                      got_marcus: containsSentinel(r.reply, M_S),
-                      got_guest: containsSentinel(r.reply, G_S)});
+                      observed_canary: spec.canaryFor ? observed[spec.canaryFor] : null,
+                      // Against what STT actually delivered, not the cue card.
+                      got_marcus: containsSentinel(r.reply, observed.marcus),
+                      got_guest: containsSentinel(r.reply, observed.guest)});
       return {note: `${spec.who}: ${r.speaker?.status ?? "?"}`};
     },
   });
@@ -904,16 +966,20 @@ async function sentinelFlow() {
   // ONE comparison function for the positive checks and the privacy checks
   // alike. Anything that makes "Marcus got his own" easier to satisfy must
   // make "the guest got Marcus's" easier to DETECT by exactly the same amount.
-  out.marcus_got_own = containsSentinel(replies[2], M_S);
-  out.guest_got_own = containsSentinel(replies[3], G_S);
-  out.guest_got_marcus = containsSentinel(replies[3], M_S);
-  out.unverified_got_either = containsSentinel(replies[4], M_S)
-                           || containsSentinel(replies[4], G_S);
+  // Every check — positive AND privacy — uses the OBSERVED canaries, so the
+  // oracle is what production actually received.
+  out.canaries_parsed = !!(observed.marcus && observed.guest);
+  out.marcus_got_own = containsSentinel(replies[2], observed.marcus);
+  out.guest_got_own = containsSentinel(replies[3], observed.guest);
+  out.guest_got_marcus = containsSentinel(replies[3], observed.marcus);
+  out.unverified_got_either = containsSentinel(replies[4], observed.marcus)
+                           || containsSentinel(replies[4], observed.guest);
   out.sentinels = {marcus: M_S, guest: G_S};
   out.comparison = "canonical uppercase alphanumeric tokens, consecutive match; "
                  + "no fuzzy or edit-distance matching; same rule for positive "
                  + "and privacy checks";
-  out.pass = out.conversation_stable && out.marcus_recognised && out.guest_recognised
+  out.pass = out.conversation_stable && out.canaries_parsed
+             && out.marcus_recognised && out.guest_recognised
              && out.unverified_is_unverified && out.marcus_got_own && out.guest_got_own
              && !out.guest_got_marcus && !out.unverified_got_either;
   return out;

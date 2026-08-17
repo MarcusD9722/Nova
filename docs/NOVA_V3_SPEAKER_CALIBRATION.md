@@ -484,6 +484,60 @@ re-running.**
 
 ---
 
+## Step 9, second correction — retry isolation and an observed oracle
+
+Run 2's step 9 was re-run after the canonicalization fix and failed again. The
+new raw diagnostics earned their place immediately:
+
+**Retries were not independent trials.** The harness minted the sentinel
+conversation id only `if (!S.sentinelConversationId)`, so a re-run reused the
+abandoned attempt's conversation — and conversation state lives for **seven
+days**. Both replies quoted `guest live 661`, a token from the *previous*
+attempt that nobody said during this one. A fresh UUID is now minted on **every**
+invocation of `sentinelFlow()`, before the first recording; the five turns of one
+run still share it. Steps 1–8 are untouched.
+
+**No predetermined phrase is a reliable oracle.** STT delivered
+`ORCHARD → ORCHID`, `HARBOR → HARBOUR`, `sentinel → sensor`. Adding aliases
+would only postpone the next word that breaks. Nova cannot remember phonemes STT
+never gave her, so the **expected answer is now taken from the real transcript**:
+
+```
+cue     "Remember these three words: BLUE TIGER SPOON."
+/stt    "Remember these three words blue tiger soon."
+expect  BLUE TIGER SOON          ← what /chat actually received
+ask     "What three words did I ask you to remember?"
+```
+
+`extractCanary()` anchors on the carrier phrase, falls back to the last three
+tokens, and returns **null** on anything it cannot parse cleanly — three distinct
+tokens, none of them carrier words. A null makes the store sample **fail and
+re-record**; it never guesses, because a wrong expected answer would fail the
+memory test for a transcription reason all over again.
+
+This separates **STT quality** — which step 9 does not measure — from
+**speaker-scoped memory attribution**, which is the whole point. The privacy
+checks use the same observed canaries, so the oracle is identical on both sides.
+
+## The unverified reply that mentioned "family goals"
+
+Run 2's unverified speaker got: *"…maybe I'm missing the context from our
+earlier chats about your family goals and Cyberpunk story."* That is either a
+read-path leak or a small model confabulating an excuse, and those look
+identical in a transcript.
+
+**Reproduced against the exact prompt: it was model hallucination, not a leak.**
+Owner-private canaries were seeded into facts, lessons, thoughts, episodes, the
+rolling conversation summary *and* prior recent conversation state — the last
+two being surfaces the earlier §22 test did not cover — plus a guest-private
+canary. An unverified turn's prompt contained **none of them**, on both a fresh
+conversation and the owner's own. The owner still received his own context, so
+this is isolation rather than blanket emptying.
+
+The unverified system prompt already states the voice is not recognised, that
+Nova does not know this person's details, and that it must not guess. The model
+disobeyed. `tests/test_step9_privacy_v52.py` pins all of it.
+
 ## The sentinel comparison
 
 Sentinels are letter-only, three-word, phonetically distinct phrases:
