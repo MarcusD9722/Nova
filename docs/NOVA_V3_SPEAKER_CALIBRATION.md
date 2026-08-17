@@ -451,6 +451,69 @@ session, and the prior session's scores were not retained.
 
 ---
 
+## P5.2 HUMAN CALIBRATION ATTEMPT 2 — PAUSED AT STEP 9 (harness false negative)
+
+**2026-08-16. Steps 1–8 completed; calibration fitted and applied.** Step 9
+reported `pass: false` with `marcus_got_own = false` **and**
+`guest_got_own = false`, while both privacy negatives "passed".
+
+Those negatives were **vacuous**: when nobody receives anything,
+"the guest did not get Marcus's sentinel" is true for the wrong reason. The
+result could not distinguish a memory failure from a detection failure, because
+the report kept neither the STT text nor the assistant reply.
+
+**The production path was then verified end to end and is correct.** Through the
+real turn pipeline, each speaker's ask prompt carries their own sentinel and not
+the other's; conversation state is isolated by *key*, not by filtering:
+
+```
+owner       conv_state:<cid>
+guest       conv_state:<cid>#speaker:<profile_id>
+unverified  conv_state:<cid>#unverified:<per-turn nonce>   (and stays empty)
+```
+
+**Root cause: the harness compared with exact `reply.includes("MARCUS-LIVE-551")`
+on a voice pipeline.** The store utterance passes through STT *before* it is
+stored, and STT renders a hyphenated, digit-bearing token as something like
+`Marcus live 551`. The model then answers with what it was given, and the exact
+string test reports a memory failure that never happened.
+
+Fixed by making the tokens transcribable and the comparison canonical — see
+*The sentinel comparison* below. **Steps 1–8 remain valid; only step 9 needs
+re-running.**
+
+---
+
+## The sentinel comparison
+
+Sentinels are letter-only, three-word, phonetically distinct phrases:
+
+| speaker | sentinel |
+|---|---|
+| Marcus | `COBALT ORCHARD PINE` |
+| guest | `SILVER HARBOR LANTERN` |
+
+No digits and no punctuation, so STT has nothing to reinterpret.
+
+Comparison canonicalizes both sides to **uppercase alphanumeric tokens** and
+requires a **consecutive exact token run**. Case, punctuation and whitespace are
+ignored; words are not. `Cobalt-orchard-pine` matches; `COBALT ORCHARD`,
+`COBALT ORCHARD LIME`, `PINE ORCHARD COBALT` and the other speaker's phrase all
+fail. There is no fuzzy or edit-distance matching — a near-miss is a miss.
+
+**The same function backs the positive checks and the privacy checks.** Anything
+that makes "Marcus got his own" easier to satisfy makes "the guest got Marcus's"
+easier to *detect* by exactly the same amount. Normalising only the positives
+would weaken leak detection while making the test look better, which is the
+wrong trade twice over.
+
+Every sentinel turn now records `stt_text`, `assistant_reply`, their canonical
+token forms, speaker status, profile id and conversation id — so a future
+failure can be diagnosed from the report instead of by recording it all again.
+These are synthetic test tokens; no embedding, similarity or audio is added.
+
+---
+
 ## Status of this phase
 
 **Implementation: complete. Human calibration: NOT RUN (attempt 1 incomplete,

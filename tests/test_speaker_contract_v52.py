@@ -467,8 +467,17 @@ async def test_harness_sentinel_shares_one_conversation():
     phases = re.findall(r'phase:"([^"]+)"', flat)
     check(phases == ["store", "store", "ask", "ask", "ask"],
           f"two stores then three asks ({phases})")
-    check("MARCUS-LIVE-551" in steps and "GUEST-LIVE-661" in steps,
-          "each speaker stores their own sentinel")
+    # Letter-only sentinels: a voice pipeline transcribes the store utterance
+    # BEFORE storing it, and STT renders a hyphenated digit-bearing token as
+    # words — which is what made run 2 report a memory failure that had not
+    # happened. The tokens live in SENTINELS and the cues interpolate them.
+    tokens = html[html.index("const SENTINELS"):html.index("function canonTokens")]
+    check("COBALT ORCHARD PINE" in tokens and "SILVER HARBOR LANTERN" in tokens,
+          "each speaker stores their own letter-only sentinel")
+    check(not any(c.isdigit() for c in tokens),
+          "with no digits for STT to spell out")
+    check("${SENTINELS.marcus}" in steps and "${SENTINELS.guest}" in steps,
+          "and the spoken cues interpolate exactly those tokens")
     check("chatTurn(blob, CID)" in code,
           "and every turn goes through the full /stt -> /chat pipeline with that CID")
 
