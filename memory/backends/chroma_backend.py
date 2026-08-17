@@ -94,15 +94,26 @@ SEMANTIC_DIM = 384
 
 
 def semantic_model_id() -> str:
-    import os
-    return os.getenv("NOVA_EMBED_MODEL", "BAAI/bge-small-en-v1.5").strip() \
-        or "BAAI/bge-small-en-v1.5"
+    from memory import embeddings as emb_mod
+    return emb_mod.embedding_model_id()
+
+
+def semantic_model_revision() -> str:
+    """The pinned model repository commit — part of the space identity.
+
+    A repository can change its weights while keeping the same model id, so
+    without this a silent upstream reupload would give: same id, same dimension,
+    same pooling, DIFFERENT vectors, reusing the same collection. The revision is
+    what makes "one collection == one vector space" true rather than hopeful.
+    """
+    from memory import embeddings as emb_mod
+    return emb_mod.embedding_revision()
 
 
 def semantic_space_id() -> str:
     """Full, human-readable identity of the vector space."""
-    return (f"{SEMANTIC_BACKEND}|{semantic_model_id()}|{SEMANTIC_ALGORITHM}"
-            f"|{SEMANTIC_DIM}")
+    return (f"{SEMANTIC_BACKEND}|{semantic_model_id()}"
+            f"@{semantic_model_revision()}|{SEMANTIC_ALGORITHM}|{SEMANTIC_DIM}")
 
 
 def semantic_collection_name() -> str:
@@ -198,6 +209,10 @@ class ChromaMemoryBackend:
         self._skipped_writes = 0
         self._skipped_queries = 0
         self._last_skip_reason = ""
+        #: Set only between begin_staged_rebuild() and commit/abort. While set,
+        #: writes go to staging and a skip becomes a raise.
+        self._staging: Any | None = None
+        self._writing_staged = False
 
     # ── honest state, for /status ─────────────────────────────────────────────
     def semantic_status(self) -> dict[str, Any]:
@@ -207,10 +222,20 @@ class ChromaMemoryBackend:
         except Exception as e:  # noqa: BLE001
             available, err = False, str(e)[:200]
         else:
-            err = ""
+            # `embedding_available()` CATCHES the load failure and returns False,
+            # so the except branch above can never see a normal model-load error
+            # — it only fires if the availability check itself explodes. The real
+            # reason lives in `embeddings.load_error()`, which is the only place
+            # that has it. Reading it here is what makes `load_error` mean
+            # something instead of always being null.
+            err = "" if available else (emb_mod.load_error() or "")
+            if not available and not err:
+                err = ("the embedding model is not loaded and reported no error "
+                       "(it may not have been asked to load yet)")
         return {
             "backend": SEMANTIC_BACKEND,
             "model": semantic_model_id(),
+            "revision": semantic_model_revision(),
             "algorithm": SEMANTIC_ALGORITHM,
             "dimension": SEMANTIC_DIM,
             "space_id": semantic_space_id(),
@@ -256,6 +281,7 @@ class ChromaMemoryBackend:
                       "nova_semantic_space": semantic_space_id(),
                       "nova_semantic_backend": SEMANTIC_BACKEND,
                       "nova_semantic_model": semantic_model_id(),
+                      "nova_semantic_revision": semantic_model_revision(),
                       "nova_semantic_algorithm": SEMANTIC_ALGORITHM},
         )
 
@@ -271,18 +297,26 @@ class ChromaMemoryBackend:
         metas = [metadata] if metadata else None
         async with self._lock:
             await asyncio.to_thread(self._ensure)
+            target = self._staging if self._writing_staged else self._collection
             try:
                 await asyncio.to_thread(
-                    self._collection.upsert,
+                    target.upsert,
                     ids=[doc_id],
                     documents=[str(text)],
                     metadatas=metas,
                 )
             except SemanticUnavailable as e:
-                # SKIP, do not substitute. SQLite already holds this record, so
-                # the only loss is semantic recall until the model returns — and
-                # a rebuild can restore it from the authoritative store.
+                # Live: SKIP, do not substitute. SQLite already holds this record,
+                # so the only loss is semantic recall until the model returns —
+                # and a rebuild can restore it from the authoritative store.
+                #
+                # Staged rebuild: RAISE. A skipped record inside a rebuild is a
+                # hole in the thing being promoted, and promoting a holed index
+                # would state coverage that does not exist. The caller aborts and
+                # the previous index survives.
                 self._note_skip("write", e)
+                if self._writing_staged:
+                    raise
                 return
 
     async def query(self, q: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -340,6 +374,90 @@ class ChromaMemoryBackend:
             self._client = None
             await asyncio.to_thread(self._ensure)
 
+
+    # ── atomic rebuild: staging collection, promoted only on full success ─────
+    #
+    # `reset()` then N independent writes is not a rebuild, it is a demolition
+    # followed by an attempt. If the embedder dies or an upsert fails at record
+    # 400 of 900, what survives is a partial index that looks exactly like a
+    # complete one — and the previous, working index is already gone.
+    #
+    # So a rebuild builds into a SEPARATE collection and only becomes
+    # authoritative when every record is in. On failure the staging collection is
+    # dropped and the OLD index is still there, untouched: better than the empty
+    # collection the brief allows as a minimum, and the same guarantee.
+
+    def _staging_name(self) -> str:
+        return f"{self._collection_name}__staging"
+
+    async def begin_staged_rebuild(self) -> None:
+        """Start writing into a fresh staging collection instead of the live one."""
+        async with self._lock:
+            await asyncio.to_thread(self._ensure)
+            assert self._client is not None
+            staging = self._staging_name()
+            # A staging collection left behind by an earlier crashed rebuild is
+            # garbage, never a partial result to resume from.
+            try:
+                await asyncio.to_thread(self._client.delete_collection, staging)
+            except Exception:
+                pass
+            self._staging = await asyncio.to_thread(
+                self._client.get_or_create_collection,
+                name=staging,
+                embedding_function=self._emb,
+                metadata={"hnsw:space": "cosine",
+                          "nova_semantic_space": semantic_space_id(),
+                          "nova_semantic_backend": SEMANTIC_BACKEND,
+                          "nova_semantic_model": semantic_model_id(),
+                          "nova_semantic_revision": semantic_model_revision(),
+                          "nova_semantic_algorithm": SEMANTIC_ALGORITHM,
+                          "nova_staging": "true"},
+            )
+            self._writing_staged = True
+
+    async def abort_staged_rebuild(self) -> None:
+        """Throw the staging collection away. The live index is left as it was."""
+        async with self._lock:
+            self._writing_staged = False
+            self._staging = None
+            if self._client is None:
+                return
+            try:
+                await asyncio.to_thread(self._client.delete_collection, self._staging_name())
+            except Exception:
+                pass
+
+    async def commit_staged_rebuild(self) -> int:
+        """Promote staging to authoritative. Returns the promoted record count.
+
+        The live collection is deleted and staging is RENAMED into its place, so
+        there is no window in which records are half-copied. If the rename fails
+        the live collection is recreated empty rather than left missing — empty is
+        recoverable from SQLite, absent is a crash on next read.
+        """
+        async with self._lock:
+            if self._client is None or self._staging is None:
+                raise RuntimeError("commit_staged_rebuild called without a staged rebuild")
+            count = int(await asyncio.to_thread(self._staging.count))
+            try:
+                await asyncio.to_thread(self._client.delete_collection, self._collection_name)
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(self._staging.modify, name=self._collection_name)
+            finally:
+                self._writing_staged = False
+                self._staging = None
+                self._collection = None
+                await asyncio.to_thread(self._ensure)
+            return count
+
+    async def staged_count(self) -> int:
+        async with self._lock:
+            if self._staging is None:
+                return 0
+            return int(await asyncio.to_thread(self._staging.count))
 
     async def delete_ids(self, ids: list[str]) -> None:
         """Best-effort delete of documents by id."""

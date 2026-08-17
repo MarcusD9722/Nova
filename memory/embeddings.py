@@ -19,6 +19,21 @@ logger = get_logger(__name__)
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
 
+#: The EXACT model repository commit Nova embeds with. This is the revision
+#: already cached on this machine (verified in
+#: ~/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5/refs/main), so pinning
+#: it changes no weights and triggers no download.
+#:
+#: A repository can change its weights while keeping the same model id. Same id,
+#: same 384 dimensions, same pooling — different vectors. Without the revision in
+#: the identity, a silent upstream reupload would reuse the same persistent Chroma
+#: collection and mix two vector spaces, which is the exact class of corruption
+#: this pin exists to prevent. "main" and "latest" are not identities; a commit is.
+_DEFAULT_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+
+#: Loose labels a caller might set that do NOT identify a fixed vector space.
+_UNPINNED_REVISIONS = {"", "main", "master", "latest", "head", "none"}
+
 _lock = threading.Lock()
 _model: Any | None = None
 _tokenizer: Any | None = None
@@ -57,9 +72,14 @@ def _load() -> None:
     else:
         device = requested
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # ONE revision value, passed to BOTH loads. Loading the tokenizer from one
+    # commit and the weights from another would be a third vector space nobody
+    # named.
+    revision = embedding_revision()
+    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
     model = AutoModel.from_pretrained(
         model_id,
+        revision=revision,
         torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
     )
     model = model.to(device).eval()
@@ -67,7 +87,29 @@ def _load() -> None:
     _tokenizer = tokenizer
     _model = model
     _device = device
-    logger.info("embedding_model_loaded", model=model_id, device=device)
+    logger.info("embedding_model_loaded", model=model_id, revision=revision, device=device)
+
+
+def embedding_model_id() -> str:
+    return os.getenv("NOVA_EMBED_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
+
+
+def embedding_revision() -> str:
+    """The pinned model repository commit. THE authoritative revision value.
+
+    An override that is not a fixed commit is refused rather than honoured: a
+    caller setting NOVA_EMBED_REVISION=main would silently re-open exactly the
+    hole this closes. Overriding to a real commit is fine and yields its own
+    collection, because `semantic_space_id()` includes this.
+    """
+    raw = (os.getenv("NOVA_EMBED_REVISION", "") or "").strip()
+    if raw and raw.lower() not in _UNPINNED_REVISIONS:
+        return raw
+    if raw:
+        logger.warning("embedding_revision_override_ignored", requested=raw,
+                       using=_DEFAULT_REVISION,
+                       reason="a moving ref is not a vector-space identity")
+    return _DEFAULT_REVISION
 
 
 def embedding_available() -> bool:
@@ -126,7 +168,11 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     Raises if the model is unavailable — call embedding_available() first.
     """
     if not embedding_available():
-        raise RuntimeError(f"embedding model unavailable: {_load_failed}")
+        # `_load_failed` is None when the model simply is not loaded rather than
+        # having failed to load, and "unavailable: None" reads like a bug in the
+        # error path instead of a state.
+        raise RuntimeError("embedding model unavailable: "
+                           + (_load_failed or "not loaded"))
 
     import torch  # type: ignore
 

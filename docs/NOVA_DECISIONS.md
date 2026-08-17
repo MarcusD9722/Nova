@@ -912,3 +912,122 @@ place the approval window is written.
 **Revisit if.** A tool needs to wait on something slower than a human (a long
 build, an external job). Give it its own declared budget; do not reuse the
 permission constant for it.
+
+### D18 addendum (2026-08-17, review round 1)
+
+Five gaps in the above were found in independent review. Four were proof or
+correctness gaps in D18's own claims; all are closed.
+
+**The revision is part of the identity.** `semantic_space_id()` was
+`backend|model_id|algorithm|dimension`, and `memory/embeddings.py` loaded the
+model with no pinned revision. A Hugging Face repository can change its weights
+while keeping its model id, which yields: same id, same 384 dimensions, same CLS
+pooling, DIFFERENT vectors â€” reusing the same persistent collection. That is the
+original corruption arriving through a different door, and the identity could not
+see it.
+
+The commit already cached on this machine is now pinned:
+`5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`, verified against
+`~/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5/refs/main`, so pinning
+changed no weights and triggered no download. ONE value, passed to BOTH
+`AutoTokenizer.from_pretrained` and `AutoModel.from_pretrained` â€” loading a
+tokenizer from one commit and weights from another would be a third space nobody
+named. It appears in the space id, the collection metadata, `semantic_status()`,
+the tests and here. `NOVA_EMBED_REVISION` may override it with another commit, and
+a moving ref (`main`, `latest`, `head`) is REFUSED rather than honoured: an
+override of `main` would silently re-open the hole.
+
+The space id is now
+`bge|BAAI/bge-small-en-v1.5@<revision>|normalized-cls-v1|384` and the collection
+is `nova_sem_bge_b573f29469954dfc`. The previous, revision-less collection name is
+orphaned by this change and is treated exactly like `nova_memory_v2`: never read,
+never written, not deleted.
+
+**One canonical record builder, not two formatters.** D18 claimed a rebuild wrote
+"the same ids and text shape `index_document` writes, so a rebuild is
+indistinguishable from live indexing". It was not:
+
+    live document chunk:    "FILE notes.txt (part 1/4): ..."
+    rebuilt document chunk: "FILE notes.txt (part 1): ..."
+
+    live turn:              id "turn:<uuid>",  text "Marcus said: ..."
+    rebuilt turn:           id "<uuid>",       text "..."
+
+Different embedded text is a different vector for the same source row, so a
+"rebuild" quietly changed what recall would match. The turn case was worse than
+cosmetic: without the `turn:` prefix a rebuild wrote records that live code could
+neither find nor delete, in the same flat id namespace as facts.
+
+`memory/semantic_records.py` now owns the id, embedded text and metadata for all
+five classes, and both the live path and the rebuild call it. The property is
+structural instead of asserted.
+
+**A rebuild is all-or-nothing.** The old flow was an availability precheck, then
+`reset()`, then N independent writes, each class wrapped in its own
+`except: log and continue`. It could not fail honestly: a model that died at
+record 400 of 900 left a partial index that looked exactly like a complete one,
+and the working index it replaced was already deleted. D18's own words â€” "a
+half-built one is a false claim about coverage" â€” were not enforced by the code.
+
+Records are now written to a STAGING collection and promoted by rename only after
+every one lands, with the staged count checked against the number written. On any
+failure the staging collection is dropped and the OLD index survives untouched â€”
+stronger than the empty-but-recoverable state the review allowed as a minimum. A
+skipped write is the LIVE behaviour by design; inside a staged rebuild it RAISES,
+because a skip there is a hole in the thing about to be promoted. A failed rebuild
+appends no snapshot and returns `complete: False` with a reason and zero counts.
+
+**`load_error` could never report a load failure.** `embedding_available()`
+catches the model-load exception and returns False, so a `try/except` around it
+only ever sees a failure of the availability check itself. `semantic_status()` now
+reads `embeddings.load_error()`, which is the only place that holds the reason.
+
+**Alternatives rejected.** Keeping two formatters with a test that compares them
+(rejected: the test is the only thing holding them together, and it is exactly
+what did not exist before); deleting the orphaned revision-less collection
+(rejected: same reasoning as `nova_memory_v2` â€” it is data, and this PR does not
+delete data to tidy up); wiping the index on a failed rebuild (rejected: keeping
+the old one is strictly better and the staging rename makes it free).
+
+**Evidence.** `tests/test_semantic_vector_space_p10.py`, 100 checks: a different
+revision yields a different collection with model id and dimension unchanged; both
+loads are pinned, read from the AST; live and rebuilt records are compared id by
+id, text by text and metadata by metadata after writing all five classes through
+production APIs; a rebuilt turn and a rebuilt document chunk are queried
+successfully and survive reconstruction of `MemoryUnifier`; a failure injected mid
+rebuild leaves the previous 20-record index intact with no staging collection and
+no success snapshot, and a clean rebuild afterwards restores all 20; the two
+staging guards are also exercised directly at the backend, because driving them
+through the unifier could not reach them.
+
+**Known untested.** The staged-count check is defence in depth against a Chroma
+upsert that reports success without storing. Removing it alone leaves the suite
+green â€” with the raise in place nothing can silently vanish â€” and inducing that
+state would require mocking Chroma. It is kept as a cheap invariant, not claimed
+as proven.
+
+### D19 addendum (2026-08-17, review round 1)
+
+**The frontend claim was withdrawn.** D19 said `permission.expired` "lets the UI
+withdraw a button it cannot honour". Checked, and it does not: nothing in
+`frontend/src` consumes `permission.requested` or `permission.expired` â€” every
+match for "permission" there is browser mic, camera or geolocation. There is no
+approval surface, so there was nothing to fix surgically and building one is out
+of scope for a blocker PR.
+
+The event is still emitted for a future consumer, and the correctness of the fix
+does not rest on it: `resolve()` refuses a settled request regardless of what any
+client displays. The absence is now pinned by a test that FAILS if a frontend
+consumer appears, so whoever adds the approval UI has to test its lifecycle rather
+than inherit an assumption. Frontend approval lifecycle status: NOT TESTED.
+
+**The integration is now proven against the real runtime.** The suite built a gate
+with the same shape as `RuntimeManager`'s production closure, which is not proof
+for a defect that lived in the wiring between `Agent.run`'s timeout, the
+registration and `_gate`. A case now constructs the actual `RuntimeManager` on
+temp directories with a stub LLM that RAISES if called, and drives the tools it
+registered itself: the live router reports 140s for `project.delete` and 25s for
+`project.trash`, `permission.requested` is published by the real broker at tier
+`admin`, approval deletes to `.trash` exactly once with a truthful result, restore
+returns the exact file contents, a denial leaves the project untouched, and the
+audit ends `approved, approved, rejected` with nothing pending.

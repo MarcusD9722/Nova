@@ -173,11 +173,17 @@ class PermissionBroker:
     def _close_out(self, request_id: str, outcome: str, reason: str) -> bool:
         """Drop a pending request that will never run, and say so once.
 
-        Removing it from `_pending` is the security-relevant half: a request left
-        pending is still listed as awaiting approval and still resolvable, so a
-        click minutes later would return True for an action whose caller is long
-        gone. The bus event exists so the UI takes the button away rather than
-        offering an approval that cannot be honoured.
+        Removing it from `_pending` is the security-relevant half, and it is the
+        half that actually protects anything: a request left pending is still
+        listed by `pending()` and still resolvable, so a click minutes later would
+        return True for an action whose caller is long gone.
+
+        `permission.expired` is published for whatever consumes the bus. Be precise
+        about what that buys today: as of this commit NOTHING in frontend/src
+        consumes `permission.requested` or `permission.expired` — there is no
+        approval UI to withdraw a button from. The event is emitted so a future
+        one can be correct; the correctness here does not depend on it, because
+        `resolve()` refuses a settled request regardless of what any client shows.
         """
         fut = self._pending.pop(str(request_id), None)
         if fut is None:

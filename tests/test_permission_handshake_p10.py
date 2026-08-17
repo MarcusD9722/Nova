@@ -731,6 +731,187 @@ def case_2f() -> None:
     asyncio.run(run())
 
 
+class _StubLLM:
+    """Stands in for LLMRuntime.
+
+    Not a convenience: the delete path must never reach the model, and a stub that
+    RAISES proves it. Loading a real 9B model to test a folder move would also put
+    this suite behind a GPU.
+    """
+
+    gpu_status = type("S", (), {"status": "stub"})()
+
+    async def initialize(self):
+        return None
+
+    async def generate(self, *a, **k):
+        raise AssertionError("the project.delete path must not call the model")
+
+    async def chat(self, *a, **k):
+        raise AssertionError("the project.delete path must not call the model")
+
+
+def case_runtime() -> None:
+    """The ACTUAL production RuntimeManager, its registered tools, its own broker.
+
+    Everything above builds a gate with the same SHAPE as the production closure.
+    That is not proof of the integration defect we fixed: the bug lived in the
+    wiring between `Agent.run`'s timeout, the registration, and `_gate`. So this
+    case constructs the real `RuntimeManager` on temp directories and drives the
+    tools it registered itself.
+    """
+    print("\nRUNTIME  the real RuntimeManager, real registered project.delete")
+
+    async def run() -> None:
+        from core.event_bus import BUS
+        from core.runtime import RuntimeManager
+        from core.tooling import build_tool_router
+        from memory.unifier import MemoryUnifier
+
+        with TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            projects = root / "projects"
+            (projects / "toy").mkdir(parents=True)
+            (projects / "toy" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+            (projects / "toy" / "README.md").write_text("# toy\n", encoding="utf-8")
+            mem_dir = root / "memory"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+
+            mem = MemoryUnifier(mem_dir)
+            await mem.initialize()
+            router = build_tool_router(repo_root=root, projects_dir=projects, memory=mem)
+            rt = RuntimeManager(repo_root=root, projects_dir=projects, memory=mem,
+                                llm=_StubLLM(), router=router, memory_dir=mem_dir)
+            broker = rt.permission_broker
+
+            check("R1 the real runtime registered project.delete and project.restore",
+                  "project.delete" in rt._router.list_tools()
+                  and "project.restore" in rt._router.list_tools())
+            # Asserted on the LIVE router object, not on source text.
+            check("R2 the LIVE router gives project.delete the permission budget",
+                  rt._router.timeout_for("project.delete") == PERMISSION_TOOL_TIMEOUT_S,
+                  f"{rt._router.timeout_for('project.delete'):g}s")
+            check("R3 and it beats the agent loop's generic value",
+                  rt._router.timeout_for("project.delete", DEFAULT_TOOL_TIMEOUT_S)
+                  == PERMISSION_TOOL_TIMEOUT_S,
+                  f"generic {DEFAULT_TOOL_TIMEOUT_S:g}s -> "
+                  f"{rt._router.timeout_for('project.delete', DEFAULT_TOOL_TIMEOUT_S):g}s")
+            check("R4 an ordinary registered tool is NOT raised to it",
+                  rt._router.timeout_for("project.trash") == DEFAULT_TOOL_TIMEOUT_S,
+                  f"project.trash = {rt._router.timeout_for('project.trash'):g}s")
+            check("R5 the audit log lands under the temp memory dir",
+                  str(broker._audit_path).startswith(str(root)),  # noqa: SLF001
+                  str(broker._audit_path))                        # noqa: SLF001
+
+            # ── DELETE, approved ────────────────────────────────────────────
+            q = BUS.subscribe()
+            task = asyncio.create_task(rt._router.execute(
+                ToolCall(name="project.delete", args={"name": "toy"}), retries=0))
+            await asyncio.sleep(0.4)
+
+            seen = []
+            while not q.empty():
+                seen.append(q.get_nowait())
+            BUS.unsubscribe(q)
+            requested = [e for e in seen if e.type == "permission.requested"]
+            check("R6 permission.requested was published by the real broker",
+                  len(requested) == 1, f"events={[e.type for e in seen]}")
+            check("R7 naming the capability and its tier",
+                  requested and requested[0].data.get("capability") == "project.delete"
+                  and requested[0].data.get("tier") == "admin",
+                  str(requested[0].data if requested else None))
+
+            pend = broker.pending()
+            check("R8 exactly one request is pending", len(pend) == 1, str(pend))
+            rid = pend[0]["request_id"]
+            check("R9 resolving it reports that it applied",
+                  broker.resolve(rid, True, by="marcus") is True)
+
+            res = await task
+            entry = (res.result or {}).get("moved_to_trash", "")
+            check("R10 the operation completed", res.ok is True and (res.error or "") == "",
+                  f"ok={res.ok} error={res.error!r}")
+            check("R11 the source directory is gone", not (projects / "toy").exists())
+            trash_entries = sorted(pp.name for pp in (projects / ".trash").glob("*"))
+            check("R12 exactly ONE trash entry exists",
+                  trash_entries == [entry] and len(trash_entries) == 1,
+                  f"entry={entry!r} trash={trash_entries}")
+            check("R13 holding the real files",
+                  (projects / ".trash" / entry / "main.py").exists()
+                  and (projects / ".trash" / entry / "README.md").exists())
+            check("R14 the tool result is truthful about what happened",
+                  (res.result or {}).get("ok") is True
+                  and (res.result or {}).get("files") == 2
+                  and (res.result or {}).get("recoverable") is True
+                  and entry in str((res.result or {}).get("note", "")),
+                  f"result={res.result}")
+            check("R15 no request is left pending", broker.pending() == [])
+            check("R16 the audit records exactly one approval",
+                  sum(1 for e in broker.audit_log(limit=50)
+                      if e.get("outcome") == "approved") == 1,
+                  str([e.get("outcome") for e in reversed(broker.audit_log(limit=50))]))
+
+            # ── RESTORE, approved ───────────────────────────────────────────
+            task = asyncio.create_task(rt._router.execute(
+                ToolCall(name="project.restore", args={"entry": entry}), retries=0))
+            await asyncio.sleep(0.4)
+            pend = broker.pending()
+            check("R17 restore also asks permission", len(pend) == 1, str(pend))
+            broker.resolve(pend[0]["request_id"], True, by="marcus")
+            res = await task
+            check("R18 the content is restored exactly as it was",
+                  res.ok
+                  and (projects / "toy" / "main.py").read_text(encoding="utf-8") == "print('hi')\n"
+                  and (projects / "toy" / "README.md").read_text(encoding="utf-8") == "# toy\n",
+                  f"result={res.result}")
+            check("R19 and the trash entry is consumed, not duplicated",
+                  [pp.name for pp in (projects / ".trash").glob("*")] == [],
+                  str([pp.name for pp in (projects / ".trash").glob("*")]))
+
+            # ── DELETE, denied ──────────────────────────────────────────────
+            task = asyncio.create_task(rt._router.execute(
+                ToolCall(name="project.delete", args={"name": "toy"}), retries=0))
+            await asyncio.sleep(0.4)
+            broker.resolve(broker.pending()[0]["request_id"], False, by="marcus")
+            res = await task
+            check("R20 a denied delete leaves the project untouched",
+                  (res.result or {}).get("status") == "not_approved"
+                  and (projects / "toy" / "main.py").exists(),
+                  f"result={res.result}")
+            check("R21 audited as rejected, never as approved",
+                  sum(1 for e in broker.audit_log(limit=50)
+                      if e.get("outcome") == "rejected") == 1
+                  and sum(1 for e in broker.audit_log(limit=50)
+                          if e.get("outcome") == "approved") == 2,
+                  str([e.get("outcome") for e in reversed(broker.audit_log(limit=50))]))
+            check("R22 nothing pending at the end", broker.pending() == [])
+            check("R23 Marcus's real projects directory was never involved",
+                  str(projects).startswith(str(root)) and "Desktop" not in str(projects),
+                  str(projects))
+
+            # R24/R25 record a LIMIT, not an achievement. The backend emits
+            # `permission.expired`; no frontend consumes it. Claiming "the UI
+            # withdraws the button" would be unfounded, so the absence is pinned
+            # here instead — if an approval UI ever lands, this check fails and
+            # whoever adds it has to test the lifecycle properly (Stage-10 case 8).
+            fe = REPO / "frontend" / "src"
+            consumers = []
+            if fe.exists():
+                for f in list(fe.rglob("*.jsx")) + list(fe.rglob("*.js")):
+                    txt = f.read_text(encoding="utf-8", errors="ignore")
+                    if "permission.requested" in txt or "permission.expired" in txt:
+                        consumers.append(f.name)
+            check("R24 the broker emits permission.expired on abandonment",
+                  "permission.expired" in
+                  (REPO / "core" / "permissions.py").read_text(encoding="utf-8"))
+            check("R25 NO frontend approval lifecycle exists yet — not claimed as tested",
+                  consumers == [],
+                  f"consumers found: {consumers} — if this fails, the frontend "
+                  f"approval surface now exists and MUST be tested rather than assumed")
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     print("=" * 72)
     print("P10 PRE-FLIGHT — permission / tool timeout handshake")
@@ -738,7 +919,7 @@ if __name__ == "__main__":
           f"budget {BUDGET:g}s | approve at {APPROVE_AT:g}s")
     print("=" * 72)
     for fn in (case_a, case_a_wiring, case_b, case_c, case_d, case_e, case_f,
-               case_g, case_h, case_2f):
+               case_g, case_h, case_2f, case_runtime):
         fn()
     print("\n" + "=" * 72)
     print(f"RESULT: {'ALL PASS' if not FAIL else 'FAILURES'}  "
