@@ -71,21 +71,32 @@ MAX_FALSE_ACCEPTS = 0
 # unexamined guess carried over from synthetic fixtures whose scores happened to
 # be high; real speech is not obliged to agree with it.
 #
-# LOWER BOUND 0.00, and this one IS principled rather than a guess. A cosine
-# threshold at or below zero cannot express an identity claim: it admits vectors
-# with no directional agreement with the centroid at all, which for 192-d unit
-# vectors is roughly half of everything. The empirical bars below ("no impostor
-# in THIS sample cleared it") cannot protect against that, because the sample is
-# 12-23 utterances and the runtime population is every voice that ever speaks.
-# If no non-negative threshold satisfies both bars, the honest answer is that
-# this pair of voices is not separable — so the fit fails closed.
+# LOWER BOUND 0.01 — the first STRICTLY POSITIVE grid point, and this one IS
+# principled rather than a guess. A cosine threshold at or below zero cannot
+# express an identity claim: it admits vectors with no directional agreement
+# with the centroid at all, which for 192-d unit vectors is roughly half of
+# everything. The empirical bars below ("no impostor in THIS sample cleared it")
+# cannot protect against that, because the sample is 12-23 utterances and the
+# runtime population is every voice that ever speaks.
+#
+# The floor is 0.01 and not 0.00 deliberately. With 0.00 on the grid the fitter
+# could SELECT exactly zero whenever every observed impostor happened to score
+# negative and >=90% of genuine samples cleared zero — a configuration that
+# satisfies both bars on paper while asserting an identity claim the policy
+# above says is meaningless. That is the exact fail-open this floor exists to
+# prevent, so zero is excluded from the candidate set rather than merely
+# discouraged in a comment.
+#
+# If no strictly positive threshold satisfies both bars, the honest answer is
+# that this pair of voices is not separable by a bar worth asserting — so the
+# fit fails closed and says which boundary it hit.
 #
 # UPPER BOUND 1.00 rather than 0.90, for the same reason the floor moved: 0.90
 # would reject a genuinely tight speaker whose impostor max sat above it.
 #
 # 0.01 resolution is kept: well below the run-to-run spread of a real voice, and
 # it keeps the search deterministic and explainable.
-THRESHOLD_MIN, THRESHOLD_MAX = 0.00, 1.00
+THRESHOLD_MIN, THRESHOLD_MAX = 0.01, 1.00
 THRESHOLD_GRID = [round(THRESHOLD_MIN + 0.01 * i, 2)
                   for i in range(int(round((THRESHOLD_MAX - THRESHOLD_MIN) / 0.01)) + 1)]
 
@@ -228,6 +239,20 @@ def fit_profile_threshold(profile_id: str, display_name: str,
                 f"threshold at or below {ceiling:.4f}, but an impostor reached "
                 f"{imax:.4f} — the distributions genuinely overlap, so any bar "
                 f"loose enough to admit them admits somebody else too"
+            )
+        elif ceiling < THRESHOLD_MIN:
+            # A threshold WOULD satisfy both bars, but only at or below zero —
+            # every impostor in this sample happened to score negative. Refusing
+            # is the policy, not a limitation, and the message must not blame
+            # the search range for a deliberate safety decision.
+            fit.reason = (
+                f"accepting {MIN_GENUINE_ACCEPT_RATE:.0%} of this speaker needs a "
+                f"threshold at or below {ceiling:.4f}, which is under the minimum "
+                f"{THRESHOLD_MIN:.2f} this system will assert. A bar that low "
+                f"admits voices with no directional agreement at all; the "
+                f"{len(impostor)} impostor samples here all scored below it, but "
+                f"that is a property of this sample, not of every voice that will "
+                f"ever speak. Refusing to calibrate rather than fail open"
             )
         elif not any(imax < c <= ceiling for c in THRESHOLD_GRID):
             # A valid threshold exists in the data but not on the grid. After
