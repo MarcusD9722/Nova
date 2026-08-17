@@ -80,10 +80,16 @@ def _node(body: str) -> dict:
         mod = Path(td) / "harness.cjs"
         mod.write_text(_script(), encoding="utf-8")
         driver = Path(td) / "run.cjs"
+        # The body is wrapped in an async IIFE so it may use `await` — a .cjs
+        # file has no top-level await, and switching to .mjs would break the
+        # CommonJS export the harness uses.
         driver.write_text(
             "const P52 = require(" + json.dumps(str(mod).replace("\\", "/")) + ");\n"
-            "const out = {};\n" + body + "\n"
-            "process.stdout.write(JSON.stringify(out));\n",
+            "const out = {};\n"
+            "(async () => {\n" + body + "\n})()\n"
+            "  .then(() => process.stdout.write(JSON.stringify(out)))\n"
+            "  .catch(e => { console.error(e && e.stack || String(e));"
+            " process.exit(1); });\n",
             encoding="utf-8")
         proc = subprocess.run([node, str(driver)], capture_output=True, text=True,
                               timeout=60)
@@ -588,11 +594,17 @@ async def test_step9_canary_comes_from_the_real_transcript():
     html = HARNESS.read_text(encoding="utf-8")
     flow = _code_only(html[html.index("async function sentinelFlow"):
                            html.index("async function permissionFlow")])
-    check("extractCanary(s.text)" in flow, "the canary is read from the /stt text")
-    check("throw new Error" in flow,
+    # The per-sample logic now lives in makeSentinelDoSample (PART 1) so it can
+    # be driven with injected deps — see the behavioural test below.
+    sample = _code_only(html[html.index("function makeSentinelDoSample"):
+                             html.index("// ── the guided stage")])
+    check("extractCanary(s.text)" in sample, "the canary is read from the /stt text")
+    check("throw new Error" in sample,
           "and a failed parse throws, so runBlock re-records the SAME index")
-    check("observed[spec.canaryFor] = pendingCanary" in flow,
+    check("ctx.observed[spec.canaryFor] = pendingCanary" in sample,
           "the observed canary is stored per speaker, only after /chat succeeds")
+    check("makeSentinelDoSample(" in flow,
+          "and the flow wires the real deps into it")
     # And every verdict compares against `observed`, never the cue card.
     for field in ("marcus_got_own", "guest_got_own", "guest_got_marcus",
                   "unverified_got_either"):
@@ -619,21 +631,30 @@ async def test_store_is_atomic_with_respect_to_chat():
           "the pipeline is split into /stt and /chat primitives")
     check("chatTurn(" not in flow,
           "the fused /stt->/chat call is gone from the sentinel flow")
-    stt_at = flow.index("await sttTurn(blob)")
-    extract_at = flow.index("extractCanary(s.text)")
-    ask_at = flow.index("isAskTranscript(s.text)")
-    chat_at = flow.index("await chatFromStt(")
+    sample_src = _code_only(html[html.index("function makeSentinelDoSample"):
+                                 html.index("// ── the guided stage")])
+    stt_at = sample_src.index("await deps.sttTurn(blob)")
+    extract_at = sample_src.index("extractCanary(s.text)")
+    ask_at = sample_src.index("isAskTranscript(s.text)")
+    chat_at = sample_src.index("await deps.chatFromStt(")
     check(stt_at < extract_at < chat_at,
           "the store canary is validated between /stt and /chat")
     check(stt_at < ask_at < chat_at,
           "the ask transcript is validated between /stt and /chat too")
-    check("throw new Error" in flow[extract_at:chat_at],
+    check("throw new Error" in sample_src[extract_at:chat_at],
           "a rejection throws BEFORE any /chat call is made")
 
     # Exactly one transcription per sample: no re-running Whisper on audio that
-    # already succeeded.
-    check(flow.count("await sttTurn(") == 1, "audio is transcribed exactly once")
-    check(flow.count("await chatFromStt(") == 1, "and redeemed at most once")
+    # already succeeded. (Proven behaviourally as well, further down.)
+    check(sample_src.count("await deps.sttTurn(") == 1,
+          "audio is transcribed exactly once")
+    check(sample_src.count("await deps.chatFromStt(") == 1,
+          "and redeemed at most once")
+    # The commit boundary covers the bookkeeping, not only the HTTP call.
+    check("committed = true" in sample_src and "committed && !e.postChat" in sample_src,
+          "everything after dispatch is inside the post-chat boundary")
+    check("throw PostChatError(" in sample_src,
+          "and a bookkeeping failure is promoted to a run abort")
 
     # The handle and text forwarded are THE ones /stt returned — the browser
     # never asserts identity.
@@ -781,6 +802,226 @@ async def test_ask_and_glue_grammar():
         check(w in out["stopwords"], f"{w} is rejected as a payload word")
 
 
+async def test_live_contract_consistency():
+    check.section("7: the CUE the human sees passes the VALIDATOR that runs")
+    # This is the test that was missing. The validator was only ever exercised
+    # against phrases invented next to it, so 99/99 stayed green while the
+    # printed cue ("What three words did I ask you to remember?") contained no
+    # MY and could never pass — a guaranteed live deadlock on all three asks.
+    out = _node("""
+      const U = P52.ASK_UTTERANCE;
+      out.utterance = U;
+      out.utterance_valid = P52.isAskTranscript(U);
+      out.cue_derives = P52.ASK_CUE.indexOf(U) >= 0;
+      // EVERY ask step, exactly as shown to the human.
+      out.asks = P52.SENTINEL_STEPS.filter(s => s.phase === "ask").map(s => {
+        const m = /say — "([^"]+)"/.exec(s.cue);
+        const spoken = m ? m[1] : null;
+        return {who: s.who, spoken, valid: spoken ? P52.isAskTranscript(spoken) : false,
+                derived: spoken === U};
+      });
+      // And the STORE cue: a perfect transcription must parse to the intended
+      // canary, or the store turn deadlocks the same way.
+      out.stores = P52.SENTINEL_STEPS.filter(s => s.canaryFor).map(s => {
+        const m = /say — "([^"]+)"/.exec(s.cue);
+        const spoken = m ? m[1] : null;
+        return {who: s.who, spoken, parsed: P52.extractCanary(spoken),
+                intended: P52.SENTINELS[s.canaryFor]};
+      });
+    """)
+    check(out["utterance_valid"] is True,
+          f"the real utterance {out['utterance']!r} passes the real validator")
+    check(out["cue_derives"] is True, "and the cue is derived from it")
+    check(len(out["asks"]) == 3, f"three ask turns ({len(out['asks'])})")
+    for a in out["asks"]:
+        check(a["valid"] is True,
+              f"{a['who']}: the spoken cue {a['spoken']!r} is ACCEPTED")
+        check(a["derived"] is True,
+              f"{a['who']}: and comes from ASK_UTTERANCE, not a second copy")
+    check(len(out["stores"]) == 2, "two store turns")
+    for s in out["stores"]:
+        check(s["parsed"] == s["intended"],
+              f"{s['who']}: a perfect transcription parses to {s['intended']!r} "
+              f"(got {s['parsed']!r})")
+
+
+async def test_sentinel_sample_behaviour_with_injected_deps():
+    check.section("3: real call COUNTS, not source-code shape")
+    out = _node("""
+      const REV = P52.STEP9_EVIDENCE_REVISION;
+      function harness(sttText, opts) {
+        opts = opts || {};
+        const calls = {stt: 0, chat: 0};
+        const ctx = {steps: P52.SENTINEL_STEPS, CID: "CID-1",
+                     observed: {marcus: null, guest: null}, replies: [],
+                     out: {steps: [], conversation_stable: true}};
+        const deps = {
+          sttTurn: async () => { calls.stt++;
+            return {text: sttText, speaker: {status: "known"}, handle: "h1"}; },
+          chatFromStt: async () => { calls.chat++;
+            if (opts.chatThrows) { const e = new Error("boom"); e.postChat = true; throw e; }
+            return {text: sttText, speaker: {status: "known"},
+                    reply: opts.reply || "ok",
+                    conversation_id: opts.cid === undefined ? "CID-1" : opts.cid}; },
+        };
+        // Optionally break the bookkeeping AFTER /chat returns.
+        if (opts.breakBookkeeping) {
+          Object.defineProperty(ctx.out, "steps",
+            {get() { throw new Error("bookkeeping exploded"); }});
+        }
+        return {calls, ctx, fn: P52.makeSentinelDoSample(deps, ctx)};
+      }
+      async function run(h, i) {
+        try { await h.fn(null, i); return {ok: true}; }
+        catch (e) { return {ok: false, msg: e.message, postChat: !!e.postChat}; }
+      }
+      // A. invalid STORE transcript -> stt 1, chat 0
+      let h = harness("uh what");
+      out.invalid = {r: await run(h, 0), calls: h.calls};
+      // B. valid STORE -> stt 1, chat 1
+      h = harness("Remember these three words blue tiger spoon");
+      out.valid = {r: await run(h, 0), calls: h.calls,
+                   observed: h.ctx.observed.marcus};
+      // C. invalid ASK -> stt 1, chat 0
+      h = harness("tell me about the weather");
+      out.badAsk = {r: await run(h, 2), calls: h.calls};
+      // D. valid ASK -> stt 1, chat 1
+      h = harness(P52.ASK_UTTERANCE);
+      out.goodAsk = {r: await run(h, 2), calls: h.calls};
+      // E. post-chat bookkeeping failure -> chat happened, must be postChat
+      h = harness(P52.ASK_UTTERANCE, {breakBookkeeping: true});
+      out.bookkeeping = {r: await run(h, 2), calls: h.calls};
+      // F. wrong conversation id -> postChat abort
+      h = harness(P52.ASK_UTTERANCE, {cid: "SOMEONE-ELSE"});
+      out.wrongCid = {r: await run(h, 2), calls: h.calls,
+                      stable: h.ctx.out.conversation_stable};
+      // G. null conversation id -> postChat abort
+      h = harness(P52.ASK_UTTERANCE, {cid: null});
+      out.nullCid = {r: await run(h, 2), calls: h.calls};
+      // H. /chat itself fails -> postChat
+      h = harness(P52.ASK_UTTERANCE, {chatThrows: true});
+      out.chatFails = {r: await run(h, 2), calls: h.calls};
+    """)
+
+    check(out["invalid"]["calls"] == {"stt": 1, "chat": 0},
+          f"invalid STORE: /stt once, /chat NEVER ({out['invalid']['calls']})")
+    check(out["invalid"]["r"]["postChat"] is False,
+          "and it is retryable, not an abort")
+    check(out["valid"]["calls"] == {"stt": 1, "chat": 1},
+          f"valid STORE: /stt once, /chat once ({out['valid']['calls']})")
+    check(out["valid"]["observed"] == "BLUE TIGER SPOON",
+          f"with the observed canary recorded ({out['valid']['observed']})")
+    check(out["badAsk"]["calls"] == {"stt": 1, "chat": 0},
+          f"malformed ASK: /stt once, /chat NEVER ({out['badAsk']['calls']})")
+    check(out["goodAsk"]["calls"] == {"stt": 1, "chat": 1},
+          f"the REAL ask utterance goes through ({out['goodAsk']['calls']})")
+    check(out["goodAsk"]["r"]["ok"] is True,
+          f"and succeeds ({out['goodAsk']['r'].get('msg')})")
+
+    # The whole point of item 2.
+    check(out["bookkeeping"]["calls"]["chat"] == 1,
+          "post-chat failure: /chat DID happen")
+    check(out["bookkeeping"]["r"]["postChat"] is True,
+          f"so it is promoted to a run-aborting error "
+          f"({out['bookkeeping']['r'].get('msg')})")
+    for name in ("wrongCid", "nullCid"):
+        check(out[name]["r"]["postChat"] is True,
+              f"{name}: a conversation-id mismatch ABORTS ({out[name]['r'].get('msg')})")
+    check(out["wrongCid"]["stable"] is False, "and is recorded as unstable")
+    check(out["chatFails"]["r"]["postChat"] is True,
+          "a /chat transport failure aborts too")
+
+
+async def test_effective_policy_helper_is_shared():
+    check.section("4: one policy helper, used everywhere")
+    out = _node("""
+      const C = P52.calibratedPolicyStatus;
+      const good = {threshold_calibrated:true, threshold_source:"calibrated",
+                    margin_source:"calibrated"};
+      out.good = C(good);
+      out.noStatus = C(null);
+      out.envT = C({...good, threshold_source:"env override"});
+      out.envM = C({...good, margin_source:"env override"});
+      out.provT = C({...good, threshold_source:"provisional default"});
+      out.provM = C({...good, margin_source:"provisional default"});
+      out.notCal = C({...good, threshold_calibrated:false});
+      out.problemEnv = P52.policyProblem({...good, threshold_source:"env override"});
+      out.problemNone = P52.policyProblem(null);
+      out.problemGood = P52.policyProblem(good);
+    """)
+    check(out["good"] is True, "all three calibrated -> true")
+    for k in ("noStatus", "envT", "envM", "provT", "provM", "notCal"):
+        check(out[k] is False, f"{k} -> false")
+    check("env override" in out["problemEnv"], f"and says why ({out['problemEnv']})")
+    check("press Check" in out["problemNone"], "no status tells the human to Check")
+    check(out["problemGood"] == "", "a good policy reports no problem")
+
+    html = HARNESS.read_text(encoding="utf-8")
+    code = _code_only(html)
+    # One definition, used by Apply, Check, both preflights and acceptance.
+    check(code.count("function calibratedPolicyStatus") == 1,
+          "the helper is defined once")
+    check(code.count("calibratedPolicyStatus(") >= 4,
+          f"and consulted from several places ({code.count('calibratedPolicyStatus(')})")
+    check("policyPreflight(\"Step 8 validation\")" in code,
+          "step 8 preflights the policy")
+    check("policyPreflight(\"Step 9\")" in code, "step 9 preflights the policy")
+    # The preflight must run BEFORE the mic and before state is cleared.
+    ms = code[code.index("msb.onclick"):code.index("ms.appendChild(msb)")]
+    check(ms.index("policyPreflight") < ms.index("S.sentinel = null"),
+          "and step 9's preflight runs BEFORE the previous result is cleared")
+    # Check button persists the status it fetched.
+    ping = code[code.index('$("#ping").onclick'):]
+    check("S.statusAfter = st" in ping, "the Check button PERSISTS the status")
+    check("threshold_source" in ping and "margin_source" in ping,
+          "and displays BOTH sources")
+
+
+async def test_step_gating_predicates():
+    check.section("5: a failed mandatory gate cannot be stepped past")
+    out = _node("""
+      const REV = P52.STEP9_EVIDENCE_REVISION;
+      const ready = {marcusId:"m", guestId:"g",
+        enroll:{marcus:{meets_p52_bar:true}, guest:{meets_p52_bar:true}},
+        applied:true, validation:[{}], sentinel:null, permission:null};
+      out.s9ready = P52.step9Ready(ready);
+      out.s9notReady = P52.step9Ready({...ready, applied:false});
+      out.s9noValidation = P52.step9Ready({...ready, validation:[]});
+
+      const pass9 = {...ready, sentinel:{pass:true, evidence_revision:REV}};
+      const fail9 = {...ready, sentinel:{pass:false, evidence_revision:REV}};
+      const old9  = {...ready, sentinel:{pass:true, evidence_revision:"p52-OLD"}};
+      out.s10_afterPass = P52.step10Ready(pass9);
+      out.s10_afterFail = P52.step10Ready(fail9);
+      out.s10_afterOld  = P52.step10Ready(old9);
+      out.s10_afterNone = P52.step10Ready(ready);
+
+      out.s11_afterPass = P52.step11Ready({...pass9, permission:{pass:true}});
+      out.s11_afterFail = P52.step11Ready({...pass9, permission:{pass:false}});
+      out.s11_afterNone = P52.step11Ready(pass9);
+    """)
+    check(out["s9ready"] is True, "step 9 available once steps 1-8 exist")
+    check(out["s9notReady"] is False, "not before calibration is applied")
+    check(out["s9noValidation"] is False, "nor before step 8 validation exists")
+    check(out["s10_afterPass"] is True, "step 10 available after a step-9 PASS")
+    check(out["s10_afterFail"] is False, "NOT after a step-9 failure")
+    check(out["s10_afterOld"] is False,
+          "NOT after an old-revision step-9 PASS")
+    check(out["s10_afterNone"] is False, "nor with no step-9 result at all")
+    check(out["s11_afterPass"] is True, "step 11 available after a step-10 PASS")
+    check(out["s11_afterFail"] is False, "NOT after a step-10 failure")
+    check(out["s11_afterNone"] is False, "nor with no step-10 result")
+
+    html = HARNESS.read_text(encoding="utf-8")
+    code = _code_only(html)
+    for pred, btn in (("step9Ready", "msb"), ("step10Ready", "pmb"), ("step11Ready", "ltb")):
+        check(f"if (!{pred}(S))" in code and f"{btn}.disabled = true" in code,
+              f"{btn} is disabled when {pred} is false")
+    # Results must remain visible even when the next gate is locked.
+    check("ms.appendChild(el(\"pre\", null, JSON.stringify(S.sentinel" in code,
+          "a failed step-9 result stays on screen and copyable")
+
+
 async def test_sentinel_comparison_is_symmetric():
     check.section("STEP 9: one comparison rule for positives AND privacy")
     html = HARNESS.read_text(encoding="utf-8")
@@ -804,8 +1045,9 @@ async def test_sentinel_comparison_is_symmetric():
 async def test_sentinel_turns_carry_raw_evidence():
     check.section("STEP 9: raw STT and reply are recorded for diagnosis")
     html = HARNESS.read_text(encoding="utf-8")
-    flow = html[html.index("async function sentinelFlow"):
-                html.index("async function permissionFlow")]
+    # The recorded object lives in makeSentinelDoSample (PART 1) now.
+    flow = html[html.index("function makeSentinelDoSample"):
+                html.index("// ── the guided stage")]
 
     for field in ("stt_text", "assistant_reply", "status", "profile_id",
                   "conversation_id", "stt_tokens", "reply_tokens"):
@@ -814,7 +1056,7 @@ async def test_sentinel_turns_carry_raw_evidence():
           "taken from the real /stt text and /chat reply")
     # Diagnostics, not biometrics — checked against the recorded object itself,
     # not the surrounding code (which legitimately has a `blob` parameter).
-    rec = flow[flow.index("out.steps.push({"):]
+    rec = flow[flow.index("ctx.out.steps.push({"):]
     rec = _code_only(rec[:rec.index("});") + 3])
     for banned in ("embedding", "centroid", "similarity", "blob", "audio",
                    "threshold"):
@@ -1014,6 +1256,10 @@ async def main():
     await test_store_is_atomic_with_respect_to_chat()
     await test_step9_evidence_revision_and_gating()
     await test_ask_and_glue_grammar()
+    await test_live_contract_consistency()
+    await test_sentinel_sample_behaviour_with_injected_deps()
+    await test_effective_policy_helper_is_shared()
+    await test_step_gating_predicates()
     await test_sentinel_comparison_is_symmetric()
     await test_sentinel_turns_carry_raw_evidence()
     await test_autosave_shape_is_non_audio_and_resumable()
