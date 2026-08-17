@@ -371,32 +371,69 @@ function stepLabel(step) { return (step && (step.label || step.who)) || ""; }
 //
 // So every piece of evidence now carries the generation it was measured under,
 // and anything that consumes it checks first.
-function generationOf(profileIds, status) {
-  const ids = (profileIds || []).slice().sort();
-  const model = (status && status.model_id) || "";
-  const rev = (status && status.model_revision) || "";
-  return ids.length ? `${model}@${rev}#${ids.join(",")}` : "";
+// THE INVARIANT IS ABOUT CENTROIDS, NOT POPULATION SIZE.
+//
+// The first attempt at this compared the whole compatible-profile set and
+// treated any change as staleness. That deadlocked a PERFECTLY CLEAN run: the
+// P5.2 protocol deliberately grows the population halfway through —
+//
+//     steps 3-4  Phase A      only Marcus is enrolled; the guest records 12
+//                             utterances as an UNENROLLED impostor, scored
+//                             against Marcus's centroid alone
+//     step 5     the guest is enrolled  {M} -> {M, G}
+//     step 6     Phase B      12 + 12, now scored against both
+//
+// so `trialsGeneration` ({M}) could never match the current set ({M,G}) and
+// step 6 was unreachable.
+//
+// The real rule is the one that was always meant: NO SCORE MAY DEPEND ON A
+// CENTROID THAT HAS BEEN DELETED OR REPLACED. Adding a profile invalidates
+// nothing. Replacing one invalidates exactly the evidence scored against it.
+//
+// So each block records the centroids its scores were measured against, and the
+// model build. Phase A honestly records {M} — the audio was never scored
+// against a guest centroid, and relabelling the impostor rows' TRUTH once the
+// guest is enrolled does not change what they were scored against.
+function buildOf(status) {
+  const m = (status && status.model_id) || "";
+  const r = (status && status.model_revision) || "";
+  return `${m}@${r}`;
 }
 
-/** The generation currently enrolled on the backend. */
-function currentGeneration(profiles, status) {
-  return generationOf((profiles || [])
-    .filter(p => p.compatible !== false)
-    .map(p => p.profile_id), status);
+function compatibleIds(profiles) {
+  return (profiles || []).filter(p => p.compatible !== false)
+                         .map(p => p.profile_id).sort();
 }
 
-/** Every stale piece of evidence, named. Empty when everything agrees. */
-function staleEvidence(S, current) {
+/** Record which centroids a block's scores were measured against. */
+function recordLineage(S, blockId, centroidIds, build) {
+  S.lineage = S.lineage || {};
+  S.lineage[blockId] = {build, centroids: (centroidIds || []).slice().sort()};
+  return S.lineage[blockId];
+}
+
+/**
+ * Which recorded blocks depended on a centroid that is now gone (or a different
+ * model build). Empty when every score still refers to something that exists.
+ */
+function staleLineage(S, currentIds, build) {
+  const present = new Set(currentIds || []);
   const bad = [];
-  const cmp = (label, gen) => {
-    if (gen && current && gen !== current) bad.push({what: label, generation: gen});
-  };
-  cmp("calibration trials", S.trialsGeneration);
-  cmp("proposal", S.proposalGeneration);
-  cmp("applied calibration", S.appliedGeneration);
-  cmp("validation trials", S.validationGeneration);
-  cmp("step 9 memory attribution", S.sentinel && S.sentinel.generation);
-  cmp("permission regression", S.permission && S.permission.generation);
+  const lineage = S.lineage || {};
+  Object.keys(lineage).forEach(blockId => {
+    const lin = lineage[blockId] || {};
+    if (build && lin.build && lin.build !== build) {
+      bad.push({block: blockId, why: `model build changed `
+                                   + `(${lin.build} -> ${build})`});
+      return;
+    }
+    const gone = (lin.centroids || []).filter(id => !present.has(id));
+    if (gone.length) {
+      bad.push({block: blockId, missing: gone,
+                why: `scored against centroid(s) that no longer exist: `
+                   + gone.join(", ")});
+    }
+  });
   return bad;
 }
 
@@ -431,17 +468,20 @@ function invalidateForProfile(S, profileId) {
                     || r.second_profile_id === profileId
                     || r.predicted_profile_id === profileId;
   if ((S.trials || []).some(touches)) {
-    S.trials = []; S.trialsGeneration = null; dropped.push("trials");
+    S.trials = []; dropped.push("trials");
     delete S.blocks.trials_marcus; delete S.blocks.trials_guest;
     delete S.blocks.phaseb_marcus; delete S.blocks.phaseb_guest;
   }
   if ((S.validation || []).some(touches)) {
-    S.validation = []; S.validationGeneration = null; dropped.push("validation");
+    S.validation = []; dropped.push("validation");
     delete S.blocks.valid_marcus; delete S.blocks.valid_guest;
   }
   // The fit, and everything downstream of it, described the old population.
-  S.proposal = null; S.proposalGeneration = null;
-  S.applied = false; S.appliedGeneration = null;
+  S.proposal = null; S.applied = false;
+  // Drop the lineage of every block whose centroid is gone.
+  Object.keys(S.lineage || {}).forEach(b => {
+    if ((S.lineage[b].centroids || []).indexOf(profileId) >= 0) delete S.lineage[b];
+  });
   S.statusAfter = null;
   S.sentinel = null; S.sentinelConversationId = null;
   S.permission = null;
@@ -769,18 +809,18 @@ function computeAcceptance(S) {
   const generation = {
     expected_ids: genWantIds,
     trial_ids: trialIds, validation_ids: valIds,
-    trials_generation: S.trialsGeneration || null,
-    validation_generation: S.validationGeneration || null,
-    applied_generation: S.appliedGeneration || null,
+    lineage: S.lineage || {},
     trials_ok: !trialIds.length
                || trialIds.every(id => genWantIds.indexOf(id) >= 0),
     validation_ok: !valIds.length
                    || valIds.every(id => genWantIds.indexOf(id) >= 0),
-    tags_consistent: !S.trialsGeneration || !S.validationGeneration
-                     || S.trialsGeneration === S.validationGeneration,
+    // Every recorded block must still refer to centroids that exist. Adding a
+    // profile is the designed progression and is NOT staleness.
+    lineage_ok: staleLineage(S, genWantIds, null).length === 0,
   };
+  generation.stale_blocks = staleLineage(S, genWantIds, null);
   generation.ok = generation.trials_ok && generation.validation_ok
-                  && generation.tags_consistent;
+                  && generation.lineage_ok;
 
   const plan = blockPlan();
   const need = {};
@@ -848,9 +888,9 @@ function computeAcceptance(S) {
   if (!generation.validation_ok)
     failed.push(`validation trials reference a stale profile generation `
               + `(${generation.validation_ids.join(", ")} vs ${genWantIds.join(", ")})`);
-  if (!generation.tags_consistent)
-    failed.push("calibration and validation were measured under different "
-              + "profile generations");
+  if (!generation.lineage_ok)
+    failed.push("evidence was scored against centroids that no longer exist: "
+              + generation.stale_blocks.map(b => b.block).join(", "));
 
   const acceptance = failed.length ? "FAIL" : (missing.length ? "NOT COMPLETE" : "PASS");
   return {recog, recogPass, twoProfiles, audit, generation, counts, missing,
@@ -868,9 +908,9 @@ function freshState() {
     sentinelConversationId: null,
     // Non-audio progress, so a refresh never costs completed utterances.
     blocks: {}, startedAt: null, paceMs: [], latencySamples: {off:[], on:[]},
-    // Which profile generation each body of evidence was measured under.
-    trialsGeneration: null, proposalGeneration: null,
-    appliedGeneration: null, validationGeneration: null,
+    // Which CENTROIDS each recorded block's scores were measured against.
+    // Keyed by block id; see recordLineage/staleLineage.
+    lineage: {},
   };
 }
 
@@ -881,7 +921,7 @@ const P52 = {
   STEP9_EVIDENCE_REVISION, ASK_PATTERNS, ASK_UTTERANCE, ASK_CUE,
   canonTokens, containsSentinel, extractCanary, isAskTranscript,
   calibratedPolicyStatus, policyProblem, PostChatError, makeSentinelDoSample,
-  generationOf, currentGeneration, staleEvidence, idsReferencedBy,
+  buildOf, compatibleIds, recordLineage, staleLineage, idsReferencedBy,
   dependentEvidence, invalidateForProfile,
   step9Ready, step9Passed, step10Ready, step10Passed, step11Ready,
   planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
@@ -1371,7 +1411,7 @@ async function sentinelFlow() {
                            || containsSentinel(replies[4], observed.guest);
   out.sentinels = {marcus: M_S, guest: G_S};
   out.evidence_revision = STEP9_EVIDENCE_REVISION;
-  out.generation = S.trialsGeneration || S.validationGeneration || null;
+  out.centroids = compatibleIds((S.statusAfter || {}).profiles_detail || []);
   out.comparison = "canonical uppercase alphanumeric tokens, consecutive match; "
                  + "no fuzzy or edit-distance matching; same rule for positive "
                  + "and privacy checks";
@@ -1433,7 +1473,7 @@ async function permissionFlow() {
     both_recognised: marcus.recognised && guest.recognised,
     same_decision: sameDecision, same_tier: sameTier, nothing_executed: nothingRan,
     execution_enabled: typed.execution_enabled, adapter_installed: typed.adapter_installed,
-    generation: S.trialsGeneration || S.validationGeneration || null,
+    centroids: compatibleIds((S.statusAfter || {}).profiles_detail || []),
     pass: sameDecision && sameTier && nothingRan && marcus.recognised && guest.recognised,
     note: "PermissionBroker.evaluate() takes no identity argument. Measured, not "
         + "asserted: all three decisions are compared to the typed reference.",
@@ -1590,22 +1630,20 @@ async function policyPreflight(what, opts) {
   }
   S.statusAfter = st; save();
 
-  // GENERATION FIRST. Evidence measured against deleted centroids is not
-  // evidence about the profiles enrolled now, and no amount of correct policy
-  // makes it so.
-  const cur = currentGeneration(pr.profiles, st);
-  const stale = staleEvidence(S, cur);
+  // LINEAGE FIRST. Adding the guest at step 5 is the designed progression and
+  // invalidates nothing; a centroid DISAPPEARING invalidates exactly what was
+  // scored against it.
+  const curIds = compatibleIds(pr.profiles);
+  const stale = staleLineage(S, curIds, buildOf(st));
   if (stale.length) {
-    const curIds = (pr.profiles || []).filter(p => p.compatible !== false)
-                     .map(p => p.profile_id).sort();
     alertBanner(
-      `<b>${what} blocked — evidence belongs to a different profile generation.</b><br>`
+      `<b>${what} blocked — evidence was scored against centroids that no longer `
+      + `exist.</b><br>`
       + `Current compatible profiles: <code>${curIds.join(", ") || "none"}</code><br>`
-      + stale.map(s => `stale ${s.what}: <code>${s.generation}</code>`).join("<br>")
-      + `<br><br>Those scores were measured against centroids that no longer `
-      + `exist, so they say nothing about the profiles enrolled now. They cannot `
-      + `be relabelled. <b>Reset and run a single clean calibration</b> — nothing `
-      + `was recorded or changed just now.`);
+      + stale.map(s => `<code>${s.block}</code>: ${s.why}`).join("<br>")
+      + `<br><br>Those scores cannot be relabelled onto the profiles enrolled `
+      + `now. <b>Reset and run a single clean calibration</b> — nothing was `
+      + `recorded or changed just now.`);
     return false;
   }
   if (opts.generationOnly) return true;
@@ -1627,21 +1665,28 @@ function alertBanner(msg) {
 }
 
 async function runTrialBlock({id, truthId, truthName, phase, count, pool, stepAfter, handoffTitle, handoffBody}) {
-  // Which generation is this evidence being measured against? Captured BEFORE
-  // recording, and refused if it disagrees with evidence already collected —
-  // mixing two generations is what invalidated a whole human run.
-  let gen = "";
+  // Which centroids will THIS block's scores be measured against? Profiles AND
+  // build come from ONE fresh backend read — deriving a fingerprint from fresh
+  // profiles plus a stale cached status would describe neither.
+  let curIds = [], build = "";
   try {
     const pr = await api("/speaker/profiles");
-    gen = currentGeneration(pr.profiles, S.statusAfter);
-  } catch (e) { alertBanner(`Could not read profiles: ${e.message}`); return false; }
-  const key = phase === "V" ? "validationGeneration" : "trialsGeneration";
-  if (S[key] && S[key] !== gen) {
+    const st = await api("/speaker/status");
+    S.statusAfter = st;
+    curIds = compatibleIds(pr.profiles);
+    build = buildOf(st);
+  } catch (e) { alertBanner(`Could not read the backend: ${e.message}`); return false; }
+
+  // Anything ALREADY recorded whose centroids have since vanished blocks here —
+  // but a larger population does not, because that is the designed step-5
+  // progression.
+  const stale = staleLineage(S, curIds, build);
+  if (stale.length) {
     alertBanner(
-      `<b>Blocked — the enrolled profiles changed since this evidence was `
-      + `collected.</b><br>collected under <code>${S[key]}</code><br>`
-      + `now <code>${gen}</code><br><br>Those scores cannot be relabelled. Reset `
-      + `and run one clean calibration.`);
+      `<b>Blocked — earlier evidence was scored against centroids that no longer `
+      + `exist.</b><br>`
+      + stale.map(s => `<code>${s.block}</code>: ${s.why}`).join("<br>")
+      + `<br><br>Reset and run one clean calibration.`);
     return false;
   }
   if (handoffTitle) await handoff(handoffTitle, handoffBody);
@@ -1659,7 +1704,10 @@ async function runTrialBlock({id, truthId, truthName, phase, count, pool, stepAf
               note: `${out.status}${out.similarity!=null ? " · "+out.similarity.toFixed(3) : ""}`};
     },
   });
-  if (ok) { S[key] = gen; save(); }
+  // Honest lineage: the centroids these scores were ACTUALLY measured against.
+  // For Phase A that is Marcus alone, and relabelling the impostor rows' truth
+  // later does not change it.
+  if (ok) { recordLineage(S, id, curIds, build); save(); }
   if (ok && stepAfter != null) { S.step = stepAfter; save(); }
   return ok;
 }
@@ -1776,7 +1824,6 @@ function render() {
         headers:{"Content-Type":"application/json"},
         body: JSON.stringify({trials: S.trials.map(trialPayload), apply:false})});
       S.proposal = out;
-      S.proposalGeneration = S.trialsGeneration;
       if (out.generation_ok === false) {
         alertBanner("<b>The backend rejected this evidence as a stale profile "
           + "generation.</b><br>" + (out.generation_problems || []).join("<br>"));
@@ -1799,7 +1846,6 @@ function render() {
             headers:{"Content-Type":"application/json"},
             body: JSON.stringify({trials: S.trials.map(trialPayload), apply:true})});
           S.applied = true;
-          S.appliedGeneration = S.trialsGeneration;
           // CHECK THE EFFECTIVE POLICY NOW, not at the report. `calibrated`
           // only means a valid record exists; NOVA_SPEAKER_THRESHOLD or
           // NOVA_SPEAKER_MARGIN silently outrank it. Discovering that after

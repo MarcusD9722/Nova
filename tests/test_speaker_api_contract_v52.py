@@ -687,40 +687,173 @@ async def test_enrolment_invalidates_and_stale_cannot_be_recreated():
               f"saying which profile is uncovered ({r3.text[:120]})")
 
 
-async def test_apply_is_atomic_when_persistence_fails():
-    check.section("a failed write leaves NO half-calibrated state")
+async def _state(nova, db):
+    """What a FRESH service sees — the only state that matters after a crash."""
+    from core.speaker.service import SpeakerService
+    svc = SpeakerService(db)
+    await svc.initialize()
+    st = await svc.status()
+    return {p["profile_id"]: p["stored_threshold"] for p in st["profiles_detail"]}, st
+
+
+async def test_apply_is_one_transaction_at_both_failure_boundaries():
+    check.section("ONE transaction: neither half can survive alone")
+    from core.speaker import calibration as C
+
+    # D. No prior calibration; fail the SECOND THRESHOLD write.
     async with boot() as nova:
         speak_as = _install_fakes(nova)
         m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
         g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
         M, G = m["profile_id"], g["profile_id"]
-        svc = nova.state.speaker
+        db = nova.state.speaker.registry._db_path
 
-        # Break the SECOND persistence step: thresholds save, the record does not.
-        original = svc.calib.save
-        async def boom(_rec):
-            raise RuntimeError("simulated disk failure")
-        svc.calib.save = boom          # type: ignore[assignment]
+        # A real failure mode, not a stub: the second profile disappears from
+        # the registry mid-apply, so its UPDATE matches zero rows.
+        import aiosqlite
+        async with aiosqlite.connect(str(db)) as raw:
+            await raw.execute("DELETE FROM speaker_profiles WHERE profile_id=?", (G,))
+            await raw.commit()
+
+        r = await nova.http.post("/speaker/calibration",
+                                 json={"trials": _trials_for(M, G), "apply": True})
+        check(r.status_code in (409, 500), f"it fails ({r.status_code})")
+        check('"applied":true' not in r.text.replace(" ", ""),
+              "and never claims applied")
+        thresholds, st = await _state(nova, db)
+        check(thresholds.get(M) is None,
+              f"after a RESTART Marcus's threshold is untouched ({thresholds.get(M)})")
+        check(st["threshold_calibrated"] is False, "and nothing is calibrated")
+        cal = await SpeakerServiceCal(db)
+        check(cal is None, "no calibration record was written")
+
+    # B/C. A VALID calibration A exists; calibration B fails at the RECORD half.
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+        db = nova.state.speaker.registry._db_path
+
+        ok = await nova.http.post("/speaker/calibration",
+                                  json={"trials": _trials_for(M, G), "apply": True})
+        check(ok.json().get("applied") is True, "calibration A applied")
+        before, _ = await _state(nova, db)
+        rec_a = await SpeakerServiceCal(db)
+        check(rec_a is not None, "and its record exists")
+
+        # Now fail the transaction between the two halves.
+        real = C.apply_atomically
+        async def failing(dbp, *, thresholds, record, _fail_between=None):
+            def boom(): raise RuntimeError("simulated crash before the record")
+            return await real(dbp, thresholds=thresholds, record=record,
+                              _fail_between=boom)
+        C.apply_atomically = failing        # type: ignore[assignment]
         try:
-            r = await nova.http.post("/speaker/calibration",
-                                     json={"trials": _trials_for(M, G), "apply": True})
+            r = await nova.http.post(
+                "/speaker/calibration",
+                json={"trials": _trials_for(M, G, n=16), "apply": True})
         finally:
-            svc.calib.save = original  # type: ignore[assignment]
+            C.apply_atomically = real       # type: ignore[assignment]
 
-        check(r.status_code == 500, f"the failure surfaces ({r.status_code})")
-        check("applied" not in r.text or '"applied":true' not in r.text.replace(" ", ""),
-              "and applied is NOT reported true")
+        check(r.status_code == 500, f"calibration B fails ({r.status_code})")
+        check('"applied":true' not in r.text.replace(" ", ""),
+              "and never claims applied")
+        after, st = await _state(nova, db)
+        check(after == before,
+              f"after a RESTART every threshold is exactly calibration A's "
+              f"({before} vs {after})")
+        rec_b = await SpeakerServiceCal(db)
+        check(rec_b is not None and sorted(rec_b.profile_ids) == sorted([M, G]),
+              "calibration A's record is intact")
+        check(st["threshold_calibrated"] is True
+              and st["threshold_source"] == "calibrated",
+              "and the runtime is still coherently on calibration A")
 
-        st = (await nova.http.get("/speaker/status")).json()
-        detail = {p["profile_id"]: p for p in st["profiles_detail"]}
-        check(detail[M]["stored_threshold"] is None
-              and detail[G]["stored_threshold"] is None,
-              f"both thresholds were rolled back "
-              f"({detail[M]['stored_threshold']}, {detail[G]['stored_threshold']})")
-        check(st["threshold_calibrated"] is False,
-              "and nothing claims to be calibrated")
+
+async def SpeakerServiceCal(db):
+    """The persisted calibration record, read straight from disk."""
+    from core.speaker.calibration import CalibrationStore
+    return await CalibrationStore(db).load()
+
+
+async def test_calibration_effective_vs_covers_under_env_override():
+    check.section("covering the profiles is not the same as DECIDING")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+        await nova.http.post("/speaker/calibration",
+                             json={"trials": _trials_for(M, G), "apply": True})
+
         cal = (await nova.http.get("/speaker/calibration")).json()
-        check(cal["record_present"] is False, "no record was left behind")
+        check(cal["covers_current_profiles"] and cal["effective"],
+              "baseline: covered AND effective")
+
+        for var, field in (("NOVA_SPEAKER_THRESHOLD", "threshold_source"),
+                           ("NOVA_SPEAKER_MARGIN", "margin_source")):
+            os.environ[var] = "0.80" if "THRESHOLD" in var else "0.20"
+            try:
+                cal = (await nova.http.get("/speaker/calibration")).json()
+                check(cal["record_present"] is True, f"{var}: record still present")
+                check(cal["valid_for_build"] is True, f"{var}: still valid for build")
+                check(cal["covers_current_profiles"] is True,
+                      f"{var}: still COVERS the current profiles")
+                check(cal["calibrated"] is True
+                      and cal["usable_for_current_profiles"] is True,
+                      f"{var}: still usable")
+                check(cal["effective"] is False,
+                      f"{var}: but NOT effective — the override decides "
+                      f"({cal['effective']})")
+                check(cal[field] == "env override",
+                      f"{var}: {field} is env override ({cal[field]})")
+                check("NOT what the runtime uses" in cal.get("stale_reason", ""),
+                      f"{var}: and it says so rather than claiming provisional "
+                      f"({cal.get('stale_reason')})")
+            finally:
+                os.environ.pop(var, None)
+
+        cal = (await nova.http.get("/speaker/calibration")).json()
+        check(cal["effective"] is True, "removing the override restores effective")
+
+
+async def test_proposal_requires_full_fit_coverage():
+    check.section("a proposal that fits only ONE of two profiles is not clean")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+
+        # Trials naming only Marcus: current ids, but incomplete coverage.
+        only_m = [{"truth": M, "top_profile_id": M, "top_score": 0.9 - i * 0.01,
+                   "second_profile_id": None, "second_score": None,
+                   "status": "known", "condition": "normal", "phase": "B"}
+                  for i in range(12)]
+        prop = (await nova.http.post("/speaker/calibration",
+                                     json={"trials": only_m, "apply": False})).json()
+        check(prop["fit_covers_current_profiles"] is False,
+              "fit coverage is explicitly false")
+        check(prop["generation_ok"] is False,
+              "so the proposal is not generation-clean")
+        check(prop.get("ok") is False, "and is not presented as usable")
+        check(any("does not cover every current profile" in p
+                  for p in prop["generation_problems"]),
+              f"naming the uncovered profile ({prop['generation_problems']})")
+        check(prop["evidence_lineage_ok"] is True,
+              "while the lineage itself is fine — a different fault, said so")
+
+        r = await nova.http.post("/speaker/calibration",
+                                 json={"trials": only_m, "apply": True})
+        check(r.status_code == 409, f"and Apply is impossible ({r.status_code})")
+
+        full = (await nova.http.post("/speaker/calibration",
+                                     json={"trials": _trials_for(M, G),
+                                           "apply": False})).json()
+        check(full["fit_covers_current_profiles"] is True
+              and full["generation_ok"] is True,
+              "a full two-profile fit is clean")
 
 
 async def test_permission_evaluate_takes_no_identity():
@@ -750,7 +883,9 @@ async def main():
     await test_calibration_endpoint_distinguishes_record_from_usable()
     await test_current_generation_applies_and_survives_restart()
     await test_enrolment_invalidates_and_stale_cannot_be_recreated()
-    await test_apply_is_atomic_when_persistence_fails()
+    await test_apply_is_one_transaction_at_both_failure_boundaries()
+    await test_calibration_effective_vs_covers_under_env_override()
+    await test_proposal_requires_full_fit_coverage()
     await test_permission_evaluate_takes_no_identity()
     check.finish()
 

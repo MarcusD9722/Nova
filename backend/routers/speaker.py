@@ -339,15 +339,18 @@ def generation_problems(trials, fits, profiles, *, applying: bool) -> list[str]:
         problems.append(
             f"calibration fit references stale profile generation: "
             f"old={stale}, current={sorted(compatible)}")
+    # Coverage is required at BOTH proposal and apply. Discovering at Apply that
+    # the fit only covers one of two profiles wastes the whole session, and a
+    # proposal that looks clean while covering a subset is the misleading state
+    # this endpoint exists to prevent.
     missing = sorted(compatible - fitted)
-    if missing and applying:
+    if missing:
         problems.append(
             f"calibration does not cover every current profile: "
             f"uncovered={missing}, current={sorted(compatible)}")
-    if applying:
-        for f in fits:
-            if f.profile_id in compatible and f.threshold is None:
-                problems.append(f"{f.profile_id} has no fitted threshold")
+    for f in fits:
+        if f.profile_id in compatible and f.threshold is None:
+            problems.append(f"{f.profile_id} has no fitted threshold")
 
     # Every identity a trial names must belong to this generation.
     allowed_truth = set(compatible)
@@ -421,13 +424,27 @@ async def get_calibration() -> dict[str, Any]:
     current = sorted(p.profile_id for p in profiles if p.compatible)
     covers = calibration_covers(rec, profiles)
 
+    # COVERING IS NOT THE SAME AS DECIDING. Precedence is env override ->
+    # calibration -> provisional, so a calibration can cover the current
+    # profiles while NOVA_SPEAKER_THRESHOLD / NOVA_SPEAKER_MARGIN are what
+    # actually decide. Asked through the PRODUCTION resolver rather than
+    # re-derived here, so this cannot drift from what the matcher does.
+    pol = await svc.policy()
+    effective = bool(covers
+                     and pol.threshold_source == "calibrated"
+                     and pol.margin_source == "calibrated")
+
     out: dict[str, Any] = {
         "record_present": raw is not None,
         "valid_for_build": bool(rec is not None),
         "covers_current_profiles": bool(covers),
-        # What the runtime will actually do. Same answer as /speaker/status.
-        "effective": bool(covers),
+        # Usable for this profile generation...
         "calibrated": bool(covers),
+        "usable_for_current_profiles": bool(covers),
+        # ...but `effective` means it is what the runtime is ACTUALLY using.
+        "effective": effective,
+        "threshold_source": pol.threshold_source,
+        "margin_source": pol.margin_source,
         "current_profile_ids": current,
         "record_profile_ids": (list(raw.profile_ids) if raw else []),
     }
@@ -438,8 +455,15 @@ async def get_calibration() -> dict[str, Any]:
     if raw is not None and not covers:
         out["stale_reason"] = (
             f"the stored calibration covers {sorted(raw.profile_ids)} but the "
-            f"current compatible profiles are {current} — it is inert, and the "
-            f"runtime is using provisional defaults")
+            f"current compatible profiles are {current} — it is inert. The "
+            f"runtime is deciding by threshold_source={pol.threshold_source}, "
+            f"margin_source={pol.margin_source}")
+    elif covers and not effective:
+        # Covered but overridden. Saying "provisional" here would be wrong.
+        out["stale_reason"] = (
+            f"the calibration covers the current profiles but is NOT what the "
+            f"runtime uses: threshold_source={pol.threshold_source}, "
+            f"margin_source={pol.margin_source}")
     return out
 
 
@@ -469,6 +493,13 @@ async def post_calibration(body: CalibrateIn) -> dict[str, Any]:
                                    applying=bool(body.apply))
     out["generation_problems"] = problems
     out["generation_ok"] = not problems
+    # Reported separately so a caller can tell "stale evidence" from "an
+    # incomplete fit" — different faults with different remedies.
+    _compat = {p.profile_id for p in profiles.values() if p.compatible}
+    _fitted = {f.profile_id for f in result.profiles}
+    out["fit_covers_current_profiles"] = bool(_compat) and _fitted == _compat
+    out["evidence_lineage_ok"] = not any(
+        "stale profile generation" in p for p in problems)
     if problems and not body.apply:
         # A proposal built on stale scores must not look usable.
         out["ok"] = False
@@ -488,36 +519,19 @@ async def post_calibration(body: CalibrateIn) -> dict[str, Any]:
             raise HTTPException(status_code=400,
                                 detail=f"calibration failed: {result.reason}")
 
-        # ATOMIC-ish: remember what every threshold was, and put it all back if
-        # any write fails. Half a calibration is worse than none — it would
-        # leave one profile judged by a fitted number and the other by the
-        # provisional default, with nothing saying so.
-        targets = [(profiles[f.profile_id], float(f.threshold))
-                   for f in result.profiles]
-        previous = [(prof, prof.threshold) for prof, _ in targets]
-
-        async def _rollback() -> None:
-            for prof, old in previous:
-                try:
-                    prof.threshold = old
-                    await svc.registry.save(prof)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("speaker_calibration_rollback_failed",
-                                   profile=prof.profile_id, error=str(e)[:160])
+        # ONE SQLite transaction for every threshold AND the record. Not
+        # several commits with best-effort compensation: replacing a valid
+        # calibration and failing partway could otherwise leave the OLD record
+        # (which still matches the current ids) beside MIXED thresholds, and
+        # `threshold_calibrated` would happily report true.
+        from core.speaker.calibration import apply_atomically
 
         try:
-            for prof, value in targets:
-                prof.threshold = value
-                await svc.registry.save(prof)
-        except Exception as e:  # noqa: BLE001
-            await _rollback()
-            logger.warning("speaker_calibration_apply_failed", error=str(e)[:200])
-            raise HTTPException(status_code=500,
-                                detail="could not persist thresholds; nothing was "
-                                       "applied") from e
-
-        try:
-            await svc.calib.save(CalibrationRecord(
+            await apply_atomically(
+                svc.registry._db_path,
+                thresholds={f.profile_id: float(f.threshold)
+                            for f in result.profiles},
+                record=CalibrationRecord(
                 margin=float(result.margin or 0.0),
                 profile_ids=[f.profile_id for f in result.profiles],
                 metrics={
@@ -534,15 +548,14 @@ async def post_calibration(body: CalibrateIn) -> dict[str, Any]:
                 },
             ))
         except Exception as e:  # noqa: BLE001
-            # The thresholds are already written but the record that makes them
-            # ACTIVE is not. `calibration_covers()` would report uncalibrated
-            # and the stored numbers would sit inert — recoverable, but a lie in
-            # the making. Put the thresholds back so the state is one thing.
-            await _rollback()
-            logger.warning("speaker_calibration_record_failed", error=str(e)[:200])
-            raise HTTPException(status_code=500,
-                                detail="could not persist the calibration record; "
-                                       "thresholds were rolled back") from e
+            # The transaction rolled back, so the previous coherent state — an
+            # earlier calibration, or none — is exactly intact. No compensation
+            # was attempted and none was needed.
+            logger.warning("speaker_calibration_apply_failed", error=str(e)[:200])
+            raise HTTPException(
+                status_code=500,
+                detail=f"calibration was NOT applied and nothing changed: "
+                       f"{str(e)[:200]}") from e
 
         out["applied"] = True
         logger.info("speaker_calibration_applied", margin=result.margin,

@@ -820,3 +820,69 @@ exactly the two this run enrolled, Marcus is `owner` and the guest is `guest`.
 This is not inferred from `threshold_calibrated`: a third profile left over from
 an earlier session changes what every threshold means, and "calibrated" would not
 necessarily say so.
+
+---
+
+## Staged lineage — adding the guest is not staleness
+
+The first attempt at generation tracking compared the whole compatible-profile
+set and treated any change as staleness. That **deadlocked a perfectly clean
+run**: the protocol deliberately grows the population halfway through, so Phase
+A (`{Marcus}`) could never match Phase B (`{Marcus, Guest}`) and step 6 was
+unreachable.
+
+The invariant was always meant to be narrower:
+
+> **No score may depend on a centroid that has been deleted or replaced.**
+
+Each recorded block stores the centroids its scores were measured against, plus
+the model build. Phase A honestly records `{Marcus}` — the guest's twelve
+impostor utterances were scored against Marcus's centroid alone, and relabelling
+their *truth* once the guest is enrolled does not change that.
+
+| event | invalidated |
+|---|---|
+| guest enrolled at step 5 | **nothing** — the designed progression |
+| Marcus replaced | everything |
+| guest replaced | Phase B and validation only; Phase A survives |
+| model build changed | everything |
+| ids from the failed run | everything |
+
+## `covers` is not `effective`
+
+Precedence is env override → calibration → provisional, so a calibration can
+cover the current profiles while `NOVA_SPEAKER_THRESHOLD` / `NOVA_SPEAKER_MARGIN`
+are what actually decide. `/speaker/calibration` reports both, asking the
+**production resolver** rather than re-deriving precedence:
+
+| field | means |
+|---|---|
+| `record_present` | a row exists |
+| `valid_for_build` | it matches this model build |
+| `covers_current_profiles` / `calibrated` / `usable_for_current_profiles` | it covers the profiles enrolled now |
+| `effective` | it is what the runtime is **actually using** |
+| `threshold_source`, `margin_source` | which policy is deciding |
+
+`stale_reason` names the resolved source instead of assuming provisional.
+
+## Fit coverage is checked at proposal time too
+
+A fit covering only one of two current profiles is reported
+`fit_covers_current_profiles: false` and is **not** generation-clean — at
+`apply:false` as well as `apply:true`, because discovering it at Apply wastes the
+session. `evidence_lineage_ok` is reported separately: stale evidence and an
+incomplete fit are different faults with different remedies.
+
+## Apply is one SQLite transaction
+
+`SpeakerRegistry` and `CalibrationStore` share one database, so
+`apply_atomically()` writes every fitted threshold **and** the record on one
+connection with one commit, and rolls back on any error. Not several commits with
+best-effort compensation.
+
+The case that forced it: replacing a valid calibration, failing at the record,
+and failing the compensation would leave the **old** record — still matching the
+current ids — beside **mixed** thresholds, with `threshold_calibrated` reporting
+true. A transaction does not enter that state. Both failure boundaries are
+tested, and the assertions are made against a **freshly constructed service**,
+because only what survives a restart counts.
