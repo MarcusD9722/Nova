@@ -651,6 +651,68 @@ Step 9 requires steps 1–8 evidence; step 10 requires a step-9 PASS **at the
 current evidence revision**; step 11 requires a step-10 PASS. Failed results stay
 on screen and copyable — only proceeding is blocked.
 
+## Profile generation — evidence belongs to the centroids it was measured against
+
+A profile id names a **centroid**. Delete a profile and enrol again and the new
+profile has a new id and a different centroid, so every similarity score measured
+against the old one is evidence about a voice model that no longer exists. It
+cannot be relabelled onto the new profile; the numbers would be unreproducible.
+
+**This happened.** A live run mixed two generations:
+
+| evidence | profile ids |
+|---|---|
+| 56 calibration trials | `spk-601053c258fa`, `spk-c96353f36365` |
+| 20 validation trials | `spk-ccc5aafb945f`, `spk-4ebf6e6c6135` |
+| enrolled profiles | `spk-ccc5aafb945f`, `spk-4ebf6e6c6135` |
+
+The calibration was applied. Every threshold write was silently skipped because
+`profiles.get(stale_id)` returned `None`; the `CalibrationRecord` was persisted
+naming the **stale** ids; and the API answered `applied: true`. Both profiles
+ended with `stored_threshold = null` and the runtime fell back to provisional
+0.55 / 0.10. Nothing was calibrated, and nothing said so.
+
+That is also why `/speaker/calibration` reported `calibrated: true` while
+`/speaker/status` reported `threshold_calibrated: false`: the first only asked
+whether a record existed and matched the model build, the second asked whether it
+covers the profiles enrolled now. Both were right about different questions and
+the operator could only be misled.
+
+### What now happens
+
+**Backend, fail-closed.** `POST /speaker/calibration` validates the whole
+generation *before the first write*: the fitted ids must equal the current
+compatible set exactly, every fitted profile must exist with a threshold, and
+every id a trial names — `truth`, `top_profile_id`, `second_profile_id` — must
+belong to the current generation. A stale id anywhere is **409** with
+`old=[…], current=[…]`; no threshold is written, no record is created, and
+`applied` is never true. The same check runs for `apply:false`, so a proposal
+built on stale scores is flagged before it looks convincing.
+
+**Application is atomic.** All invariants are checked first; then thresholds and
+the record are written, and any failure rolls the thresholds back. A half-applied
+calibration — one profile fitted, one provisional, nothing saying so — cannot
+survive.
+
+**`/speaker/calibration` separates the questions:** `record_present`,
+`valid_for_build`, `covers_current_profiles`, `effective`, `record_profile_ids`,
+`current_profile_ids`, plus a `stale_reason`. `calibrated` now means *usable for
+the current profiles* — the same answer `/speaker/status` gives. A stale record
+is **not** deleted on read; it is evidence that something went wrong.
+
+**The harness tracks generation.** Trials, proposal, applied calibration,
+validation, step 9 and the permission regression each record the generation they
+were measured under. Computing a proposal, applying, and starting steps 8 and 9
+all block first — before any recording — showing current ids, evidence ids, and
+which evidence is stale. Acceptance additionally checks the ids the stored rows
+*actually reference*, not just the recorded tag.
+
+**Deleting a profile reconciles the browser.** It used to change the backend and
+leave the old trial rows in `localStorage`, which is precisely how one run ended
+up with 56 trials scored against centroids that no longer existed. The confirm
+dialog now lists what will be discarded, and everything downstream of that
+profile is cleared.
+
 ## The unverified self-history guard
 
 An unverified speaker asking about their own history now gets a deterministic
@@ -758,3 +820,104 @@ exactly the two this run enrolled, Marcus is `owner` and the guest is `guest`.
 This is not inferred from `threshold_calibrated`: a third profile left over from
 an earlier session changes what every threshold means, and "calibrated" would not
 necessarily say so.
+
+---
+
+## Staged lineage — adding the guest is not staleness
+
+The first attempt at generation tracking compared the whole compatible-profile
+set and treated any change as staleness. That **deadlocked a perfectly clean
+run**: the protocol deliberately grows the population halfway through, so Phase
+A (`{Marcus}`) could never match Phase B (`{Marcus, Guest}`) and step 6 was
+unreachable.
+
+The invariant was always meant to be narrower:
+
+> **No score may depend on a centroid that has been deleted or replaced.**
+
+Each recorded block stores the centroids its scores were measured against, plus
+the model build. Phase A honestly records `{Marcus}` — the guest's twelve
+impostor utterances were scored against Marcus's centroid alone, and relabelling
+their *truth* once the guest is enrolled does not change that.
+
+| event | invalidated |
+|---|---|
+| guest enrolled at step 5 | **nothing** — the designed progression |
+| Marcus replaced | everything |
+| guest replaced | Phase B and validation — see the two views below |
+| model build changed | everything |
+| ids from the failed run | everything |
+
+## `covers` is not `effective`
+
+Precedence is env override → calibration → provisional, so a calibration can
+cover the current profiles while `NOVA_SPEAKER_THRESHOLD` / `NOVA_SPEAKER_MARGIN`
+are what actually decide. `/speaker/calibration` reports both, asking the
+**production resolver** rather than re-deriving precedence:
+
+| field | means |
+|---|---|
+| `record_present` | a row exists |
+| `valid_for_build` | it matches this model build |
+| `covers_current_profiles` / `calibrated` / `usable_for_current_profiles` | it covers the profiles enrolled now |
+| `effective` | it is what the runtime is **actually using** |
+| `threshold_source`, `margin_source` | which policy is deciding |
+
+`stale_reason` names the resolved source instead of assuming provisional.
+
+## Fit coverage is checked at proposal time too
+
+A fit covering only one of two current profiles is reported
+`fit_covers_current_profiles: false` and is **not** generation-clean — at
+`apply:false` as well as `apply:true`, because discovering it at Apply wastes the
+session. `evidence_lineage_ok` is reported separately: stale evidence and an
+incomplete fit are different faults with different remedies.
+
+## Apply is one SQLite transaction
+
+`SpeakerRegistry` and `CalibrationStore` share one database, so
+`apply_atomically()` writes every fitted threshold **and** the record on one
+connection with one commit, and rolls back on any error. Not several commits with
+best-effort compensation.
+
+The case that forced it: replacing a valid calibration, failing at the record,
+and failing the compensation would leave the **old** record — still matching the
+current ids — beside **mixed** thresholds, with `threshold_calibrated` reporting
+true. A transaction does not enter that state. Both failure boundaries are
+tested, and the assertions are made against a **freshly constructed service**,
+because only what survives a restart counts.
+
+
+### Two views, deliberately different
+
+`staleLineage()` is a **diagnostic** over completed blocks: replacing the guest
+leaves Phase A's *scores* valid, because Phase A was scored against Marcus's
+centroid alone.
+
+`invalidateForProfile()` decides what the **run** can continue from, and is
+deliberately coarser: Phase A's guest rows carry `truth = G` after the step-5
+association, so once that profile is gone they identify something that no longer
+exists — and keeping only the Marcus half would leave `trials_marcus` partially
+complete with no coherent way to resume it. **Deleting either profile therefore
+discards all trial and validation evidence.** Correctness over resume;
+re-recording is cheap, unreproducible evidence is not. Both behaviours are
+asserted, so the code and this page cannot drift apart.
+
+### Lineage is stamped before the first sample
+
+Rows and block progress persist sample-by-sample, so a block interrupted at
+10/20 used to hold ten saved rows with no lineage stamp — and a resume after a
+profile change could add ten more against a different population before anything
+noticed. The stamp is now written and saved **before the microphone opens**, and
+an existing partial stamp is **verified, never overwritten**: reinterpreting
+those first ten rows under a new population is the relabelling this design
+forbids.
+
+### The population cannot change under the transaction
+
+`apply_atomically()` opens `BEGIN IMMEDIATE`, re-reads the profile table **under
+the write lock**, and applies the canonical `SpeakerProfile.compatible` rule in
+Python — including the centroid-dimension check that cannot be expressed safely
+in SQL. If the live set is not exactly the fitted set the transaction aborts, so
+a profile enrolled between the router's validation and the commit cannot produce
+a record that fails to cover the moment it lands.

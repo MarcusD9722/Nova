@@ -522,6 +522,107 @@ class CalibrationStore:
             await db.commit()
 
 
+async def apply_atomically(db_path: Path, *, thresholds: dict[str, float],
+                           record: "CalibrationRecord",
+                           _fail_between: Any = None) -> None:
+    """Write every fitted threshold AND the calibration record, or NOTHING.
+
+    `SpeakerRegistry` and `CalibrationStore` share one SQLite file, so this is a
+    single connection and a single commit rather than several independently
+    committed writes with best-effort compensation.
+
+    That distinction is not pedantic. The dangerous case is REPLACING a valid
+    calibration: if the thresholds are written, the new record fails, and the
+    rollback of one threshold also fails, the runtime is left holding the OLD
+    record — which still matches the current profile ids — alongside MIXED
+    threshold values. Every profile would then be judged by a number nobody
+    fitted, and `threshold_calibrated` would say true. Compensation cannot
+    guarantee its way out of that; a transaction can simply not enter it.
+
+    A missing profile row is an error, not a silent skip: it means the
+    population changed under us, which is exactly the defect this whole change
+    exists to stop.
+
+    `_fail_between` is a test seam — a callable invoked inside the transaction
+    after the threshold updates and before the record write, so a suite can fail
+    the second half and assert nothing survived. It is never passed in
+    production.
+    """
+    expected = set(thresholds)
+    # isolation_level=None disables Python's implicit transaction handling, so
+    # BEGIN IMMEDIATE / COMMIT below are the only transaction boundaries.
+    async with aiosqlite.connect(str(db_path), isolation_level=None) as db:
+        db.row_factory = aiosqlite.Row
+        # DDL first, outside the unit of work: CREATE TABLE commits implicitly
+        # in SQLite and would otherwise end the transaction early.
+        for sql in CALIBRATION_DDL:
+            await db.execute(sql)
+        try:
+            # IMMEDIATE takes the write lock now, so the population cannot change
+            # between the check below and the commit.
+            await db.execute("BEGIN IMMEDIATE")
+
+            # THE POPULATION, RE-READ UNDER THE LOCK. The router validated a
+            # snapshot taken before this call; a profile enrolled in between
+            # would leave the record naming {M,G} while the registry holds
+            # {M,G,H}, and the runtime would immediately report it as not
+            # covering. Narrow race, same invariant.
+            #
+            # The CANONICAL compatibility rule is applied here in Python rather
+            # than approximated in SQL — `SpeakerProfile.compatible` also checks
+            # the centroid's dimension, and a weaker second definition is
+            # exactly the kind of drift this whole change exists to prevent.
+            async with db.execute(
+                "SELECT profile_id, model_id, model_revision, embedding_dim, "
+                "centroid FROM speaker_profiles") as cur:
+                rows = await cur.fetchall()
+            live = set()
+            for r in rows:
+                try:
+                    cen = json.loads(r["centroid"] or "[]")
+                except Exception:  # noqa: BLE001
+                    cen = []
+                if (r["model_id"] == MODEL_ID
+                        and r["model_revision"] == MODEL_REVISION
+                        and int(r["embedding_dim"]) == EMBEDDING_DIM
+                        and len(cen) == EMBEDDING_DIM):
+                    live.add(r["profile_id"])
+            if live != expected:
+                raise RuntimeError(
+                    f"the enrolled population changed during apply: "
+                    f"expected {sorted(expected)}, found {sorted(live)}")
+
+            for pid, value in thresholds.items():
+                cur = await db.execute(
+                    "UPDATE speaker_profiles SET threshold=?, updated_at=? "
+                    "WHERE profile_id=?", (float(value), _now(), str(pid)))
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        f"profile {pid} is no longer in the registry — the "
+                        f"enrolled population changed during apply")
+            if _fail_between is not None:
+                _fail_between()
+            await db.execute(
+                """INSERT OR REPLACE INTO speaker_calibration
+                   (id, protocol_version, model_id, model_revision, embedding_dim,
+                    margin, profile_ids, metrics, calibrated_at)
+                   VALUES (1,?,?,?,?,?,?,?,?)""",
+                (record.protocol_version, record.model_id, record.model_revision,
+                 record.embedding_dim, float(record.margin),
+                 json.dumps(list(record.profile_ids)),
+                 json.dumps(record.metrics, default=str), record.calibrated_at),
+            )
+            await db.execute("COMMIT")
+        except Exception:
+            try:
+                await db.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+    logger.info("speaker_calibration_applied_atomically",
+                profiles=len(thresholds), margin=record.margin)
+
+
 # ── the ONE effective policy (V3 P5.2 closure) ───────────────────────────────
 
 SOURCE_ENV = "env override"

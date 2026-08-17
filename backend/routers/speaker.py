@@ -304,6 +304,78 @@ async def permission_probe(body: PermissionProbeIn) -> dict[str, Any]:
     }
 
 
+#: Trials recorded before the guest is enrolled carry this placeholder truth.
+#: The harness relabels them once the guest has an id, so it is legitimate while
+#: PROPOSING and never legitimate when APPLYING.
+IMPOSTOR_PLACEHOLDER = "__impostor__"
+
+
+def generation_problems(trials, fits, profiles, *, applying: bool) -> list[str]:
+    """Does this calibration describe the profiles that exist RIGHT NOW?
+
+    A profile id identifies a CENTROID. Delete a profile and enrol again and the
+    new profile has a new id and a different centroid, so every similarity score
+    measured against the old one is evidence about a voice model that no longer
+    exists. Applying it would set thresholds from numbers nobody can reproduce.
+
+    This is not hypothetical. A live run mixed two generations: 56 calibration
+    trials scored against `spk-601053c258fa` / `spk-c96353f36365`, 20 validation
+    trials against the current `spk-ccc5aafb945f` / `spk-4ebf6e6c6135`. The fit
+    was applied, every threshold write was silently skipped because
+    `profiles.get(stale_id)` returned None, the CalibrationRecord was persisted
+    naming the STALE ids, and the API answered `applied: true`. Nothing was
+    calibrated and nothing said so.
+
+    Returns human-readable problems; empty means the generation is consistent.
+    """
+    compatible = {p.profile_id for p in profiles.values() if p.compatible}
+    problems: list[str] = []
+    if not compatible:
+        return ["no compatible speaker profiles are enrolled"]
+
+    fitted = {f.profile_id for f in fits}
+    stale = sorted(fitted - compatible)
+    if stale:
+        problems.append(
+            f"calibration fit references stale profile generation: "
+            f"old={stale}, current={sorted(compatible)}")
+    # Coverage is required at BOTH proposal and apply. Discovering at Apply that
+    # the fit only covers one of two profiles wastes the whole session, and a
+    # proposal that looks clean while covering a subset is the misleading state
+    # this endpoint exists to prevent.
+    missing = sorted(compatible - fitted)
+    if missing:
+        problems.append(
+            f"calibration does not cover every current profile: "
+            f"uncovered={missing}, current={sorted(compatible)}")
+    for f in fits:
+        if f.profile_id in compatible and f.threshold is None:
+            problems.append(f"{f.profile_id} has no fitted threshold")
+
+    # Every identity a trial names must belong to this generation.
+    allowed_truth = set(compatible)
+    if not applying:
+        allowed_truth.add(IMPOSTOR_PLACEHOLDER)
+    bad_truth, bad_rank = set(), set()
+    for t in trials:
+        if t.truth and t.truth not in allowed_truth:
+            bad_truth.add(t.truth)
+        for pid in (t.top_profile_id, t.second_profile_id):
+            if pid and pid not in compatible:
+                bad_rank.add(pid)
+    if bad_truth:
+        extra = ("" if applying else
+                 f" (the {IMPOSTOR_PLACEHOLDER} placeholder is allowed here)")
+        problems.append(
+            f"trials reference stale profile generation in `truth`: "
+            f"old={sorted(bad_truth)}, current={sorted(compatible)}{extra}")
+    if bad_rank:
+        problems.append(
+            f"trials reference stale profile generation in scored ranks: "
+            f"old={sorted(bad_rank)}, current={sorted(compatible)}")
+    return problems
+
+
 class TrialIn(BaseModel):
     truth: str
     top_profile_id: str | None = None
@@ -322,13 +394,77 @@ class CalibrateIn(BaseModel):
 
 @router.get("/calibration")
 async def get_calibration() -> dict[str, Any]:
-    rec = await _service().calibration()
-    if rec is None:
-        return {"calibrated": False}
-    return {"calibrated": True, "margin": rec.margin,
-            "profile_ids": rec.profile_ids, "metrics": rec.metrics,
-            "calibrated_at": rec.calibrated_at,
-            "model_id": rec.model_id, "model_revision": rec.model_revision}
+    """The calibration record AND whether it is actually usable.
+
+    These are different questions, and answering only the first was misleading
+    in production: a live run had a stale record for deleted profiles, so this
+    endpoint said `calibrated: true` while `/speaker/status` correctly said
+    `threshold_calibrated: false, threshold_source: provisional default`. Both
+    were "right" about different things and the operator could only be wrong.
+
+    `calibrated` now means USABLE FOR THE CURRENT PROFILES — the same question
+    `/speaker/status` answers, via the same `calibration_covers()`. The record's
+    mere existence is reported separately as `record_present`, and the stale
+    record is NOT deleted just because it was read: it is history, and deleting
+    on read would destroy the evidence that something went wrong.
+    """
+    from core.speaker.calibration import calibration_covers
+
+    svc = _service()
+    raw = None
+    try:
+        raw = await svc.calib.load()
+    except Exception:  # noqa: BLE001
+        raw = None
+    rec = await svc.calibration()          # None unless valid for this build
+    try:
+        profiles = await svc.registry.all()
+    except Exception:  # noqa: BLE001
+        profiles = []
+    current = sorted(p.profile_id for p in profiles if p.compatible)
+    covers = calibration_covers(rec, profiles)
+
+    # COVERING IS NOT THE SAME AS DECIDING. Precedence is env override ->
+    # calibration -> provisional, so a calibration can cover the current
+    # profiles while NOVA_SPEAKER_THRESHOLD / NOVA_SPEAKER_MARGIN are what
+    # actually decide. Asked through the PRODUCTION resolver rather than
+    # re-derived here, so this cannot drift from what the matcher does.
+    pol = await svc.policy()
+    effective = bool(covers
+                     and pol.threshold_source == "calibrated"
+                     and pol.margin_source == "calibrated")
+
+    out: dict[str, Any] = {
+        "record_present": raw is not None,
+        "valid_for_build": bool(rec is not None),
+        "covers_current_profiles": bool(covers),
+        # Usable for this profile generation...
+        "calibrated": bool(covers),
+        "usable_for_current_profiles": bool(covers),
+        # ...but `effective` means it is what the runtime is ACTUALLY using.
+        "effective": effective,
+        "threshold_source": pol.threshold_source,
+        "margin_source": pol.margin_source,
+        "current_profile_ids": current,
+        "record_profile_ids": (list(raw.profile_ids) if raw else []),
+    }
+    if raw is not None:
+        out.update({"margin": raw.margin, "profile_ids": list(raw.profile_ids),
+                    "metrics": raw.metrics, "calibrated_at": raw.calibrated_at,
+                    "model_id": raw.model_id, "model_revision": raw.model_revision})
+    if raw is not None and not covers:
+        out["stale_reason"] = (
+            f"the stored calibration covers {sorted(raw.profile_ids)} but the "
+            f"current compatible profiles are {current} — it is inert. The "
+            f"runtime is deciding by threshold_source={pol.threshold_source}, "
+            f"margin_source={pol.margin_source}")
+    elif covers and not effective:
+        # Covered but overridden. Saying "provisional" here would be wrong.
+        out["stale_reason"] = (
+            f"the calibration covers the current profiles but is NOT what the "
+            f"runtime uses: threshold_source={pol.threshold_source}, "
+            f"margin_source={pol.margin_source}")
+    return out
 
 
 @router.post("/calibration")
@@ -349,35 +485,78 @@ async def post_calibration(body: CalibrateIn) -> dict[str, Any]:
     out = result.to_dict()
     out["applied"] = False
 
+    # Reported on BOTH proposal and apply, so stale evidence is visible before
+    # the human is shown numbers that look valid.
+    out["current_profile_ids"] = sorted(p.profile_id for p in profiles.values()
+                                        if p.compatible)
+    problems = generation_problems(trials, result.profiles, profiles,
+                                   applying=bool(body.apply))
+    out["generation_problems"] = problems
+    out["generation_ok"] = not problems
+    # Reported separately so a caller can tell "stale evidence" from "an
+    # incomplete fit" — different faults with different remedies.
+    _compat = {p.profile_id for p in profiles.values() if p.compatible}
+    _fitted = {f.profile_id for f in result.profiles}
+    out["fit_covers_current_profiles"] = bool(_compat) and _fitted == _compat
+    out["evidence_lineage_ok"] = not any(
+        "stale profile generation" in p for p in problems)
+    if problems and not body.apply:
+        # A proposal built on stale scores must not look usable.
+        out["ok"] = False
+        out["reason"] = "; ".join(problems)
+
     if body.apply:
+        # EVERY invariant is checked before the FIRST write. The previous code
+        # skipped unknown profiles with `continue`, wrote the record anyway, and
+        # returned applied=true — so a stale generation produced an
+        # authoritative-looking calibration that had changed nothing.
+        if problems:
+            raise HTTPException(status_code=409, detail="; ".join(problems))
         if not result.ok:
             # Refusing to apply a failed fit is the entire point. A threshold
             # that only passes because it was loosened carries a claim it cannot
             # support.
             raise HTTPException(status_code=400,
                                 detail=f"calibration failed: {result.reason}")
-        for fit in result.profiles:
-            prof = profiles.get(fit.profile_id)
-            if prof is None or fit.threshold is None:
-                continue
-            prof.threshold = float(fit.threshold)
-            await svc.registry.save(prof)
-        await svc.calib.save(CalibrationRecord(
-            margin=float(result.margin or 0.0),
-            profile_ids=[f.profile_id for f in result.profiles],
-            metrics={
-                "protocol_version": result.protocol_version,
-                "margin_correct_rate": result.margin_correct_rate,
-                "profiles": [
-                    {k: v for k, v in vars(f).items()
-                     if k in ("profile_id", "display_name", "threshold",
-                              "genuine_n", "impostor_n", "genuine_accept_rate",
-                              "false_accepts", "separation")}
-                    for f in result.profiles
-                ],
-                "trials": len(trials),
-            },
-        ))
+
+        # ONE SQLite transaction for every threshold AND the record. Not
+        # several commits with best-effort compensation: replacing a valid
+        # calibration and failing partway could otherwise leave the OLD record
+        # (which still matches the current ids) beside MIXED thresholds, and
+        # `threshold_calibrated` would happily report true.
+        from core.speaker.calibration import apply_atomically
+
+        try:
+            await apply_atomically(
+                svc.registry._db_path,
+                thresholds={f.profile_id: float(f.threshold)
+                            for f in result.profiles},
+                record=CalibrationRecord(
+                margin=float(result.margin or 0.0),
+                profile_ids=[f.profile_id for f in result.profiles],
+                metrics={
+                    "protocol_version": result.protocol_version,
+                    "margin_correct_rate": result.margin_correct_rate,
+                    "profiles": [
+                        {k: v for k, v in vars(f).items()
+                         if k in ("profile_id", "display_name", "threshold",
+                                  "genuine_n", "impostor_n", "genuine_accept_rate",
+                                  "false_accepts", "separation")}
+                        for f in result.profiles
+                    ],
+                    "trials": len(trials),
+                },
+            ))
+        except Exception as e:  # noqa: BLE001
+            # The transaction rolled back, so the previous coherent state — an
+            # earlier calibration, or none — is exactly intact. No compensation
+            # was attempted and none was needed.
+            logger.warning("speaker_calibration_apply_failed", error=str(e)[:200])
+            raise HTTPException(
+                status_code=500,
+                detail=f"calibration was NOT applied and nothing changed: "
+                       f"{str(e)[:200]}") from e
+
         out["applied"] = True
         logger.info("speaker_calibration_applied", margin=result.margin,
                     profiles=len(result.profiles))
