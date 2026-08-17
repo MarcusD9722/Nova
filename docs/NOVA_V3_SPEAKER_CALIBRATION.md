@@ -651,6 +651,68 @@ Step 9 requires steps 1–8 evidence; step 10 requires a step-9 PASS **at the
 current evidence revision**; step 11 requires a step-10 PASS. Failed results stay
 on screen and copyable — only proceeding is blocked.
 
+## Profile generation — evidence belongs to the centroids it was measured against
+
+A profile id names a **centroid**. Delete a profile and enrol again and the new
+profile has a new id and a different centroid, so every similarity score measured
+against the old one is evidence about a voice model that no longer exists. It
+cannot be relabelled onto the new profile; the numbers would be unreproducible.
+
+**This happened.** A live run mixed two generations:
+
+| evidence | profile ids |
+|---|---|
+| 56 calibration trials | `spk-601053c258fa`, `spk-c96353f36365` |
+| 20 validation trials | `spk-ccc5aafb945f`, `spk-4ebf6e6c6135` |
+| enrolled profiles | `spk-ccc5aafb945f`, `spk-4ebf6e6c6135` |
+
+The calibration was applied. Every threshold write was silently skipped because
+`profiles.get(stale_id)` returned `None`; the `CalibrationRecord` was persisted
+naming the **stale** ids; and the API answered `applied: true`. Both profiles
+ended with `stored_threshold = null` and the runtime fell back to provisional
+0.55 / 0.10. Nothing was calibrated, and nothing said so.
+
+That is also why `/speaker/calibration` reported `calibrated: true` while
+`/speaker/status` reported `threshold_calibrated: false`: the first only asked
+whether a record existed and matched the model build, the second asked whether it
+covers the profiles enrolled now. Both were right about different questions and
+the operator could only be misled.
+
+### What now happens
+
+**Backend, fail-closed.** `POST /speaker/calibration` validates the whole
+generation *before the first write*: the fitted ids must equal the current
+compatible set exactly, every fitted profile must exist with a threshold, and
+every id a trial names — `truth`, `top_profile_id`, `second_profile_id` — must
+belong to the current generation. A stale id anywhere is **409** with
+`old=[…], current=[…]`; no threshold is written, no record is created, and
+`applied` is never true. The same check runs for `apply:false`, so a proposal
+built on stale scores is flagged before it looks convincing.
+
+**Application is atomic.** All invariants are checked first; then thresholds and
+the record are written, and any failure rolls the thresholds back. A half-applied
+calibration — one profile fitted, one provisional, nothing saying so — cannot
+survive.
+
+**`/speaker/calibration` separates the questions:** `record_present`,
+`valid_for_build`, `covers_current_profiles`, `effective`, `record_profile_ids`,
+`current_profile_ids`, plus a `stale_reason`. `calibrated` now means *usable for
+the current profiles* — the same answer `/speaker/status` gives. A stale record
+is **not** deleted on read; it is evidence that something went wrong.
+
+**The harness tracks generation.** Trials, proposal, applied calibration,
+validation, step 9 and the permission regression each record the generation they
+were measured under. Computing a proposal, applying, and starting steps 8 and 9
+all block first — before any recording — showing current ids, evidence ids, and
+which evidence is stale. Acceptance additionally checks the ids the stored rows
+*actually reference*, not just the recorded tag.
+
+**Deleting a profile reconciles the browser.** It used to change the backend and
+leave the old trial rows in `localStorage`, which is precisely how one run ended
+up with 56 trials scored against centroids that no longer existed. The confirm
+dialog now lists what will be discarded, and everything downstream of that
+profile is cleared.
+
 ## The unverified self-history guard
 
 An unverified speaker asking about their own history now gets a deterministic

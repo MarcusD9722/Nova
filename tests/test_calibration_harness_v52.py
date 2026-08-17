@@ -1022,6 +1022,91 @@ async def test_step_gating_predicates():
           "a failed step-9 result stays on screen and copyable")
 
 
+async def test_mixed_profile_generation_is_rejected():
+    check.section("6: the EXACT live mixed-generation shape must FAIL")
+    # Reproduced from the real run: 56 calibration trials scored against
+    # spk-601053c258fa / spk-c96353f36365, 20 validation trials against the
+    # current spk-ccc5aafb945f / spk-4ebf6e6c6135. The browser computed and
+    # applied a calibration from the old scores without noticing.
+    out = _node("""
+      const OLD_M = "spk-601053c258fa", OLD_G = "spk-c96353f36365";
+      const NEW_M = "spk-ccc5aafb945f", NEW_G = "spk-4ebf6e6c6135";
+      const gen = ids => "model@rev#" + ids.slice().sort().join(",");
+
+      const S = P52.freshState();
+      S.marcusId = NEW_M; S.guestId = NEW_G;
+      S.enroll = {marcus:{meets_p52_bar:true, ok:true, profile_id:NEW_M},
+                  guest:{meets_p52_bar:true, ok:true, profile_id:NEW_G}};
+      S.trials = Array.from({length:56}, (_, i) => ({
+        block: i < 20 ? "trials_marcus" : "phaseb_marcus",
+        truth: i % 2 ? OLD_M : OLD_G, truthName:"x", phase:"B", condition:"normal",
+        status:"known", predicted_profile_id: i % 2 ? OLD_M : OLD_G,
+        top_profile_id: i % 2 ? OLD_M : OLD_G,
+        second_profile_id: i % 2 ? OLD_G : OLD_M, top_score:0.8, second_score:0.2}));
+      S.validation = Array.from({length:20}, (_, i) => ({
+        block: i < 10 ? "valid_marcus" : "valid_guest",
+        truth: i < 10 ? NEW_M : NEW_G, truthName:"x", phase:"V", condition:"normal",
+        status:"known", predicted_profile_id: i < 10 ? NEW_M : NEW_G,
+        top_profile_id: i < 10 ? NEW_M : NEW_G, second_profile_id:null,
+        top_score:0.8, second_score:null}));
+      S.proposal = {ok:true, profiles:[{profile_id:OLD_M, threshold:0.38},
+                                       {profile_id:OLD_G, threshold:0.24}]};
+      S.applied = true;
+      S.trialsGeneration = gen([OLD_M, OLD_G]);
+      S.proposalGeneration = gen([OLD_M, OLD_G]);
+      S.appliedGeneration = gen([OLD_M, OLD_G]);
+      S.validationGeneration = gen([NEW_M, NEW_G]);
+      S.statusAfter = {threshold_calibrated:false,
+                       threshold_source:"provisional default",
+                       margin_source:"provisional default",
+                       profiles_detail:[{profile_id:NEW_M, role:"owner", compatible:true},
+                                        {profile_id:NEW_G, role:"guest", compatible:true}]};
+
+      const A = P52.computeAcceptance(S);
+      out.acceptance = A.acceptance;
+      out.generation = A.generation;
+      out.failed = A.failed;
+      // What the preflight would say against the CURRENT generation.
+      out.stale = P52.staleEvidence(S, gen([NEW_M, NEW_G]));
+      // Deleting a profile must discard everything measured against it.
+      const D = JSON.parse(JSON.stringify(S));
+      out.dependent = P52.dependentEvidence(D, NEW_M);
+      P52.invalidateForProfile(D, NEW_M);
+      out.after = {trials: D.trials.length, validation: D.validation.length,
+                   proposal: D.proposal, applied: D.applied,
+                   marcusId: D.marcusId, sentinel: D.sentinel,
+                   trialsGeneration: D.trialsGeneration};
+    """)
+    check(out["acceptance"] == "FAIL",
+          f"the mixed-generation state FAILS acceptance ({out['acceptance']})")
+    check(out["generation"]["ok"] is False, "the generation check reports not-ok")
+    check(out["generation"]["trial_ids"] == ["spk-601053c258fa", "spk-c96353f36365"],
+          f"naming the stale ids ({out['generation']['trial_ids']})")
+    check(out["generation"]["expected_ids"] == ["spk-4ebf6e6c6135", "spk-ccc5aafb945f"],
+          f"and the current ones ({out['generation']['expected_ids']})")
+    check(any("stale profile generation" in f for f in out["failed"]),
+          f"with an explicit failure ({out['failed']})")
+    check(any("different profile generations" in f for f in out["failed"]),
+          "and it says calibration and validation disagree")
+    check(out["generation"]["validation_ok"] is True,
+          "the validation trials themselves are current — only the fit is stale")
+
+    # The preflight would block before any recording.
+    check(len(out["stale"]) >= 1,
+          f"a preflight against the current generation flags it ({out['stale']})")
+    check(any(s["what"] == "calibration trials" for s in out["stale"]),
+          "naming the calibration trials specifically")
+
+    # Deletion reconciles the browser instead of leaving orphaned scores.
+    check("Marcus enrolment" in out["dependent"],
+          f"deleting Marcus is shown to discard his enrolment ({out['dependent']})")
+    check(out["after"]["validation"] == 0, "validation rows measured against him go")
+    check(out["after"]["proposal"] is None and out["after"]["applied"] is False,
+          "the fit and its application go")
+    check(out["after"]["marcusId"] is None, "and his id is cleared")
+    check(out["after"]["sentinel"] is None, "step 9 evidence goes too")
+
+
 async def test_sentinel_comparison_is_symmetric():
     check.section("STEP 9: one comparison rule for positives AND privacy")
     html = HARNESS.read_text(encoding="utf-8")
@@ -1260,6 +1345,7 @@ async def main():
     await test_sentinel_sample_behaviour_with_injected_deps()
     await test_effective_policy_helper_is_shared()
     await test_step_gating_predicates()
+    await test_mixed_profile_generation_is_rejected()
     await test_sentinel_comparison_is_symmetric()
     await test_sentinel_turns_carry_raw_evidence()
     await test_autosave_shape_is_non_audio_and_resumable()

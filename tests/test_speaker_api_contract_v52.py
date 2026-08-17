@@ -465,6 +465,264 @@ async def test_sentinel_conversation_state_is_speaker_isolated():
         check(not ru.strip(), f"unverified state is empty ({ru!r})")
 
 
+# ── 7. profile GENERATION: evidence from one set of centroids is not evidence
+#       about another ───────────────────────────────────────────────────────
+
+def _trials_for(m_id, g_id, *, n=14):
+    """A mathematically valid, separable two-speaker trial set."""
+    rows = []
+    for i in range(n):
+        rows.append({"truth": m_id, "top_profile_id": m_id,
+                     "top_score": 0.86 - i * 0.005, "second_profile_id": g_id,
+                     "second_score": 0.12, "status": "known",
+                     "condition": "normal", "phase": "B"})
+    for i in range(n):
+        rows.append({"truth": g_id, "top_profile_id": g_id,
+                     "top_score": 0.84 - i * 0.005, "second_profile_id": m_id,
+                     "second_score": 0.10, "status": "known",
+                     "condition": "normal", "phase": "B"})
+    return rows
+
+
+async def test_stale_generation_calibration_is_refused():
+    check.section("a fit for DELETED profiles must not apply, or claim it did")
+    # The live failure: 56 trials scored against spk-601053c258fa /
+    # spk-c96353f36365, current profiles spk-ccc5aafb945f / spk-4ebf6e6c6135.
+    # Every threshold write was skipped by `profiles.get(stale) -> None`, the
+    # record was persisted naming the STALE ids, and the API said applied: true.
+    OLD_M, OLD_G = "spk-601053c258fa", "spk-c96353f36365"
+
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        NEW_M, NEW_G = m["profile_id"], g["profile_id"]
+        check(NEW_M != OLD_M and NEW_G != OLD_G, "the fixture ids really differ")
+
+        stale = _trials_for(OLD_M, OLD_G)
+
+        # PROPOSAL must not look usable.
+        prop = (await nova.http.post("/speaker/calibration",
+                                     json={"trials": stale, "apply": False})).json()
+        check(prop.get("generation_ok") is False,
+              "a proposal on stale evidence is flagged, not presented as valid")
+        check(prop.get("ok") is False,
+              f"and is not reported as a good fit ({prop.get('ok')})")
+        check(any("stale profile generation" in p
+                  for p in prop.get("generation_problems", [])),
+              f"naming the problem ({prop.get('generation_problems')})")
+        check(OLD_M in str(prop.get("generation_problems"))
+              and NEW_M in str(prop.get("current_profile_ids")),
+              "showing BOTH the stale ids and the current ones")
+
+        # APPLY must be refused outright.
+        r = await nova.http.post("/speaker/calibration",
+                                 json={"trials": stale, "apply": True})
+        check(r.status_code in (400, 409),
+              f"apply is refused ({r.status_code})")
+        check("stale profile generation" in r.text,
+              f"with a diagnostic ({r.text[:140]})")
+
+        # NOTHING was written.
+        st = (await nova.http.get("/speaker/status")).json()
+        detail = {p["profile_id"]: p for p in st["profiles_detail"]}
+        check(detail[NEW_M]["stored_threshold"] is None
+              and detail[NEW_G]["stored_threshold"] is None,
+              "no profile threshold was written")
+        check(st["threshold_calibrated"] is False,
+              "status still reports uncalibrated")
+        cal = (await nova.http.get("/speaker/calibration")).json()
+        check(cal["record_present"] is False,
+              "and NO calibration record was created")
+        check(cal["calibrated"] is False, "so nothing claims to be calibrated")
+
+
+async def test_calibration_endpoint_distinguishes_record_from_usable():
+    check.section("a record that exists is not a calibration that applies")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        NEW_M, NEW_G = m["profile_id"], g["profile_id"]
+
+        # Plant a stale record directly, the way the old buggy apply would have.
+        from core.speaker.calibration import CalibrationRecord, CalibrationStore
+        db = nova.state.speaker.registry._db_path
+        await CalibrationStore(db).save(CalibrationRecord(
+            margin=0.29, profile_ids=["spk-601053c258fa", "spk-c96353f36365"],
+            metrics={}))
+
+        cal = (await nova.http.get("/speaker/calibration")).json()
+        check(cal["record_present"] is True, "the record is reported as present")
+        check(cal["valid_for_build"] is True, "and valid for this model build")
+        check(cal["covers_current_profiles"] is False,
+              "but it does NOT cover the current profiles")
+        check(cal["effective"] is False and cal["calibrated"] is False,
+              "so `calibrated` is FALSE — the operationally useful answer")
+        check("stale_reason" in cal, f"with an explanation ({cal.get('stale_reason')})")
+        check(sorted(cal["current_profile_ids"]) == sorted([NEW_M, NEW_G]),
+              "showing the current ids")
+
+        # And it agrees with /speaker/status, which was the contradiction.
+        st = (await nova.http.get("/speaker/status")).json()
+        check(st["threshold_calibrated"] == cal["calibrated"],
+              f"/calibration and /status agree ({cal['calibrated']} / "
+              f"{st['threshold_calibrated']})")
+        check(st["threshold_source"] == "provisional default",
+              "the runtime falls back to provisional")
+
+        # Reading it must NOT delete the evidence.
+        again = (await nova.http.get("/speaker/calibration")).json()
+        check(again["record_present"] is True,
+              "a stale record survives being read — it is history, not litter")
+
+
+async def test_current_generation_applies_and_survives_restart():
+    check.section("a CURRENT-generation fit applies, and reloads after restart")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+
+        r = await nova.http.post("/speaker/calibration",
+                                 json={"trials": _trials_for(M, G), "apply": True})
+        body = r.json()
+        check(r.status_code == 200 and body.get("applied") is True,
+              f"the current generation applies ({r.status_code}, {body.get('reason')})")
+        check(body.get("generation_ok") is True, "with a clean generation check")
+
+        st = (await nova.http.get("/speaker/status")).json()
+        detail = {p["profile_id"]: p for p in st["profiles_detail"]}
+        check(detail[M]["stored_threshold"] is not None
+              and detail[G]["stored_threshold"] is not None,
+              "both thresholds persisted")
+        check(st["threshold_calibrated"] is True, "status says calibrated")
+        check(st["threshold_source"] == "calibrated"
+              and st["margin_source"] == "calibrated",
+              f"and BOTH sources are calibrated ({st['threshold_source']} / "
+              f"{st['margin_source']})")
+        saved = {M: detail[M]["stored_threshold"], G: detail[G]["stored_threshold"]}
+
+        # RESTART. The original defect only surfaced after a reboot, so the
+        # policy has to be proven to survive one.
+        db = nova.state.speaker.registry._db_path
+        from core.speaker.service import SpeakerService
+        fresh = SpeakerService(db)
+        await fresh.initialize()
+        st2 = await fresh.status()
+        check(st2["threshold_calibrated"] is True,
+              "a freshly constructed service reloads the calibration")
+        check(st2["threshold_source"] == "calibrated"
+              and st2["margin_source"] == "calibrated",
+              f"with both sources still calibrated ({st2['threshold_source']} / "
+              f"{st2['margin_source']})")
+        d2 = {p["profile_id"]: p for p in st2["profiles_detail"]}
+        for pid, val in saved.items():
+            check(abs(d2[pid]["effective_threshold"] - val) < 1e-9,
+                  f"{pid} still judged by {val} after restart "
+                  f"({d2[pid]['effective_threshold']})")
+
+
+async def test_enrolment_invalidates_and_stale_cannot_be_recreated():
+    check.section("enrol/delete invalidates; stale evidence cannot resurrect it")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+        await nova.http.post("/speaker/calibration",
+                             json={"trials": _trials_for(M, G), "apply": True})
+        check((await nova.http.get("/speaker/status")).json()["threshold_calibrated"],
+              "baseline: calibrated")
+
+        # Replace the guest, the way the protocol says: DELETE the stale profile
+        # deliberately, then enrol again. (Enrolling without deleting leaves
+        # three compatible profiles, and a two-profile fit correctly fails to
+        # cover them — checked at the end.)
+        d = await nova.http.delete(f"/speaker/profiles/{G}")
+        check(d.status_code == 200, f"the old guest profile is deleted ({d.status_code})")
+        g2 = await _enrol(nova, speak_as, "guest", "Leslie 2", "guest")
+        G2 = g2["profile_id"]
+        check(G2 != G, "re-enrolment produced a new profile id")
+
+        st = (await nova.http.get("/speaker/status")).json()
+        check(st["threshold_calibrated"] is False,
+              "the calibration is no longer usable")
+        check(st["threshold_source"] == "provisional default",
+              f"and the runtime falls closed ({st['threshold_source']})")
+
+        # The OLD trials must not be able to rebuild the old record.
+        r = await nova.http.post("/speaker/calibration",
+                                 json={"trials": _trials_for(M, G), "apply": True})
+        check(r.status_code in (400, 409),
+              f"stale trials cannot recreate a calibration ({r.status_code})")
+        cal = (await nova.http.get("/speaker/calibration")).json()
+        check(cal["calibrated"] is False,
+              "and nothing usable exists afterwards")
+
+        # A fresh fit for the CURRENT generation works.
+        r2 = await nova.http.post("/speaker/calibration",
+                                  json={"trials": _trials_for(M, G2), "apply": True})
+        check(r2.status_code == 200 and r2.json().get("applied") is True,
+              f"a current-generation fit applies ({r2.status_code})")
+        st2 = (await nova.http.get("/speaker/status")).json()
+        check(st2["threshold_calibrated"] is True
+              and st2["threshold_source"] == "calibrated",
+              "and the runtime is calibrated again")
+
+        # A THIRD profile must invalidate it again, and a two-profile fit must
+        # not cover a three-profile population.
+        speak_as("stranger")
+        g3 = await _enrol(nova, speak_as, "stranger", "Third", "guest")
+        st3 = (await nova.http.get("/speaker/status")).json()
+        check(st3["threshold_calibrated"] is False,
+              "a third enrolment invalidates the calibration")
+        r3 = await nova.http.post("/speaker/calibration",
+                                  json={"trials": _trials_for(M, G2), "apply": True})
+        check(r3.status_code == 409,
+              f"and a two-profile fit no longer covers the population "
+              f"({r3.status_code})")
+        check("does not cover every current profile" in r3.text,
+              f"saying which profile is uncovered ({r3.text[:120]})")
+
+
+async def test_apply_is_atomic_when_persistence_fails():
+    check.section("a failed write leaves NO half-calibrated state")
+    async with boot() as nova:
+        speak_as = _install_fakes(nova)
+        m = await _enrol(nova, speak_as, "marcus", "Marcus", "owner")
+        g = await _enrol(nova, speak_as, "guest", "Leslie", "guest")
+        M, G = m["profile_id"], g["profile_id"]
+        svc = nova.state.speaker
+
+        # Break the SECOND persistence step: thresholds save, the record does not.
+        original = svc.calib.save
+        async def boom(_rec):
+            raise RuntimeError("simulated disk failure")
+        svc.calib.save = boom          # type: ignore[assignment]
+        try:
+            r = await nova.http.post("/speaker/calibration",
+                                     json={"trials": _trials_for(M, G), "apply": True})
+        finally:
+            svc.calib.save = original  # type: ignore[assignment]
+
+        check(r.status_code == 500, f"the failure surfaces ({r.status_code})")
+        check("applied" not in r.text or '"applied":true' not in r.text.replace(" ", ""),
+              "and applied is NOT reported true")
+
+        st = (await nova.http.get("/speaker/status")).json()
+        detail = {p["profile_id"]: p for p in st["profiles_detail"]}
+        check(detail[M]["stored_threshold"] is None
+              and detail[G]["stored_threshold"] is None,
+              f"both thresholds were rolled back "
+              f"({detail[M]['stored_threshold']}, {detail[G]['stored_threshold']})")
+        check(st["threshold_calibrated"] is False,
+              "and nothing claims to be calibrated")
+        cal = (await nova.http.get("/speaker/calibration")).json()
+        check(cal["record_present"] is False, "no record was left behind")
+
+
 async def test_permission_evaluate_takes_no_identity():
     check.section("permission: evaluate() has no identity parameter at all")
     import inspect
@@ -488,6 +746,11 @@ async def main():
     await test_stt_speaker_info_drops_nothing()
     await test_permission_probe_is_real_and_identity_blind()
     await test_sentinel_conversation_state_is_speaker_isolated()
+    await test_stale_generation_calibration_is_refused()
+    await test_calibration_endpoint_distinguishes_record_from_usable()
+    await test_current_generation_applies_and_survives_restart()
+    await test_enrolment_invalidates_and_stale_cannot_be_recreated()
+    await test_apply_is_atomic_when_persistence_fails()
     await test_permission_evaluate_takes_no_identity()
     check.finish()
 
