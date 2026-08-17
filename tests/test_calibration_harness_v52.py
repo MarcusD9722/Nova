@@ -57,6 +57,20 @@ def _script() -> str:
     return blocks[0]
 
 
+def _code_only(js: str) -> str:
+    """Strip JS comments. Every "must NOT appear" check has to run against code:
+    the harness explains in comments exactly which mistakes it avoids, and
+    naming them there would otherwise fail the check that they are gone."""
+    out = []
+    for line in js.splitlines():
+        if line.strip().startswith("//"):
+            continue
+        if "//" in line and "://" not in line:
+            line = line[:line.index("//")]
+        out.append(line)
+    return "\n".join(out)
+
+
 def _node(body: str) -> dict:
     """Load the harness logic in node and run `body`, which sets `out`."""
     node = shutil.which("node")
@@ -429,6 +443,104 @@ async def test_trial_persistence_is_atomic():
     check(".push(" not in body, "and does not push the row itself")
 
 
+async def test_sentinel_canonicalization():
+    check.section("STEP 9: formatting-tolerant, word-exact sentinel matching")
+    out = _node("""
+      const M = P52.SENTINELS.marcus, G = P52.SENTINELS.guest;
+      out.M = M; out.G = G;
+      const c = (r, s) => P52.containsSentinel(r, s);
+
+      // POSITIVE: the same words, however STT chose to punctuate them.
+      out.pos = {
+        exact:      c("COBALT ORCHARD PINE", M),
+        lower:      c("cobalt orchard pine", M),
+        hyphen:     c("Cobalt-orchard-pine", M),
+        sentence:   c("Your calibration sentinel is Cobalt Orchard Pine.", M),
+        commas:     c("It's cobalt, orchard, pine!", M),
+        multispace: c("COBALT   ORCHARD\\n PINE", M),
+      };
+
+      // NEGATIVE: a near-miss is a miss. No edit distance, no partial credit.
+      out.neg = {
+        truncated:  c("COBALT ORCHARD", M),
+        substituted:c("COBALT ORCHARD LIME", M),
+        otherToken: c(G, M),
+        reordered:  c("PINE ORCHARD COBALT", M),
+        extraInside:c("COBALT ORCHARD GREEN PINE", M),
+        empty:      c("", M),
+        nullReply:  c(null, M),
+      };
+
+      // LEAK DETECTION uses the SAME function, so normalisation cannot make the
+      // positive easier while making the leak harder to see.
+      out.leak = {
+        plain:   c("Your sentinel is COBALT ORCHARD PINE", M),
+        cased:   c("your sentinel is cobalt orchard pine", M),
+        hyphen:  c("I recall Cobalt-Orchard-Pine for you", M),
+        guestGotMarcus: c("Marcus said cobalt orchard pine", M),
+      };
+      out.sameFn = String(P52.containsSentinel).length > 0;
+      out.tokens = P52.canonTokens("  Cobalt-Orchard, PINE!! ");
+    """)
+    check(out["M"] == "COBALT ORCHARD PINE", f"Marcus sentinel ({out['M']})")
+    check(out["G"] == "SILVER HARBOR LANTERN", f"guest sentinel ({out['G']})")
+    check(out["tokens"] == ["COBALT", "ORCHARD", "PINE"],
+          f"canonical tokens ({out['tokens']})")
+    check(not any(ch.isdigit() for ch in out["M"] + out["G"]),
+          "letter-only — no digits for STT to render as words")
+    check("-" not in out["M"] and "-" not in out["G"],
+          "and no punctuation for STT to drop")
+
+    for name, got in out["pos"].items():
+        check(got is True, f"POSITIVE {name}: counts as the sentinel")
+    for name, got in out["neg"].items():
+        check(got is False, f"NEGATIVE {name}: does NOT count")
+    for name, got in out["leak"].items():
+        check(got is True,
+              f"LEAK {name}: a formatting-varied Marcus sentinel IS detected")
+
+
+async def test_sentinel_comparison_is_symmetric():
+    check.section("STEP 9: one comparison rule for positives AND privacy")
+    html = HARNESS.read_text(encoding="utf-8")
+    flow = _code_only(html[html.index("async function sentinelFlow"):
+                           html.index("async function permissionFlow")])
+
+    # All four verdicts must go through containsSentinel — none may use
+    # `.includes(...)`, which is what produced the false negative in run 2.
+    for field in ("marcus_got_own", "guest_got_own", "guest_got_marcus",
+                  "unverified_got_either"):
+        line = [l for l in flow.splitlines() if field in l and "=" in l]
+        check(any("containsSentinel" in l for l in line),
+              f"{field} uses containsSentinel ({[l.strip()[:60] for l in line]})")
+    check(".includes(M_S)" not in flow and ".includes(G_S)" not in flow,
+          "no exact .includes() comparison survives anywhere in the flow")
+    check(flow.count("containsSentinel(") >= 5,
+          f"used for every verdict and both per-turn flags "
+          f"({flow.count('containsSentinel(')})")
+
+
+async def test_sentinel_turns_carry_raw_evidence():
+    check.section("STEP 9: raw STT and reply are recorded for diagnosis")
+    html = HARNESS.read_text(encoding="utf-8")
+    flow = html[html.index("async function sentinelFlow"):
+                html.index("async function permissionFlow")]
+
+    for field in ("stt_text", "assistant_reply", "status", "profile_id",
+                  "conversation_id", "stt_tokens", "reply_tokens"):
+        check(f"{field}:" in flow, f"every sentinel turn records `{field}`")
+    check("r.text" in flow and "r.reply" in flow,
+          "taken from the real /stt text and /chat reply")
+    # Diagnostics, not biometrics — checked against the recorded object itself,
+    # not the surrounding code (which legitimately has a `blob` parameter).
+    rec = flow[flow.index("out.steps.push({"):]
+    rec = _code_only(rec[:rec.index("});") + 3])
+    for banned in ("embedding", "centroid", "similarity", "blob", "audio",
+                   "threshold"):
+        check(banned not in rec.lower(),
+              f"and no {banned} is recorded on a sentinel turn")
+
+
 async def test_autosave_shape_is_non_audio_and_resumable():
     check.section("5: reload preserves progress, and never audio")
     out = _node("""
@@ -608,6 +720,9 @@ async def main():
     await test_below_bar_enrollment_does_not_advance()
     await test_speaker_handoffs_gate_every_change()
     await test_trial_persistence_is_atomic()
+    await test_sentinel_canonicalization()
+    await test_sentinel_comparison_is_symmetric()
+    await test_sentinel_turns_carry_raw_evidence()
     await test_autosave_shape_is_non_audio_and_resumable()
     await test_acceptance_bars_are_unchanged()
     await test_incomplete_run_is_not_complete_not_pass()

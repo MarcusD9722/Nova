@@ -397,6 +397,74 @@ async def test_permission_probe_is_real_and_identity_blind():
               f"no confirmation left dangling ({broker.pending()})")
 
 
+# ── 6. the Step-9 sentinel, through the real turn path ───────────────────────
+
+async def test_sentinel_conversation_state_is_speaker_isolated():
+    check.section("step 9: each speaker's own sentinel reaches their own prompt")
+    # Human run 2 reported step 9 FAILED with BOTH positives false. Because the
+    # privacy negatives are vacuously true when nobody receives anything, that
+    # result could not distinguish a memory failure from a detection failure.
+    # This pins the production side so the question never has to be re-litigated
+    # from a browser run.
+    from uuid import uuid4
+
+    from core.speaker.matcher import STATUS_KNOWN, SpeakerMatch
+    from core.turn_identity import TurnIdentity, active_turn
+
+    M_S, G_S = "COBALT ORCHARD PINE", "SILVER HARBOR LANTERN"
+
+    async with boot(default_reply="Noted.") as nova:
+        cid = uuid4()
+        marcus = TurnIdentity.typed()
+        guest = TurnIdentity.from_match(
+            SpeakerMatch(status=STATUS_KNOWN, profile_id="spk-guest",
+                         display_name="Leslie", attempted=True), profile=None)
+        stranger = TurnIdentity.voice_unverified("not recognised")
+
+        check(marcus.memory_entity == "user", "Marcus is the owner")
+        check(guest.memory_entity == "speaker:spk-guest", "the guest is scoped")
+        check(stranger.memory_entity is None, "the stranger owns nothing")
+
+        async def turn(ident, text):
+            nova.llm.reset_calls()
+            # `identity=` is how backend/app.py passes it, and the runtime enters
+            # active_turn() itself. Wrapping the call from OUTSIDE does not work:
+            # active_turn(None) resets to typed owner and silently overrides it.
+            await nova.brain.chat(text, conversation_id=cid, identity=ident)
+            return "\n".join(p for p in nova.llm.prompts if "You are Nova" in p)
+
+        await turn(marcus, f"Remember that my calibration sentinel is {M_S}.")
+        await turn(guest, f"Remember that my calibration sentinel is {G_S}.")
+        pm = await turn(marcus, "What is my calibration sentinel?")
+        pg = await turn(guest, "What is my calibration sentinel?")
+        pu = await turn(stranger, "What is my calibration sentinel?")
+
+        check(M_S in pm, "Marcus's ask prompt carries HIS sentinel")
+        check(G_S not in pm, "and not the guest's")
+        check(G_S in pg, "the guest's ask prompt carries HERS")
+        check(M_S not in pg, "and not Marcus's — no leak")
+        check(M_S not in pu and G_S not in pu,
+              "an unverified speaker's prompt carries neither")
+
+        # The isolation is structural: different storage keys, not filtering.
+        store = nova.runtime._state_store
+        with active_turn(marcus):
+            km, rm = store._key(cid), await store.recent_chat_text(cid)
+        with active_turn(guest):
+            kg, rg = store._key(cid), await store.recent_chat_text(cid)
+        with active_turn(stranger):
+            ku, ru = store._key(cid), await store.recent_chat_text(cid)
+
+        check(km != kg, f"owner and guest use different keys ({km} vs {kg})")
+        check(str(cid) in km and "speaker:spk-guest" in kg,
+              "the guest's key carries their scope")
+        check(ku != km and ku != kg,
+              f"and an unverified turn gets its own ephemeral key ({ku})")
+        check(M_S in rm and G_S not in rm, "owner state holds only his")
+        check(G_S in rg and M_S not in rg, "guest state holds only hers")
+        check(not ru.strip(), f"unverified state is empty ({ru!r})")
+
+
 async def test_permission_evaluate_takes_no_identity():
     check.section("permission: evaluate() has no identity parameter at all")
     import inspect
@@ -419,6 +487,7 @@ async def main():
     await test_status_reports_sources_over_http()
     await test_stt_speaker_info_drops_nothing()
     await test_permission_probe_is_real_and_identity_blind()
+    await test_sentinel_conversation_state_is_speaker_isolated()
     await test_permission_evaluate_takes_no_identity()
     check.finish()
 

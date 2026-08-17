@@ -180,13 +180,68 @@ function planConditions(count, conds) {
   return out;
 }
 
+// ── the sentinel tokens ─────────────────────────────────────────────────────
+//
+// Human run 2 failed step 9 with marcus_got_own=false AND guest_got_own=false,
+// while both negative privacy checks "passed" — which they do vacuously when
+// nobody receives anything. The production path was then verified end to end
+// and is correct: each speaker's prompt carries their own sentinel and not the
+// other's, from separately-keyed conversation state.
+//
+// The old tokens were MARCUS-LIVE-551 / GUEST-LIVE-661, compared with exact
+// `reply.includes(...)`. But this is a VOICE pipeline: the store utterance goes
+// through STT before it is ever stored, and STT will happily render a
+// hyphenated, digit-bearing token as "Marcus live 551". The model then answers
+// with what it was given, and an exact string test reports a memory failure
+// that never happened.
+//
+// So: letter-only, three-word, phonetically distinct phrases that STT can
+// transcribe without inventing punctuation, and a canonicalizing comparison.
+const SENTINELS = {
+  marcus: "COBALT ORCHARD PINE",
+  guest:  "SILVER HARBOR LANTERN",
+};
+
+/** Uppercase alphanumeric tokens. Deterministic; no fuzzy or semantic matching. */
+function canonTokens(s) {
+  return String(s == null ? "" : s)
+    .toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim()
+    .split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Does `reply` contain `sentinel` as a consecutive run of identical tokens?
+ *
+ * Case, punctuation and whitespace are ignored; WORDS ARE NOT. A missing token
+ * ("COBALT ORCHARD"), a substituted one ("COBALT ORCHARD LIME") and the other
+ * speaker's phrase all fail. No edit distance, no fuzzy matching — a near-miss
+ * is a miss.
+ *
+ * THE SAME function backs the positive checks (did Marcus get his own?) and the
+ * negative privacy checks (did the guest get Marcus's?). Normalising only the
+ * positives would make the test easier to pass while making leaks harder to
+ * see, which is the wrong trade in both directions at once.
+ */
+function containsSentinel(reply, sentinel) {
+  const r = canonTokens(reply), s = canonTokens(sentinel);
+  if (!s.length || r.length < s.length) return false;
+  for (let i = 0; i + s.length <= r.length; i++) {
+    let hit = true;
+    for (let j = 0; j < s.length; j++) {
+      if (r[i + j] !== s[j]) { hit = false; break; }
+    }
+    if (hit) return true;
+  }
+  return false;
+}
+
 // ── who speaks, in the two multi-person blocks ──────────────────────────────
 // Pure data so the handoff rule below can be tested without a browser.
 const SENTINEL_STEPS = [
   {who:"Marcus", phase:"store", secs:5.0,
-   cue:'Marcus: say — "Remember that my calibration sentinel is MARCUS-LIVE-551."'},
+   cue:`Marcus: say — "Remember that my calibration sentinel is ${SENTINELS.marcus}."`},
   {who:"Guest", phase:"store", secs:5.0,
-   cue:'Guest: say — "Remember that my calibration sentinel is GUEST-LIVE-661."'},
+   cue:`Guest: say — "Remember that my calibration sentinel is ${SENTINELS.guest}."`},
   {who:"Marcus", phase:"ask", secs:4.0,
    cue:'Marcus: say — "What is my calibration sentinel?"'},
   {who:"Guest", phase:"ask", secs:4.0,
@@ -427,7 +482,8 @@ function freshState() {
 const P52 = {
   DUR, GAP_MS, LEAD_IN_S, LEAD_NEXT_S, CONDITION_NAMES, CONDITION_HINT,
   ENROLL_PHRASES, CAL_CUES, VAL_CUES, UNVERIFIED_OK,
-  SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS,
+  SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS, SENTINELS,
+  canonTokens, containsSentinel,
   planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
   handoffBeforeIndex, stepLabel, enrollmentComplete, enrollmentAcceptable,
   reconcileEnrollment, commitSample,
@@ -777,7 +833,7 @@ async function sttOnly(blob, wantSpeaker) {
 // the handoff rule that reads them has to be testable without a browser.
 
 async function sentinelFlow() {
-  const M_S = "MARCUS-LIVE-551", G_S = "GUEST-LIVE-661";
+  const M_S = SENTINELS.marcus, G_S = SENTINELS.guest;
   if (!S.sentinelConversationId) { S.sentinelConversationId = crypto.randomUUID(); save(); }
   const CID = S.sentinelConversationId;
   const out = { steps: [], conversation_id: CID, conversation_stable: true };
@@ -810,12 +866,22 @@ async function sentinelFlow() {
       // exactly what a server ignoring conversation_id produces.
       if (r.conversation_id !== CID) out.conversation_stable = false;
       replies[i] = r.reply;
+      // RAW EVIDENCE. Run 2 reported a memory failure and kept neither the STT
+      // text nor the reply, so there was no way to tell a real failure from a
+      // transcription mismatch without recording the whole thing again. These
+      // are synthetic test tokens and a scripted question; there is nothing
+      // sensitive to withhold, and no embedding or biometric value is included.
       out.steps.push({who:spec.who, phase:spec.phase,
                       status: r.speaker?.status ?? null,
                       name: r.speaker?.display_name ?? null,
                       profile_id: r.speaker?.profile_id ?? null,
                       conversation_id: r.conversation_id,
-                      got_marcus: r.reply.includes(M_S), got_guest: r.reply.includes(G_S)});
+                      stt_text: r.text ?? null,
+                      assistant_reply: r.reply ?? null,
+                      stt_tokens: canonTokens(r.text).join(" "),
+                      reply_tokens: canonTokens(r.reply).join(" "),
+                      got_marcus: containsSentinel(r.reply, M_S),
+                      got_guest: containsSentinel(r.reply, G_S)});
       return {note: `${spec.who}: ${r.speaker?.status ?? "?"}`};
     },
   });
@@ -835,10 +901,18 @@ async function sentinelFlow() {
              + "check does NOT pass — re-run it with a genuinely unenrolled person, "
              + "or a real unverified condition.";
   }
-  out.marcus_got_own = !!replies[2] && replies[2].includes(M_S);
-  out.guest_got_own = !!replies[3] && replies[3].includes(G_S);
-  out.guest_got_marcus = !!replies[3] && replies[3].includes(M_S);
-  out.unverified_got_either = !!replies[4] && (replies[4].includes(M_S) || replies[4].includes(G_S));
+  // ONE comparison function for the positive checks and the privacy checks
+  // alike. Anything that makes "Marcus got his own" easier to satisfy must
+  // make "the guest got Marcus's" easier to DETECT by exactly the same amount.
+  out.marcus_got_own = containsSentinel(replies[2], M_S);
+  out.guest_got_own = containsSentinel(replies[3], G_S);
+  out.guest_got_marcus = containsSentinel(replies[3], M_S);
+  out.unverified_got_either = containsSentinel(replies[4], M_S)
+                           || containsSentinel(replies[4], G_S);
+  out.sentinels = {marcus: M_S, guest: G_S};
+  out.comparison = "canonical uppercase alphanumeric tokens, consecutive match; "
+                 + "no fuzzy or edit-distance matching; same rule for positive "
+                 + "and privacy checks";
   out.pass = out.conversation_stable && out.marcus_recognised && out.guest_recognised
              && out.unverified_is_unverified && out.marcus_got_own && out.guest_got_own
              && !out.guest_got_marcus && !out.unverified_got_either;
