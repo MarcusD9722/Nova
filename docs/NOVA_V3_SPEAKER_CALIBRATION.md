@@ -595,6 +595,62 @@ spends steps 8–11 validating a policy that is not the calibrated one.
 
 **Latency requires exactly 6 + 6.** Any other count is incomplete.
 
+### Integration hotfix — the cue and the validator are one contract
+
+The first closure shipped a **guaranteed deadlock**. The printed ask cue was
+*"What three words did I ask you to remember?"*, while `isAskTranscript()`
+required `MY + THREE + WORDS`. A **perfect** transcription of the instruction on
+screen was rejected before `/chat`, on all three ask turns, forever.
+
+99/99 tests were green because the validator had only ever been checked against
+phrases written next to it — never against the cue a human would actually read.
+
+There is now one source of truth:
+
+```js
+const ASK_UTTERANCE = "Repeat my three words.";
+const ASK_CUE = `say — "${ASK_UTTERANCE}"`;
+```
+
+and a coupled test walks **every** `SENTINEL_STEPS` ask entry, extracts the words
+it displays, and asserts the live validator accepts them. Changing the utterance
+without updating the validator now fails the suite. The same test asserts a
+perfect store transcription parses to the intended canary.
+
+### The commit boundary covers the bookkeeping too
+
+Splitting `/stt` from `/chat` was not enough: everything *after* `chatFromStt()`
+returned — recording the canary, the reply, the diagnostics — still ran outside
+the boundary, so a client-side exception there was treated as retryable even
+though the backend may already hold the turn. The per-sample logic now sets a
+`committed` flag and promotes any later failure to a run-aborting
+`PostChatError`. A **conversation-id mismatch aborts immediately** rather than
+setting a flag and recording the remaining speakers.
+
+The logic moved into `makeSentinelDoSample(deps, ctx)` with its dependencies
+injected, so tests **count real calls** instead of reading the source — an
+invalid take is `stt 1 / chat 0`, a valid one `stt 1 / chat 1`, and a post-chat
+bookkeeping failure is `chat 1` plus a full-run abort.
+
+### Effective policy, for resumed sessions
+
+`calibratedPolicyStatus()` is consulted by Apply, the **Check** button, the step
+8 and step 9 preflights and acceptance — one helper, so they cannot drift. Check
+now **persists** the status it fetches and displays `threshold`,
+`threshold_source`, `margin`, `margin_source` and `threshold_calibrated`, each
+coloured. The preflights run before the microphone opens and before any state is
+cleared, so a block costs nothing.
+
+This matters for a **resumed** run: calibration applied under an older harness
+never hit the post-Apply check, so without a preflight a session could validate
+steps 8–11 against an env override.
+
+### Mandatory gates are disabled, not merely un-advancing
+
+Step 9 requires steps 1–8 evidence; step 10 requires a step-9 PASS **at the
+current evidence revision**; step 11 requires a step-10 PASS. Failed results stay
+on screen and copyable — only proceeding is blocked.
+
 ## The unverified self-history guard
 
 An unverified speaker asking about their own history now gets a deterministic

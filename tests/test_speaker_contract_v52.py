@@ -448,13 +448,17 @@ async def test_harness_sentinel_shares_one_conversation():
     sent = html[html.index("async function sentinelFlow"):html.index("async function permissionFlow")]
     code = _code_only(sent)
 
-    # STRICT equality. A null/missing returned id must FAIL, not pass — that is
-    # precisely what a server ignoring conversation_id would produce, so a
-    # truthiness guard would excuse the exact bug being tested for.
-    check("if (r.conversation_id !== CID)" in code,
+    # STRICT equality, and now an ABORT rather than a flag. A null/missing
+    # returned id is precisely what a server ignoring conversation_id produces,
+    # so a truthiness guard would excuse the exact bug being tested for.
+    sample = _code_only(html[html.index("function makeSentinelDoSample"):
+                             html.index("// ── the guided stage")])
+    check("if (r.conversation_id !== ctx.CID)" in sample,
           "the id check is strict equality against the requested CID")
-    check("r.conversation_id &&" not in code,
+    check("r.conversation_id &&" not in sample,
           "no truthiness guard — a missing id is not 'stable'")
+    check("throw PostChatError(" in sample[sample.index("r.conversation_id !== ctx.CID"):],
+          "and a mismatch ABORTS the run rather than continuing")
     # The five turns are data now (SENTINEL_STEPS), driven by the batch engine.
     # Behaviour is proven by executing it in tests/test_calibration_harness_v52.py;
     # this only pins the declared order.
@@ -479,10 +483,12 @@ async def test_harness_sentinel_shares_one_conversation():
           "and the oracle is derived from the actual /stt transcript")
     check("${SENTINELS.marcus}" in steps and "${SENTINELS.guest}" in steps,
           "and the spoken cues interpolate exactly those tokens")
-    check("chatFromStt(s, CID)" in code,
+    check("deps.chatFromStt(s, ctx.CID)" in sample,
           "and every turn is redeemed through /chat with that CID")
-    check("sttTurn(blob)" in code,
+    check("deps.sttTurn(blob)" in sample,
           "after a single transcription that can be validated first")
+    check("makeSentinelDoSample(" in code and "{sttTurn, chatFromStt}" in code,
+          "with the real /stt and /chat wired in by the flow")
 
     # The unverified turn must actually BE unverified.
     check("UNVERIFIED_OK" in html, "allowed unverified statuses are named")
@@ -522,7 +528,7 @@ async def test_harness_latency_measures_stt_only():
     # The full pipeline still exists for the sentinel — but SPLIT, so that a
     # transcript can be validated between /stt and /chat.
     st = _code_only(html[html.index("async function sttTurn"):
-                         html.index("function PostChatError")])
+                         html.index("// PostChatError lives in PART 1")])
     # Just chatFromStt's own body — sttOnly sits between it and the next marker.
     cf = _code_only(html[html.index("async function chatFromStt"):
                          html.index("/** /stt and NOTHING else")])

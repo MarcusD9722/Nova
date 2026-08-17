@@ -252,6 +252,20 @@ function extractCanary(sttText) {
   return picked.join(" ");
 }
 
+// ── ONE source of truth for the ask ─────────────────────────────────────────
+//
+// The cue shown to the human and the validator that accepts their transcript
+// MUST be the same contract. They were not: the displayed cue was "What three
+// words did I ask you to remember?", which contains no MY, while the validator
+// required MY + THREE + WORDS. A PERFECT transcription of the printed
+// instruction was rejected before /chat, forever — a guaranteed live deadlock
+// that 99/99 green tests never saw, because the validator was only ever tested
+// against phrases invented alongside it rather than against the real cue.
+//
+// So the utterance is defined once, the cue is derived from it, and a
+// regression asserts the real thing passes the real validator.
+const ASK_UTTERANCE = "Repeat my three words.";
+
 //: The ASK must also be transcribed recognisably, or the turn tests Whisper
 //: rather than memory. Deterministic and strict: a first-person recall request
 //: for the three words. No classifier, no model call, no fuzzy matching.
@@ -320,7 +334,8 @@ function containsSentinel(reply, sentinel) {
 
 // ── who speaks, in the two multi-person blocks ──────────────────────────────
 // Pure data so the handoff rule below can be tested without a browser.
-const ASK_CUE = 'say — "What three words did I ask you to remember?"';
+//: Derived, never written out separately — see ASK_UTTERANCE above.
+const ASK_CUE = `say — "${ASK_UTTERANCE}"`;
 const SENTINEL_STEPS = [
   {who:"Marcus", phase:"store", secs:5.0, canaryFor:"marcus",
    cue:`Marcus: say — "Remember these three words: ${SENTINELS.marcus}."`},
@@ -341,6 +356,135 @@ const PERMISSION_STEPS = [
 
 /** Display name for a step. */
 function stepLabel(step) { return (step && (step.label || step.who)) || ""; }
+
+// ── the effective-policy question, asked in exactly one place ───────────────
+//
+// `threshold_calibrated` only means a valid RECORD covers the profiles.
+// NOVA_SPEAKER_THRESHOLD / NOVA_SPEAKER_MARGIN silently outrank it, so a run
+// can be "calibrated" while every decision is made by an env override. Apply,
+// the Check button, the step 8 and step 9 preflights and acceptance all ask
+// through here, so they cannot drift apart.
+function calibratedPolicyStatus(st) {
+  return !!(st
+            && st.threshold_calibrated === true
+            && st.threshold_source === "calibrated"
+            && st.margin_source === "calibrated");
+}
+
+/** Why the policy is not calibrated, for a human. Empty when it is. */
+function policyProblem(st) {
+  if (!st) return "no /speaker/status has been fetched yet — press Check";
+  const bad = [];
+  if (st.threshold_calibrated !== true) bad.push("threshold_calibrated is not true");
+  if (st.threshold_source !== "calibrated")
+    bad.push(`threshold_source is "${st.threshold_source}"`);
+  if (st.margin_source !== "calibrated")
+    bad.push(`margin_source is "${st.margin_source}"`);
+  return bad.join("; ");
+}
+
+// ── mandatory-gate prerequisites ────────────────────────────────────────────
+// A failed gate leaves its diagnostics on screen but must not let the run
+// continue past it. Pure predicates so the UI and the tests agree.
+function step9Ready(S) {
+  return !!(S && S.marcusId && S.guestId
+            && S.enroll && S.enroll.marcus && S.enroll.marcus.meets_p52_bar
+            && S.enroll.guest && S.enroll.guest.meets_p52_bar
+            && S.applied && S.validation && S.validation.length > 0);
+}
+function step9Passed(S) {
+  return !!(S && S.sentinel && S.sentinel.pass === true
+            && S.sentinel.evidence_revision === STEP9_EVIDENCE_REVISION);
+}
+function step10Ready(S) { return step9Passed(S); }
+function step10Passed(S) { return !!(S && S.permission && S.permission.pass === true); }
+function step11Ready(S) { return step10Passed(S); }
+
+//: Thrown once /chat has been dispatched. The backend may already have recorded
+//: the turn, so the client cannot prove zero side effects — the conversation is
+//: no longer clean and the whole run must be abandoned rather than retried.
+function PostChatError(message) {
+  const e = new Error(message);
+  e.postChat = true;
+  return e;
+}
+
+/**
+ * One sentinel sample, with its dependencies injected.
+ *
+ * Extracted from the flow so tests can supply fake `sttTurn`/`chatFromStt` and
+ * COUNT the calls. Structural assertions ("the source contains one await") are
+ * not the same claim as "one call happened", and the ask-cue deadlock is what
+ * that difference costs.
+ *
+ * The commit boundary covers EVERYTHING after dispatch, not just the HTTP call:
+ * once /chat has gone out, a failure in the bookkeeping below is still a dirty
+ * conversation, and retrying the sample would build the rest of the run on top
+ * of a turn the backend may already hold.
+ */
+function makeSentinelDoSample(deps, ctx) {
+  return async function doSample(blob, i) {
+    const spec = ctx.steps[i];
+
+    // 1. TRANSCRIBE. No /chat yet.
+    const s = await deps.sttTurn(blob);
+
+    // 2. VALIDATE, still before /chat. A rejection costs one /stt and leaves
+    //    the conversation untouched, so the sample may be retaken safely.
+    let pendingCanary = null;
+    if (spec.canaryFor) {
+      pendingCanary = extractCanary(s.text);
+      if (!pendingCanary) {
+        throw new Error(`could not read three words from "${(s.text||"").slice(0,70)}" `
+                      + `— nothing was sent to Nova; say the cue again, clearly`);
+      }
+    } else if (!isAskTranscript(s.text)) {
+      throw new Error(`that did not transcribe as "${ASK_UTTERANCE}" `
+                    + `("${(s.text||"").slice(0,70)}") — nothing was sent to Nova; `
+                    + `say it again`);
+    }
+
+    // 3. COMMIT. Everything from here is inside the post-dispatch boundary.
+    let committed = false;
+    try {
+      const r = await deps.chatFromStt(s, ctx.CID);
+      committed = true;
+
+      // A different or missing conversation id is an INTEGRITY failure, not a
+      // flag to note and carry on: the turn landed somewhere this run does not
+      // control, so recording the remaining speakers would be meaningless.
+      if (r.conversation_id !== ctx.CID) {
+        ctx.out.conversation_stable = false;
+        throw PostChatError(
+          `backend returned conversation ${r.conversation_id} instead of ${ctx.CID}`);
+      }
+
+      if (pendingCanary) ctx.observed[spec.canaryFor] = pendingCanary;
+      ctx.replies[i] = r.reply;
+      ctx.out.steps.push({
+        who: spec.who, phase: spec.phase,
+        status: r.speaker && r.speaker.status || null,
+        name: r.speaker && r.speaker.display_name || null,
+        profile_id: r.speaker && r.speaker.profile_id || null,
+        conversation_id: r.conversation_id,
+        stt_text: r.text != null ? r.text : null,
+        assistant_reply: r.reply != null ? r.reply : null,
+        stt_tokens: canonTokens(r.text).join(" "),
+        reply_tokens: canonTokens(r.reply).join(" "),
+        observed_canary: spec.canaryFor ? ctx.observed[spec.canaryFor] : null,
+        got_marcus: containsSentinel(r.reply, ctx.observed.marcus),
+        got_guest: containsSentinel(r.reply, ctx.observed.guest),
+      });
+      return {note: `${spec.who}: ${(r.speaker && r.speaker.status) || "?"}`};
+    } catch (e) {
+      // Bookkeeping blew up AFTER dispatch. Promote it: the run must abort.
+      if (committed && !e.postChat) {
+        throw PostChatError(`post-chat processing failed: ${e.message}`);
+      }
+      throw e;
+    }
+  };
+}
 
 /** Who must take over before sample `i`, or null if the speaker is unchanged.
  *
@@ -527,16 +671,12 @@ function computeAcceptance(S) {
   if (!S.applied) missing.push("calibration applied");
   if (!(S.statusAfter && S.statusAfter.threshold_calibrated)) missing.push("status threshold_calibrated == true");
   if (!S.statusAfter) missing.push("post-run /speaker/status");
-  // `threshold_calibrated` only says a valid RECORD covers the profiles. It does
-  // NOT say calibration is the policy actually deciding: NOVA_SPEAKER_THRESHOLD
-  // or NOVA_SPEAKER_MARGIN silently outrank it. Validating steps 8-11 against an
-  // env override would measure a policy that is not the calibrated one.
-  const tSrc = S.statusAfter && S.statusAfter.threshold_source;
-  const mSrc = S.statusAfter && S.statusAfter.margin_source;
-  if (S.statusAfter && tSrc !== "calibrated")
-    missing.push(`threshold_source is "${tSrc}", not "calibrated"`);
-  if (S.statusAfter && mSrc !== "calibrated")
-    missing.push(`margin_source is "${mSrc}", not "calibrated"`);
+  // THE SAME helper Apply, Check and both preflights use. `threshold_calibrated`
+  // only says a valid RECORD covers the profiles; NOVA_SPEAKER_THRESHOLD or
+  // NOVA_SPEAKER_MARGIN silently outrank it, and validating steps 8-11 against
+  // an env override would measure a policy nobody calibrated.
+  if (S.statusAfter && !calibratedPolicyStatus(S.statusAfter))
+    missing.push(`effective policy is not calibrated (${policyProblem(S.statusAfter)})`);
   if (counts.valid_marcus < need.valid_marcus) missing.push("Marcus validation");
   if (counts.valid_guest < need.valid_guest) missing.push("guest validation");
   if (!S.sentinel) missing.push("memory attribution");
@@ -588,8 +728,10 @@ const P52 = {
   DUR, GAP_MS, LEAD_IN_S, LEAD_NEXT_S, CONDITION_NAMES, CONDITION_HINT,
   ENROLL_PHRASES, CAL_CUES, VAL_CUES, UNVERIFIED_OK,
   SENTINEL_STEPS, PERMISSION_STEPS, ENROLL_BLOCKS, SENTINELS, CANARY_STOPWORDS,
-  STEP9_EVIDENCE_REVISION, ASK_PATTERNS,
+  STEP9_EVIDENCE_REVISION, ASK_PATTERNS, ASK_UTTERANCE, ASK_CUE,
   canonTokens, containsSentinel, extractCanary, isAskTranscript,
+  calibratedPolicyStatus, policyProblem, PostChatError, makeSentinelDoSample,
+  step9Ready, step9Passed, step10Ready, step10Passed, step11Ready,
   planConditions, cueFor, blockPlan, totalRecordings, storeFor, advance,
   handoffBeforeIndex, stepLabel, enrollmentComplete, enrollmentAcceptable,
   reconcileEnrollment, commitSample,
@@ -934,14 +1076,8 @@ async function sttTurn(blob) {
            stt_ms: Math.round(performance.now() - t0) };
 }
 
-//: Thrown once /chat has been dispatched. The backend may already have recorded
-//: the turn, so the client cannot prove zero side effects — the conversation is
-//: no longer clean and the whole run must be abandoned rather than retried.
-function PostChatError(message) {
-  const e = new Error(message);
-  e.postChat = true;
-  return e;
-}
+// PostChatError lives in PART 1 beside makeSentinelDoSample, which is what
+// raises it for post-dispatch bookkeeping failures.
 
 /** Redeem exactly this /stt result through /chat, once. Never re-transcribes. */
 async function chatFromStt(sttResult, convId) {
@@ -1022,57 +1158,15 @@ async function sentinelFlow() {
                   + `<span class="dim">${SENTINEL_STEPS[i].cue}</span>`,
               cta: `${next} is ready`};
     },
-    doSample: async (blob, i) => {
-      const spec = SENTINEL_STEPS[i];
-
-      // ── 1. TRANSCRIBE. No /chat yet. ──────────────────────────────────────
-      const s = await sttTurn(blob);
-
-      // ── 2. VALIDATE, still before /chat. A rejection here costs one /stt and
-      //       leaves the conversation untouched. ─────────────────────────────
-      let pendingCanary = null;
-      if (spec.canaryFor) {
-        pendingCanary = extractCanary(s.text);
-        if (!pendingCanary) {
-          throw new Error(`could not read three words from "${(s.text||"").slice(0,70)}" `
-                        + `— nothing was sent to Nova; say the cue again, clearly`);
-        }
-      } else if (!isAskTranscript(s.text)) {
-        throw new Error(`that did not transcribe as "repeat my three words" `
-                      + `("${(s.text||"").slice(0,70)}") — nothing was sent to Nova; `
-                      + `say it again`);
-      }
-
-      // ── 3. COMMIT. From here the backend may have recorded the turn, so any
-      //       failure aborts the whole run instead of retrying into a dirty
-      //       conversation (chatFromStt throws a postChat error). ────────────
-      const r = await chatFromStt(s, CID);
-      if (pendingCanary) observed[spec.canaryFor] = pendingCanary;
-
-      // STRICT. A missing or null returned id is a FAILURE, not a pass: that is
-      // exactly what a server ignoring conversation_id produces.
-      if (r.conversation_id !== CID) out.conversation_stable = false;
-      replies[i] = r.reply;
-      // RAW EVIDENCE. Run 2 reported a memory failure and kept neither the STT
-      // text nor the reply, so there was no way to tell a real failure from a
-      // transcription mismatch without recording the whole thing again. These
-      // are synthetic test tokens and a scripted question; there is nothing
-      // sensitive to withhold, and no embedding or biometric value is included.
-      out.steps.push({who:spec.who, phase:spec.phase,
-                      status: r.speaker?.status ?? null,
-                      name: r.speaker?.display_name ?? null,
-                      profile_id: r.speaker?.profile_id ?? null,
-                      conversation_id: r.conversation_id,
-                      stt_text: r.text ?? null,
-                      assistant_reply: r.reply ?? null,
-                      stt_tokens: canonTokens(r.text).join(" "),
-                      reply_tokens: canonTokens(r.reply).join(" "),
-                      observed_canary: spec.canaryFor ? observed[spec.canaryFor] : null,
-                      // Against what STT actually delivered, not the cue card.
-                      got_marcus: containsSentinel(r.reply, observed.marcus),
-                      got_guest: containsSentinel(r.reply, observed.guest)});
-      return {note: `${spec.who}: ${r.speaker?.status ?? "?"}`};
-    },
+    // The per-sample logic lives in PART 1 with its dependencies injected, so
+    // tests can count real /stt and /chat calls rather than reading the source.
+    // RAW EVIDENCE (stt_text, assistant_reply, token forms) is recorded there:
+    // run 2 reported a memory failure and kept neither, so a transcription
+    // mismatch was indistinguishable from a real one without recording it all
+    // again. Synthetic tokens and a scripted question; nothing biometric.
+    doSample: makeSentinelDoSample(
+      {sttTurn, chatFromStt},
+      {steps: SENTINEL_STEPS, CID, observed, replies, out}),
   });
   if (out.steps.length < SENTINEL_STEPS.length) return null;   // aborted
 
@@ -1319,6 +1413,35 @@ async function runEnrollBlock(key, name, role, id, stepAfter) {
   return true;
 }
 
+/**
+ * Fetch /speaker/status, persist it, and refuse to proceed unless the
+ * CALIBRATED policy is the one actually deciding.
+ *
+ * Needed for RESUMED sessions above all: Marcus applied calibration under an
+ * older harness, so the post-Apply check never ran for him. Without this, a run
+ * could spend steps 8-11 validating an env override.
+ *
+ * Runs BEFORE any microphone access or state mutation, so a block costs nothing.
+ */
+async function policyPreflight(what) {
+  let st;
+  try { st = await api("/speaker/status"); }
+  catch (e) {
+    alertBanner(`Could not reach /speaker/status before ${what}: ${e.message}`);
+    return false;
+  }
+  S.statusAfter = st; save();
+  if (calibratedPolicyStatus(st)) return true;
+  alertBanner(
+    `<b>${what} blocked — the effective policy is not the calibrated one.</b><br>`
+    + `${policyProblem(st)}.<br>`
+    + `Nothing was recorded and nothing was cleared. Unset `
+    + `<code>NOVA_SPEAKER_THRESHOLD</code> / <code>NOVA_SPEAKER_MARGIN</code>, `
+    + `restart the backend, press <b>Check</b> to confirm both sources read `
+    + `"calibrated", then try again.`);
+  return false;
+}
+
 function alertBanner(msg) {
   const b = el("div","banner"); b.innerHTML = `<h3 class="bad">Problem</h3><div>${msg}</div>`;
   $("#steps").prepend(b);
@@ -1505,6 +1628,9 @@ function render() {
   const vb = el("button","primary","Start validation (10 + 10)");
   vb.onclick = async () => { vb.disabled=true;
     try {
+      // Validation under an env override would measure a policy nobody
+      // calibrated. Checked before the first recording.
+      if (!(await policyPreflight("Step 8 validation"))) { vb.disabled=false; return; }
       const gname = S.enroll.guest?.display_name || "Guest";
       const okm = await runTrialBlock({id:"valid_marcus", truthId:S.marcusId, truthName:"Marcus",
         phase:"V", count:10, pool:VAL_CUES,
@@ -1523,10 +1649,20 @@ function render() {
     "The real pipeline: /stt with speaker=true → voice_turn_id → /chat, all five turns in ONE conversation. "
     + "<b>Needs a third, unenrolled voice for the last turn</b> — or a genuinely unverified condition, which only counts if the backend actually returns one."));
   const msb = el("button","primary","Run memory-attribution check (5 turns)");
+  // Mandatory-gate prerequisites. The CARD and any failed result stay visible
+  // and copyable — only proceeding is prevented.
+  if (!step9Ready(S)) {
+    msb.disabled = true;
+    ms.appendChild(el("div","warn",
+      "Complete enrolment, calibration and step 8 validation first."));
+  }
   msb.onclick = async () => { msb.disabled = true;
-    // The previous result is cleared BEFORE the run, not after: an aborted or
-    // failed retry must never leave an earlier PASS on screen masquerading as
-    // this run's evidence. Steps 1-8 state is untouched.
+    // Policy FIRST — before the mic opens and before anything is cleared, so a
+    // block costs no recordings and loses no prior evidence.
+    if (!(await policyPreflight("Step 9"))) { msb.disabled = false; render(); return; }
+    // Only now: the previous result is cleared BEFORE the run, not after, so an
+    // aborted or failed retry never leaves an earlier PASS on screen
+    // masquerading as this run's evidence. Steps 1-8 state is untouched.
     S.sentinel = null; save();
     try {
       const r = await sentinelFlow();
@@ -1558,6 +1694,16 @@ function render() {
     "The real PermissionBroker, via ComputerControl, on <b>computer.type</b>. Typed, then Marcus, then guest — "
     + "all three decisions must match. Nothing can be typed: the probe rejects its own request, execution is off, no adapter ships."));
   const pmb = el("button","primary","Run permission regression (2 recordings)");
+  if (!step10Ready(S)) {
+    pmb.disabled = true;
+    pm.appendChild(el("div","warn",
+      S.sentinel && !S.sentinel.pass
+        ? "Step 9 FAILED. Fix and re-run step 9 before continuing — its "
+          + "diagnostics stay below."
+        : (S.sentinel && S.sentinel.evidence_revision !== STEP9_EVIDENCE_REVISION
+             ? "Step 9 evidence is from an older protocol. Re-run step 9."
+             : "Step 9 must PASS first.")));
+  }
   pmb.onclick = async () => { pmb.disabled = true;
     S.permission = null; save();      // same rule: no stale PASS may survive
     try {
@@ -1583,6 +1729,10 @@ function render() {
   lt.appendChild(el("div","dim","/stt only — no /chat inside the number. 6 with speaker OFF, 6 with it ON, same window length so the delta is a fair comparison."));
   lt.appendChild(blockStatus("latency", 12));
   const ltb = el("button","primary","Measure /stt latency (12 recordings)");
+  if (!step11Ready(S)) {
+    ltb.disabled = true;
+    lt.appendChild(el("div","warn", "The permission regression must PASS first."));
+  }
   ltb.onclick = async () => { ltb.disabled = true;
     try { const r = await sttLatencyFlow();
           if (r) { S.sttLatency = r; S.statusAfter = await api("/speaker/status"); S.step = 11; save(); } }
@@ -1680,8 +1830,25 @@ if (HAS_DOM) {
     try {
       const st = await api("/speaker/status");
       const pr = await api("/speaker/profiles");
-      out.innerHTML = `<span class="ok">connected</span> · model ${st.model_id||"?"} `
-        + `· calibrated: <b>${st.threshold_calibrated}</b> · margin ${st.margin} (${st.margin_source})`;
+      // PERSIST it. The instructions tell Marcus to press Check and confirm both
+      // sources, but Check used to display only the margin source and threw the
+      // status away — so a resumed session had no statusAfter for the preflights
+      // or the report to read.
+      S.statusAfter = st; save();
+      const ok = calibratedPolicyStatus(st);
+      out.innerHTML = `<span class="ok">connected</span> · model ${st.model_id||"?"}<br>`
+        + `threshold <b>${st.threshold}</b> · source `
+        + `<b class="${st.threshold_source === "calibrated" ? "ok" : "bad"}">`
+        + `${st.threshold_source}</b><br>`
+        + `margin <b>${st.margin}</b> · source `
+        + `<b class="${st.margin_source === "calibrated" ? "ok" : "bad"}">`
+        + `${st.margin_source}</b><br>`
+        + `threshold_calibrated: <b class="${st.threshold_calibrated ? "ok" : "bad"}">`
+        + `${st.threshold_calibrated}</b><br>`
+        + (ok ? `<span class="ok">Effective policy IS the calibrated one.</span>`
+              : `<span class="bad">EFFECTIVE POLICY IS NOT CALIBRATED — `
+                + `${policyProblem(st)}.</span> Unset NOVA_SPEAKER_THRESHOLD / `
+                + `NOVA_SPEAKER_MARGIN, restart the backend, press Check again.`);
       const box = $("#proflist"); box.innerHTML = "";
       if (!pr.profiles.length) box.appendChild(el("div","dim","No profiles enrolled."));
       pr.profiles.forEach(p => {
