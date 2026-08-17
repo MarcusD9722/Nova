@@ -194,12 +194,12 @@ async def test_human_run1_threshold_below_the_old_floor():
                          >= MIN_GENUINE_ACCEPT_RATE), None)
     check(old_best is None,
           f"the old 0.30-floor grid finds nothing ({old_best}) — this is the bug")
-    check(THRESHOLD_MIN == 0.0 and THRESHOLD_MAX == 1.0,
-          f"the grid now spans the metric's usable range ({THRESHOLD_MIN}"
-          f"-{THRESHOLD_MAX})")
-    check(min(THRESHOLD_GRID) == 0.0 and max(THRESHOLD_GRID) == 1.0
-          and len(THRESHOLD_GRID) == 101,
-          f"101 candidates at 0.01 resolution ({len(THRESHOLD_GRID)})")
+    check(THRESHOLD_MIN == 0.01 and THRESHOLD_MAX == 1.0,
+          f"the grid spans the metric's ASSERTABLE range ({THRESHOLD_MIN}"
+          f"-{THRESHOLD_MAX}) — strictly positive, up to the cosine maximum")
+    check(min(THRESHOLD_GRID) == 0.01 and max(THRESHOLD_GRID) == 1.0
+          and len(THRESHOLD_GRID) == 100,
+          f"100 candidates at 0.01 resolution ({len(THRESHOLD_GRID)})")
 
 
 async def test_strictest_valid_threshold_is_chosen():
@@ -802,11 +802,59 @@ async def test_safety_bars_are_untouched():
     check(C.MARGIN_GRID[0] == 0.02 and C.MARGIN_GRID[-1] == 0.30,
           f"the margin grid is unchanged ({C.MARGIN_GRID[0]}-{C.MARGIN_GRID[-1]})")
     check(C.PROTOCOL_VERSION == 1, "and the protocol version is unchanged")
-    # A negative threshold can never be proposed: it would admit vectors with no
-    # directional agreement at all, which no amount of impostor evidence from a
-    # 23-sample run can rule out at runtime.
-    check(min(C.THRESHOLD_GRID) >= 0.0,
+    # THE INVARIANT, asserted as written. This previously read `>= 0.0` while the
+    # comment beside it claimed no non-positive candidate existed — so 0.00 sat
+    # on the grid and was selectable, which is precisely the fail-open the floor
+    # is supposed to prevent. A safety assertion weaker than the safety claim is
+    # worse than none, because it reads as coverage.
+    check(min(C.THRESHOLD_GRID) > 0.0,
           f"no non-positive candidate exists ({min(C.THRESHOLD_GRID)})")
+    check(abs(min(C.THRESHOLD_GRID) - 0.01) < 1e-9,
+          f"the floor is the first strictly-positive grid point ({min(C.THRESHOLD_GRID)})")
+    check(0.0 not in C.THRESHOLD_GRID, "and 0.00 is not a candidate at all")
+    check(abs(C.THRESHOLD_MIN - 0.01) < 1e-9 and abs(C.THRESHOLD_MAX - 1.0) < 1e-9,
+          f"range is 0.01-1.00 ({C.THRESHOLD_MIN}-{C.THRESHOLD_MAX})")
+    check(len(C.THRESHOLD_GRID) == 100,
+          f"100 candidates at 0.01 resolution ({len(C.THRESHOLD_GRID)})")
+
+
+async def test_all_negative_impostors_fail_closed_not_at_zero():
+    check.section("zero boundary: a bar of 0.00 is refused, not selected")
+    from core.speaker.calibration import (MIN_GENUINE_ACCEPT_RATE, THRESHOLD_MIN,
+                                          fit_profile_threshold)
+
+    # Every observed impostor scored NEGATIVE, and exactly 90% of genuine speech
+    # clears zero. On paper 0.00 satisfies both bars — zero false accepts and
+    # 90% acceptance — which is exactly the configuration that would have let
+    # the fitter assert a meaningless identity claim.
+    genuine = [0.50, 0.40, 0.30, 0.20, 0.15, 0.10, 0.05, 0.02, 0.00, -0.10]
+    impostor = [-0.02, -0.05, -0.11, -0.20, -0.31]
+
+    # Confirm the trap is real before asserting we avoid it.
+    fa_at_zero = sum(1 for s in impostor if s >= 0.0)
+    acc_at_zero = sum(1 for s in genuine if s >= 0.0) / len(genuine)
+    check(fa_at_zero == 0 and acc_at_zero >= MIN_GENUINE_ACCEPT_RATE,
+          f"0.00 WOULD satisfy both bars ({fa_at_zero} false accepts, "
+          f"{acc_at_zero:.0%} accepted) — this is the fail-open being blocked")
+    acc_at_floor = sum(1 for s in genuine if s >= THRESHOLD_MIN) / len(genuine)
+    check(acc_at_floor < MIN_GENUINE_ACCEPT_RATE,
+          f"while 0.01 accepts only {acc_at_floor:.0%} — no positive bar works")
+
+    fit = fit_profile_threshold(M_ID, "Marcus", genuine, impostor)
+    check(not fit.ok, "so the fit FAILS CLOSED")
+    check(fit.threshold is None,
+          f"and proposes nothing — certainly not 0.00 ({fit.threshold})")
+    check(fit.accept_ceiling is not None and fit.accept_ceiling < THRESHOLD_MIN,
+          f"the accept ceiling {fit.accept_ceiling} is below the floor {THRESHOLD_MIN}")
+
+    # The reason must name the policy floor, NOT blame overlap or the grid.
+    check("minimum" in fit.reason and "0.01" in fit.reason,
+          f"the reason names the refused boundary ({fit.reason})")
+    check("genuinely overlap" not in fit.reason,
+          "it does not claim overlap — the impostors were nowhere near")
+    check("FITTER limitation" not in fit.reason,
+          "nor blames the search range for a deliberate safety decision")
+    check("fail open" in fit.reason, "and says plainly what it is refusing to do")
 
 
 async def main():
@@ -826,6 +874,7 @@ async def main():
     await test_failure_diagnostic_distinguishes_causes()
     await test_sub_030_threshold_survives_the_whole_runtime()
     await test_safety_bars_are_untouched()
+    await test_all_negative_impostors_fail_closed_not_at_zero()
     check.finish()
 
 

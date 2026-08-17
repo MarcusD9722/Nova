@@ -186,23 +186,30 @@ counted as rejects, never as errors.
 Scores are **true cosine similarities** between L2-normalised ECAPA embeddings
 (`matcher.cosine`), so the metric is bounded **[-1, 1]** — not [0, 1].
 
-The grid is **0.00 → 1.00 at 0.01 resolution** (101 candidates). It used to be
+The grid is **0.01 → 1.00 at 0.01 resolution** (100 candidates). It used to be
 0.30 → 0.90, which was an unexamined guess carried over from synthetic fixtures
 whose scores happened to be high. Real speech is not obliged to agree with it,
 and the first human run proved it does not — see *Attempt 1* below.
 
-The lower bound of 0.00 is a deliberate floor rather than the metric's true
-minimum. A cosine threshold at or below zero cannot express an identity claim:
-it admits vectors with no directional agreement with the centroid at all, which
-for 192-d unit vectors is roughly half of everything. The empirical bars ("no
-impostor in *this* sample cleared it") cannot protect against that, because the
-sample is a couple of dozen utterances and the runtime population is every voice
-that ever speaks. If no non-negative threshold satisfies both bars, the honest
-answer is that the two voices are not separable, and the fit **fails closed**.
+The lower bound is **strictly positive**, and that is a deliberate floor rather
+than the metric's true minimum. A cosine threshold at or below zero cannot
+express an identity claim: it admits vectors with no directional agreement with
+the centroid at all, which for 192-d unit vectors is roughly half of everything.
+The empirical bars ("no impostor in *this* sample cleared it") cannot protect
+against that, because the sample is a couple of dozen utterances and the runtime
+population is every voice that ever speaks.
+
+The floor is `0.01`, not `0.00`, for a concrete reason. With zero on the grid the
+fitter could **select** it whenever every observed impostor happened to score
+negative and ≥90% of genuine samples cleared zero — a configuration that
+satisfies both bars on paper while asserting a claim this document calls
+meaningless. Zero is therefore excluded from the candidate set rather than
+merely discouraged. If no strictly positive threshold satisfies both bars, the
+fit **fails closed** and says which boundary it hit.
 
 ### Per-profile threshold
 
-Walks `0.90 → 0.30` and takes the **first** value with zero impostor accepts and
+Walks `1.00 → 0.01` and takes the **first** value with zero impostor accepts and
 ≥90% genuine acceptance. Strictest-first is deliberate: among candidates that
 satisfy both bars, the tightest leaves the most headroom for a voice the fit has
 never seen.
@@ -233,8 +240,19 @@ Ambiguity beats a confident mistake.
 
 ### If it does not fit
 
-**Calibration fails and says why**, reporting the measured overlap. The
-thresholds are not loosened to make the screen green — a threshold that only
+**Calibration fails and says which boundary it hit.** The reason is derived from
+the data, never inferred from "the search found nothing" — the first human run
+was told the distributions overlapped when they were separated by +0.04, and the
+real fault was the search floor. Four distinct outcomes:
+
+| when | what it says |
+|---|---|
+| the 90% accept ceiling is at or below the impostor max | the distributions **genuinely overlap** — any bar loose enough for this speaker admits somebody else |
+| a valid threshold exists only at or below `0.01` | **refusing to fail open** — that bar admits voices with no directional agreement; this sample's impostors all scoring lower is a property of the sample, not of every voice |
+| a valid interval exists but no candidate lands inside it | a **fitter limitation**, named as such, not a property of the voices |
+| too few genuine trials, or no impostor evidence | said plainly, and neither mentions overlap |
+
+Thresholds are never loosened to make the screen green. A threshold that only
 passes because it was fitted loosely carries a claim it cannot support, which is
 worse than an honest provisional one.
 
