@@ -19,7 +19,9 @@ from core.skills import detect_repeated_workflow, workflow_parameters
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from core.settings import get_bool
+from memory import semantic_records
 from memory.backends.chroma_backend import ChromaMemoryBackend
+from memory.backends.chroma_backend import semantic_space_id as chroma_semantic_space_id
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.backends.json_backend import JsonAuditBackend
 from memory.backends.sqlite_backend import SQLiteMemoryBackend
@@ -409,13 +411,24 @@ class MemoryUnifier:
         """
         if self._chroma is None:
             return {"enabled": False, "reason": "chroma disabled for this instance"}
-        return {
+        out = {
             "enabled": True,
             "degraded": self._chroma_failures > 0,
             "writes_ok": self._chroma_writes,
             "failures": self._chroma_failures,
             "last_error": self._chroma_last_error or None,
         }
+        # Vector-space identity and skip counters (P10 pre-flight). `degraded`
+        # must also be true when the embedding model is simply unavailable —
+        # nothing is failing in that case, semantic work is being SKIPPED, and
+        # the old shape could not express the difference.
+        try:
+            sem = self._chroma.semantic_status()
+            out["semantic"] = sem
+            out["degraded"] = bool(out["degraded"] or sem.get("degraded"))
+        except Exception as e:  # noqa: BLE001
+            out["semantic"] = {"error": str(e)[:200]}
+        return out
 
     def set_query_expander(self, expander: Any | None) -> None:
         """Install an `async (query, terms) -> list[str]` term expander."""
@@ -562,65 +575,160 @@ class MemoryUnifier:
         except Exception:
             chroma_count = 0
 
-        # If there is nothing stable to index, don't touch Chroma.
-        stable_total = int(sqlite_counts.get("facts", 0)) + int(sqlite_counts.get("people", 0)) + int(sqlite_counts.get("events", 0))
+        # If there is nothing to index, don't touch Chroma. Turns and document
+        # chunks count too now that the rebuild covers them — otherwise a store
+        # holding only conversation history would never rebuild its index.
+        stable_total = (int(sqlite_counts.get("facts", 0))
+                        + int(sqlite_counts.get("people", 0))
+                        + int(sqlite_counts.get("events", 0)))
         if stable_total <= 0:
-            return
+            try:
+                extra = (len(await self._sqlite.all_turns(limit=1))
+                         + len(await self._sqlite.all_document_chunks(limit=1)))
+            except Exception:  # noqa: BLE001
+                extra = 0
+            if extra <= 0:
+                return
 
         # Only rebuild when Chroma looks empty.
         if chroma_count <= 0:
             await self.rebuild_semantic_index()
 
-    async def rebuild_semantic_index(self) -> dict[str, int]:
-        """Rebuild Chroma documents from SQLite facts/people/events."""
+    async def rebuild_semantic_index(self) -> dict[str, Any]:
+        """Rebuild the semantic index from SQLite, the authoritative store.
+
+        Covers EVERY record class this system indexes semantically. The name said
+        "rebuild" long before it did: facts, people and events were restored, but
+        substantive TURNS and DOCUMENT CHUNKS — both written to Chroma live and
+        both fully present in SQLite — were silently left out, so a rebuild
+        produced a quietly incomplete index (P10 pre-flight).
+
+        ALL OR NOTHING. Records are written to a STAGING collection which becomes
+        authoritative only after every one of them lands. The previous shape —
+        `reset()` then N independent writes, each class wrapped in its own
+        `except: log and continue` — could not fail honestly: a model that died at
+        record 400 of 900 left a partial index that looked exactly like a complete
+        one, and the working index it replaced was already deleted. On failure the
+        staging collection is dropped and the OLD index survives untouched.
+
+        Every record shape comes from `memory/semantic_records.py`, the same
+        builders live indexing uses, so a rebuilt record is byte-identical to the
+        live one rather than merely intended to be.
+
+        Returns the per-class counts plus `complete`. `complete: False` always
+        carries a `reason`, and nothing was promoted.
+        """
+        empty = {"facts": 0, "people": 0, "events": 0, "turns": 0, "documents": 0}
         if self._chroma is None:
-            return {"facts": 0, "people": 0, "events": 0}
+            return {**empty, "complete": False, "reason": "no semantic backend configured"}
+
+        # Precheck. Not a guarantee — the model can die mid-rebuild, which is
+        # what the staging collection is for — just a cheap way to avoid
+        # demolishing anything when it is already known to be down.
+        try:
+            from memory import embeddings as _emb
+            if not _emb.embedding_available():
+                logger.warning("semantic_rebuild_skipped_model_unavailable")
+                return {**empty, "complete": False, "skipped": 1,
+                        "reason": f"embedding model unavailable: {_emb.load_error() or 'not loaded'}"}
+        except Exception as e:  # noqa: BLE001
+            return {**empty, "complete": False, "skipped": 1,
+                    "reason": f"embedding availability check failed: {str(e)[:160]}"}
+
         await self._sqlite.initialize()
         await self._json.initialize()
 
-        await self._chroma.reset()
+        counts = dict(empty)
+        try:
+            await self._chroma.begin_staged_rebuild()
+            for row in await self._sqlite.all_facts(limit=None):
+                rec = semantic_records.fact_record(
+                    fact_id=row["id"], entity=row["entity"], attribute=row["attribute"],
+                    value=row["value"], created_at=row.get("created_at") or "")
+                await self._chroma.upsert_text(**rec.as_kwargs())
+                counts["facts"] += 1
 
-        facts = await self._sqlite.all_facts(limit=None)
-        people = await self._sqlite.all_people(limit=None)
-        events = await self._sqlite.all_events(limit=None)
+            for row in await self._sqlite.all_people(limit=None):
+                rec = semantic_records.person_record(
+                    person_id=row["id"], name=row["name"],
+                    attributes_json=row["attributes_json"],
+                    created_at=row.get("created_at") or "")
+                await self._chroma.upsert_text(**rec.as_kwargs())
+                counts["people"] += 1
 
-        # Upsert in small batches to avoid large thread payloads.
-        fact_n = 0
-        for row in facts:
-            fact_n += 1
-            await self._chroma.upsert_text(
-                doc_id=str(row["id"]),
-                text=f"FACT {row['entity']} {row['attribute']} = {row['value']}",
-                metadata={
-                    "kind": "fact",
-                    "entity": str(row["entity"]),
-                    "attribute": str(row["attribute"]),
-                    "created_at": str(row.get("created_at") or ""),
-                },
-            )
+            for row in await self._sqlite.all_events(limit=None):
+                rec = semantic_records.event_record(
+                    event_id=row["id"], date=row["date"], note=row["note"],
+                    created_at=row.get("created_at") or "")
+                await self._chroma.upsert_text(**rec.as_kwargs())
+                counts["events"] += 1
 
-        person_n = 0
-        for row in people:
-            person_n += 1
-            await self._chroma.upsert_text(
-                doc_id=str(row["id"]),
-                text=f"PERSON {row['name']} {row['attributes_json']}",
-                metadata={"kind": "person", "name": str(row["name"]), "created_at": str(row.get("created_at") or "")},
-            )
+            # TURNS, under the SAME substantive-length rule live indexing uses.
+            for row in await self._sqlite.all_turns(limit=None):
+                content = str(row.get("content") or "")
+                if not semantic_records.turn_is_indexable(content):
+                    continue
+                rec = semantic_records.turn_record(
+                    turn_id=row["id"], role=row.get("role") or "", content=content,
+                    created_at=row.get("created_at") or "",
+                    conversation_id=row.get("conversation_id") or "",
+                    speaker_entity=row.get("speaker_entity") or "user",
+                    speaker_label=row.get("speaker_label") or "")
+                await self._chroma.upsert_text(**rec.as_kwargs())
+                counts["turns"] += 1
 
-        event_n = 0
-        for row in events:
-            event_n += 1
-            await self._chroma.upsert_text(
-                doc_id=str(row["id"]),
-                text=f"EVENT {row['date']}: {row['note']}",
-                metadata={"kind": "event", "date": str(row["date"]), "created_at": str(row.get("created_at") or "")},
-            )
+            # DOCUMENT CHUNKS. The chunk TOTAL is part of the embedded text, so
+            # the rows are grouped by path first — reconstructing them one at a
+            # time is what produced "(part 1)" against a live "(part 1/4)".
+            by_path: dict[str, list[dict[str, Any]]] = {}
+            for row in await self._sqlite.all_document_chunks(limit=None):
+                by_path.setdefault(str(row.get("path") or ""), []).append(row)
+            for path, rows in by_path.items():
+                rows.sort(key=lambda r: int(r.get("chunk_index") or 0))
+                total = len(rows)
+                for row in rows:
+                    rec = semantic_records.document_chunk_record(
+                        path=path, chunk_index=int(row.get("chunk_index") or 0),
+                        chunk_total=total, text=row.get("text") or "",
+                        created_at=row.get("created_at") or _now().isoformat())
+                    await self._chroma.upsert_text(**rec.as_kwargs())
+                    counts["documents"] += 1
+
+            expected = sum(counts[k] for k in empty)
+            staged = await self._chroma.staged_count()
+            if staged != expected:
+                # Every write returned without raising, yet the collection does
+                # not hold what we counted. Refuse to promote rather than report a
+                # number the index cannot back up.
+                raise RuntimeError(
+                    f"staged {staged} records but expected {expected}; refusing to promote")
+
+            # `expected` is re-checked inside the promotion, under the lock, and
+            # again after the swap through a fresh handle.
+            promoted = await self._chroma.commit_staged_rebuild(expected)
+        except Exception as e:  # noqa: BLE001
+            await self._chroma.abort_staged_rebuild()
+            logger.warning("semantic_rebuild_aborted", error=str(e)[:200], **counts)
+            # No snapshot is appended: a failed rebuild must leave no trace that
+            # says it succeeded.
+            #
+            # And the reason must not ASSERT that the old index survived — an
+            # earlier version said "previous index kept" unconditionally, which was
+            # false in the one path where promotion had already destroyed it. Ask
+            # the backend what is actually there instead of claiming.
+            kept = await self._chroma.authoritative_state()
+            return {**empty, "complete": False,
+                    "reason": f"rebuild aborted ({kept['summary']}): {str(e)[:200]}",
+                    "previous_index_kept": bool(kept["live_present"]),
+                    "live_records": kept["live_count"],
+                    "attempted": counts}
 
         await self._json.append_snapshot(
-            {"kind": "semantic_index_rebuild", "facts": fact_n, "people": person_n, "events": event_n, "ts": _now().isoformat()}
+            {"kind": "semantic_index_rebuild", **counts, "promoted": promoted,
+             "complete": True, "space_id": chroma_semantic_space_id(),
+             "ts": _now().isoformat()}
         )
-        return {"facts": fact_n, "people": person_n, "events": event_n}
+        return {**counts, "complete": True, "promoted": promoted}
 
     async def ingest_turn(self, conversation_id: UUID, role: str, content: str) -> UUID:
         await self.initialize()
@@ -630,9 +738,13 @@ class MemoryUnifier:
         # Index substantive turns semantically so anything said is recallable
         # later (not just what got distilled into a structured fact). Skip short
         # greetings/acks to keep the index signal-rich. Best-effort; never blocks.
+        # The length rule lives in `semantic_records`, not here. Two copies of
+        # `>= 25` — one live, one in the rebuild — is exactly the drift that module
+        # exists to prevent, and a rebuild that indexed a different set of turns
+        # than live would change the corpus without changing any record.
         index_turn = (
             os.getenv("NOVA_INDEX_TURNS", "1").strip().lower() not in {"0", "false", "no", "off"}
-            and len((content or "").strip()) >= 25
+            and semantic_records.turn_is_indexable(content)
         )
 
         # Whose turn this is, resolved once and written to all three stores so
@@ -673,14 +785,11 @@ class MemoryUnifier:
             if index_turn and self._chroma is not None:
                 writes.append(
                     self._chroma_upsert_safe(
-                        doc_id=f"turn:{turn_id}",
-                        text=f"{speaker} said: {content}",
-                        # `speaker_entity` is what lets a read decide whose
-                        # conversation this was. Without it the index is a flat
-                        # pile of sentences with Marcus's name on all of them.
-                        metadata={"kind": "turn", "role": role, "created_at": created_at,
-                                  "conversation_id": str(conversation_id),
-                                  "speaker_entity": owner_ent},
+                        **semantic_records.turn_record(
+                            turn_id=turn_id, role=role, content=content,
+                            created_at=created_at, conversation_id=conversation_id,
+                            speaker_entity=owner_ent,
+                            speaker_label=speaker).as_kwargs()
                     )
                 )
             await asyncio.gather(*writes)
@@ -1541,9 +1650,9 @@ class MemoryUnifier:
             if self._chroma is not None:
                 tasks.append(
                     self._chroma_upsert_safe(
-                        doc_id=str(fact_id),
-                        text=f"FACT {entity} {attribute} = {value}",
-                        metadata={"kind": "fact", "entity": entity, "attribute": attribute, "created_at": created_at},
+                        **semantic_records.fact_record(
+                            fact_id=fact_id, entity=entity, attribute=attribute,
+                            value=value, created_at=created_at).as_kwargs()
                     )
                 )
             await asyncio.gather(*tasks)
@@ -1609,9 +1718,10 @@ class MemoryUnifier:
             if self._chroma is not None:
                 tasks.append(
                     self._chroma_upsert_safe(
-                        doc_id=str(person_id),
-                        text=f"PERSON {name} {attributes_json}",
-                        metadata={"kind": "person", "name": name, "created_at": created_at},
+                        **semantic_records.person_record(
+                            person_id=person_id, name=name,
+                            attributes_json=attributes_json,
+                            created_at=created_at).as_kwargs()
                     )
                 )
             await asyncio.gather(*tasks)
@@ -1756,9 +1866,9 @@ class MemoryUnifier:
             if self._chroma is not None:
                 tasks.append(
                     self._chroma_upsert_safe(
-                        doc_id=str(event_id),
-                        text=f"EVENT {date}: {note}",
-                        metadata={"kind": "event", "date": date, "created_at": created_at},
+                        **semantic_records.event_record(
+                            event_id=event_id, date=date, note=note,
+                            created_at=created_at).as_kwargs()
                     )
                 )
             await asyncio.gather(*tasks)
@@ -2389,12 +2499,12 @@ class MemoryUnifier:
             await self._sqlite.replace_document_chunks(path, chunks)
 
             if self._chroma is not None:
-                name = Path(path).name
+                created = _now().isoformat()
                 for i, chunk in enumerate(chunks):
                     await self._chroma_upsert_safe(
-                        doc_id=f"doc:{path}#{i}",
-                        text=f"FILE {name} (part {i + 1}/{len(chunks)}): {chunk}",
-                        metadata={"kind": "document", "path": path, "chunk_index": i, "created_at": _now().isoformat()},
+                        **semantic_records.document_chunk_record(
+                            path=path, chunk_index=i, chunk_total=len(chunks),
+                            text=chunk, created_at=created).as_kwargs()
                     )
         self._search_gen += 1
         BUS.publish("memory.write", {"kind": "document", "path": clip(path, 200), "source": "file_index"})

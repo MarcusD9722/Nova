@@ -4,11 +4,17 @@ Chroma is the rebuildable semantic index over SQLite's truth. Its failure mode
 is the quiet kind: a query that returns nothing looks identical to a query with
 no matches, so recall silently degrades and nobody notices.
 
-Runs against the HASH embedder, not the real transformer. `_SemanticEmbeddingFunction`
-falls back to it per-call when `embedding_available()` is False, so forcing that
-exercises the real Chroma code path — client, collection, upsert, query, delete —
-without pulling bge-small onto the GPU. The fallback path is itself worth
-pinning: it is what runs on any machine where the embed model won't load.
+`_SemanticEmbeddingFunction` used to fall back to the hash embedder per call when
+`embedding_available()` was False, and this suite forced that globally so the real
+Chroma plumbing could be exercised without pulling bge-small onto the GPU. That
+fallback was a corruption — two orthogonal vector spaces in one collection — and
+it is gone. The embedder now fails closed, so a globally-unavailable model would
+make every write here a skip, and `test_backend` would be asserting nothing.
+
+So the backend tests run against the REAL embedder, and unavailability is scoped
+to the one test that asserts the fail-closed contract. Degraded-mode backend
+behaviour (skip counters, empty query results, rebuild) is covered in
+tests/test_semantic_vector_space_p10.py.
 """
 from __future__ import annotations
 
@@ -24,13 +30,13 @@ from harness import Checks
 
 from memory import embeddings as emb_mod
 from memory.backends.chroma_backend import (
-    ChromaMemoryBackend, _HashEmbeddingFunction, _SemanticEmbeddingFunction,
+    ChromaMemoryBackend, SemanticUnavailable, _HashEmbeddingFunction,
+    _SemanticEmbeddingFunction,
 )
 
 check = Checks()
 
-# Force the documented degraded path instead of loading a CUDA transformer.
-emb_mod.embedding_available = lambda: False
+_real_available = emb_mod.embedding_available
 
 
 async def test_hash_embedder() -> None:
@@ -60,14 +66,49 @@ async def test_hash_embedder() -> None:
     check(f.get_config() == {"dim": 384}, "get_config reports the dimension")
 
 
-async def test_semantic_falls_back() -> None:
+async def test_semantic_fails_closed() -> None:
+    """This test used to assert the bug.
+
+    It read: "it degrades to the hash embedder instead of raising", and it passed
+    for exactly as long as the corruption was live. Silently substituting an
+    orthogonal vector space is not degradation — measured on the same text,
+    cosine(BGE, HASH) = -0.0162. The contract is now the opposite one, and the
+    assertion is inverted rather than deleted so the old behaviour cannot come
+    back unnoticed. See tests/test_semantic_vector_space_p10.py for the full
+    corruption cases.
+    """
     check.section("_SemanticEmbeddingFunction with the model unavailable")
     s = _SemanticEmbeddingFunction(dim=384)
     h = _HashEmbeddingFunction(dim=384)
-    check(s.embed_query("anything") == h.embed_query("anything"),
-          "it degrades to the hash embedder instead of raising")
-    check(len(s.embed_documents(["a", "b"])) == 2, "batch path also degrades cleanly")
-    check(s.name() == "nova-semantic-v1", "it still reports its own name")
+    emb_mod.embedding_available = lambda: False   # scoped to this test only
+    try:
+        s.embed_query("anything")
+    except SemanticUnavailable as e:
+        raised, msg = True, str(e)
+    else:
+        raised, msg = False, ""
+    check(raised, "it RAISES SemanticUnavailable rather than substituting a hash vector")
+    check("unavailable" in msg and "SQLite" in msg,
+          f"and says what was skipped and what was not ({msg[:80]!r})")
+
+    try:
+        s.embed_documents(["a", "b"])
+    except SemanticUnavailable:
+        batch_raised = True
+    else:
+        batch_raised = False
+    check(batch_raised, "the batch path fails closed too — no partial writes")
+
+    # The class is kept and still works, but it now has NO production caller —
+    # verified: nothing outside this module and the test suite constructs it. It
+    # is retained deliberately, as the negative reference the vector-space tests
+    # measure bge against. Deleting it would remove the only thing that can
+    # demonstrate the two spaces are orthogonal.
+    check(len(h.embed_query("anything")) == 384,
+          "the hash embedder still works, but nothing in production constructs it")
+    check(s.name() == "nova-semantic-bge-normalized-cls-v1",
+          f"the semantic embedder names its vector space ({s.name()})")
+    emb_mod.embedding_available = _real_available
 
 
 async def test_backend(tmp: Path) -> None:
@@ -135,7 +176,7 @@ async def test_backend(tmp: Path) -> None:
 async def main() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         await test_hash_embedder()
-        await test_semantic_falls_back()
+        await test_semantic_fails_closed()
         await test_backend(Path(td))
     check.finish()
 

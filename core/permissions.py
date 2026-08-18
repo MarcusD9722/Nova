@@ -63,6 +63,12 @@ CAPABILITY_TIERS: dict[str, int] = {
 
 DECISION_ALLOW, DECISION_CONFIRM, DECISION_DENY = "allow", "confirm", "deny"
 
+#: How long a pending request waits for a human. THE authoritative number for the
+#: approval window: `core/tool_router.py` derives a permission-gated tool's
+#: execution budget from it rather than hard-coding a second one, so a tool can
+#: never be abandoned before the window it advertised to Marcus has closed.
+HUMAN_DECISION_TIMEOUT_S = 120.0
+
 # Per-mode: the HIGHEST tier that is auto-allowed, and the highest that may be
 # confirmed. Above the confirm ceiling → denied.
 _MODES = {
@@ -102,6 +108,11 @@ class PermissionBroker:
         self._audit_path = audit_path
         self._pending: dict[str, asyncio.Future] = {}
         self._recent: list[dict[str, Any]] = []
+        #: request_id -> how it finally settled ("approved", "rejected",
+        #: "timeout", "abandoned", "cancelled"). Kept so a LATE answer can be
+        #: audited as what it actually was instead of as a fresh approval. Ids
+        #: only, never details, and bounded.
+        self._settled: dict[str, str] = {}
 
     @property
     def mode(self) -> str:
@@ -153,26 +164,113 @@ class PermissionBroker:
         return {"decision": "needs_confirmation", "request_id": request_id,
                 "note": f"'{capability}' needs your explicit approval before it runs."}
 
-    def resolve(self, request_id: str, approved: bool, *, by: str = "user") -> bool:
-        """The human answers a pending request. Returns False if unknown/settled."""
-        fut = self._pending.pop(request_id, None)
-        self._audit({"outcome": "approved" if approved else "rejected", "request_id": request_id, "by": by})
-        if fut is None or fut.done():
+    def _settle(self, request_id: str, how: str) -> None:
+        self._settled[str(request_id)] = how
+        if len(self._settled) > 500:
+            for rid in list(self._settled)[: len(self._settled) - 500]:
+                self._settled.pop(rid, None)
+
+    def _close_out(self, request_id: str, outcome: str, reason: str) -> bool:
+        """Drop a pending request that will never run, and say so once.
+
+        Removing it from `_pending` is the security-relevant half, and it is the
+        half that actually protects anything: a request left pending is still
+        listed by `pending()` and still resolvable, so a click minutes later would
+        return True for an action whose caller is long gone.
+
+        `permission.expired` is published for whatever consumes the bus. Be precise
+        about what that buys today: as of this commit NOTHING in frontend/src
+        consumes `permission.requested` or `permission.expired` — there is no
+        approval UI to withdraw a button from. The event is emitted so a future
+        one can be correct; the correctness here does not depend on it, because
+        `resolve()` refuses a settled request regardless of what any client shows.
+        """
+        fut = self._pending.pop(str(request_id), None)
+        if fut is None:
             return False
+        if not fut.done():
+            # DENY the waiter, do not cancel it. Cancelling the future made
+            # `await_decision` raise CancelledError into a tool that was waiting
+            # perfectly normally, which propagated through `ToolRouter.execute`
+            # (CancelledError is a BaseException, so the router never catches it)
+            # and killed the turn instead of returning "not approved".
+            #
+            # Withdrawing a request means it will not be approved, and that is
+            # exactly what False says. The caller gets a clean result.
+            fut.set_result(False)
+        self._settle(request_id, outcome)
+        self._audit({"outcome": outcome, "request_id": str(request_id), "reason": reason})
+        BUS.publish("permission.expired", {"request_id": str(request_id), "outcome": outcome})
+        return True
+
+    def cancel(self, request_id: str, *, reason: str = "the caller stopped waiting") -> bool:
+        """Withdraw a pending request whose caller no longer wants it."""
+        return self._close_out(request_id, "cancelled", reason)
+
+    def resolve(self, request_id: str, approved: bool, *, by: str = "user") -> bool:
+        """The human answers a pending request. Returns False if unknown/settled.
+
+        The audit entry describes WHAT HAPPENED, not what was clicked. The old
+        version audited "approved" before checking whether the request was still
+        live, so a timed-out request that Marcus then approved left an audit trail
+        saying `approved` for an action that never ran — the log implied a
+        deletion that did not happen, and would equally have hidden one that did.
+        """
+        rid = str(request_id)
+        answer = "approved" if approved else "rejected"
+        # The ignored-answer outcome is a NOUN ("late_approval_ignored"), distinct
+        # from the successful verb ("approved"), so no substring match can confuse
+        # the two when reading the audit trail.
+        ignored = "late_approval_ignored" if approved else "late_rejection_ignored"
+        fut = self._pending.pop(rid, None)
+
+        if fut is None:
+            prior = self._settled.get(rid)
+            if prior:
+                self._audit({"outcome": ignored, "request_id": rid,
+                             "by": by, "answered": answer, "settled_as": prior,
+                             "reason": f"the request had already ended as '{prior}'; "
+                                       f"this answer arrived too late and NOTHING was executed"})
+            else:
+                self._audit({"outcome": "unknown_request", "request_id": rid,
+                             "by": by, "answered": answer,
+                             "reason": "no request with this id was ever pending"})
+            return False
+
+        if fut.done():
+            self._settle(rid, "already_settled")
+            self._audit({"outcome": ignored, "request_id": rid,
+                         "by": by, "answered": answer, "settled_as": "already_settled",
+                         "reason": "the request was already settled; this answer changed nothing"})
+            return False
+
+        self._settle(rid, answer)
+        self._audit({"outcome": answer, "request_id": rid, "by": by})
         fut.set_result(bool(approved))
         return True
 
-    async def await_decision(self, request_id: str, *, timeout_s: float = 120.0) -> bool:
+    async def await_decision(self, request_id: str, *,
+                             timeout_s: float = HUMAN_DECISION_TIMEOUT_S) -> bool:
         """Wait for the human to resolve a pending request; False on timeout."""
-        fut = self._pending.get(request_id)
+        rid = str(request_id)
+        fut = self._pending.get(rid)
         if fut is None:
             return False
         try:
             return bool(await asyncio.wait_for(fut, timeout=timeout_s))
         except (TimeoutError, asyncio.TimeoutError):
-            self._pending.pop(request_id, None)
-            self._audit({"outcome": "timeout", "request_id": request_id})
+            self._close_out(rid, "timeout",
+                            f"no answer within {timeout_s:g}s; treated as DENIED")
             return False
+        except asyncio.CancelledError:
+            # The tool above us was cancelled (its own timeout fired, the turn was
+            # abandoned, shutdown). Cleaning up here is what stops an orphaned
+            # request from being approvable later — and cancellation is re-raised
+            # rather than swallowed, because reporting False would tell the caller
+            # "denied" when nobody decided anything.
+            self._close_out(rid, "abandoned",
+                            "the caller was cancelled while waiting; nothing was executed")
+            raise
 
     def pending(self) -> list[dict[str, Any]]:
         return [{"request_id": rid} for rid in self._pending]

@@ -178,7 +178,11 @@ class ToolLoopExecutor:
                 break
 
             call = ToolCall(name=decision["tool"], args=decision["args"])
-            res = await self._router.execute(call, timeout_s=25.0, retries=0)
+            # No timeout here on purpose. The router holds the authoritative
+            # budget per tool; a number typed at this generic call site cannot
+            # know that `project.delete` waits on a human, and the 25.0 that used
+            # to sit here silently cancelled that approval handshake.
+            res = await self._router.execute(call, retries=0)
             # `args` travels with the observation so downstream can record what
             # was actually asked — artifact provenance needs the query, not just
             # the answer (memory/artifacts.py::capture_tool_result).

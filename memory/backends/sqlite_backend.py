@@ -1333,6 +1333,46 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
+    async def all_document_chunks(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Every indexed chunk, for rebuilding the semantic index (P10 pre-flight).
+
+        Document chunks are written to Chroma live but were absent from
+        `rebuild_semantic_index`, so a rebuild produced a quietly incomplete
+        index. They are fully present here, which is what makes the rebuild
+        honest rather than partial.
+        """
+        await self.initialize()
+        sql = "SELECT path, chunk_index, text FROM document_chunks ORDER BY path, chunk_index"
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def all_turns(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Every stored turn, for rebuilding the semantic index.
+
+        Same reason as `all_document_chunks`: substantive turns are indexed
+        live and were missing from the rebuild.
+        """
+        await self.initialize()
+        sql = ("SELECT id, conversation_id, role, content, created_at, "
+               "speaker_entity, speaker_label, input_source FROM turns "
+               "ORDER BY created_at")
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def search_document_chunks(self, q: str, limit: int = 20) -> list[dict[str, Any]]:
         """Keyword fallback across chunk text — same resilience role as
         search_documents, but at chunk granularity for synthesis queries."""

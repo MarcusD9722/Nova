@@ -53,7 +53,7 @@ from core.cloud_runtime import CloudRuntime, cloud_enabled
 from core.understanding import Understanding
 from core.expression import Expression
 from core.screen_broker import ScreenCaptureBroker
-from core.tool_router import ToolCall, ToolRouter
+from core.tool_router import PERMISSION_TOOL_TIMEOUT_S, ToolCall, ToolRouter
 from core.llm_runtime import LLMRuntime
 from core.episodic_promoter import EpisodicPromoter
 from core.turn_identity import (OWNER_ENTITY, TurnIdentity, active_turn,
@@ -926,7 +926,10 @@ class RuntimeManager:
                 return None
             if decision["decision"] == "denied":
                 return {"ok": False, "status": "denied", "reason": decision.get("reason")}
-            approved = await self._permission_broker.await_decision(decision["request_id"], timeout_s=120.0)
+            # No second timeout here: the broker owns the approval window and the
+            # router derives the tool's budget from it. Restating 120.0 is how the
+            # two numbers drifted apart in the first place.
+            approved = await self._permission_broker.await_decision(decision["request_id"])
             if not approved:
                 return {"ok": False, "status": "not_approved",
                         "note": "You didn't approve it (declined or timed out) — nothing was touched."}
@@ -976,17 +979,24 @@ class RuntimeManager:
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "error": str(e)[:200]}
 
+        # These four block on Marcus clicking Approve, so they declare the
+        # permission budget (approval window + execution allowance). Without the
+        # declaration the agent loop's generic 25s cancelled the handshake at 25s
+        # while the UI still showed a live approval button for another 95s.
         self._router.register("project.delete", _tool_project_delete,
             "Delete a project Marcus asks you to remove. The folder is MOVED to projects/.trash/ so it stays "
-            "recoverable, and it needs his explicit approval first. args: {name}")
+            "recoverable, and it needs his explicit approval first. args: {name}",
+            timeout_s=PERMISSION_TOOL_TIMEOUT_S)
         self._router.register("project.trash", _tool_project_trash,
             "List deleted projects still sitting in the trash (recoverable). args: {}")
         self._router.register("project.restore", _tool_project_restore,
-            "Restore a deleted project from the trash back into projects/. args: {entry}")
+            "Restore a deleted project from the trash back into projects/. args: {entry}",
+            timeout_s=PERMISSION_TOOL_TIMEOUT_S)
         self._router.register("project.purge", _tool_project_purge,
             "PERMANENTLY erase trashed projects — this destroys the files for good and cannot be undone. "
             "Only use when Marcus explicitly asks to permanently delete. Omit 'entry' to purge everything. "
-            "args: {entry?}")
+            "args: {entry?}",
+            timeout_s=PERMISSION_TOOL_TIMEOUT_S)
 
         self._router.register("computer.observe", _tool_computer_observe,
             "Observe the computer (list windows/apps, read state) — read-only. Honestly reports when no observation "
