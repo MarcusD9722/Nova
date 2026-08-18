@@ -960,18 +960,34 @@ class RuntimeManager:
             # Historical facts about the project are deliberately LEFT ALONE:
             # "do you remember the project we made?" should still work after a
             # delete. Only the pointer to the CURRENT project is cleared.
+            # Compare against the project ACTUALLY deleted, not the raw argument.
+            # `name` is whatever the model or a human typed ("Balloon Tower
+            # Defense"); the pointer holds the canonical slug
+            # ("balloon-tower-defense"), so a raw comparison never matched and the
+            # pointer was left dangling.
+            deleted = str(result.get("project") or "").strip()
+            cleanup_warning = ""
             try:
                 current = await self._memory.get_latest_fact(
                     entity="projects", attribute="last_active")
-                if current and (current.value or "").strip() == name:
+                if current and (current.value or "").strip() == deleted:
                     await self._memory.add_fact(
                         entity="projects", attribute="last_active", value="",
                         confidence=0.95)
             except Exception as e:  # noqa: BLE001
+                # The files ARE moved. Reporting the delete as failed would be
+                # false, so this surfaces as a non-fatal cleanup warning — and
+                # `ProjectBuilder.last_active()` verifies existence anyway, so a
+                # stale pointer can never be handed back as the current project.
                 logger.debug("last_active_clear_failed", error=str(e)[:160])
+                cleanup_warning = ("The project was moved to trash, but I could "
+                                   "not update which project is active.")
 
-            return {"ok": True, **result,
-                    "note": f"Moved to trash — recoverable with project.restore('{result['moved_to_trash']}')."}
+            out = {"ok": True, **result,
+                   "note": f"Moved to trash — recoverable with project.restore('{result['moved_to_trash']}')."}
+            if cleanup_warning:
+                out["warning"] = cleanup_warning
+            return out
 
         async def _tool_project_trash(args: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True, "trash": await asyncio.to_thread(_projects.list_trash)}

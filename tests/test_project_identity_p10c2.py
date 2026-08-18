@@ -1,0 +1,481 @@
+"""PR #59 Round 2: ONE project identity contract, and a case-blind name boundary.
+
+Two things this file exists to prevent.
+
+CAPITALISATION IS NOT EVIDENCE. The previous boundary rule decided title-vs-
+requirement by case: "Rock and Roll Tracker" looked like a title, "Serpent and use
+Python" looked like a requirement. Nova is voice-first. An STT transcript does not
+preserve intentional title case, so "create a project called rock and roll tracker"
+would have been truncated to "rock" purely because it was spoken. Changing ONLY
+capitalisation must never change which words belong to the name.
+
+TWO SUBSYSTEMS MUST NOT DEFINE ONE NAMESPACE. `ProjectBuilder.slugify` and
+`ProjectManager._sanitize` were independent: one lowercase/ASCII/48-capped with
+Win32 remapping, the other case-preserving, dot- and underscore-allowing, uncapped
+and unprotected. So `project.start_build` and `project.scaffold` could create two
+different directories for one human name, and only one path was safe from
+`CON`/`NUL`/`COM1`.
+
+Run:  venv\\Scripts\\python.exe tests\\test_project_identity_p10c2.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tests"))
+
+os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
+
+from harness import Checks, run  # noqa: E402
+
+from core.project_builder import (  # noqa: E402
+    NAME_AMBIGUOUS, NEEDS_NAME, ProjectBuilder, resolve_name_boundary, slugify,
+)
+from core.project_manager import ProjectManager  # noqa: E402
+from core.project_names import (  # noqa: E402
+    MAX_SLUG_LEN, WIN_RESERVED, canonical_project_slug, safe_trash_entry,
+)
+
+check = Checks()
+extract = ProjectBuilder.extract_start_request
+
+
+def _tmp():
+    return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
+def _name(text):
+    got = extract(text)
+    return None if got is None else got[0]
+
+
+def _variants(phrase: str) -> list[tuple[str, str]]:
+    """The same words in four capitalisations."""
+    return [
+        ("original", phrase),
+        ("lower", phrase.lower()),
+        ("UPPER", phrase.upper()),
+        ("Sentence", phrase[:1].upper() + phrase[1:].lower()),
+    ]
+
+
+# ── A. CAPITALISATION INVARIANCE ─────────────────────────────────────────────
+async def test_case_invariance_of_the_name_boundary():
+    check.section("A: changing ONLY case never changes the boundary decision")
+
+    # Each entry: the name span, and how many words the boundary should keep.
+    # Expectations are expressed as a WORD COUNT so they survive case changes.
+    cases = [
+        ("Rock and Roll Tracker", 4, "clean title"),
+        ("Man with a Plan", NAME_AMBIGUOUS, "ambiguous title"),
+        ("Python for Beginners", NAME_AMBIGUOUS, "ambiguous title"),
+        ("Apps Using AI", NAME_AMBIGUOUS, "ambiguous title"),
+        ("Serpent and use Python", 1, "requirement suffix"),
+        ("Serpent and add levels", 1, "requirement suffix"),
+        ("Serpent then add a scoreboard", 1, "requirement suffix"),
+        ("Serpent and keep it offline", 1, "requirement suffix"),
+        ("Serpent with a dark theme", NAME_AMBIGUOUS, "ambiguous requirement"),
+        ("War and Peace Notes", 4, "clean title"),
+        ("To Do List", 3, "clean title"),
+        ("Balloon Tower Defense", 3, "clean title"),
+    ]
+
+    for phrase, expect, label in cases:
+        results = {}
+        for vlabel, variant in _variants(phrase):
+            out = resolve_name_boundary(variant)
+            results[vlabel] = (NAME_AMBIGUOUS if out == NAME_AMBIGUOUS
+                               else len(out.split()))
+        distinct = set(results.values())
+        check(len(distinct) == 1,
+              f"{label} {phrase!r}: all four capitalisations agree "
+              f"({results})")
+        check(results["original"] == expect,
+              f"{label} {phrase!r}: boundary is {results['original']}, "
+              f"expected {expect}")
+
+    # The exact regression the review named: a lowercase legitimate title.
+    lower = resolve_name_boundary("rock and roll tracker")
+    check(lower == "rock and roll tracker",
+          f"a lowercase legitimate title is NOT truncated ({lower!r})")
+    check(resolve_name_boundary("ROCK AND ROLL TRACKER") == "ROCK AND ROLL TRACKER",
+          "and neither is an uppercase one")
+
+
+async def test_case_invariance_end_to_end():
+    check.section("A: the same invariance through extract_start_request")
+
+    for phrase in ("create a project called Rock and Roll Tracker",
+                   "create a project called Serpent and use Python",
+                   "create a project called Serpent with a dark theme",
+                   "create a project called Man with a Plan"):
+        outs = {}
+        for vlabel, variant in _variants(phrase):
+            got = _name(variant)
+            # Compare shape, not literal text: case differs by construction.
+            outs[vlabel] = (got if got in (None, NEEDS_NAME)
+                            else len(got.split()))
+        check(len(set(outs.values())) == 1,
+              f"{phrase!r}: all capitalisations agree ({outs})")
+
+    # Requirement suffixes are cut in every casing.
+    for variant in ("create a project called Serpent and use Python",
+                    "create a project called serpent and use python",
+                    "CREATE A PROJECT CALLED SERPENT AND USE PYTHON"):
+        got = _name(variant)
+        check(got is not None and got != NEEDS_NAME and len(got.split()) == 1,
+              f"{variant!r} -> a one-word name ({got!r})")
+
+
+async def test_ambiguous_names_ask_rather_than_guess():
+    check.section("A: genuinely ambiguous boundaries FAIL CLOSED")
+
+    for text in ("create a project called Serpent with a dark theme",
+                 "create a project called Man with a Plan",
+                 "create a project called Python for Beginners",
+                 "create a project called apps using ai",
+                 "create a project called Serpent that tracks spending"):
+        got = _name(text)
+        check(got == NEEDS_NAME,
+              f"{text!r} -> asks for clarification ({got!r})")
+
+    # Quoting removes the ambiguity, and is honoured exactly.
+    for text, want in (
+        ('create a project called "Man with a Plan" and use Python',
+         "Man with a Plan"),
+        ('create a project called "Serpent with a dark theme"',
+         "Serpent with a dark theme"),
+        ("create a project called 'Python for Beginners' using Rust",
+         "Python for Beginners"),
+    ):
+        check(_name(text) == want, f"{text!r} -> {_name(text)!r} (want {want!r})")
+
+
+# ── B. SINGLE IDENTITY OWNER ─────────────────────────────────────────────────
+async def test_one_canonical_identity_owner():
+    check.section("B: one module owns live-project identity")
+
+    for raw, want in [
+        ("Balloon Tower Defense", "balloon-tower-defense"),
+        ("  Balloon   Tower  Defense  ", "balloon-tower-defense"),
+        ("BALLOON TOWER DEFENSE", "balloon-tower-defense"),
+        ("balloon_tower_defense", "balloon-tower-defense"),
+        ("balloon.tower.defense", "balloon-tower-defense"),
+        ("Balloon---Tower---Defense", "balloon-tower-defense"),
+        ("émoji café", "moji-caf"),
+        ("CON", "project-con"),
+        ("", "untitled"),
+    ]:
+        got = canonical_project_slug(raw)
+        check(got == want, f"{raw!r} -> {got!r} (want {want!r})")
+        check(bool(re.fullmatch(r"[a-z0-9-]+", got)),
+              f"{raw!r} -> matches ^[a-z0-9-]+$ ({got!r})")
+        check(len(got) <= MAX_SLUG_LEN, f"{raw!r} -> within {MAX_SLUG_LEN}")
+
+    # slugify is now only a wrapper.
+    for raw, label in [("Balloon Tower Defense", "normal"), ("CON", "reserved"),
+                       ("a" * 200, "very long"), ("../escape", "traversal"),
+                       ("🎈", "emoji")]:
+        check(slugify(raw) == canonical_project_slug(raw),
+              f"slugify delegates for the {label} case")
+
+    # Builder and Manager must AGREE for the same human name.
+    with _tmp() as td:
+        root = Path(td)
+        projects = root / "projects"
+        projects.mkdir(parents=True)
+        pm = ProjectManager(repo_root=root, projects_dir=projects)
+        for raw in ["Balloon Tower Defense", "CON", "NUL", "COM1",
+                    "My Personal Finance Dashboard 2026"]:
+            builder_id = slugify(raw)
+            manager_id = pm.project_path(raw).name
+            check(builder_id == manager_id,
+                  f"{raw!r}: Builder {builder_id!r} == Manager {manager_id!r}")
+
+    # Trash keeps its own contract (timestamps are not slugs).
+    entry = "balloon-tower-defense--20260818-062122"
+    check(safe_trash_entry(entry) == entry,
+          f"a trash id survives its own sanitizer ({safe_trash_entry(entry)!r})")
+    check(canonical_project_slug(entry) != entry,
+          "and is NOT what the live contract would produce")
+
+
+async def test_legacy_directories_are_preserved():
+    check.section("B: legacy non-canonical directories still resolve")
+
+    with _tmp() as td:
+        root = Path(td)
+        projects = root / "projects"
+        # A directory the OLD ProjectManager._sanitize could have created.
+        legacy = projects / "My_Old.Project"
+        legacy.mkdir(parents=True)
+        (legacy / "PROJECT.md").write_text("# legacy\n", encoding="utf-8")
+
+        pm = ProjectManager(repo_root=root, projects_dir=projects)
+        resolved = pm.project_path("My_Old.Project")
+        check(resolved.name == "My_Old.Project",
+              f"an existing legacy directory resolves to ITSELF ({resolved.name!r})")
+        check(resolved.is_dir() and (resolved / "PROJECT.md").exists(),
+              "and its contents are reachable")
+        check(legacy.exists(),
+              "it is NOT renamed or destroyed to satisfy the new contract")
+
+        # A NEW name gets the canonical contract.
+        fresh = pm.project_path("My New.Project")
+        check(fresh.name == "my-new-project",
+              f"a new name is canonicalised ({fresh.name!r})")
+
+
+# ── C. REAL TOOLROUTER / WINDOWS ─────────────────────────────────────────────
+class _StubLLM:
+    gpu_status = type("S", (), {"status": "stub"})()
+
+    async def initialize(self):
+        return None
+
+    async def generate(self, *a, **k):
+        raise AssertionError("scaffold/delete must not call the model")
+
+
+async def _runtime(td):
+    from core.runtime import RuntimeManager
+    from core.tooling import build_tool_router
+    from memory.unifier import MemoryUnifier
+
+    root = Path(td)
+    projects = root / "projects"
+    projects.mkdir(parents=True, exist_ok=True)
+    mem_dir = root / "memory"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    m = MemoryUnifier(mem_dir)
+    await m.initialize()
+    router = build_tool_router(repo_root=root, projects_dir=projects, memory=m)
+    rt = RuntimeManager(repo_root=root, projects_dir=projects, memory=m,
+                        llm=_StubLLM(), router=router, memory_dir=mem_dir)
+    return rt, m, projects
+
+
+async def test_scaffold_through_the_real_router():
+    check.section("C: project.scaffold through the real ToolRouter")
+
+    from core.tool_router import ToolCall
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        check("project.scaffold" in rt._router.list_tools(),
+              f"project.scaffold is registered ({'project.scaffold' in rt._router.list_tools()})")
+
+        for raw in ["CON", "NUL", "COM1", "Balloon Tower Defense"]:
+            res = await rt._router.execute(
+                ToolCall(name="project.scaffold", args={"name": raw}), retries=0)
+            check(res.ok, f"{raw!r}: scaffold succeeded ({res.error!r})")
+
+            want = canonical_project_slug(raw)
+            made = [p.name for p in projects.iterdir()
+                    if p.is_dir() and not p.name.startswith(".")]
+            check(want in made, f"{raw!r} -> canonical directory {want!r} ({made})")
+            check(want not in WIN_RESERVED,
+                  f"{raw!r} -> {want!r} is not a Win32 device name")
+
+            d = projects / want
+            (d / "PROJECT.md").write_text(f"# {raw}\n", encoding="utf-8")
+            check((d / "PROJECT.md").read_text(encoding="utf-8").strip() == f"# {raw}",
+                  f"{raw!r}: files write and read back")
+            check(str(d.resolve()).startswith(str(projects.resolve())),
+                  f"{raw!r}: stays inside the projects directory")
+
+
+# ── D. NATURAL-NAME DELETE ───────────────────────────────────────────────────
+async def _approve_next(rt, tries=40):
+    for _ in range(tries):
+        p = rt.permission_broker.pending()
+        if p:
+            rt.permission_broker.resolve(p[0]["request_id"], True, by="marcus")
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def test_delete_by_natural_name_clears_the_pointer():
+    check.section("D: delete uses the ACTUAL identity, not the raw argument")
+
+    from core.tool_router import ToolCall
+
+    for spoken in ["Balloon Tower Defense", "balloon tower defense",
+                   "  Balloon   Tower Defense  "]:
+        with _tmp() as td:
+            rt, m, projects = await _runtime(td)
+            slug = canonical_project_slug("Balloon Tower Defense")
+            (projects / slug).mkdir(parents=True)
+            (projects / slug / "main.py").write_text("print(1)\n", encoding="utf-8")
+            await m.add_fact(entity="projects", attribute="last_active",
+                             value=slug, confidence=0.95)
+            await m.add_fact(entity=f"project:{slug}", attribute="brief",
+                             value="a tower defense game", confidence=0.95)
+
+            task = asyncio.create_task(rt._router.execute(
+                ToolCall(name="project.delete", args={"name": spoken}), retries=0))
+            check(await _approve_next(rt), f"{spoken!r}: permission requested")
+            res = await task
+
+            check(res.ok, f"{spoken!r}: delete succeeded ({res.error!r})")
+            check((res.result or {}).get("project") == slug,
+                  f"{spoken!r}: result names the canonical identity "
+                  f"({(res.result or {}).get('project')!r})")
+            check(not (projects / slug).exists(),
+                  f"{spoken!r}: the correct live project is gone")
+
+            ptr = await m.get_latest_fact(entity="projects", attribute="last_active")
+            check((ptr.value if ptr else "") == "",
+                  f"{spoken!r}: last_active cleared ({ptr.value if ptr else None!r})")
+
+            hist = await m.get_latest_fact(entity=f"project:{slug}", attribute="brief")
+            check(hist is not None and hist.value == "a tower defense game",
+                  f"{spoken!r}: historical memory retained")
+
+            entries = [p.name for p in (projects / ".trash").glob("*")]
+            check(len(entries) == 1 and entries[0].startswith(slug),
+                  f"{spoken!r}: exactly one recoverable trash entry ({entries})")
+
+
+# ── E. STALE POINTER ─────────────────────────────────────────────────────────
+async def test_stale_pointer_is_never_returned():
+    check.section("E: a stale active-project pointer is never used")
+
+    from core.tool_router import ToolCall
+
+    # E1: the memory clear FAILS, but the files are gone.
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        slug = "balloon-tower-defense"
+        (projects / slug).mkdir(parents=True)
+        (projects / slug / "main.py").write_text("print(1)\n", encoding="utf-8")
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value=slug, confidence=0.95)
+
+        real_add = m.add_fact
+
+        async def failing_add(**kw):
+            if kw.get("entity") == "projects" and kw.get("attribute") == "last_active":
+                raise RuntimeError("injected memory failure")
+            return await real_add(**kw)
+
+        m.add_fact = failing_add
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "Balloon Tower Defense"}),
+            retries=0))
+        await _approve_next(rt)
+        res = await task
+        m.add_fact = real_add
+
+        check(res.ok and not (projects / slug).exists(),
+              "E1 the filesystem delete is still reported as successful")
+        check("warning" in (res.result or {}),
+              f"E1 with a non-fatal cleanup warning "
+              f"({(res.result or {}).get('warning')!r})")
+        ptr = await m.get_latest_fact(entity="projects", attribute="last_active")
+        check((ptr.value if ptr else "") == slug,
+              "E1 the stale pointer really is still stored")
+
+        pb = rt._project_builder
+        active = await pb.last_active()
+        check(active is None,
+              f"E1 but last_active() REFUSES to return it ({active!r})")
+
+    # E2: a project removed behind Nova's back.
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        (projects / "ghost").mkdir(parents=True)
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value="ghost", confidence=0.95)
+        pb = rt._project_builder
+        check(await pb.last_active() == "ghost",
+              "E2 a live project is returned normally")
+
+        import shutil
+        shutil.rmtree(projects / "ghost")
+        check(await pb.last_active() is None,
+              "E2 once the directory is gone, last_active() returns None")
+        ptr = await m.get_latest_fact(entity="projects", attribute="last_active")
+        check((ptr.value if ptr else "") == "",
+              "E2 and it best-effort heals the stale pointer")
+
+
+# ── F. TARGETED IDENTITY LIFECYCLE ───────────────────────────────────────────
+async def test_identity_lifecycle():
+    check.section("F: one human name through the whole lifecycle")
+
+    from core.tool_router import ToolCall
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        human = "Balloon Tower Defense"
+        slug = canonical_project_slug(human)
+        check(slug == "balloon-tower-defense", f"1. canonical identity ({slug})")
+
+        res = await rt._router.execute(
+            ToolCall(name="project.scaffold", args={"name": human}), retries=0)
+        check(res.ok, f"2. scaffold ({res.error!r})")
+
+        listed = [p.name for p in projects.iterdir()
+                  if p.is_dir() and not p.name.startswith(".")]
+        check(slug in listed, f"3. listed under the canonical id ({listed})")
+
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value=slug, confidence=0.95)
+        await m.add_fact(entity=f"project:{slug}", attribute="brief",
+                         value="a tower defense game", confidence=0.95)
+        check(await rt._project_builder.last_active() == slug,
+              "4. last_active established and verified live")
+
+        check((projects / slug).is_dir(), "5. readable on disk")
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "BALLOON tower defense"}),
+            retries=0))
+        await _approve_next(rt)
+        res = await task
+        entry = (res.result or {}).get("moved_to_trash", "")
+        check(res.ok and (res.result or {}).get("project") == slug,
+              f"6. deleted by a casing variant, canonical identity reported "
+              f"({(res.result or {}).get('project')!r})")
+        check(bool(entry) and (projects / ".trash" / entry).is_dir(),
+              f"7. trash entry exists ({entry!r})")
+        check(await rt._project_builder.last_active() is None,
+              "8. active pointer invalidated")
+        hist = await m.get_latest_fact(entity=f"project:{slug}", attribute="brief")
+        check(hist is not None and hist.value == "a tower defense game",
+              "9. historical memory retained")
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.restore", args={"entry": entry}), retries=0))
+        await _approve_next(rt)
+        res = await task
+        check(res.ok, f"10. restored ({res.error!r})")
+        check((projects / slug).is_dir(),
+              f"11. same canonical live identity restored ({slug})")
+
+
+async def main():
+    await test_case_invariance_of_the_name_boundary()
+    await test_case_invariance_end_to_end()
+    await test_ambiguous_names_ask_rather_than_guess()
+    await test_one_canonical_identity_owner()
+    await test_legacy_directories_are_preserved()
+    await test_scaffold_through_the_real_router()
+    await test_delete_by_natural_name_clears_the_pointer()
+    await test_stale_pointer_is_never_returned()
+    await test_identity_lifecycle()
+    check.finish()
+
+
+if __name__ == "__main__":
+    run(main)

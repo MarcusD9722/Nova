@@ -19,6 +19,7 @@ State model:
 import asyncio
 import os
 import re
+from core.project_names import WIN_RESERVED, canonical_project_slug
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -134,70 +135,95 @@ CONTINUATION_COMPLAINT_RE = re.compile(
 # the source of the "I meant what other improvements..." misroute.
 
 
-# ── Requirement clauses must not become part of a project name ───────────────
+# ── Where does a project NAME end and a REQUIREMENT begin? ───────────────────
 #
-# "create a project Serpent and use Python" produced the name
-# "Serpent and use Python". The lead-word guard below does not help: the sentence
-# STARTS with a real title and only then runs into a requirement.
+# The previous answer used CAPITALISATION: "Rock and Roll Tracker" looked like a
+# title, "Serpent and use Python" looked like a requirement. That is not a valid
+# invariant for a voice-first assistant. An STT transcript does not preserve
+# intentional title case, and neither does ordinary typing, so
 #
-# The hard part is that a legitimate title has the same shape:
+#     "create a project called rock and roll tracker"
 #
-#     Rock and Roll Tracker          vs   Serpent and use Python
-#     Man With a Plan                vs   Serpent with a dark theme
+# would have been truncated to "rock" purely because it was spoken rather than
+# typed. Changing only capitalisation must never change which words Nova believes
+# belong to the name.
 #
-# Length cannot separate them and neither can the connective alone. CASING can.
-# In a title the words either side of the connective are capitalised; in a
-# requirement the connective and what follows are lowercase prose:
+# So the decision is deterministic SYNTAX, evaluated case-insensitively:
 #
-#     "Rock and Roll Tracker"   -> and(lower) Roll(Capital)  -> still the title
-#     "Man With a Plan"         -> With(Capital)             -> still the title
-#     "Serpent and use Python"  -> and(lower) use(lower)     -> requirement starts
-#     "Serpent with a dark…"    -> with(lower) a(lower)      -> requirement starts
+#   1. QUOTED         -> the quoted span, exactly. Quoting states the boundary.
+#   2. ACTION SUFFIX  -> a connective followed by an imperative VERB is a
+#                        requirement, not title text: "and use Python",
+#                        "and add levels", "then add a scoreboard".
+#   3. CLEAN TITLE    -> no ambiguous continuation at all -> the whole capture.
+#   4. AMBIGUOUS      -> ASK. "called Serpent with a dark theme" and a real title
+#                        like "Man with a Plan" are the same syntax; nothing short
+#                        of quotation separates them. Guessing either way is
+#                        wrong, so Nova asks instead.
 #
-# So a cut happens only where BOTH the connective and the following word are
-# lowercase. `using`/`that`/`which` are cut unconditionally: they introduce a
-# requirement in every phrasing collected and appear in no title in the corpus.
-#
-# A quoted name is never trimmed — quoting states the boundary outright.
-_CUT_ALWAYS = frozenset({"using", "that", "which", "who"})
-_CUT_IF_LOWER = frozenset({
-    "and", "or", "but", "with", "without", "for", "to", "from", "in", "on",
-    "at", "by", "about", "so", "then", "plus", "also", "if", "when", "while",
+# `using` / `that` / `which` / `who` do NOT truncate on sight — a legitimate title
+# may contain them — they make the boundary ambiguous, which routes to (4).
+_ACTION_CONNECTIVES = frozenset({"and", "then", "plus", "also"})
+
+#: Imperative verbs that begin a requirement clause. A closed list on purpose: a
+#: noun/adjective lexicon would overfit, while "<connective> <verb>" is reliable.
+_ACTION_VERBS = frozenset("""
+    use uses using add adds adding keep keeps keeping make makes making
+    include includes including support supports supporting track tracks tracking
+    build builds building create creates creating write writes writing
+    store stores storing save saves saving run runs running show shows showing
+    display displays handle handles allow allows avoid avoids target targets
+    deploy deploys test tests fix fixes remove removes delete deletes
+    put puts set sets give gives let lets have has send sends
+""".split())
+
+#: Tokens after which a title boundary cannot be proven either way.
+_AMBIGUOUS_CONTINUATIONS = frozenset({
+    "with", "without", "using", "that", "which", "who", "whom", "whose",
+    "for", "from", "in", "on", "at", "about", "to", "by", "into", "over",
+    "under", "when", "while", "if", "unless", "until", "so", "because",
 })
 
+NAME_AMBIGUOUS = "__NOVA_PROJECT_NAME_AMBIGUOUS__"
 
-def _trim_requirement_clause(name: str) -> str:
-    """Drop a trailing requirement clause from an UNQUOTED captured name."""
+
+def resolve_name_boundary(name: str) -> str:
+    """Where the title ends. Returns the name, or NAME_AMBIGUOUS to ask.
+
+    Case-insensitive by construction: every comparison lowercases first, so the
+    same words produce the same answer however they were capitalised.
+    """
     words = (name or "").split()
+    if len(words) <= 1:
+        return (name or "").strip()
+
     for i, w in enumerate(words[1:], start=1):   # never cut at the first word
         low = w.lower().strip(".,;:!?")
-        if low in _CUT_ALWAYS:
+        nxt = words[i + 1].lower().strip(".,;:!?") if i + 1 < len(words) else ""
+
+        # (2) a connective followed by an imperative verb ends the title.
+        if low in _ACTION_CONNECTIVES and nxt in _ACTION_VERBS:
             return " ".join(words[:i]).strip()
-        if low in _CUT_IF_LOWER and w[:1].islower():
-            nxt = words[i + 1] if i + 1 < len(words) else ""
-            if not nxt or nxt[:1].islower():
-                return " ".join(words[:i]).strip()
+
+        # (4) anything else that could open a requirement is unprovable.
+        if low in _AMBIGUOUS_CONTINUATIONS:
+            return NAME_AMBIGUOUS
+
+    # (3) nothing ambiguous anywhere: the whole capture is the title.
     return (name or "").strip()
 
 
-#: Win32 reserved device names. A directory whose name equals one of these is a
-#: genuine hazard on Windows — Nova's host platform — and `slugify("CON")` used to
-#: return "con", which `start()` then handed straight to `mkdir()`.
-_WIN_RESERVED = frozenset(
-    ["con", "prn", "aux", "nul"]
-    + [f"com{i}" for i in range(1, 10)]
-    + [f"lpt{i}" for i in range(1, 10)]
-)
+#: Re-exported for callers that already imported it from this module.
+_WIN_RESERVED = WIN_RESERVED
 
 
 def slugify(name: str) -> str:
-    s = (name or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    s = s[:48] or "untitled"
-    if s in _WIN_RESERVED:
-        # Deterministic, reversible-looking, and still obviously the user's name.
-        s = f"project-{s}"
-    return s
+    """Compatibility wrapper. The contract lives in `core/project_names.py`.
+
+    Kept because call sites and tests import it, but it no longer OWNS anything:
+    ProjectBuilder and ProjectManager must agree on what a live project directory
+    is called, and two independent implementations of that had already drifted.
+    """
+    return canonical_project_slug(name)
 
 
 def _now_str() -> str:
@@ -392,10 +418,12 @@ class ProjectBuilder:
             raw = m.group(1).strip()
             # Quoted => the boundary is explicit; take it exactly as written.
             quoted = bool(re.search(r"[\"']" + re.escape(raw) + r"[\"']", t))
-            name = raw if quoted else _trim_requirement_clause(raw)
-            if name:
-                return name, t
-            return NEEDS_NAME, t
+            if quoted:
+                return raw, t
+            name = resolve_name_boundary(raw)
+            if name == NAME_AMBIGUOUS or not name:
+                return NEEDS_NAME, t
+            return name, t
         m2 = PROJECT_NAME_RE.search(t)
         if m2 and m2.group("name").strip():
             name = re.sub(r"^(?:a|an|the|new|simple|small|little|basic)\s+", "",
@@ -404,9 +432,12 @@ class ProjectBuilder:
             # ("called X" / "named X") is taken at its word.
             if name and (m2.group("marker") or _looks_like_a_title(name)):
                 quoted = bool(re.search(r"[\"']" + re.escape(name) + r"[\"']", t))
-                name = name if quoted else _trim_requirement_clause(name)
-                if name and _looks_like_a_title(name):
+                if quoted:
                     return name, t
+                resolved = resolve_name_boundary(name)
+                if (resolved != NAME_AMBIGUOUS and resolved
+                        and _looks_like_a_title(resolved)):
+                    return resolved, t
                 return NEEDS_NAME, t
         return NEEDS_NAME, t
 
@@ -425,11 +456,35 @@ class ProjectBuilder:
             pass
 
     async def last_active(self) -> str | None:
+        """The current project, or None — never one that no longer exists.
+
+        The pointer lives in memory and the project is a directory, and those can
+        disagree: a delete whose memory update failed, a manual removal, a crash,
+        an older bug. Trusting the pointer made "resume where we left off" resolve
+        to a deleted project, so existence is VERIFIED here rather than assumed.
+
+        Self-healing the stale value is best-effort; correctness does not depend on
+        it succeeding. The property that matters is that a stale pointer is never
+        returned as the current project.
+        """
         try:
             fact = await self._memory.get_latest_fact(entity="projects", attribute="last_active")
-            return fact.value.strip() if fact and fact.value.strip() else None
         except Exception:
             return None
+        slug = (fact.value or "").strip() if fact else ""
+        if not slug:
+            return None
+        try:
+            if self._project_path(slug).is_dir():
+                return slug
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            await self._memory.add_fact(entity="projects", attribute="last_active",
+                                        value="", confidence=0.95)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     def _read_project_md(self, slug: str) -> str:
         path = self._project_path(slug) / "PROJECT.md"

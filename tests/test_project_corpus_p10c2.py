@@ -109,7 +109,7 @@ async def test_real_names_still_work():
     # The repair must not be "reject anything long".
     long_name = _name("start a project called My Personal Finance Dashboard 2026")
     check(long_name is not None and len(long_name.split()) == 5,
-          f"a five-word title is accepted ({long_name!r})")
+          f"a five-word title is accepted ({long_name!r})")   # no ambiguous token
     check(slugify(long_name) == "my-personal-finance-dashboard-2026",
           f"and slugs cleanly ({slugify(long_name or '')!r})")
 
@@ -208,17 +208,31 @@ async def test_stage12_hostile_names_cannot_escape_the_projects_dir():
 # reproduced as a FAILURE at 92cc6ef, INCLUDING the marked "called X" / "named X"
 # forms — NAME_RE runs first and captured just as greedily, so the lead-word guard
 # never saw them.
+# A CONNECTIVE + IMPERATIVE VERB is provably a requirement, so it is cut.
 TRAILING_REQUIREMENT = [
     ("create a project Serpent and use Python", "Serpent"),
-    ("create a project Serpent with a dark theme", "Serpent"),
-    ("create a project Serpent using Rust", "Serpent"),
-    ("create a project Serpent that tracks spending", "Serpent"),
-    ("create a project Weather Radar for me please", "Weather Radar"),
+    ("create a project Serpent and add levels", "Serpent"),
+    ("create a project Serpent then add a scoreboard", "Serpent"),
+    ("create a project Serpent and keep it offline", "Serpent"),
     ("make a project Balloon Tower Defense and add levels", "Balloon Tower Defense"),
     ("create a project called Serpent and use Python", "Serpent"),
-    ("create a project named Serpent with a dark theme", "Serpent"),
-    ("build a project called My Personal Finance Dashboard 2026 using Python",
-     "My Personal Finance Dashboard 2026"),
+    ("create a project named Serpent and add levels", "Serpent"),
+]
+
+# These were TRIMMED by the old casing rule. Round 2 replaced that with
+# fail-closed semantics: `with a dark theme` and a real title like
+# `Man with a Plan` are the same syntax, and nothing short of quotation separates
+# them. Guessing either way is wrong, so Nova ASKS. Recorded here as the
+# deliberate behaviour change it is.
+AMBIGUOUS_ASKS = [
+    "create a project Serpent with a dark theme",
+    "create a project Serpent using Rust",
+    "create a project Serpent that tracks spending",
+    "create a project Weather Radar for me please",
+    "create a project named Serpent with a dark theme",
+    "build a project called My Personal Finance Dashboard 2026 using Python",
+    "create a project called Man With a Plan",
+    "create a project called Python for Beginners",
 ]
 
 # Quoting states the boundary outright, so the quoted span is taken exactly.
@@ -239,10 +253,8 @@ QUOTED = [
 # fix above by breaking these.
 FUNCTION_WORD_TITLES = [
     ("create a project called Rock and Roll Tracker", "Rock and Roll Tracker"),
-    ("create a project called Man With a Plan", "Man With a Plan"),
-    ("create a project called To Do List", "To Do List"),
     ("create a project called War and Peace Notes", "War and Peace Notes"),
-    ("create a project called Python for Beginners", "Python for Beginners"),
+    ("create a project called To Do List", "To Do List"),
     ("create a project called Before Sunrise Tracker", "Before Sunrise Tracker"),
 ]
 
@@ -261,6 +273,12 @@ async def test_trailing_requirement_never_joins_the_name():
     check(marked == "Serpent" and unmarked == "Serpent",
           f"both the called/named path ({marked!r}) and the bare path "
           f"({unmarked!r}) are trimmed")
+
+    # And where the boundary cannot be PROVEN, Nova asks instead of guessing.
+    for text in AMBIGUOUS_ASKS:
+        got = _name(text)
+        check(got == NEEDS_NAME,
+              f"ambiguous {text!r} -> asks for clarification ({got!r})")
 
 
 async def test_quoted_names_are_taken_exactly():

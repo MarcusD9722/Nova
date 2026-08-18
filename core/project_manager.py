@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from core.project_names import canonical_project_slug, safe_trash_entry
 from core.safety import ensure_safe_subdir
 
 
@@ -26,12 +27,30 @@ class ProjectManager:
         self._projects_dir = projects_dir
 
     def _sanitize(self, name: str) -> str:
-        name = name.strip()
-        name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name)
-        name = name.strip("-.")
-        if not name:
+        """Resolve a name to a LIVE project directory component.
+
+        This used to be a second, independent definition of the project namespace
+        — case-preserving, allowing dots and underscores, no length cap and no
+        Win32 reserved-device handling. So `project.scaffold` and
+        `project.start_build` could create two different directories for one human
+        name, and only one of the two was protected from `CON`/`NUL`/`COM1`.
+
+        An EXISTING directory is resolved by its real name first, so legacy
+        projects created under the old rules keep working and are never renamed.
+        Anything new gets the canonical contract.
+        """
+        raw = (name or "").strip()
+        if not raw:
             raise ValueError("Project name is empty after sanitization")
-        return name
+
+        legacy = safe_trash_entry(raw)   # path-safe, but not canonicalised
+        try:
+            if (self._projects_dir / legacy).is_dir():
+                return legacy
+        except OSError:
+            pass
+
+        return canonical_project_slug(raw)
 
     def project_path(self, name: str) -> Path:
         safe_name = self._sanitize(name)
@@ -106,7 +125,10 @@ class ProjectManager:
 
     def restore_project(self, entry: str) -> dict[str, Any]:
         """Move a trashed project back. Refuses to clobber a live project."""
-        safe = self._sanitize(entry)
+        # A trash id carries a timestamp (`slug--20260818-062122`), so it has its
+        # own rules — forcing the live-project contract onto it would corrupt
+        # existing entries.
+        safe = safe_trash_entry(entry)
         src = ensure_safe_subdir(self._repo_root, self._trash_dir(), self._trash_dir() / safe)
         if not src.exists() or not src.is_dir():
             raise FileNotFoundError(f"nothing in trash named: {entry}")
@@ -124,7 +146,10 @@ class ProjectManager:
         if not trash.exists():
             return {"purged": [], "note": "trash is already empty"}
         if entry:
-            safe = self._sanitize(entry)
+            # A trash id carries a timestamp (`slug--20260818-062122`), so it
+            # has its own rules — forcing the live-project contract onto it
+            # would corrupt existing entries.
+            safe = safe_trash_entry(entry)
             target = ensure_safe_subdir(self._repo_root, trash, trash / safe)
             if not target.exists():
                 raise FileNotFoundError(f"nothing in trash named: {entry}")
