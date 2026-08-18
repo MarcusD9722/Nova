@@ -1200,3 +1200,63 @@ corruption, and `ChromaMemoryBackend` promised "a deterministic hash fallback so
 query()/upsert() never hard-fail". Both now state the real contract. The hash
 implementation itself stays as the negative reference the vector-space tests
 measure bge against.
+
+### D18 addendum 4 (2026-08-17, review round 4)
+
+Round 3 introduced the promotion journal. Three gaps in the journal's own
+authority remained.
+
+**The journal is scoped to its collection.** It lived at
+`<persist_dir>/nova_promotion.json`, global to the whole Chroma directory â€” but one
+directory can hold several semantic collections at once: a different pinned
+revision, the orphaned revision-less collection, `nova_memory_v2`. A backend for
+revision B would therefore read, and DELETE, the recovery evidence belonging to
+revision A. No vectors were destroyed, but the proof was, and the proof is the
+entire mechanism: an A that later reopened would find live+backup with no journal
+and have to refuse it forever. The path is now
+`nova_promotion_<collection>.json`, and each collection reads, writes and deletes
+only its own.
+
+**The journal must prove it describes THIS collection.** Reading `state ==
+"promoting"` was the only check. Every field is now bound to the current identity â€”
+`collection`, `backup`, `space_id`, a non-negative integer `expected_count`, a
+non-empty `generation` â€” and a journal that fails any of them is not evidence about
+this collection. Malformed or mismatched, with both live and backup present, fails
+closed and preserves both.
+
+**Missing provenance fails exactly like wrong provenance.** The verification read
+`if want_space and space and space != want_space`, so a collection carrying NO
+`nova_semantic_space` passed: absence of evidence was being read as evidence of the
+right space. An expected space now requires an exact match, and a collection that
+cannot say which space it holds cannot be promoted.
+
+**A cleanup failure must never cost the proof.** Finalization deleted the backup
+inside `try/except: pass` and then cleared the journal unconditionally. A transient
+delete failure therefore produced `live + backup + no journal` â€” a generation that
+HAD been verified but could no longer be proven, which the next startup would have
+to refuse. Now the journal is cleared only after the backup is confirmed gone; a
+failure keeps live, backup and journal together, records the cleanup as pending,
+and leaves the verified live authoritative and usable. The next open re-verifies
+and retries. Both the normal path and crash-recovery finalization go through the
+same helper, so they cannot diverge. A verified new generation is never rolled back
+merely because deleting the stale backup failed.
+
+**Evidence.** `tests/test_semantic_vector_space_p10.py`, 337 checks. Cross-revision
+isolation: A crashes mid-promotion, B runs in the same directory, A's journal and
+both A collections are untouched, and A then recovers using its own journal and
+finalizes. Seven malformed/mismatched journals (other collection, other backup,
+other space, non-integer count, negative count, empty generation, wrong state) each
+refuse and preserve both collections. Missing provenance and wrong provenance are
+both rejected while matching provenance is still accepted â€” the check was not made
+impossible to pass. Backup-cleanup failure is tested on both the normal promotion
+path and the recovery path: the new generation stays authoritative and queryable,
+backup and journal both remain, cleanup is recorded pending, and a later restart
+completes the cleanup and only then clears the journal.
+
+**Mutation testing.** Six mutations, all six caught: global journal path, ignoring
+`journal.collection`, ignoring `journal.backup`, accepting missing
+`nova_semantic_space`, clearing the journal when the backup delete throws, and
+skipping journal validation entirely. One first-pass mutation of the provenance
+check was behaviourally EQUIVALENT â€” removing the explicit "no provenance" branch
+still left the `!=` comparison to reject `None` â€” so it was re-run as the original
+`and space and` condition, which is caught.

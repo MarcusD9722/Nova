@@ -1161,7 +1161,11 @@ async def _seed_backend(td, n=4, prefix="good"):
     return be, await _dump_backend(be)
 
 
-async def _stage_crash(be, *, expected: int, new_ids: list[str], journal: bool = True):
+_OMIT = object()   # sentinel: build the collection with NO provenance metadata
+
+
+async def _stage_crash(be, *, expected: int, new_ids: list[str], journal: bool = True,
+                       space=None, journal_overrides: dict | None = None):
     """Hand-build the exact on-disk state a crash mid-promotion leaves behind.
 
     live -> backup, then a NEW live containing `new_ids`, with the journal saying
@@ -1175,15 +1179,19 @@ async def _stage_crash(be, *, expected: int, new_ids: list[str], journal: bool =
     await _a.to_thread(be._ensure)
     live, backup = be._collection_name, be._backup_name()
     if journal:
-        await _a.to_thread(be._write_journal, {
-            "state": "promoting", "generation": "gen-under-test",
-            "collection": live, "backup": backup,
-            "expected_count": expected, "space_id": cb.semantic_space_id()})
+        entry = {"state": "promoting", "generation": "gen-under-test",
+                 "collection": live, "backup": backup,
+                 "expected_count": expected, "space_id": cb.semantic_space_id()}
+        entry.update(journal_overrides or {})
+        await _a.to_thread(be._write_journal, entry)
     old = await _a.to_thread(be._client.get_collection, live, embedding_function=be._emb)
     await _a.to_thread(old.modify, name=backup)
+    meta = {"hnsw:space": "cosine"}
+    if space is not _OMIT:
+        meta["nova_semantic_space"] = space if space is not None else cb.semantic_space_id()
     fresh = await _a.to_thread(
         be._client.get_or_create_collection, name=live, embedding_function=be._emb,
-        metadata={"hnsw:space": "cosine", "nova_semantic_space": cb.semantic_space_id()})
+        metadata=meta)
     if new_ids:
         await _a.to_thread(
             fresh.add, ids=list(new_ids),
@@ -1381,6 +1389,229 @@ async def test_promotion_finalizes_and_leaves_a_clean_store():
               "status reports no recovery error")
 
 
+async def test_journal_is_scoped_and_validated():
+    """Round 4: the journal must belong to THIS collection, and prove it.
+
+    A single `nova_promotion.json` for the whole persistence directory meant a
+    backend for one embedding revision read — and deleted — the recovery evidence
+    of another. No vectors were destroyed, but the proof was, and the proof is the
+    entire mechanism: without it a live+backup state must be refused forever.
+    """
+    check.section("journal: collection-scoped and schema-validated")
+    from memory.backends.chroma_backend import ChromaMemoryBackend, SemanticRecoveryError
+
+    ALT_REV = "b" * 40
+
+    # ── cross-revision isolation: A crashes mid-promotion, B runs, A recovers ──
+    with _tmp() as td:
+        beA, oldA = await _seed_backend(td, n=4, prefix="a")
+        liveA, backupA = await _stage_crash(beA, expected=2,
+                                            new_ids=["newA0", "newA1"])
+        jA = beA._journal_path()
+        check(jA.name == f"nova_promotion_{liveA}.json",
+              f"the journal is named for its collection ({jA.name})")
+        check(jA.exists(), "and exists after the interrupted promotion")
+
+        prev = os.environ.get("NOVA_EMBED_REVISION")
+        os.environ["NOVA_EMBED_REVISION"] = ALT_REV
+        try:
+            beB = ChromaMemoryBackend(Path(td) / "chroma")
+            await beB.upsert_text("b0", "a revision B record", {"g": "1"})
+            check(beB._collection_name != liveA,
+                  f"revision B uses its own collection ({beB._collection_name})")
+            check(beB._journal_path() != jA,
+                  f"and its own journal path ({beB._journal_path().name})")
+            check(jA.exists(),
+                  "A's journal is UNTOUCHED by B operating in the same directory")
+            bnames = sorted(c.name for c in beB._client.list_collections())
+            check(liveA in bnames and backupA in bnames,
+                  f"and B deleted none of A's collections ({bnames})")
+        finally:
+            if prev is None:
+                os.environ.pop("NOVA_EMBED_REVISION", None)
+            else:
+                os.environ["NOVA_EMBED_REVISION"] = prev
+
+        beA2 = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(beA2)
+        check(set(got) == {"newA0", "newA1"},
+              f"A then recovers using ITS OWN journal ({sorted(got)})")
+        check(beA2._finalized_after_crash == 1,
+              f"finalizing the generation the journal described "
+              f"({beA2._finalized_after_crash})")
+
+    # ── a journal that does not bind to this collection is not evidence ──────
+    for label, overrides in (
+            ("names another collection", {"collection": "nova_sem_bge_somethingelse"}),
+            ("names another backup", {"backup": "nova_sem_bge_other__backup"}),
+            ("describes another vector space", {"space_id": "bge|other@x|y|384"}),
+            ("has a non-integer count", {"expected_count": "three"}),
+            ("has a negative count", {"expected_count": -1}),
+            ("has an empty generation", {"generation": ""}),
+            ("is not in the promoting state", {"state": "done"}),
+    ):
+        with _tmp() as td:
+            be, old_records = await _seed_backend(td, n=4)
+            old_ids = set(old_records)
+            live, backup = await _stage_crash(
+                be, expected=2, new_ids=["n0", "n1"], journal_overrides=overrides)
+
+            fresh = ChromaMemoryBackend(Path(td) / "chroma")
+            raised = ""
+            try:
+                await fresh.count()
+            except SemanticRecoveryError as e:
+                raised = str(e)
+            check(bool(raised),
+                  f"a journal that {label} is REFUSED, not acted on ({raised[:70]})")
+            names = sorted(c.name for c in fresh._client.list_collections())
+            check(names == sorted([live, backup]),
+                  f"and BOTH collections are preserved ({names})")
+
+
+async def test_missing_or_wrong_provenance_fails_verification():
+    """Round 4: absent `nova_semantic_space` must fail exactly like a wrong one.
+
+    The check read `if want_space and space and space != want_space`, so a
+    collection carrying NO provenance passed — absence of evidence being read as
+    evidence of the right space.
+    """
+    check.section("vector-space provenance: missing fails like wrong")
+    from memory.backends.chroma_backend import ChromaMemoryBackend
+
+    # MISSING provenance, but the promised record count.
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td, n=4)
+        old_ids = set(old_records)
+        live, backup = await _stage_crash(be, expected=2, new_ids=["n0", "n1"],
+                                          space=_OMIT)
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(fresh)
+        check(set(got) == old_ids,
+              f"a live with NO provenance is not accepted; the backup is restored "
+              f"({sorted(got)})")
+        check("n0" not in got, "and the unprovable generation is gone")
+        check(fresh._rolled_back == 1, f"via rollback ({fresh._rolled_back})")
+        names = sorted(c.name for c in fresh._client.list_collections())
+        check(names == [live], f"leaving one clean collection ({names})")
+
+    # WRONG provenance with the correct count.
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td, n=4)
+        old_ids = set(old_records)
+        live, backup = await _stage_crash(be, expected=2, new_ids=["n0", "n1"],
+                                          space="bge|other-model@" + ("c" * 40)
+                                                + "|normalized-cls-v1|384")
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(fresh)
+        check(set(got) == old_ids,
+              f"a live from another vector space is rejected ({sorted(got)})")
+        check(all(got[i]["text"] == old_records[i]["text"] for i in old_ids),
+              "and the known-good content is intact")
+
+    # CORRECT provenance and count is still accepted — the check has not simply
+    # been made impossible to pass.
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td, n=4)
+        live, backup = await _stage_crash(be, expected=2, new_ids=["n0", "n1"])
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(fresh)
+        check(set(got) == {"n0", "n1"},
+              f"matching provenance and count IS accepted ({sorted(got)})")
+
+
+async def test_backup_cleanup_failure_keeps_the_proof():
+    """Round 4: a cleanup failure must not discard the journal.
+
+    `live + backup + no journal` is unprovable, so the next startup would have to
+    refuse a generation that had already been verified. Failing to delete a stale
+    backup is a tidiness problem; it must never cost the proof.
+    """
+    check.section("backup cleanup failure keeps live, backup AND journal")
+    from memory.backends.chroma_backend import ChromaMemoryBackend
+
+    # ── A: normal promotion, backup delete fails ────────────────────────────
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td, n=4, prefix="old")
+        await be.begin_staged_rebuild()
+        for i in range(3):
+            await be.upsert_text(f"new{i}", f"new generation record {i}", {"g": "2"})
+
+        import asyncio as _a
+        await _a.to_thread(be._ensure)
+        backup = be._backup_name()
+        real_delete = be._client.delete_collection
+
+        def refuse_backup_delete(name, *a, **k):
+            if name == backup:
+                raise RuntimeError("injected backup delete failure")
+            return real_delete(name, *a, **k)
+
+        be._client.delete_collection = refuse_backup_delete
+        promoted = await be.commit_staged_rebuild(3)
+
+        live_now = await _dump_backend(be)
+        check(promoted == 3 and set(live_now) == {"new0", "new1", "new2"},
+              f"A the verified new generation IS authoritative ({sorted(live_now)})")
+        hits = await be.query("new generation record", limit=3)
+        check(bool(hits), f"A and queryable ({[h['id'] for h in hits][:3]})")
+        names = sorted(c.name for c in be._client.list_collections())
+        check(backup in names, f"A the backup remains ({names})")
+        check(be._journal_path().exists(),
+              "A and the JOURNAL remains, so the proof survives the cleanup failure")
+        check(be._finalization_pending >= 1,
+              f"A cleanup is recorded as pending, not pretended complete "
+              f"({be._finalization_pending})")
+
+        be._client.delete_collection = real_delete
+        restarted = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(restarted)
+        check(set(got) == {"new0", "new1", "new2"},
+              f"A after restart the promoted generation stands ({sorted(got)})")
+        check(all(got[i]["text"] == live_now[i]["text"] for i in live_now),
+              "A with identical content")
+        names = sorted(c.name for c in restarted._client.list_collections())
+        check(names == [restarted._collection_name],
+              f"A the retry cleans the backup up ({names})")
+        check(not restarted._journal_path().exists(),
+              "A and only THEN is the journal cleared")
+
+    # ── B: crash-recovery finalization, backup delete fails ─────────────────
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td, n=4, prefix="old")
+        live, backup = await _stage_crash(be, expected=3, new_ids=["n0", "n1", "n2"])
+
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        fresh._open_client()
+        real_delete = fresh._client.delete_collection
+
+        def refuse_backup_delete2(name, *a, **k):
+            if name == backup:
+                raise RuntimeError("injected backup delete failure")
+            return real_delete(name, *a, **k)
+
+        fresh._client.delete_collection = refuse_backup_delete2
+        got = await _dump_backend(fresh)
+        check(set(got) == {"n0", "n1", "n2"},
+              f"B the verified generation is NOT rejected over a cleanup failure "
+              f"({sorted(got)})")
+        names = sorted(c.name for c in fresh._client.list_collections())
+        check(backup in names, f"B the backup remains ({names})")
+        check(fresh._journal_path().exists(), "B and the journal remains")
+        check(fresh._finalization_pending >= 1,
+              f"B cleanup recorded as pending ({fresh._finalization_pending})")
+
+        fresh._client.delete_collection = real_delete
+        restarted = ChromaMemoryBackend(Path(td) / "chroma")
+        got2 = await _dump_backend(restarted)
+        check(set(got2) == {"n0", "n1", "n2"},
+              f"B a later restart keeps the same generation ({sorted(got2)})")
+        names = sorted(c.name for c in restarted._client.list_collections())
+        check(names == [restarted._collection_name],
+              f"B and completes the cleanup ({names})")
+        check(not restarted._journal_path().exists(), "B clearing the journal last")
+
+
 async def test_semantic_status_reports_the_real_load_error():
     """Review finding 5: load_error was structurally always null.
 
@@ -1471,6 +1702,9 @@ async def main():
     await test_crash_residue_is_recovered_not_ignored()
     await test_recovery_authority_is_durable_not_inferred()
     await test_promotion_finalizes_and_leaves_a_clean_store()
+    await test_journal_is_scoped_and_validated()
+    await test_missing_or_wrong_provenance_fails_verification()
+    await test_backup_cleanup_failure_keeps_the_proof()
     await test_live_and_rebuilt_records_are_identical()
     await test_a_failed_rebuild_never_becomes_authoritative()
     await test_staged_rebuild_defences_individually()

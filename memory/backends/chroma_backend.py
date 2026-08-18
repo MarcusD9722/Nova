@@ -235,6 +235,7 @@ class ChromaMemoryBackend:
         self._recovered_from_backup = 0
         self._rolled_back = 0
         self._finalized_after_crash = 0
+        self._finalization_pending = 0
         #: Non-empty when recovery REFUSED to produce an authority. The store is
         #: intact and untouched; semantic work is skipped until it is resolved.
         self._recovery_error = ""
@@ -278,6 +279,7 @@ class ChromaMemoryBackend:
             "promotions_rolled_back": self._rolled_back,
             "recovered_from_backup": self._recovered_from_backup,
             "finalized_after_crash": self._finalized_after_crash,
+            "finalization_pending": self._finalization_pending,
             "recovery_error": self._recovery_error or None,
         }
 
@@ -463,7 +465,46 @@ class ChromaMemoryBackend:
     # small JSON file, replaced atomically; a local store needs nothing larger.
 
     def _journal_path(self) -> Path:
-        return self._persist_dir / "nova_promotion.json"
+        """Scoped to THIS collection, not to the persistence directory.
+
+        One directory can hold several semantic collections at once: a different
+        pinned revision, the orphaned revision-less collection, `nova_memory_v2`.
+        A single global `nova_promotion.json` meant a backend for revision B would
+        read — and DELETE — the recovery evidence belonging to revision A, so
+        switching back to A left A with live+backup and no journal, which A must
+        then refuse. No vectors were lost, but the durable proof was, and proof is
+        the whole mechanism.
+
+        `_collection_name` is already `nova_sem_bge_<hex>`, i.e. filename-safe.
+        """
+        return self._persist_dir / f"nova_promotion_{self._collection_name}.json"
+
+    def _journal_is_authoritative(self, journal: Any) -> tuple[bool, str]:
+        """Does this journal actually describe THIS collection mid-promotion?
+
+        Every field is bound to the current identity. A journal that does not
+        match is not evidence about this collection, and a malformed one is not
+        evidence at all — in both cases the caller must fail closed rather than
+        infer.
+        """
+        if not isinstance(journal, dict):
+            return False, "journal is not an object"
+        if journal.get("state") != "promoting":
+            return False, f"state is {journal.get('state')!r}, not 'promoting'"
+        if journal.get("collection") != self._collection_name:
+            return False, (f"journal names collection {journal.get('collection')!r}, "
+                           f"not {self._collection_name!r}")
+        if journal.get("backup") != self._backup_name():
+            return False, (f"journal names backup {journal.get('backup')!r}, "
+                           f"not {self._backup_name()!r}")
+        if journal.get("space_id") != semantic_space_id():
+            return False, "journal describes a different vector space"
+        count = journal.get("expected_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            return False, f"expected_count {count!r} is not a non-negative integer"
+        if not str(journal.get("generation") or "").strip():
+            return False, "generation is empty"
+        return True, "journal matches this collection"
 
     def _write_journal(self, entry: dict[str, Any] | None) -> None:
         """Atomically replace (or remove) the promotion journal."""
@@ -519,9 +560,43 @@ class ChromaMemoryBackend:
             return False, f"{name} holds {got} records, promotion expected {want}"
         space = (col.metadata or {}).get("nova_semantic_space")
         want_space = journal.get("space_id")
-        if want_space and space and space != want_space:
-            return False, f"{name} carries a different vector space ({space})"
+        if want_space:
+            # MISSING provenance fails, exactly like WRONG provenance. The earlier
+            # `and space and` made an absent `nova_semantic_space` pass, so a
+            # collection that could not prove which vector space it held was
+            # treated as proving the right one. Absence of evidence was being read
+            # as evidence.
+            if not space:
+                return False, (f"{name} carries no vector-space provenance, so it "
+                               f"cannot be verified against the promotion")
+            if space != want_space:
+                return False, f"{name} carries a different vector space ({space})"
         return True, f"{name} verified: {got} records"
+
+    def _finalize_promotion(self, backup: str) -> bool:
+        """Drop the stale backup, and clear the journal ONLY once it is gone.
+
+        A cleanup failure must not become `live + backup + no journal`: the next
+        startup would then have a provably-good live it can no longer prove, and
+        would have to refuse it. So a failed delete keeps ALL THREE — the verified
+        live stays authoritative and usable, the backup stays, and the journal
+        stays so the next open can verify again and retry the cleanup.
+        """
+        assert self._client is not None
+        try:
+            self._client.delete_collection(backup)
+        except Exception:  # noqa: BLE001
+            self._finalization_pending += 1
+            return False
+        try:
+            if backup in self._existing_names():
+                self._finalization_pending += 1
+                return False
+        except Exception:  # noqa: BLE001
+            self._finalization_pending += 1
+            return False
+        self._write_journal(None)
+        return True
 
     def _restore_backup(self, live: str, backup: str) -> tuple[bool, str]:
         assert self._client is not None
@@ -589,24 +664,24 @@ class ChromaMemoryBackend:
             return
 
         # live AND backup: ambiguous by name. Decide from durable state.
-        if journal is None or journal.get("state") != "promoting":
-            # Nothing durable says this live is a completed, verified generation,
-            # so it cannot be trusted over a backup that was authoritative by
-            # construction. Refuse rather than guess in either direction.
+        usable, why = self._journal_is_authoritative(journal)
+        if not usable:
+            # Nothing durable says this live is a completed generation for THIS
+            # collection, so it cannot be trusted over a backup that was
+            # authoritative by construction. Refuse rather than guess either way.
             self._recovery_error = (
                 f"both {live} and {backup} exist but no promotion journal proves "
-                f"{live} is a completed, verified generation. BOTH are preserved "
-                f"and semantic memory is unavailable until this is resolved. "
-                f"SQLite memory is unaffected.")
+                f"{live} is a completed, verified generation ({why}). BOTH are "
+                f"preserved and semantic memory is unavailable until this is "
+                f"resolved. SQLite memory is unaffected.")
             raise SemanticRecoveryError(self._recovery_error)
 
         valid, detail = self._collection_is_valid(live, journal)
         if valid:
-            try:
-                self._client.delete_collection(backup)
-            except Exception:  # noqa: BLE001
-                pass   # harmless: the next open sees live-only
-            self._write_journal(None)
+            # The live generation is PROVEN. Cleaning up the stale backup is the
+            # only work left, and failing at it must not cost us that proof: keep
+            # the journal so the next open can verify again and retry.
+            self._finalize_promotion(backup)
             self._finalized_after_crash += 1
             self._recovery_error = ""
             return
@@ -765,16 +840,16 @@ class ChromaMemoryBackend:
                         f"expected {count}")
 
                 if backed_up:
-                    try:
-                        await asyncio.to_thread(self._client.delete_collection, backup)
-                    except Exception:  # noqa: BLE001
-                        # Harmless: the journal still says "promoting" and the new
-                        # live verifies, so recovery finalizes it on the next open.
-                        pass
-                # Finalized: the journal has no more work to describe. Cleared LAST,
-                # so a crash before this point still leaves the evidence recovery
-                # needs.
-                await asyncio.to_thread(self._write_journal, None)
+                    # Deletes the backup and clears the journal ONLY once it is
+                    # confirmed gone. If cleanup fails, live/backup/journal all
+                    # stay: the new generation is already proven and stays
+                    # authoritative, and the next open re-verifies and retries.
+                    # Clearing the journal here on failure would leave a
+                    # provably-good live that can no longer be proven.
+                    await asyncio.to_thread(self._finalize_promotion, backup)
+                else:
+                    # Nothing to clean up, so the journal has no more work.
+                    await asyncio.to_thread(self._write_journal, None)
                 self._writing_staged = False
                 self._staging = None
                 self._collection = None
