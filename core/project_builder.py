@@ -63,9 +63,38 @@ NAME_RE = re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?[\"']?([A-Za-z0-9][A
 # Explicit "…project <Name>" phrasing, e.g. "let's start a project Serpent" or
 # "create a project named Cobra". Captures the trailing name after "project".
 PROJECT_NAME_RE = re.compile(
-    r"\bproject\s+(?:called\s+|named\s+)?[\"']?([A-Za-z0-9][A-Za-z0-9 _\-]{0,40}?)[\"']?\s*[.!?]*\s*$",
+    r"\bproject\s+(?P<marker>called\s+|named\s+)?[\"']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _\-]{0,40}?)[\"']?\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+# A bare "…project X" has no marker saying X is a title, so it swallows whatever
+# follows the word "project" up to the end of the sentence. That is how
+# "create a new project and I want you to use python" became the project
+# `and-i-want-you-to-use-python`, and how the malformed
+# `blue-and-tower-defense-and-i-want-you-to/` directory got created.
+#
+# A title does not START with a conjunction, preposition, pronoun or relativiser.
+# Fourteen phrasings were reproduced ("…project and then…", "…project so it…",
+# "…project that tracks…", "…project for me please", "…project using rust", …) and
+# every one begins with one of these. Nine legitimate names — including
+# "My Personal Finance Dashboard 2026" and "to-do-list" — begin with none of them.
+#
+# This guard applies ONLY to the unmarked form. "called X" / "named X" states
+# outright that X is the title, so it is trusted as given.
+_NOT_A_NAME_LEAD = frozenset("""
+    and or but so then also plus that which who whom whose what when while where
+    with without for to from into onto about around after before during under over
+    using via as if unless until because since though although
+    i you we they he she it me my your our their his her its
+    is are was were be been being do does did done have has had
+    can could will would shall should may might must
+    please just really actually maybe perhaps
+""".split())
+
+
+def _looks_like_a_title(name: str) -> bool:
+    """Is this capture a project NAME, or the rest of the sentence?"""
+    first = (name or "").strip().split()
+    return bool(first) and first[0].lower() not in _NOT_A_NAME_LEAD
 STATUS_WORDS_RE = re.compile(r"\b(?:where (?:did|do) we leave off|left off|leave off|status|progress|where were we)\b", re.IGNORECASE)
 RESUME_WORDS_RE = re.compile(r"\b(?:continue|resume|keep (?:working|going)|finish)\b", re.IGNORECASE)
 # Inflection-aware: plain \b(?:improve)\b never matched "improvements"/"improving".
@@ -302,9 +331,12 @@ class ProjectBuilder:
         if m:
             return m.group(1).strip(), t
         m2 = PROJECT_NAME_RE.search(t)
-        if m2 and m2.group(1).strip():
-            name = re.sub(r"^(?:a|an|the|new|simple|small|little|basic)\s+", "", m2.group(1).strip(), flags=re.IGNORECASE)
-            if name:
+        if m2 and m2.group("name").strip():
+            name = re.sub(r"^(?:a|an|the|new|simple|small|little|basic)\s+", "",
+                          m2.group("name").strip(), flags=re.IGNORECASE)
+            # An unmarked capture must still look like a title; a marked one
+            # ("called X" / "named X") is taken at its word.
+            if name and (m2.group("marker") or _looks_like_a_title(name)):
                 return name, t
         return NEEDS_NAME, t
 
