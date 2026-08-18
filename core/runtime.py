@@ -951,6 +951,25 @@ class RuntimeManager:
                 return {"ok": False, "error": "not_found", "project": name}
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "error": str(e)[:200]}
+
+            # The `last_active` pointer must not name a project that no longer
+            # exists — "resume where we left off" would then resolve to a deleted
+            # directory. ProjectManager holds no memory reference by design, so
+            # the coupling lives here, in the caller that has both.
+            #
+            # Historical facts about the project are deliberately LEFT ALONE:
+            # "do you remember the project we made?" should still work after a
+            # delete. Only the pointer to the CURRENT project is cleared.
+            try:
+                current = await self._memory.get_latest_fact(
+                    entity="projects", attribute="last_active")
+                if current and (current.value or "").strip() == name:
+                    await self._memory.add_fact(
+                        entity="projects", attribute="last_active", value="",
+                        confidence=0.95)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("last_active_clear_failed", error=str(e)[:160])
+
             return {"ok": True, **result,
                     "note": f"Moved to trash — recoverable with project.restore('{result['moved_to_trash']}')."}
 

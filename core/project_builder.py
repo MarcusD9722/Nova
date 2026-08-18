@@ -134,10 +134,70 @@ CONTINUATION_COMPLAINT_RE = re.compile(
 # the source of the "I meant what other improvements..." misroute.
 
 
+# ── Requirement clauses must not become part of a project name ───────────────
+#
+# "create a project Serpent and use Python" produced the name
+# "Serpent and use Python". The lead-word guard below does not help: the sentence
+# STARTS with a real title and only then runs into a requirement.
+#
+# The hard part is that a legitimate title has the same shape:
+#
+#     Rock and Roll Tracker          vs   Serpent and use Python
+#     Man With a Plan                vs   Serpent with a dark theme
+#
+# Length cannot separate them and neither can the connective alone. CASING can.
+# In a title the words either side of the connective are capitalised; in a
+# requirement the connective and what follows are lowercase prose:
+#
+#     "Rock and Roll Tracker"   -> and(lower) Roll(Capital)  -> still the title
+#     "Man With a Plan"         -> With(Capital)             -> still the title
+#     "Serpent and use Python"  -> and(lower) use(lower)     -> requirement starts
+#     "Serpent with a dark…"    -> with(lower) a(lower)      -> requirement starts
+#
+# So a cut happens only where BOTH the connective and the following word are
+# lowercase. `using`/`that`/`which` are cut unconditionally: they introduce a
+# requirement in every phrasing collected and appear in no title in the corpus.
+#
+# A quoted name is never trimmed — quoting states the boundary outright.
+_CUT_ALWAYS = frozenset({"using", "that", "which", "who"})
+_CUT_IF_LOWER = frozenset({
+    "and", "or", "but", "with", "without", "for", "to", "from", "in", "on",
+    "at", "by", "about", "so", "then", "plus", "also", "if", "when", "while",
+})
+
+
+def _trim_requirement_clause(name: str) -> str:
+    """Drop a trailing requirement clause from an UNQUOTED captured name."""
+    words = (name or "").split()
+    for i, w in enumerate(words[1:], start=1):   # never cut at the first word
+        low = w.lower().strip(".,;:!?")
+        if low in _CUT_ALWAYS:
+            return " ".join(words[:i]).strip()
+        if low in _CUT_IF_LOWER and w[:1].islower():
+            nxt = words[i + 1] if i + 1 < len(words) else ""
+            if not nxt or nxt[:1].islower():
+                return " ".join(words[:i]).strip()
+    return (name or "").strip()
+
+
+#: Win32 reserved device names. A directory whose name equals one of these is a
+#: genuine hazard on Windows — Nova's host platform — and `slugify("CON")` used to
+#: return "con", which `start()` then handed straight to `mkdir()`.
+_WIN_RESERVED = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
+
+
 def slugify(name: str) -> str:
     s = (name or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s[:48] or "untitled"
+    s = s[:48] or "untitled"
+    if s in _WIN_RESERVED:
+        # Deterministic, reversible-looking, and still obviously the user's name.
+        s = f"project-{s}"
+    return s
 
 
 def _now_str() -> str:
@@ -329,7 +389,13 @@ class ProjectBuilder:
             return None
         m = NAME_RE.search(t)
         if m:
-            return m.group(1).strip(), t
+            raw = m.group(1).strip()
+            # Quoted => the boundary is explicit; take it exactly as written.
+            quoted = bool(re.search(r"[\"']" + re.escape(raw) + r"[\"']", t))
+            name = raw if quoted else _trim_requirement_clause(raw)
+            if name:
+                return name, t
+            return NEEDS_NAME, t
         m2 = PROJECT_NAME_RE.search(t)
         if m2 and m2.group("name").strip():
             name = re.sub(r"^(?:a|an|the|new|simple|small|little|basic)\s+", "",
@@ -337,7 +403,11 @@ class ProjectBuilder:
             # An unmarked capture must still look like a title; a marked one
             # ("called X" / "named X") is taken at its word.
             if name and (m2.group("marker") or _looks_like_a_title(name)):
-                return name, t
+                quoted = bool(re.search(r"[\"']" + re.escape(name) + r"[\"']", t))
+                name = name if quoted else _trim_requirement_clause(name)
+                if name and _looks_like_a_title(name):
+                    return name, t
+                return NEEDS_NAME, t
         return NEEDS_NAME, t
 
     # ── Memory + PROJECT.md state ────────────────────────────────────────────

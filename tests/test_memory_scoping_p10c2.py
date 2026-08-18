@@ -17,6 +17,7 @@ Run:  venv\\Scripts\\python.exe tests\\test_memory_scoping_p10c2.py
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -117,8 +118,15 @@ async def test_m6_restart_durability():
               "M6 an unknown project has no state")
 
 
-async def test_m9_transient_observation_is_not_a_user_fact():
-    check.section("M9: a transient tool observation is not a permanent preference")
+async def test_m9_observation_entity_separation_only():
+    """M9, honestly scoped: this proves ENTITY SEPARATION, not classification.
+
+    It writes the observation under `observation:*` itself, so it shows that a
+    fact stored there does not appear under `user`. It does NOT exercise the
+    production tool-result -> memory path, and therefore does not prove that a
+    real tool observation is classified as transient. That path is NOT ASSESSED.
+    """
+    check.section("M9: observation entity separation (NOT the ingestion path)")
 
     with _tmp() as td:
         m = await _fresh(td)
@@ -132,36 +140,155 @@ async def test_m9_transient_observation_is_not_a_user_fact():
               "M9 it did NOT become a user preference")
         check(await _val(m, "user", "port_preference") is None,
               "M9 nor a fabricated preference of any name")
+        check(True,
+              "M9 SCOPE: this test wrote the observation under observation:* "
+              "itself; the production tool->memory classification path is NOT "
+              "ASSESSED")
 
 
-async def test_m8_deleted_project_history():
-    check.section("M8: a deleted project leaves history but not presence")
+async def test_m8_real_project_delete_vs_memory():
+    """M8 through the REAL ProjectManager, not a hand-cleared pointer.
+
+    The first version of this test wrote `last_active = ""` itself and called the
+    result a pass. That proved the unifier can store an empty string — nothing
+    about deletion. This drives the actual delete and then states plainly which
+    parts the production code does, and which it does not.
+    """
+    check.section("M8: real project delete vs memory state")
+
+    from core.project_manager import ProjectManager
 
     with _tmp() as td:
+        root = Path(td)
+        projects = root / "projects"
+        (projects / "gamma").mkdir(parents=True)
+        (projects / "gamma" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+        pm = ProjectManager(repo_root=root, projects_dir=projects)
+
         m = await _fresh(td)
         await m.add_fact(entity="project:gamma", attribute="brief",
                          value="a small dice roller", confidence=0.95)
         await m.add_fact(entity="projects", attribute="last_active",
                          value="gamma", confidence=0.95)
 
-        # Deleting the project moves the directory; the historical fact remains
-        # unless something removes it. Record what actually happens.
+        listed_before = [p.name for p in projects.iterdir() if p.is_dir()
+                         and not p.name.startswith(".")]
+        check("gamma" in listed_before,
+              f"the project is present before deletion ({listed_before})")
+
+        res = await asyncio.to_thread(pm.delete_project, "gamma")
+        entry = res.get("moved_to_trash", "")
+
+        listed_after = [p.name for p in projects.iterdir() if p.is_dir()
+                        and not p.name.startswith(".")]
+        check("gamma" not in listed_after,
+              f"M8 the live project disappears from the listing ({listed_after})")
+        check(bool(entry) and (projects / ".trash" / entry / "main.py").exists(),
+              f"M8 the files move to trash, recoverable ({entry!r})")
+
         hist = await _val(m, "project:gamma", "brief")
         check(hist == "a small dice roller",
-              "M8 historical memory of the project remains after the fact is written")
-        check(await _val(m, "projects", "last_active") == "gamma",
-              "M8 last_active points at it while it is current")
+              f"M8 historical project memory REMAINS after deletion ({hist!r})")
 
-        # After a delete, the pointer must be updated by whoever deletes; this
-        # test records the CURRENT contract rather than asserting a fix.
+        # ProjectManager deliberately holds no memory reference, so it cannot
+        # clear the pointer itself; the coupling lives in the caller.
+        check(not hasattr(pm, "_memory"),
+              "M8 ProjectManager holds no memory reference by design")
+        still = await _val(m, "projects", "last_active")
+        check(still == "gamma",
+              f"M8 at the manager level the pointer is untouched ({still!r}) — "
+              f"the runtime tool is what clears it, proven below")
+
+
+async def test_m8_runtime_delete_clears_the_active_pointer():
+    """The stated invariant: `last_active` never names a project that is gone.
+
+    Driven through the REAL RuntimeManager tool, because the fix lives in the
+    caller and a ProjectManager-only test cannot see it. Found by rewriting the
+    hand-cleared version of M8 into a real delete.
+    """
+    check.section("M8: runtime delete clears a stale active-project pointer")
+
+    from core.runtime import RuntimeManager
+    from core.tool_router import ToolCall
+    from core.tooling import build_tool_router
+
+    class _StubLLM:
+        gpu_status = type("S", (), {"status": "stub"})()
+
+        async def initialize(self):
+            return None
+
+        async def generate(self, *a, **k):
+            raise AssertionError("delete must not call the model")
+
+    with _tmp() as td:
+        root = Path(td)
+        projects = root / "projects"
+        (projects / "gamma").mkdir(parents=True)
+        (projects / "gamma" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+        mem_dir = root / "memory"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+
+        m = MemoryUnifier(mem_dir)
+        await m.initialize()
+        await m.add_fact(entity="project:gamma", attribute="brief",
+                         value="a small dice roller", confidence=0.95)
         await m.add_fact(entity="projects", attribute="last_active",
-                         value="", confidence=0.95)
-        check((await _val(m, "projects", "last_active")) == "",
-              "M8 last_active can be cleared")
+                         value="gamma", confidence=0.95)
+
+        router = build_tool_router(repo_root=root, projects_dir=projects, memory=m)
+        rt = RuntimeManager(repo_root=root, projects_dir=projects, memory=m,
+                            llm=_StubLLM(), router=router, memory_dir=mem_dir)
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "gamma"}), retries=0))
+        await asyncio.sleep(0.4)
+        pend = rt.permission_broker.pending()
+        check(len(pend) == 1, f"the delete asks permission ({len(pend)})")
+        rt.permission_broker.resolve(pend[0]["request_id"], True, by="marcus")
+        res = await task
+        check(res.ok, f"the delete completed ({res.error!r})")
+
+        after = await _val(m, "projects", "last_active")
+        check((after or "") == "",
+              f"M8 last_active no longer names the deleted project ({after!r})")
+        hist = await _val(m, "project:gamma", "brief")
+        check(hist == "a small dice roller",
+              f"M8 but historical memory of it REMAINS ({hist!r})")
+        listed = [p.name for p in projects.iterdir() if p.is_dir()
+                  and not p.name.startswith(".")]
+        check("gamma" not in listed, f"M8 and the project is gone ({listed})")
+
+        # A delete of a DIFFERENT project must not clear a pointer that is still
+        # valid.
+        (projects / "delta").mkdir(parents=True)
+        (projects / "delta" / "x.py").write_text("x=1\n", encoding="utf-8")
+        (projects / "epsilon").mkdir(parents=True)
+        (projects / "epsilon" / "y.py").write_text("y=1\n", encoding="utf-8")
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value="delta", confidence=0.95)
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "epsilon"}), retries=0))
+        await asyncio.sleep(0.4)
+        rt.permission_broker.resolve(
+            rt.permission_broker.pending()[0]["request_id"], True, by="marcus")
+        await task
+        check(await _val(m, "projects", "last_active") == "delta",
+              "M8 deleting another project leaves a VALID pointer alone")
 
 
-async def test_m10_unverified_speaker_isolation():
-    check.section("M10: an unverified speaker does not resolve to the owner")
+async def test_m10_entity_separation_only():
+    """M10, honestly scoped: MemoryUnifier entity separation only.
+
+    The entities are chosen BY THIS TEST, so it proves the unifier keeps separate
+    entities separate. It does not drive TurnIdentity or the runtime, so it says
+    nothing about whether production routes a given speaker to the right entity.
+    Identity -> memory END TO END is NOT ASSESSED here; the P5 speaker suites are
+    separate, prior evidence and this test must not be credited with their proof.
+    """
+    check.section("M10: unifier entity separation (NOT identity->memory routing)")
 
     from core.turn_identity import current_identity
 
@@ -188,14 +315,18 @@ async def test_m10_unverified_speaker_isolation():
               "M10 a guest lookup never returns the owner's value")
         check(await _val(m, "speaker:unverified", "private_note") is None,
               "M10 an unverified speaker has no inherited state")
+        check(True,
+              "M10 SCOPE: entities were chosen by this test; production "
+              "identity->memory routing is NOT ASSESSED here")
 
 
 async def main():
     await test_m3_m4_m5_scoping()
     await test_m6_restart_durability()
-    await test_m9_transient_observation_is_not_a_user_fact()
-    await test_m8_deleted_project_history()
-    await test_m10_unverified_speaker_isolation()
+    await test_m9_observation_entity_separation_only()
+    await test_m8_real_project_delete_vs_memory()
+    await test_m8_runtime_delete_clears_the_active_pointer()
+    await test_m10_entity_separation_only()
     check.finish()
 
 
