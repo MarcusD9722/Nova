@@ -1165,7 +1165,8 @@ _OMIT = object()   # sentinel: build the collection with NO provenance metadata
 
 
 async def _stage_crash(be, *, expected: int, new_ids: list[str], journal: bool = True,
-                       space=None, journal_overrides: dict | None = None):
+                       space=None, journal_overrides: dict | None = None,
+                       generation=None):
     """Hand-build the exact on-disk state a crash mid-promotion leaves behind.
 
     live -> backup, then a NEW live containing `new_ids`, with the journal saying
@@ -1189,6 +1190,13 @@ async def _stage_crash(be, *, expected: int, new_ids: list[str], journal: bool =
     meta = {"hnsw:space": "cosine"}
     if space is not _OMIT:
         meta["nova_semantic_space"] = space if space is not None else cb.semantic_space_id()
+    # Stamp the SAME generation the journal names. Real `begin_staged_rebuild`
+    # writes this onto staging, so a hand-built crash state must too — recovery
+    # now requires the collection and the journal to agree on the generation, and
+    # an unstamped live is (correctly) unmatchable.
+    entry_gen = (journal_overrides or {}).get("generation", "gen-under-test")
+    if generation is not _OMIT and entry_gen:
+        meta["nova_promotion_generation"] = generation or entry_gen
     fresh = await _a.to_thread(
         be._client.get_or_create_collection, name=live, embedding_function=be._emb,
         metadata=meta)

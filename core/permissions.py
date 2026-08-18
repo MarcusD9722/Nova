@@ -189,7 +189,15 @@ class PermissionBroker:
         if fut is None:
             return False
         if not fut.done():
-            fut.cancel()
+            # DENY the waiter, do not cancel it. Cancelling the future made
+            # `await_decision` raise CancelledError into a tool that was waiting
+            # perfectly normally, which propagated through `ToolRouter.execute`
+            # (CancelledError is a BaseException, so the router never catches it)
+            # and killed the turn instead of returning "not approved".
+            #
+            # Withdrawing a request means it will not be approved, and that is
+            # exactly what False says. The caller gets a clean result.
+            fut.set_result(False)
         self._settle(request_id, outcome)
         self._audit({"outcome": outcome, "request_id": str(request_id), "reason": reason})
         BUS.publish("permission.expired", {"request_id": str(request_id), "outcome": outcome})

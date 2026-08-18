@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +237,8 @@ class ChromaMemoryBackend:
         self._rolled_back = 0
         self._finalized_after_crash = 0
         self._finalization_pending = 0
+        #: Generation id of the promotion currently being staged.
+        self._pending_generation = ""
         #: Non-empty when recovery REFUSED to produce an authority. The store is
         #: intact and untouched; semantic work is skipped until it is resolved.
         self._recovery_error = ""
@@ -558,7 +561,19 @@ class ChromaMemoryBackend:
         want = journal.get("expected_count")
         if want is not None and got != int(want):
             return False, f"{name} holds {got} records, promotion expected {want}"
-        space = (col.metadata or {}).get("nova_semantic_space")
+        meta = col.metadata or {}
+        want_gen = str(journal.get("generation") or "")
+        got_gen = str(meta.get("nova_promotion_generation") or "")
+        if want_gen:
+            # Same count and same vector space can still be a DIFFERENT promotion.
+            # The generation is what ties this collection to this journal.
+            if not got_gen:
+                return False, (f"{name} carries no promotion generation, so it "
+                               f"cannot be matched to this journal")
+            if got_gen != want_gen:
+                return False, (f"{name} carries generation {got_gen[:8]}…, the "
+                               f"journal describes {want_gen[:8]}…")
+        space = meta.get("nova_semantic_space")
         want_space = journal.get("space_id")
         if want_space:
             # MISSING provenance fails, exactly like WRONG provenance. The earlier
@@ -709,12 +724,44 @@ class ChromaMemoryBackend:
         self._rolled_back += 1
         self._recovery_error = ""
 
+    def _unfinished_promotion(self) -> str:
+        """Reason a NEW promotion must not start, or "" when the store is clean.
+
+        At most one unresolved promotion per collection. If generation N is still
+        pending cleanup, its backup and journal are the only proof that N is
+        authoritative — and starting N+1 would rename that backup away and
+        overwrite the journal, leaving N unprovable and N+1 unrecoverable.
+        """
+        assert self._client is not None
+        try:
+            names = self._existing_names()
+        except Exception as e:  # noqa: BLE001
+            return f"cannot inspect the semantic store: {str(e)[:120]}"
+        if self._backup_name() in names:
+            return (f"a previous promotion is unfinished: {self._backup_name()} "
+                    f"still exists")
+        if self._journal_path().exists():
+            return "a previous promotion journal has not been cleared"
+        return ""
+
     async def begin_staged_rebuild(self) -> None:
         """Start writing into a fresh staging collection instead of the live one."""
         async with self._lock:
             await asyncio.to_thread(self._ensure)
             assert self._client is not None
+
+            # ONE unresolved promotion at a time. `_ensure` above already ran
+            # recovery, so anything still outstanding here is genuinely pending
+            # rather than crash residue.
+            blocked = await asyncio.to_thread(self._unfinished_promotion)
+            if blocked:
+                raise SemanticRecoveryError(
+                    f"refusing to start a rebuild: {blocked}. Resolve it first; "
+                    f"starting another promotion would destroy the evidence that "
+                    f"makes the current index provable.")
+
             staging = self._staging_name()
+            self._pending_generation = uuid4().hex
             # A staging collection left behind by an earlier crashed rebuild is
             # garbage, never a partial result to resume from.
             try:
@@ -731,6 +778,12 @@ class ChromaMemoryBackend:
                           "nova_semantic_model": semantic_model_id(),
                           "nova_semantic_revision": semantic_model_revision(),
                           "nova_semantic_algorithm": SEMANTIC_ALGORITHM,
+                          # Stamped NOW, so the promoted collection carries the
+                          # same generation id the journal will name. Without it,
+                          # a live with the right count and space but from a
+                          # DIFFERENT promotion is indistinguishable from the one
+                          # the journal describes.
+                          "nova_promotion_generation": self._pending_generation,
                           "nova_staging": "true"},
             )
             self._writing_staged = True
@@ -740,6 +793,7 @@ class ChromaMemoryBackend:
         async with self._lock:
             self._writing_staged = False
             self._staging = None
+            self._pending_generation = ""
             if self._client is None:
                 return
             try:
@@ -786,14 +840,15 @@ class ChromaMemoryBackend:
                     f"refusing to promote")
 
             names = await asyncio.to_thread(self._existing_names)
-            # A backup here is residue; recovery at open time already resolved the
-            # store into a safe authority, and keeping it would block this swap.
-            if backup in names:
-                try:
-                    await asyncio.to_thread(self._client.delete_collection, backup)
-                except Exception:  # noqa: BLE001
-                    pass
-                names.discard(backup)
+            # Re-check at COMMIT, not only at begin. A backup or journal can appear
+            # between the two (another promotion, a recovery), and the begin-side
+            # guard alone would let this swap rename away a backup that is somebody
+            # else's only proof.
+            if backup in names or self._journal_path().exists():
+                raise SemanticRecoveryError(
+                    f"refusing to promote: an unresolved promotion appeared while "
+                    f"this rebuild was running (backup present: {backup in names}, "
+                    f"journal present: {self._journal_path().exists()})")
 
             had_live = live in names
             backed_up = False
@@ -803,10 +858,11 @@ class ChromaMemoryBackend:
             # was supposed to contain. Without it, `live + backup` on the next boot
             # is unreadable: it looks identical whether the rename beat the crash
             # or whether verification rejected the new generation.
-            import uuid as _uuid
+            # The journal names the SAME generation stamped on the staging
+            # collection at begin time, which is what binds the two together.
             await asyncio.to_thread(self._write_journal, {
                 "state": "promoting",
-                "generation": _uuid.uuid4().hex,
+                "generation": self._pending_generation,
                 "collection": live,
                 "backup": backup,
                 "expected_count": count,
