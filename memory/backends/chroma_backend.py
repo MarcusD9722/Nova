@@ -84,6 +84,16 @@ class SemanticUnavailable(RuntimeError):
     """
 
 
+class SemanticRecoveryError(SemanticUnavailable):
+    """An interrupted promotion could not be resolved into a safe authority.
+
+    A SUBCLASS of SemanticUnavailable on purpose: every caller already treats that
+    as "skip semantic work, SQLite is unaffected", which is exactly the right
+    response. Semantic memory being unavailable is acceptable; destroying the last
+    known-good copy to make it available is not.
+    """
+
+
 #: Identity of the vector space this backend writes. Anything that changes what
 #: a vector MEANS must change this, because a collection may only ever hold one
 #: space. Dimension is deliberately NOT part of the identity on its own — that
@@ -186,8 +196,15 @@ class _SemanticEmbeddingFunction:
 class ChromaMemoryBackend:
     """Persistent Chroma-backed store for semantic recall.
 
-    Uses a real embedding model (see memory/embeddings.py) with a
-    deterministic hash fallback so query()/upsert() never hard-fail.
+    Uses a real embedding model (see memory/embeddings.py) and NO fallback
+    embedder. This docstring used to promise "a deterministic hash fallback so
+    query()/upsert() never hard-fail"; that fallback put two orthogonal vector
+    spaces in one collection and is gone (D18).
+
+    Failing softly is still the behaviour, but by SKIPPING rather than
+    substituting: an unavailable model, or a promotion that cannot be resolved
+    into a safe authority, makes writes skip and queries return no hits, while
+    SQLite and lexical recall carry on.
     """
 
     #: The legacy collection. It was written by code that could put EITHER a BGE
@@ -213,10 +230,14 @@ class ChromaMemoryBackend:
         #: writes go to staging and a skip becomes a raise.
         self._staging: Any | None = None
         self._writing_staged = False
-        #: Observability for the two repair paths, so a test (and /status) can tell
+        #: Observability for the repair paths, so a test (and /status) can tell
         #: "it worked" from "it silently did nothing".
         self._recovered_from_backup = 0
         self._rolled_back = 0
+        self._finalized_after_crash = 0
+        #: Non-empty when recovery REFUSED to produce an authority. The store is
+        #: intact and untouched; semantic work is skipped until it is resolved.
+        self._recovery_error = ""
 
     # ── honest state, for /status ─────────────────────────────────────────────
     def semantic_status(self) -> dict[str, Any]:
@@ -256,6 +277,8 @@ class ChromaMemoryBackend:
             # is the difference between "nothing happened" and "we recovered".
             "promotions_rolled_back": self._rolled_back,
             "recovered_from_backup": self._recovered_from_backup,
+            "finalized_after_crash": self._finalized_after_crash,
+            "recovery_error": self._recovery_error or None,
         }
 
     def _note_skip(self, kind: str, exc: Exception) -> None:
@@ -265,27 +288,37 @@ class ChromaMemoryBackend:
         else:
             self._skipped_queries += 1
 
-    def _ensure(self) -> None:
-        if self._collection is not None and self._client is not None:
+    def _open_client(self) -> None:
+        """Open the Chroma client WITHOUT touching any collection.
+
+        Separate from `_ensure` because recovery must inspect the store before
+        anything is created: `get_or_create_collection` is precisely the call that
+        can manufacture an empty live index next to a complete backup.
+        """
+        if self._client is not None:
             return
-
         self._persist_dir.mkdir(parents=True, exist_ok=True)
-
         settings = Settings(
             persist_directory=str(self._persist_dir),
             anonymized_telemetry=False,
         )
+        self._client = chromadb.PersistentClient(path=str(self._persist_dir),
+                                                 settings=settings)
+        if getattr(self, "_emb", None) is None:
+            self._emb = _SemanticEmbeddingFunction(dim=SEMANTIC_DIM)
 
-        # PersistentClient handles persistence via the directory.
-        self._client = chromadb.PersistentClient(path=str(self._persist_dir), settings=settings)
+    def _ensure(self) -> None:
+        if self._collection is not None and self._client is not None:
+            return
 
-        emb = _SemanticEmbeddingFunction(dim=SEMANTIC_DIM)
-        self._emb = emb
+        self._open_client()
+        emb = self._emb
 
-        # Crash residue from an interrupted promotion is recovered BEFORE the live
-        # collection is opened — otherwise `get_or_create_collection` would happily
-        # manufacture an EMPTY live collection while a complete backup sat next to
-        # it, and the emptiness would look like a legitimate cold start.
+        # Recovery runs BEFORE the live collection is opened, and it may REFUSE to
+        # produce an authority. When it refuses, `get_or_create_collection` must
+        # not run: creating an empty live index beside a good backup is how a
+        # transient failure turned into permanent loss, because the next boot saw
+        # live+backup and deleted the backup.
         self._recover_interrupted_promotion()
 
         # The space identity is recorded ON the collection so it can be audited
@@ -312,9 +345,12 @@ class ChromaMemoryBackend:
             return  # a blank id would create an unaddressable phantom row
         metas = [metadata] if metadata else None
         async with self._lock:
-            await asyncio.to_thread(self._ensure)
-            target = self._staging if self._writing_staged else self._collection
             try:
+                # Inside the guard: `_ensure` refuses to open an index it cannot
+                # prove is safe, and that refusal must degrade exactly like an
+                # unavailable embedder rather than crashing the caller.
+                await asyncio.to_thread(self._ensure)
+                target = self._staging if self._writing_staged else self._collection
                 await asyncio.to_thread(
                     target.upsert,
                     ids=[doc_id],
@@ -337,8 +373,8 @@ class ChromaMemoryBackend:
 
     async def query(self, q: str, limit: int = 10) -> list[dict[str, Any]]:
         async with self._lock:
-            await asyncio.to_thread(self._ensure)
             try:
+                await asyncio.to_thread(self._ensure)
                 res = await asyncio.to_thread(
                     self._collection.query,
                     query_texts=[str(q)],
@@ -413,53 +449,190 @@ class ChromaMemoryBackend:
         assert self._client is not None
         return {c.name for c in self._client.list_collections()}
 
-    def _recover_interrupted_promotion(self) -> None:
-        """Repair a promotion that a crash interrupted. Called before opening live.
+    # ── durable promotion authority ───────────────────────────────────────────
+    #
+    # Collection NAMES cannot answer "is this live generation trustworthy?".
+    # `live + backup` is ambiguous: it means either (A) the rename to live
+    # succeeded and the crash beat verification, or (B) verification FAILED and
+    # the rollback could not delete the bad live. Those want opposite actions, and
+    # the previous code assumed (A) and deleted the backup — which in case (B)
+    # destroys the known-good generation in order to keep the rejected one.
+    #
+    # So promotion writes a tiny journal next to the store BEFORE it moves
+    # anything, and recovery decides from that plus the collection itself. One
+    # small JSON file, replaced atomically; a local store needs nothing larger.
 
-        The swap is: live -> backup, staging -> live, verify, delete backup. A
-        process death can only leave three states, and each has one right answer:
+    def _journal_path(self) -> Path:
+        return self._persist_dir / "nova_promotion.json"
 
-          live absent, backup present   -> the rename to live never happened (or
-                                           was rolled back); restore the backup.
-                                           This is the state that MUST NOT become
-                                           a fresh empty collection.
-          live present, backup present  -> live only exists again after the second
-                                           rename succeeded, so live is the NEW
-                                           index and the backup is stale.
-          neither present               -> nothing was ever promoted; a normal
-                                           cold start.
+    def _write_journal(self, entry: dict[str, Any] | None) -> None:
+        """Atomically replace (or remove) the promotion journal."""
+        import json
+        import os
 
-        Staging is deliberately left alone: `begin_staged_rebuild()` drops a stale
-        one, and touching it here could destroy an in-flight build.
-        """
-        assert self._client is not None
-        try:
-            names = self._existing_names()
-        except Exception:  # noqa: BLE001
-            return
-
-        live, backup = self._collection_name, self._backup_name()
-        if backup not in names:
-            return
-
-        if live in names:
+        path = self._journal_path()
+        if entry is None:
             try:
-                self._client.delete_collection(backup)
+                path.unlink()
+            except FileNotFoundError:
+                pass
             except Exception:  # noqa: BLE001
                 pass
             return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)   # atomic on Windows and POSIX
 
-        # live is gone and a backup exists: put it back rather than inventing an
-        # empty index.
+    def _read_journal(self) -> dict[str, Any] | None:
+        import json
+
         try:
-            self._client.get_collection(backup, embedding_function=self._emb) \
-                .modify(name=live)
-            self._recovered_from_backup += 1
+            raw = self._journal_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
         except Exception:  # noqa: BLE001
-            # Leave the backup in place. An operator (or the next boot) can still
-            # find it; silently deleting the only complete copy is the one
-            # unacceptable outcome.
-            pass
+            return None
+        try:
+            entry = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+        return entry if isinstance(entry, dict) else None
+
+    def _collection_is_valid(self, name: str, journal: dict[str, Any]) -> tuple[bool, str]:
+        """Does `name` hold the generation the journal describes?
+
+        Checks what can be checked durably: it opens, it holds the expected number
+        of records, and it carries the expected vector space.
+        """
+        assert self._client is not None
+        try:
+            col = self._client.get_collection(name, embedding_function=self._emb)
+        except Exception as e:  # noqa: BLE001
+            return False, f"cannot open {name}: {str(e)[:120]}"
+        try:
+            got = int(col.count())
+        except Exception as e:  # noqa: BLE001
+            return False, f"cannot count {name}: {str(e)[:120]}"
+        want = journal.get("expected_count")
+        if want is not None and got != int(want):
+            return False, f"{name} holds {got} records, promotion expected {want}"
+        space = (col.metadata or {}).get("nova_semantic_space")
+        want_space = journal.get("space_id")
+        if want_space and space and space != want_space:
+            return False, f"{name} carries a different vector space ({space})"
+        return True, f"{name} verified: {got} records"
+
+    def _restore_backup(self, live: str, backup: str) -> tuple[bool, str]:
+        assert self._client is not None
+        try:
+            col = self._client.get_collection(backup, embedding_function=self._emb)
+            col.modify(name=live)
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)[:160]
+        self._recovered_from_backup += 1
+        return True, ""
+
+    def _recover_interrupted_promotion(self) -> None:
+        """Establish a SAFE authority, or refuse to open the index at all.
+
+        Decided from the journal and the collection contents, never from names:
+
+          no backup                    -> steady state or cold start.
+          live absent, backup present  -> restore the backup. If the restore
+                                          FAILS, refuse: keep the backup, create
+                                          nothing, raise. The old code swallowed
+                                          this and let `_ensure` manufacture an
+                                          empty live beside the good backup, which
+                                          the next boot then deleted — a transient
+                                          failure becoming permanent loss.
+          live AND backup present      -> ambiguous. Verify live against the
+                                          journal. Valid -> finalize and drop the
+                                          backup. Invalid -> roll back to the
+                                          backup. Cannot decide, or cannot roll
+                                          back -> refuse, keeping the backup.
+
+        Refusing raises SemanticRecoveryError, which every caller already handles
+        as "skip semantic work": SQLite, lexical and recent recall are unaffected.
+        Semantic memory being unavailable is acceptable; destroying the last
+        known-good copy to make it available is not.
+        """
+        assert self._client is not None
+        live, backup = self._collection_name, self._backup_name()
+        try:
+            names = self._existing_names()
+        except Exception as e:  # noqa: BLE001
+            self._recovery_error = f"cannot list collections: {str(e)[:140]}"
+            raise SemanticRecoveryError(self._recovery_error) from None
+
+        journal = self._read_journal()
+
+        if backup not in names:
+            # No backup: nothing to protect. A journal here is residue from a
+            # crash before anything moved, or from a finished promotion.
+            if journal is not None:
+                self._write_journal(None)
+            self._recovery_error = ""
+            return
+
+        if live not in names:
+            ok, err = self._restore_backup(live, backup)
+            if not ok:
+                self._recovery_error = (
+                    f"the previous semantic index is present as {backup} but could "
+                    f"not be restored ({err}). It has been LEFT INTACT and no empty "
+                    f"index was created; semantic memory is unavailable until this "
+                    f"is resolved. SQLite memory is unaffected.")
+                raise SemanticRecoveryError(self._recovery_error)
+            self._write_journal(None)
+            self._recovery_error = ""
+            return
+
+        # live AND backup: ambiguous by name. Decide from durable state.
+        if journal is None or journal.get("state") != "promoting":
+            # Nothing durable says this live is a completed, verified generation,
+            # so it cannot be trusted over a backup that was authoritative by
+            # construction. Refuse rather than guess in either direction.
+            self._recovery_error = (
+                f"both {live} and {backup} exist but no promotion journal proves "
+                f"{live} is a completed, verified generation. BOTH are preserved "
+                f"and semantic memory is unavailable until this is resolved. "
+                f"SQLite memory is unaffected.")
+            raise SemanticRecoveryError(self._recovery_error)
+
+        valid, detail = self._collection_is_valid(live, journal)
+        if valid:
+            try:
+                self._client.delete_collection(backup)
+            except Exception:  # noqa: BLE001
+                pass   # harmless: the next open sees live-only
+            self._write_journal(None)
+            self._finalized_after_crash += 1
+            self._recovery_error = ""
+            return
+
+        # The promoted generation is not what the journal promised: roll back.
+        try:
+            self._client.delete_collection(live)
+        except Exception as e:  # noqa: BLE001
+            self._recovery_error = (
+                f"the promoted generation failed verification ({detail}) and the "
+                f"rejected {live} could not be removed ({str(e)[:120]}). The "
+                f"known-good {backup} is PRESERVED and untouched; semantic memory "
+                f"is unavailable until this is resolved. SQLite memory is "
+                f"unaffected.")
+            raise SemanticRecoveryError(self._recovery_error)
+
+        ok, err = self._restore_backup(live, backup)
+        if not ok:
+            self._recovery_error = (
+                f"the promoted generation failed verification ({detail}) and the "
+                f"backup could not be restored ({err}). {backup} is PRESERVED; "
+                f"semantic memory is unavailable until this is resolved.")
+            raise SemanticRecoveryError(self._recovery_error)
+        self._write_journal(None)
+        self._rolled_back += 1
+        self._recovery_error = ""
 
     async def begin_staged_rebuild(self) -> None:
         """Start writing into a fresh staging collection instead of the live one."""
@@ -538,8 +711,8 @@ class ChromaMemoryBackend:
                     f"refusing to promote")
 
             names = await asyncio.to_thread(self._existing_names)
-            # A backup here is residue; recovery at open time already decided it
-            # was stale, and keeping it would block this swap.
+            # A backup here is residue; recovery at open time already resolved the
+            # store into a safe authority, and keeping it would block this swap.
             if backup in names:
                 try:
                     await asyncio.to_thread(self._client.delete_collection, backup)
@@ -549,6 +722,21 @@ class ChromaMemoryBackend:
 
             had_live = live in names
             backed_up = False
+
+            # The journal goes down BEFORE anything moves, so a crash at any point
+            # afterwards leaves durable evidence of what the promoted generation
+            # was supposed to contain. Without it, `live + backup` on the next boot
+            # is unreadable: it looks identical whether the rename beat the crash
+            # or whether verification rejected the new generation.
+            import uuid as _uuid
+            await asyncio.to_thread(self._write_journal, {
+                "state": "promoting",
+                "generation": _uuid.uuid4().hex,
+                "collection": live,
+                "backup": backup,
+                "expected_count": count,
+                "space_id": semantic_space_id(),
+            })
             try:
                 if had_live:
                     old = await asyncio.to_thread(
@@ -580,9 +768,13 @@ class ChromaMemoryBackend:
                     try:
                         await asyncio.to_thread(self._client.delete_collection, backup)
                     except Exception:  # noqa: BLE001
-                        # Harmless: recovery at next open sees live+backup and
-                        # drops the stale one.
+                        # Harmless: the journal still says "promoting" and the new
+                        # live verifies, so recovery finalizes it on the next open.
                         pass
+                # Finalized: the journal has no more work to describe. Cleared LAST,
+                # so a crash before this point still leaves the evidence recovery
+                # needs.
+                await asyncio.to_thread(self._write_journal, None)
                 self._writing_staged = False
                 self._staging = None
                 self._collection = None
@@ -612,12 +804,13 @@ class ChromaMemoryBackend:
                 self._client.delete_collection(live)
             except Exception:  # noqa: BLE001
                 return   # never leave the backup as the only copy AND delete it
-        try:
-            self._client.get_collection(backup, embedding_function=self._emb) \
-                .modify(name=live)
+        ok, _err = self._restore_backup(live, backup)
+        if ok:
             self._rolled_back += 1
-        except Exception:  # noqa: BLE001
-            pass   # the backup survives; open-time recovery restores it
+            self._write_journal(None)
+        # If it did NOT restore, the journal deliberately stays: the backup is the
+        # only good copy and open-time recovery must know that this live (if any)
+        # was never verified.
 
     async def authoritative_state(self) -> dict[str, Any]:
         """What is ACTUALLY there right now — for reporting, not for asserting.
@@ -627,7 +820,9 @@ class ChromaMemoryBackend:
         store.
         """
         async with self._lock:
-            await asyncio.to_thread(self._ensure)
+            # `_open_client` only: asking `_ensure` for an authority would raise
+            # in exactly the situation this method exists to describe.
+            await asyncio.to_thread(self._open_client)
             assert self._client is not None
             try:
                 names = await asyncio.to_thread(self._existing_names)
@@ -639,14 +834,20 @@ class ChromaMemoryBackend:
             count = 0
             if live_present:
                 try:
-                    count = int(await asyncio.to_thread(self._collection.count))
+                    col = await asyncio.to_thread(
+                        self._client.get_collection, self._collection_name,
+                        embedding_function=self._emb)
+                    count = int(await asyncio.to_thread(col.count))
                 except Exception:  # noqa: BLE001
                     count = -1
-            if live_present:
+            if live_present and not backup_present:
                 summary = f"previous index kept, {count} records"
+            elif live_present and backup_present:
+                summary = (f"an interrupted promotion is unresolved: {count} records "
+                           f"under the live name and a BACKUP preserved beside it")
             elif backup_present:
-                summary = ("the previous index is present as a BACKUP and will be "
-                           "restored on next open")
+                summary = ("the previous index is present as a BACKUP, preserved "
+                           "intact, and is restored on the next open")
             else:
                 summary = "no semantic index is present; a rebuild from SQLite is needed"
             return {"live_present": live_present, "live_count": count,

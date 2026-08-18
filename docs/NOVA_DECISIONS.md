@@ -1117,3 +1117,86 @@ the same tokenizer trap in one session: `_code_only()` newline-joins tokens, so
 are not substrings of it. Every static assertion in this suite now reads the AST,
 and the function-scoped variant exists because a module-wide check could not tell
 the live path from the rebuild.
+
+### D18 addendum 3 (2026-08-17, review round 3)
+
+Round 2 made promotion roll back. Round 3 fixes what happens when the process dies
+DURING that promotion, which round 2 decided from collection names alone.
+
+**`live + backup` is ambiguous, and names cannot resolve it.** It means either:
+
+  A. `live -> backup`, `staging -> live`, crash before verification â€” live is the
+     completed new generation and should be adopted; or
+  B. `live -> backup`, `staging -> live`, verification FAILED, and the rollback
+     could not delete the rejected live â€” live is garbage and the backup is the
+     only good copy.
+
+Those want opposite actions. Round 2 assumed A and deleted the backup, so in case B
+it destroyed the known-good generation in order to keep the rejected one.
+
+**A durable promotion journal now supplies the missing evidence.** One small JSON
+file beside the store, replaced atomically via `os.replace`, written BEFORE anything
+moves and cleared only after the backup is gone:
+
+    {state: "promoting", generation, collection, backup, expected_count, space_id}
+
+Recovery decides from that plus the collection contents â€” never from names:
+
+  no backup                   -> steady state or cold start; a stale journal is
+                                 cleared.
+  live absent, backup present -> restore the backup; verify it opens.
+  live AND backup present     -> the journal must say "promoting" AND the live
+                                 collection must hold `expected_count` records in
+                                 `space_id`. Valid -> finalize and drop the backup.
+                                 Invalid -> delete the rejected live and restore
+                                 the backup.
+
+**Recovery failure now propagates instead of falling through.** The old code
+swallowed a failed `backup -> live` restore and let `_ensure()` continue into
+`get_or_create_collection`, which manufactured an EMPTY live collection beside the
+intact backup â€” and the next boot, seeing live+backup, deleted the backup. A
+transient failure became permanent loss in two steps. `_ensure` is now split: a
+`_open_client()` that touches no collection, then recovery, then the collection.
+If recovery cannot establish a safe authority it raises `SemanticRecoveryError`
+and NOTHING is created or deleted.
+
+`SemanticRecoveryError` subclasses `SemanticUnavailable` deliberately, so every
+existing caller already does the right thing: writes skip, queries return no hits,
+SQLite and lexical recall carry on. Semantic memory being unavailable is
+acceptable. Destroying the last known-good copy to make it available is not. When
+there is no durable proof at all â€” live+backup with no journal â€” the answer is to
+refuse and preserve BOTH, which reverses a round-2 test that had asserted "live
+wins, drop the backup".
+
+**Alternatives rejected.** Inferring authority from record counts alone (rejected:
+a correct rebuild can legitimately shrink the index); timestamps on collections
+(rejected: not exposed durably by Chroma and unreliable across a crash); a
+write-ahead log of individual records (rejected: this is one local store and the
+generation is the unit that matters); deleting the backup on any doubt (rejected:
+that IS the defect).
+
+**Evidence.** `tests/test_semantic_vector_space_p10.py` â€” five recovery cases with
+the crash state constructed on disk rather than hoped for: crash after rename
+before verification (adopted and finalized, `finalized_after_crash == 1`); live
+invalid at 1 of a promised 3 (rolled back, exact old IDs and text restored,
+rejected record absent); backup restore itself failing (refuses, no empty live
+manufactured, backup intact, SQLite still writable through `MemoryUnifier`, and
+after the injection clears the exact 4 records return); rollback unable to delete
+the rejected live (refuses, backup survives, status does not claim health, and a
+later clean start completes the recovery); and the ordinary success path leaving no
+journal, backup or staging, with no repair path having run.
+
+**Mutation testing.** Six mutations, five caught â€” including both the review named:
+`live+backup -> delete backup without verification` and `swallow the restore failure
+and continue into get_or_create`. The survivor is real redundancy, verified rather
+than assumed: removing the explicit journal clear after a successful promotion
+changes nothing because `commit_staged_rebuild` ends by calling `_ensure()`, whose
+recovery clears a stale journal once no backup remains.
+
+**Also corrected.** Two production docstrings still described the removed hash
+fallback as current behaviour â€” `memory/embeddings.py` told callers to "degrade to
+the hash embedding so memory keeps working", the exact instruction that caused the
+corruption, and `ChromaMemoryBackend` promised "a deterministic hash fallback so
+query()/upsert() never hard-fail". Both now state the real contract. The hash
+implementation itself stays as the negative reference the vector-space tests
+measure bge against.

@@ -3,9 +3,24 @@ from __future__ import annotations
 """Real semantic embeddings for Nova's memory index.
 
 Uses a small sentence-embedding model (default: BAAI/bge-small-en-v1.5,
-~130 MB, 384 dims) loaded once on GPU via transformers. Falls back cleanly:
-if the model can't load (offline, OOM), callers should degrade to the hash
-embedding so memory keeps working — semantic quality degrades, nothing breaks.
+~130 MB, 384 dims) at a PINNED repository commit, loaded once via transformers.
+
+There is NO fallback embedder. This docstring used to say the opposite — that
+callers "should degrade to the hash embedding so memory keeps working" — and that
+instruction was a corruption: for the same text, cosine(BGE(t), HASH(t)) = -0.0162,
+so the two are orthogonal spaces that merely share a dimension. Mixing them into
+one persistent collection silently destroyed recall (see D18).
+
+The contract is:
+
+    the model is unavailable
+      -> semantic reads and writes are SKIPPED (and counted)
+      -> SQLite, lexical and recent-conversation recall continue unaffected
+      -> NEVER substitute a different vector space
+
+The model id AND its revision are part of the collection identity, so a repository
+that changes its weights under the same id gets its own collection instead of
+poisoning this one.
 """
 
 import os

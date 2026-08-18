@@ -639,8 +639,8 @@ class MemoryUnifier:
         await self._json.initialize()
 
         counts = dict(empty)
-        await self._chroma.begin_staged_rebuild()
         try:
+            await self._chroma.begin_staged_rebuild()
             for row in await self._sqlite.all_facts(limit=None):
                 rec = semantic_records.fact_record(
                     fact_id=row["id"], entity=row["entity"], attribute=row["attribute"],

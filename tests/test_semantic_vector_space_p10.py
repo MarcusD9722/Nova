@@ -1073,7 +1073,9 @@ async def test_rebuild_reports_promotion_failure_truthfully():
 async def test_crash_residue_is_recovered_not_ignored():
     """live missing + backup present must restore, never invent an empty index."""
     check.section("restart recovery after an interrupted promotion")
-    from memory.backends.chroma_backend import ChromaMemoryBackend
+    from memory.backends.chroma_backend import (
+        ChromaMemoryBackend, SemanticRecoveryError,
+    )
 
     with _tmp() as td:
         be = ChromaMemoryBackend(Path(td) / "chroma")
@@ -1113,9 +1115,11 @@ async def test_crash_residue_is_recovered_not_ignored():
         check(hits and all(h["id"] in ids for h in hits),
               f"and the restored index is queryable ({[h['id'] for h in hits][:3]})")
 
-    # The other crash state: live AND backup both present means the second rename
-    # succeeded, so the backup is stale and must be dropped, never restored over
-    # the newer index.
+    # live AND backup with NO journal. Round 2 asserted "live wins, drop the
+    # backup" — which is precisely the unsafe inference this round removes: that
+    # state is equally consistent with a rollback that could not delete a REJECTED
+    # live, in which case the backup is the only good copy. With no durable proof,
+    # refuse and preserve both.
     with _tmp() as td:
         be = ChromaMemoryBackend(Path(td) / "chroma")
         await be.upsert_text("newgen", "the newer promoted record", {"g": "2"})
@@ -1124,14 +1128,257 @@ async def test_crash_residue_is_recovered_not_ignored():
         stale = await _a.to_thread(
             be._client.get_or_create_collection, be._backup_name(),
             embedding_function=be._emb, metadata={"hnsw:space": "cosine"})
-        await _a.to_thread(stale.add, ids=["stalerec"], documents=["a stale backup record"],
+        await _a.to_thread(stale.add, ids=["oldrec"], documents=["a record only the backup has"],
                            metadatas=[{"g": "0"}])
+
         be3 = ChromaMemoryBackend(Path(td) / "chroma")
-        got = await _dump_backend(be3)
-        check(set(got) == {"newgen"},
-              f"live wins over a stale backup ({sorted(got)})")
+        raised = ""
+        try:
+            await be3.count()
+        except SemanticRecoveryError as e:
+            raised = str(e)
+        check(bool(raised),
+              f"an unprovable live+backup state REFUSES rather than guessing "
+              f"({raised[:90]})")
+        check("preserved" in raised.lower() or "both" in raised.lower(),
+              f"and says both copies were preserved ({raised[:90]})")
+        be3._open_client()
         names = sorted(c.name for c in be3._client.list_collections())
-        check(names == [be3._collection_name], f"and the stale backup is dropped ({names})")
+        check(names == sorted([be3._collection_name, be3._backup_name()]),
+              f"NEITHER collection was deleted ({names})")
+        st = be3.semantic_status()
+        check(bool(st.get("recovery_error")),
+              "and status reports the unresolved recovery")
+
+
+async def _seed_backend(td, n=4, prefix="good"):
+    """A healthy live index of `n` known records."""
+    from memory.backends.chroma_backend import ChromaMemoryBackend
+
+    be = ChromaMemoryBackend(Path(td) / "chroma")
+    for i in range(n):
+        await be.upsert_text(f"{prefix}{i}", f"known record number {i}", {"g": "1"})
+    return be, await _dump_backend(be)
+
+
+async def _stage_crash(be, *, expected: int, new_ids: list[str], journal: bool = True):
+    """Hand-build the exact on-disk state a crash mid-promotion leaves behind.
+
+    live -> backup, then a NEW live containing `new_ids`, with the journal saying
+    the promotion is unfinished. Constructed directly because the crash has to land
+    between two specific operations, which no injected exception can guarantee.
+    """
+    import asyncio as _a
+
+    from memory.backends import chroma_backend as cb
+
+    await _a.to_thread(be._ensure)
+    live, backup = be._collection_name, be._backup_name()
+    if journal:
+        await _a.to_thread(be._write_journal, {
+            "state": "promoting", "generation": "gen-under-test",
+            "collection": live, "backup": backup,
+            "expected_count": expected, "space_id": cb.semantic_space_id()})
+    old = await _a.to_thread(be._client.get_collection, live, embedding_function=be._emb)
+    await _a.to_thread(old.modify, name=backup)
+    fresh = await _a.to_thread(
+        be._client.get_or_create_collection, name=live, embedding_function=be._emb,
+        metadata={"hnsw:space": "cosine", "nova_semantic_space": cb.semantic_space_id()})
+    if new_ids:
+        await _a.to_thread(
+            fresh.add, ids=list(new_ids),
+            documents=[f"promoted record {i}" for i in new_ids],
+            metadatas=[{"g": "2"} for _ in new_ids])
+    return live, backup
+
+
+async def test_recovery_authority_is_durable_not_inferred():
+    """Round 3: `live + backup` is ambiguous, and names cannot resolve it.
+
+    It means either (A) the rename to live succeeded and the crash beat
+    verification, or (B) verification FAILED and rollback could not delete the bad
+    live. Those want opposite actions. The old code assumed (A) and deleted the
+    backup — which in case (B) destroys the known-good generation to keep the
+    rejected one. A promotion journal is what makes the two distinguishable.
+    """
+    check.section("crash recovery decides from a durable journal")
+    from memory.backends.chroma_backend import ChromaMemoryBackend, SemanticRecoveryError
+
+    # ── TEST 2: crash AFTER rename, BEFORE verification. Live is genuinely the
+    # completed new generation, and the journal proves it.
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td)
+        live, backup = await _stage_crash(be, expected=3,
+                                          new_ids=["new0", "new1", "new2"])
+
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(fresh)
+        check(set(got) == {"new0", "new1", "new2"},
+              f"T2 the verified new generation is adopted ({sorted(got)})")
+        check(fresh._finalized_after_crash == 1,
+              f"T2 finalized after the crash, not blindly trusted "
+              f"({fresh._finalized_after_crash})")
+        names = sorted(c.name for c in fresh._client.list_collections())
+        check(names == [live], f"T2 and only then is the backup dropped ({names})")
+        check(not fresh._journal_path().exists(), "T2 the journal is cleared")
+        check(fresh.semantic_status().get("recovery_error") is None,
+              "T2 no recovery error is reported")
+
+    # ── TEST 3: live + backup where live is INVALID (holds 1 of the promised 3).
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td)
+        old_ids = set(old_records)
+        live, backup = await _stage_crash(be, expected=3, new_ids=["partial0"])
+
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(fresh)
+        check(set(got) == old_ids,
+              f"T3 the KNOWN-GOOD backup is restored, not the bad generation "
+              f"({sorted(got)})")
+        check("partial0" not in got, "T3 and the rejected record is absent")
+        check(all(got[i]["text"] == old_records[i]["text"] for i in old_ids),
+              "T3 with the original content intact")
+        check(fresh._rolled_back == 1, f"T3 the rollback ran ({fresh._rolled_back})")
+        names = sorted(c.name for c in fresh._client.list_collections())
+        check(names == [live], f"T3 leaving a single clean collection ({names})")
+
+    # ── TEST 1: live absent, backup present, and the RESTORE ITSELF FAILS.
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td)
+        old_ids = set(old_records)
+        import asyncio as _a
+        await _a.to_thread(be._ensure)
+        live, backup = be._collection_name, be._backup_name()
+        old = await _a.to_thread(be._client.get_collection, live,
+                                 embedding_function=be._emb)
+        await _a.to_thread(old.modify, name=backup)
+
+        # Patched on the CLASS, not one instance: the refusal has to hold for
+        # every backend opened during this window, including the one a
+        # MemoryUnifier builds for itself. (Patching a single instance let the
+        # unifier quietly restore the backup and then add its own record, which
+        # is how this check first reported "5 of 4".)
+        real_restore = ChromaMemoryBackend._restore_backup
+        ChromaMemoryBackend._restore_backup = (
+            lambda self, l, b: (False, "injected restore failure"))
+        try:
+            fresh = ChromaMemoryBackend(Path(td) / "chroma")
+            raised = ""
+            try:
+                await fresh.count()
+            except SemanticRecoveryError as e:
+                raised = str(e)
+            check(bool(raised),
+                  f"T1 recovery does NOT silently succeed ({raised[:80]})")
+            check("LEFT INTACT" in raised or "preserved" in raised.lower(),
+                  f"T1 and says the backup was preserved ({raised[:100]})")
+
+            fresh._open_client()
+            names = sorted(c.name for c in fresh._client.list_collections())
+            check(names == [backup],
+                  f"T1 NO empty live collection was manufactured ({names})")
+
+            # SQLite must carry on while semantic memory is refused.
+            from memory.unifier import MemoryUnifier
+            m = MemoryUnifier(Path(td))
+            await m.initialize()
+            await m.add_fact(entity="user", attribute="editor", value="neovim",
+                             confidence=0.9)
+            got_fact = await m.get_latest_fact(entity="user", attribute="editor")
+            check(got_fact is not None and got_fact.value == "neovim",
+                  "T1 SQLite memory keeps working while semantic recovery is refused")
+            names = sorted(c.name for c in fresh._client.list_collections())
+            check(names == [backup],
+                  f"T1 and STILL no empty live collection was created ({names})")
+        finally:
+            ChromaMemoryBackend._restore_backup = real_restore
+
+        # Injection gone: a fresh backend restores everything, nothing lost.
+        recovered = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(recovered)
+        check(set(got) == old_ids,
+              f"T1 after the failure clears, the exact records return "
+              f"({len(got)} of {len(old_ids)})")
+        check(all(got[i]["text"] == old_records[i]["text"] for i in old_ids),
+              "T1 with identical text — nothing was lost")
+
+    # ── TEST 4: rollback cannot delete the bad live.
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td)
+        old_ids = set(old_records)
+        live, backup = await _stage_crash(be, expected=3, new_ids=["partial0"])
+
+        fresh = ChromaMemoryBackend(Path(td) / "chroma")
+        fresh._open_client()
+        real_delete = fresh._client.delete_collection
+
+        def refuse_live_delete(name, *a, **k):
+            if name == live:
+                raise RuntimeError("injected delete failure")
+            return real_delete(name, *a, **k)
+
+        fresh._client.delete_collection = refuse_live_delete
+        raised = ""
+        try:
+            await fresh.count()
+        except SemanticRecoveryError as e:
+            raised = str(e)
+        check(bool(raised), f"T4 the backend refuses rather than continuing "
+                            f"({raised[:80]})")
+        check("PRESERVED" in raised or "preserved" in raised.lower(),
+              f"T4 stating the known-good copy is preserved ({raised[:100]})")
+        names = sorted(c.name for c in fresh._client.list_collections())
+        check(backup in names, f"T4 the BACKUP survives ({names})")
+        st = fresh.semantic_status()
+        check(bool(st.get("recovery_error")),
+              "T4 and status does not claim a healthy authoritative live")
+
+        fresh._client.delete_collection = real_delete
+        after = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(after)
+        check(set(got) == old_ids,
+              f"T4 once the failure clears, recovery completes correctly "
+              f"({sorted(got)})")
+        check("partial0" not in got, "T4 and the rejected generation is gone")
+
+
+async def test_promotion_finalizes_and_leaves_a_clean_store():
+    """TEST 5: the ordinary success path leaves no journal, backup or staging."""
+    check.section("successful promotion finalizes cleanly")
+    from memory.backends.chroma_backend import ChromaMemoryBackend
+
+    with _tmp() as td:
+        be, old_records = await _seed_backend(td, n=5)
+        check(len(old_records) == 5, "a healthy index of 5")
+
+        await be.begin_staged_rebuild()
+        for i in range(3):
+            await be.upsert_text(f"gen2_{i}", f"second generation record {i}", {"g": "2"})
+        check(be._journal_path().exists() is False,
+              "no journal exists before promotion begins")
+
+        promoted = await be.commit_staged_rebuild(3)
+        live = await _dump_backend(be)
+        check(promoted == 3 and set(live) == {"gen2_0", "gen2_1", "gen2_2"},
+              f"the new generation is authoritative ({sorted(live)})")
+        check(not be._journal_path().exists(),
+              "the journal is cleared once the promotion is finalized")
+        names = sorted(c.name for c in be._client.list_collections())
+        check(names == [be._collection_name],
+              f"no backup or staging residue remains ({names})")
+
+        restarted = ChromaMemoryBackend(Path(td) / "chroma")
+        got = await _dump_backend(restarted)
+        check(set(got) == {"gen2_0", "gen2_1", "gen2_2"},
+              f"a restart sees exactly the promoted generation ({sorted(got)})")
+        check(all(got[i]["text"] == live[i]["text"] for i in live),
+              "with identical content")
+        check(restarted._recovered_from_backup == 0
+              and restarted._rolled_back == 0
+              and restarted._finalized_after_crash == 0,
+              "and no repair path ran at all on a clean store")
+        check(restarted.semantic_status().get("recovery_error") is None,
+              "status reports no recovery error")
 
 
 async def test_semantic_status_reports_the_real_load_error():
@@ -1222,6 +1469,8 @@ async def main():
     await test_promotion_is_failure_atomic()
     await test_rebuild_reports_promotion_failure_truthfully()
     await test_crash_residue_is_recovered_not_ignored()
+    await test_recovery_authority_is_durable_not_inferred()
+    await test_promotion_finalizes_and_leaves_a_clean_store()
     await test_live_and_rebuilt_records_are_identical()
     await test_a_failed_rebuild_never_becomes_authoritative()
     await test_staged_rebuild_defences_individually()
