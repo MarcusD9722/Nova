@@ -8,7 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from core.project_names import canonical_project_slug, safe_trash_entry
+from core.project_names import (
+    canonical_project_slug, safe_live_component, safe_trash_entry,
+)
 from core.safety import ensure_safe_subdir
 
 
@@ -40,16 +42,21 @@ class ProjectManager:
         Anything new gets the canonical contract.
         """
         raw = (name or "").strip()
-        if not raw:
-            raise ValueError("Project name is empty after sanitization")
 
-        legacy = safe_trash_entry(raw)   # path-safe, but not canonicalised
+        # Probe for an EXISTING legacy directory first. This must not raise for a
+        # degenerate name: `safe_live_component("🎈")` has nothing to work with,
+        # and letting that propagate made ProjectManager reject names that
+        # ProjectBuilder happily resolved to `untitled` — the same input producing
+        # a project on one surface and an error on the other.
         try:
+            legacy = safe_live_component(raw)
             if (self._projects_dir / legacy).is_dir():
                 return legacy
-        except OSError:
+        except (ValueError, OSError):
             pass
 
+        # Anything else is a NEW project name, and gets the canonical contract —
+        # including the `untitled` fallback, so every creation surface agrees.
         return canonical_project_slug(raw)
 
     def project_path(self, name: str) -> Path:
@@ -132,12 +139,19 @@ class ProjectManager:
         src = ensure_safe_subdir(self._repo_root, self._trash_dir(), self._trash_dir() / safe)
         if not src.exists() or not src.is_dir():
             raise FileNotFoundError(f"nothing in trash named: {entry}")
+        # Restore to the EXACT identity the project had, not a canonicalised one.
+        # `project_path()` would re-canonicalise here — and since the live legacy
+        # directory no longer exists (it is in the trash), the legacy probe misses
+        # and `My_Old.Project` came back as `my-old-project`. That silently renamed
+        # a project during restore, contradicting the legacy contract outright.
         original = src.name.rsplit("--", 1)[0]
-        dest = self.project_path(original)
+        component = safe_live_component(original)
+        dest = ensure_safe_subdir(self._repo_root, self._projects_dir,
+                                  self._projects_dir / component)
         if dest.exists():
             raise FileExistsError(f"'{original}' already exists — rename or delete it first")
         shutil.move(str(src), str(dest))
-        return {"restored": original, "from_trash": src.name}
+        return {"restored": dest.name, "from_trash": src.name}
 
     def purge_trash(self, entry: str | None = None) -> dict[str, Any]:
         """PERMANENTLY erase one trashed project, or all of them. This is the

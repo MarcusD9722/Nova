@@ -29,6 +29,7 @@ __all__ = [
     "WIN_RESERVED",
     "canonical_project_slug",
     "is_canonical_slug",
+    "safe_live_component",
     "safe_trash_entry",
 ]
 
@@ -64,16 +65,38 @@ def canonical_project_slug(name: str) -> str:
 
 
 def is_canonical_slug(value: str) -> bool:
-    """True if `value` is already exactly what `canonical_project_slug` produces.
+    """True iff `value` is already EXACTLY what `canonical_project_slug` produces.
 
-    Used to recognise LEGACY directories rather than to rewrite them: a project
-    created by the old `ProjectManager._sanitize` may contain uppercase, dots or
-    underscores, and it must keep working. Nova reads it by its real name and only
-    applies the canonical contract to newly created projects.
+    Stated as a fixed point rather than re-derived from a regex. The first version
+    checked `[a-z0-9-]`, length and the reserved set separately, and so accepted
+    `foo--bar`, `-foo` and `foo-` — all of which the canonicaliser would normalise.
+    A helper whose docstring and behaviour disagree is worse than no helper.
     """
     v = (value or "")
-    return bool(_SLUG_RE.match(v)) and len(v) <= MAX_SLUG_LEN \
-        and v not in WIN_RESERVED
+    return bool(v) and canonical_project_slug(v) == v
+
+
+def safe_live_component(value: str) -> str:
+    """Make an ALREADY-STORED/LISTED project identity safe, WITHOUT canonicalising.
+
+    This is the other half of the contract, and conflating the two caused three
+    separate defects: a legacy directory `My_Old.Project` was silently renamed to
+    `my-old-project` on restore, a stored `last_active` pointing at it was declared
+    stale, and a status read went looking in the wrong place.
+
+    A NEW human name gets `canonical_project_slug()`. An identity Nova ALREADY
+    stored or listed is resolved to itself — only made path-safe. A canonical slug
+    passes through unchanged, so this is safe to use everywhere an existing
+    identity is resolved.
+    """
+    v = (value or "").strip().replace("/", "-").replace("\\", "-")
+    v = re.sub(r"[^A-Za-z0-9._-]+", "-", v)
+    v = v.strip("-.")
+    if not v or v in {".", ".."}:
+        raise ValueError("project identity is empty after sanitization")
+    if v.lower() in WIN_RESERVED:
+        v = f"project-{v.lower()}"
+    return v[:MAX_SLUG_LEN * 2]
 
 
 def safe_trash_entry(entry: str) -> str:

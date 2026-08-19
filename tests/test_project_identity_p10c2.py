@@ -39,6 +39,7 @@ from harness import Checks, run  # noqa: E402
 from core.project_builder import (  # noqa: E402
     NAME_AMBIGUOUS, NEEDS_NAME, ProjectBuilder, resolve_name_boundary, slugify,
 )
+from core.project_builder import _MAX_RAW_NAME as _MAX_RAW  # noqa: E402
 from core.project_manager import ProjectManager  # noqa: E402
 from core.project_names import (  # noqa: E402
     MAX_SLUG_LEN, WIN_RESERVED, canonical_project_slug, safe_trash_entry,
@@ -464,6 +465,322 @@ async def test_identity_lifecycle():
               f"11. same canonical live identity restored ({slug})")
 
 
+# ── ROUND 3 ─────────────────────────────────────────────────────────────────
+async def test_active_build_guard_uses_resolved_identity():
+    """BUG A: the guard compared the RAW argument to canonical builder slugs.
+
+    `active_projects()` holds `balloon-tower-defense`; a delete request says
+    "Balloon Tower Defense". The two never matched, so a delete could proceed
+    while the builder was still writing files.
+    """
+    check.section("Round 3 A: delete cannot race an active build")
+
+    from core.tool_router import ToolCall
+
+    for spoken in ["Balloon Tower Defense", "balloon tower defense",
+                   "BALLOON TOWER DEFENSE"]:
+        with _tmp() as td:
+            rt, m, projects = await _runtime(td)
+            slug = canonical_project_slug("Balloon Tower Defense")
+            (projects / slug).mkdir(parents=True)
+            (projects / slug / "main.py").write_text("print(1)\n", encoding="utf-8")
+
+            # Mark it actively building, exactly as the builder would.
+            pb = rt._project_builder
+            done = asyncio.Event()
+
+            async def _never():
+                await done.wait()
+
+            pb._active[slug] = asyncio.create_task(_never())
+            try:
+                check(slug in pb.active_projects(),
+                      f"{spoken!r}: {slug} is registered as building")
+
+                before = len(rt.permission_broker.audit_log(limit=50))
+                res = await rt._router.execute(
+                    ToolCall(name="project.delete", args={"name": spoken}),
+                    retries=0)
+
+                check((res.result or {}).get("error") == "build_in_progress",
+                      f"{spoken!r}: refused with build_in_progress "
+                      f"({(res.result or {}).get('error')!r})")
+                check(rt.permission_broker.pending() == []
+                      and len(rt.permission_broker.audit_log(limit=50)) == before,
+                      f"{spoken!r}: NO permission was even requested")
+                check((projects / slug / "main.py").exists(),
+                      f"{spoken!r}: nothing was moved")
+                trash = projects / ".trash"
+                check(not trash.exists() or not any(trash.iterdir()),
+                      f"{spoken!r}: no trash entry created")
+                check(not pb._active[slug].done(),
+                      f"{spoken!r}: the builder task is untouched")
+            finally:
+                done.set()
+                pb._active.pop(slug, None)
+
+    # An INACTIVE project still reaches the normal permission path.
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        (projects / "other-project").mkdir(parents=True)
+        (projects / "other-project" / "x.py").write_text("x=1\n", encoding="utf-8")
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "Other Project"}),
+            retries=0))
+        check(await _approve_next(rt),
+              "an inactive project still asks permission normally")
+        res = await task
+        check(res.ok and not (projects / "other-project").exists(),
+              f"and deletes on approval ({res.error!r})")
+
+
+async def test_legacy_delete_restore_keeps_the_exact_name():
+    """BUG B: restore re-canonicalised, silently RENAMING a legacy project."""
+    check.section("Round 3 B: legacy delete/restore preserves the exact identity")
+
+    from core.tool_router import ToolCall
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        legacy = projects / "My_Old.Project"
+        legacy.mkdir(parents=True)
+        (legacy / "PROJECT.md").write_text("# legacy\n", encoding="utf-8")
+        (legacy / "app.py").write_text("print('legacy')\n", encoding="utf-8")
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "My_Old.Project"}),
+            retries=0))
+        await _approve_next(rt)
+        res = await task
+        entry = (res.result or {}).get("moved_to_trash", "")
+        check(res.ok and entry.startswith("My_Old.Project--"),
+              f"the trash entry keeps the legacy original ({entry!r})")
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.restore", args={"entry": entry}), retries=0))
+        await _approve_next(rt)
+        res = await task
+
+        check(res.ok, f"restore succeeded ({res.error!r})")
+        check((projects / "My_Old.Project").is_dir(),
+              "the EXACT legacy directory is back")
+        check(not (projects / "my-old-project").exists(),
+              "and no canonicalised sibling was created")
+        check((res.result or {}).get("restored") == "My_Old.Project",
+              f"the reported identity is the legacy one "
+              f"({(res.result or {}).get('restored')!r})")
+        check((legacy / "PROJECT.md").read_text(encoding="utf-8") == "# legacy\n"
+              and (legacy / "app.py").read_text(encoding="utf-8") == "print('legacy')\n",
+              "with contents intact")
+
+
+async def test_legacy_last_active_and_sibling_collision():
+    """BUG C: a STORED identity was re-canonicalised before the existence check."""
+    check.section("Round 3 C: stored identities resolve to themselves")
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        legacy = projects / "My_Old.Project"
+        legacy.mkdir(parents=True)
+        (legacy / "PROJECT.md").write_text("# legacy one\n", encoding="utf-8")
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value="My_Old.Project", confidence=0.95)
+
+        pb = rt._project_builder
+        check(await pb.last_active() == "My_Old.Project",
+              f"a legacy pointer is honoured ({await pb.last_active()!r})")
+        check(pb._project_path("My_Old.Project").name == "My_Old.Project",
+              "and resolves to the legacy directory, not a canonical sibling")
+
+        import shutil
+        shutil.rmtree(legacy)
+        check(await pb.last_active() is None,
+              "once really gone, the pointer is stale and cleared")
+
+    # Both siblings present: neither may resolve to the other.
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        (projects / "My_Old.Project").mkdir(parents=True)
+        (projects / "My_Old.Project" / "PROJECT.md").write_text(
+            "# LEGACY\n", encoding="utf-8")
+        (projects / "my-old-project").mkdir(parents=True)
+        (projects / "my-old-project" / "PROJECT.md").write_text(
+            "# CANONICAL\n", encoding="utf-8")
+
+        pb = rt._project_builder
+        check(pb._project_path("My_Old.Project").name == "My_Old.Project",
+              "the legacy identity resolves to the legacy directory")
+        check(pb._project_path("my-old-project").name == "my-old-project",
+              "the canonical identity resolves to the canonical directory")
+
+        for stored, marker in (("My_Old.Project", "# LEGACY\n"),
+                               ("my-old-project", "# CANONICAL\n")):
+            await m.add_fact(entity="projects", attribute="last_active",
+                             value=stored, confidence=0.95)
+            got = await pb.last_active()
+            check(got == stored, f"a pointer to {stored!r} stays {got!r}")
+            body = (pb._project_path(got) / "PROJECT.md").read_text(encoding="utf-8")
+            check(body == marker,
+                  f"and reads ITS OWN content ({body.strip()!r})")
+
+        pm = ProjectManager(repo_root=Path(td), projects_dir=projects)
+        check(pm.project_path("My_Old.Project").name == "My_Old.Project"
+              and pm.project_path("my-old-project").name == "my-old-project",
+              "the manager keeps them apart too")
+
+
+async def test_degenerate_names_agree_across_surfaces():
+    """BUG D: the manager RAISED where the builder returned a project."""
+    check.section("Round 3 D: degenerate input, same answer everywhere")
+
+    from core.tool_router import ToolCall
+
+    degenerate = ["", "   ", "...", "\U0001f388", "\u65e5\u672c\u8a9e",
+                  "___", "---"]
+    labels = ["empty", "spaces", "dots", "emoji", "cjk", "underscores", "hyphens"]
+
+    with _tmp() as td:
+        root = Path(td)
+        projects = root / "projects"
+        projects.mkdir(parents=True)
+        pm = ProjectManager(repo_root=root, projects_dir=projects)
+        for raw, label in zip(degenerate, labels):
+            builder = slugify(raw)
+            try:
+                manager = pm.project_path(raw).name
+            except Exception as e:  # noqa: BLE001
+                manager = f"RAISE {type(e).__name__}"
+            check(builder == manager,
+                  f"{label}: builder {builder!r} == manager {manager!r}")
+            check(builder == "untitled",
+                  f"{label}: the agreed answer is the canonical fallback")
+
+    # And through the real scaffold tool.
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        res = await rt._router.execute(
+            ToolCall(name="project.scaffold", args={"name": "..."}), retries=0)
+        check(res.ok, f"scaffold accepts a degenerate name ({res.error!r})")
+        made = [p.name for p in projects.iterdir()
+                if p.is_dir() and not p.name.startswith(".")]
+        check(made == ["untitled"], f"creating the same fallback ({made})")
+
+
+async def test_is_canonical_slug_matches_its_docstring():
+    check.section("Round 3 E: is_canonical_slug is a true fixed point")
+
+    from core.project_names import is_canonical_slug
+
+    for v in ["balloon-tower-defense", "project-con", "untitled", "a"]:
+        check(is_canonical_slug(v), f"{v!r} is canonical")
+        check(canonical_project_slug(v) == v, f"{v!r} is genuinely a fixed point")
+
+    for v in ["Balloon-Tower-Defense", "foo--bar", "-foo", "foo-", "con",
+              "COM1", "foo_bar", "foo.bar", "x" * 60, "", "   "]:
+        check(not is_canonical_slug(v), f"{v[:24]!r} is NOT canonical")
+
+
+async def test_quoted_and_long_names_are_exact():
+    """BUG F: quoted titles were silently truncated to a 41-character prefix."""
+    check.section("Round 3 F: quoted names are exact, prefixes are refused")
+
+    title47 = "Abcdefghij Klmnopqrst Uvwxyz Abcdefghijklmn"
+    check(len(title47) > _MAX_RAW, f"the fixture exceeds the old cap ({len(title47)})")
+
+    for text, want in [
+        (f'create a project called "{title47}"', title47),
+        ('create a project called "Rock & Roll Tracker"', "Rock & Roll Tracker"),
+        ('create a project called "My.Project_Name"', "My.Project_Name"),
+        ("create a project called 'Serpent and I Want Python'",
+         "Serpent and I Want Python"),
+    ]:
+        got = _name(text)
+        check(got == want, f"{text[:46]!r}… -> {got!r}")
+
+    # A quoted title longer than the directory limit: the human title is whole,
+    # the SLUG is bounded by the identity layer.
+    long_title = "Z" * 60
+    got = _name(f'create a project called "{long_title}"')
+    check(got == long_title, f"a 60-character quoted title survives whole ({len(got or '')})")
+    check(len(canonical_project_slug(got)) <= MAX_SLUG_LEN,
+          f"and the slug is bounded ({len(canonical_project_slug(got))})")
+
+    # An UNQUOTED capture that hits the regex limit is a prefix -> ask.
+    got = _name("create a project called " + "Y" * 60)
+    check(got == NEEDS_NAME,
+          f"an unquoted over-long name asks rather than using a prefix ({got!r})")
+
+
+async def test_requirement_clauses_with_pronouns():
+    """BUG G: "and I want …" is the grammar of the ORIGINAL live failure."""
+    check.section("Round 3 G: first-person requirement clauses are cut")
+
+    cases = [
+        "create a project called Serpent and I want Python",
+        "create a project called Serpent and I need levels",
+        "create a project called Serpent and it should run offline",
+        "create a project called Serpent and we should add multiplayer",
+        "create a project called Serpent but I want it simple",
+        "create a project called Serpent so I can run it offline",
+    ]
+    for text in cases:
+        for label, variant in _variants(text):
+            got = _name(variant)
+            check(got is not None and got != NEEDS_NAME
+                  and len(got.split()) == 1,
+                  f"{label}: {text[24:52]!r}… -> a one-word title ({got!r})")
+
+    # Quoting still means exactly the quoted title.
+    check(_name('create a project called "Serpent and I Want Python"')
+          == "Serpent and I Want Python",
+          "a quoted first-person title is kept whole")
+
+
+async def test_every_existing_identity_operation_resolves_to_itself():
+    """Self-review finding: three more sites canonicalised a STORED identity.
+
+    `is_building`, `improve` and `status_text` all took an identity Nova already
+    had and ran it back through the NEW-name canonicaliser, so a legacy project
+    was invisible to the build guard, improved the wrong directory, and reported
+    status for a project that may not exist. `start()` is the one that correctly
+    takes a human name.
+    """
+    check.section("Round 3 self-review: existing identities never re-canonicalise")
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        pb = rt._project_builder
+        legacy = projects / "My_Old.Project"
+        legacy.mkdir(parents=True)
+        (legacy / "PROJECT.md").write_text("# legacy status\n", encoding="utf-8")
+
+        # status_text must read the LEGACY project, not a canonical sibling.
+        text = pb.status_text("My_Old.Project")
+        check("don't have a project" not in text,
+              f"status_text finds the legacy project ({text[:60]!r})")
+
+        # is_building must see a build registered under the legacy identity.
+        done = asyncio.Event()
+
+        async def _never():
+            await done.wait()
+
+        pb._active["My_Old.Project"] = asyncio.create_task(_never())
+        try:
+            check(pb.is_building("My_Old.Project"),
+                  "is_building sees a legacy project's active build")
+            check("My_Old.Project" in pb.active_projects(),
+                  "and it is listed as active")
+        finally:
+            done.set()
+            pb._active.pop("My_Old.Project", None)
+
+        # improve must not report a legacy project as unknown.
+        res = await pb.improve(slug="My_Old.Project", instructions="tidy it")
+        check(res.get("reason") != "unknown project",
+              f"improve resolves the legacy project ({res.get('reason')!r})")
+
+
 async def main():
     await test_case_invariance_of_the_name_boundary()
     await test_case_invariance_end_to_end()
@@ -474,6 +791,14 @@ async def main():
     await test_delete_by_natural_name_clears_the_pointer()
     await test_stale_pointer_is_never_returned()
     await test_identity_lifecycle()
+    await test_active_build_guard_uses_resolved_identity()
+    await test_legacy_delete_restore_keeps_the_exact_name()
+    await test_legacy_last_active_and_sibling_collision()
+    await test_degenerate_names_agree_across_surfaces()
+    await test_is_canonical_slug_matches_its_docstring()
+    await test_quoted_and_long_names_are_exact()
+    await test_requirement_clauses_with_pronouns()
+    await test_every_existing_identity_operation_resolves_to_itself()
     check.finish()
 
 

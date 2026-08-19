@@ -19,7 +19,9 @@ State model:
 import asyncio
 import os
 import re
-from core.project_names import WIN_RESERVED, canonical_project_slug
+from core.project_names import (
+    WIN_RESERVED, canonical_project_slug, safe_live_component,
+)
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -60,7 +62,24 @@ PROJECT_OBJECTS = (
     r"(?:game|app|application|script|website|site|webpage|web\s+page|tool|program|project|bot|calculator|simulation|visualizer|dashboard)"
 )
 START_RE = re.compile(rf"\b{PROJECT_VERBS}\b[^.?!]*?\b{PROJECT_OBJECTS}\b", re.IGNORECASE)
-NAME_RE = re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?[\"']?([A-Za-z0-9][A-Za-z0-9 _\-]{1,40})[\"']?", re.IGNORECASE)
+#: Longest raw capture the unquoted parser will consider. Hitting it means the
+#: sentence ran past what the pattern can represent, so the capture is a PREFIX
+#: and must not be treated as a complete name.
+_MAX_RAW_NAME = 40
+
+#: Quoted names get their own pass, before anything generic. An explicit opening
+#: and matching closing quote states the boundary, so the whole span is taken —
+#: punctuation, dots and ampersands included. Bounded only for input safety.
+QUOTED_NAME_RE = re.compile(
+    r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?"
+    r"(?P<q>[\"'])(?P<qname>[^\"'\n]{1,200})(?P=q)",
+    re.IGNORECASE,
+)
+NAME_RE = re.compile(
+    r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?[\"']?"
+    rf"([A-Za-z0-9][A-Za-z0-9 _\-]{{1,{_MAX_RAW_NAME}}})[\"']?",
+    re.IGNORECASE,
+)
 # Explicit "…project <Name>" phrasing, e.g. "let's start a project Serpent" or
 # "create a project named Cobra". Captures the trailing name after "project".
 PROJECT_NAME_RE = re.compile(
@@ -183,6 +202,16 @@ _AMBIGUOUS_CONTINUATIONS = frozenset({
     "under", "when", "while", "if", "unless", "until", "so", "because",
 })
 
+#: Connectives that can introduce a first-person requirement clause. Broader than
+#: `_ACTION_CONNECTIVES` because "but I want it simple" and "so I can run it
+#: offline" are requirements too.
+_CLAUSE_CONNECTIVES = frozenset({"and", "then", "plus", "also", "but", "so",
+                                 "or", "while", "although", "though"})
+
+#: A title does not continue into a clause about the speaker or the thing.
+_SUBJECT_PRONOUNS = frozenset({"i", "we", "you", "it", "they", "he", "she",
+                               "there", "that's", "its", "lets", "let's"})
+
 NAME_AMBIGUOUS = "__NOVA_PROJECT_NAME_AMBIGUOUS__"
 
 
@@ -200,8 +229,16 @@ def resolve_name_boundary(name: str) -> str:
         low = w.lower().strip(".,;:!?")
         nxt = words[i + 1].lower().strip(".,;:!?") if i + 1 < len(words) else ""
 
-        # (2) a connective followed by an imperative verb ends the title.
+        # (2a) a connective followed by an imperative verb ends the title.
         if low in _ACTION_CONNECTIVES and nxt in _ACTION_VERBS:
+            return " ".join(words[:i]).strip()
+
+        # (2b) a connective followed by a SUBJECT PRONOUN also ends it:
+        # "and I want Python", "and it should run offline", "but I want it
+        # simple", "and we should add levels". This is the grammar of the
+        # original live failure — "…and I want you to…" — and a title does not
+        # continue into a first-person clause.
+        if low in _CLAUSE_CONNECTIVES and nxt in _SUBJECT_PRONOUNS:
             return " ".join(words[:i]).strip()
 
         # (4) anything else that could open a requirement is unprovable.
@@ -343,7 +380,14 @@ class ProjectBuilder:
     # ── Path safety ──────────────────────────────────────────────────────────
 
     def _project_path(self, slug: str) -> Path:
-        slug = slugify(slug)
+        # `slug` here is an identity Nova already has — from `list_projects()`,
+        # `known_slug_in_text()`, `last_active`, or one it just canonicalised. It
+        # must resolve to ITSELF. Re-canonicalising it turned a legacy directory
+        # `My_Old.Project` into `my-old-project`, so an existence check reported
+        # the pointer stale and a status read went looking in the wrong place —
+        # and with both directories present it could verify against the sibling.
+        # A canonical slug passes through `safe_live_component` unchanged.
+        slug = safe_live_component(slug)
         path = (self._projects_dir / slug).resolve()
         if path.parent != self._projects_dir:
             raise ValueError(f"invalid project name: {slug}")
@@ -395,7 +439,10 @@ class ProjectBuilder:
         return max(compact_only, key=len) if compact_only else None
 
     def is_building(self, slug: str) -> bool:
-        task = self._active.get(slugify(slug))
+        # `slug` is an EXISTING identity (a builder slug, or one resolved from a
+        # request), so it must resolve to itself. Canonicalising here would make a
+        # legacy project's build invisible to the guard.
+        task = self._active.get(safe_live_component(slug))
         return task is not None and not task.done()
 
     # ── Chat pre-pass detection ──────────────────────────────────────────────
@@ -413,13 +460,31 @@ class ProjectBuilder:
         t = (text or "").strip()
         if not START_RE.search(t):
             return None
+
+        # QUOTED FIRST, with its own parser. The generic regexes cap the capture
+        # around 41 characters and only allow [A-Za-z0-9 _-], so a quoted title
+        # was never actually exact: "Rock & Roll Tracker" came back as "Rock",
+        # "My.Project_Name" as "My", and a 43-character title as a 41-character
+        # PREFIX. A prefix silently accepted as a complete name is the same class
+        # of bug as swallowing a requirement.
+        #
+        # The 48-character DIRECTORY limit belongs to the identity layer, not to
+        # an accidental regex bound, so the human title is captured whole and
+        # `canonical_project_slug` bounds the slug afterwards.
+        q = QUOTED_NAME_RE.search(t)
+        if q:
+            quoted_name = q.group("qname").strip()
+            if quoted_name:
+                return quoted_name, t
+
         m = NAME_RE.search(t)
         if m:
             raw = m.group(1).strip()
-            # Quoted => the boundary is explicit; take it exactly as written.
-            quoted = bool(re.search(r"[\"']" + re.escape(raw) + r"[\"']", t))
-            if quoted:
-                return raw, t
+            # An unquoted capture that ran into the regex's own length limit is a
+            # PREFIX, not a name. Fail closed rather than name a project after a
+            # truncated fragment.
+            if len(raw) >= _MAX_RAW_NAME:
+                return NEEDS_NAME, t
             name = resolve_name_boundary(raw)
             if name == NAME_AMBIGUOUS or not name:
                 return NEEDS_NAME, t
@@ -1094,7 +1159,10 @@ class ProjectBuilder:
     # ── Improve pipeline ─────────────────────────────────────────────────────
 
     async def improve(self, *, slug: str, instructions: str) -> dict[str, Any]:
-        slug = slugify(slug)
+        # An EXISTING identity, from list_projects()/known_slug_in_text()/
+        # last_active — resolve it to itself, do not re-canonicalise it into a
+        # different project.
+        slug = safe_live_component(slug)
         path = self._project_path(slug)
         if not (path / "PROJECT.md").exists():
             return {"project": slug, "started": False, "reason": "unknown project"}
@@ -1228,7 +1296,8 @@ class ProjectBuilder:
     # ── Status for chat ──────────────────────────────────────────────────────
 
     def status_text(self, slug: str) -> str:
-        slug = slugify(slug)
+        # Same rule: an existing identity resolves to itself.
+        slug = safe_live_component(slug)
         md = self._read_project_md(slug)
         if not md:
             return f"I don't have a project called {slug} yet."

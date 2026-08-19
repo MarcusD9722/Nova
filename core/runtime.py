@@ -939,7 +939,12 @@ class RuntimeManager:
             name = str(args.get("name") or args.get("project") or "").strip()
             if not name:
                 return {"ok": False, "error": "missing_name"}
-            if name in self._project_builder.active_projects():
+            # Resolve to the live identity BEFORE comparing. `active_projects()`
+            # holds canonical builder slugs, while `name` is whatever was typed
+            # ("Balloon Tower Defense"), so a raw comparison never matched and a
+            # delete could proceed while the builder was still writing files.
+            resolved = _projects.project_path(name).name
+            if resolved in self._project_builder.active_projects():
                 return {"ok": False, "error": "build_in_progress",
                         "note": f"'{name}' is still being built — stop it before deleting."}
             blocked = await _gate("project.delete", {"project": name, "recoverable": True})
