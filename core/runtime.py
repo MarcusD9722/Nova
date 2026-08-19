@@ -939,7 +939,12 @@ class RuntimeManager:
             name = str(args.get("name") or args.get("project") or "").strip()
             if not name:
                 return {"ok": False, "error": "missing_name"}
-            if name in self._project_builder.active_projects():
+            # Resolve to the live identity BEFORE comparing. `active_projects()`
+            # holds canonical builder slugs, while `name` is whatever was typed
+            # ("Balloon Tower Defense"), so a raw comparison never matched and a
+            # delete could proceed while the builder was still writing files.
+            resolved = _projects.project_path(name).name
+            if resolved in self._project_builder.active_projects():
                 return {"ok": False, "error": "build_in_progress",
                         "note": f"'{name}' is still being built — stop it before deleting."}
             blocked = await _gate("project.delete", {"project": name, "recoverable": True})
@@ -951,8 +956,43 @@ class RuntimeManager:
                 return {"ok": False, "error": "not_found", "project": name}
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "error": str(e)[:200]}
-            return {"ok": True, **result,
-                    "note": f"Moved to trash — recoverable with project.restore('{result['moved_to_trash']}')."}
+
+            # The `last_active` pointer must not name a project that no longer
+            # exists — "resume where we left off" would then resolve to a deleted
+            # directory. ProjectManager holds no memory reference by design, so
+            # the coupling lives here, in the caller that has both.
+            #
+            # Historical facts about the project are deliberately LEFT ALONE:
+            # "do you remember the project we made?" should still work after a
+            # delete. Only the pointer to the CURRENT project is cleared.
+            # Compare against the project ACTUALLY deleted, not the raw argument.
+            # `name` is whatever the model or a human typed ("Balloon Tower
+            # Defense"); the pointer holds the canonical slug
+            # ("balloon-tower-defense"), so a raw comparison never matched and the
+            # pointer was left dangling.
+            deleted = str(result.get("project") or "").strip()
+            cleanup_warning = ""
+            try:
+                current = await self._memory.get_latest_fact(
+                    entity="projects", attribute="last_active")
+                if current and (current.value or "").strip() == deleted:
+                    await self._memory.add_fact(
+                        entity="projects", attribute="last_active", value="",
+                        confidence=0.95)
+            except Exception as e:  # noqa: BLE001
+                # The files ARE moved. Reporting the delete as failed would be
+                # false, so this surfaces as a non-fatal cleanup warning — and
+                # `ProjectBuilder.last_active()` verifies existence anyway, so a
+                # stale pointer can never be handed back as the current project.
+                logger.debug("last_active_clear_failed", error=str(e)[:160])
+                cleanup_warning = ("The project was moved to trash, but I could "
+                                   "not update which project is active.")
+
+            out = {"ok": True, **result,
+                   "note": f"Moved to trash — recoverable with project.restore('{result['moved_to_trash']}')."}
+            if cleanup_warning:
+                out["warning"] = cleanup_warning
+            return out
 
         async def _tool_project_trash(args: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True, "trash": await asyncio.to_thread(_projects.list_trash)}

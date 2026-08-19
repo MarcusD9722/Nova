@@ -19,6 +19,9 @@ State model:
 import asyncio
 import os
 import re
+from core.project_names import (
+    WIN_RESERVED, canonical_project_slug, safe_live_component,
+)
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -59,13 +62,70 @@ PROJECT_OBJECTS = (
     r"(?:game|app|application|script|website|site|webpage|web\s+page|tool|program|project|bot|calculator|simulation|visualizer|dashboard)"
 )
 START_RE = re.compile(rf"\b{PROJECT_VERBS}\b[^.?!]*?\b{PROJECT_OBJECTS}\b", re.IGNORECASE)
-NAME_RE = re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?[\"']?([A-Za-z0-9][A-Za-z0-9 _\-]{1,40})[\"']?", re.IGNORECASE)
+#: Longest raw capture the unquoted parser will consider. Hitting it means the
+#: sentence ran past what the pattern can represent, so the capture is a PREFIX
+#: and must not be treated as a complete name.
+_MAX_RAW_NAME = 40
+
+#: Quoted names get their own pass, before anything generic. An explicit opening
+#: and matching closing quote states the boundary, so the whole span is taken —
+#: punctuation, dots and ampersands included. Bounded only for input safety.
+#: DELIMITER-SPECIFIC. Only the matching quote closes the name, so the OTHER
+#: quote character is ordinary text inside it. A single pattern with
+#: `[^"'\n]` excluded both, which meant `"Marcus's Game"` did not match the
+#: quoted parser at all and fell through to the generic one — returning the
+#: prefix `Marcus` while the contract promised an exact quoted span.
+QUOTED_NAME_RES = (
+    re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?\"(?P<qname>[^\"\n]{1,200})\"",
+               re.IGNORECASE),
+    re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?'(?P<qname>[^'\n]{1,200})'",
+               re.IGNORECASE),
+)
+
+#: An opening quote right after the marker. Used only to detect an UNMATCHED
+#: quote, which must fail closed rather than fall through to a prefix.
+_OPEN_QUOTE_RE = re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?(?P<q>[\"'])",
+                            re.IGNORECASE)
+NAME_RE = re.compile(
+    r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?[\"']?"
+    rf"([A-Za-z0-9][A-Za-z0-9 _\-]{{1,{_MAX_RAW_NAME}}})[\"']?",
+    re.IGNORECASE,
+)
 # Explicit "…project <Name>" phrasing, e.g. "let's start a project Serpent" or
 # "create a project named Cobra". Captures the trailing name after "project".
 PROJECT_NAME_RE = re.compile(
-    r"\bproject\s+(?:called\s+|named\s+)?[\"']?([A-Za-z0-9][A-Za-z0-9 _\-]{0,40}?)[\"']?\s*[.!?]*\s*$",
+    r"\bproject\s+(?P<marker>called\s+|named\s+)?[\"']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _\-]{0,40}?)[\"']?\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+# A bare "…project X" has no marker saying X is a title, so it swallows whatever
+# follows the word "project" up to the end of the sentence. That is how
+# "create a new project and I want you to use python" became the project
+# `and-i-want-you-to-use-python`, and how the malformed
+# `blue-and-tower-defense-and-i-want-you-to/` directory got created.
+#
+# A title does not START with a conjunction, preposition, pronoun or relativiser.
+# Fourteen phrasings were reproduced ("…project and then…", "…project so it…",
+# "…project that tracks…", "…project for me please", "…project using rust", …) and
+# every one begins with one of these. Nine legitimate names — including
+# "My Personal Finance Dashboard 2026" and "to-do-list" — begin with none of them.
+#
+# This guard applies ONLY to the unmarked form. "called X" / "named X" states
+# outright that X is the title, so it is trusted as given.
+_NOT_A_NAME_LEAD = frozenset("""
+    and or but so then also plus that which who whom whose what when while where
+    with without for to from into onto about around after before during under over
+    using via as if unless until because since though although
+    i you we they he she it me my your our their his her its
+    is are was were be been being do does did done have has had
+    can could will would shall should may might must
+    please just really actually maybe perhaps
+""".split())
+
+
+def _looks_like_a_title(name: str) -> bool:
+    """Is this capture a project NAME, or the rest of the sentence?"""
+    first = (name or "").strip().split()
+    return bool(first) and first[0].lower() not in _NOT_A_NAME_LEAD
 STATUS_WORDS_RE = re.compile(r"\b(?:where (?:did|do) we leave off|left off|leave off|status|progress|where were we)\b", re.IGNORECASE)
 RESUME_WORDS_RE = re.compile(r"\b(?:continue|resume|keep (?:working|going)|finish)\b", re.IGNORECASE)
 # Inflection-aware: plain \b(?:improve)\b never matched "improvements"/"improving".
@@ -105,10 +165,113 @@ CONTINUATION_COMPLAINT_RE = re.compile(
 # the source of the "I meant what other improvements..." misroute.
 
 
+# ── Where does a project NAME end and a REQUIREMENT begin? ───────────────────
+#
+# The previous answer used CAPITALISATION: "Rock and Roll Tracker" looked like a
+# title, "Serpent and use Python" looked like a requirement. That is not a valid
+# invariant for a voice-first assistant. An STT transcript does not preserve
+# intentional title case, and neither does ordinary typing, so
+#
+#     "create a project called rock and roll tracker"
+#
+# would have been truncated to "rock" purely because it was spoken rather than
+# typed. Changing only capitalisation must never change which words Nova believes
+# belong to the name.
+#
+# So the decision is deterministic SYNTAX, evaluated case-insensitively:
+#
+#   1. QUOTED         -> the quoted span, exactly. Quoting states the boundary.
+#   2. ACTION SUFFIX  -> a connective followed by an imperative VERB is a
+#                        requirement, not title text: "and use Python",
+#                        "and add levels", "then add a scoreboard".
+#   3. CLEAN TITLE    -> no ambiguous continuation at all -> the whole capture.
+#   4. AMBIGUOUS      -> ASK. "called Serpent with a dark theme" and a real title
+#                        like "Man with a Plan" are the same syntax; nothing short
+#                        of quotation separates them. Guessing either way is
+#                        wrong, so Nova asks instead.
+#
+# `using` / `that` / `which` / `who` do NOT truncate on sight — a legitimate title
+# may contain them — they make the boundary ambiguous, which routes to (4).
+_ACTION_CONNECTIVES = frozenset({"and", "then", "plus", "also"})
+
+#: Imperative verbs that begin a requirement clause. A closed list on purpose: a
+#: noun/adjective lexicon would overfit, while "<connective> <verb>" is reliable.
+_ACTION_VERBS = frozenset("""
+    use uses using add adds adding keep keeps keeping make makes making
+    include includes including support supports supporting track tracks tracking
+    build builds building create creates creating write writes writing
+    store stores storing save saves saving run runs running show shows showing
+    display displays handle handles allow allows avoid avoids target targets
+    deploy deploys test tests fix fixes remove removes delete deletes
+    put puts set sets give gives let lets have has send sends
+""".split())
+
+#: Tokens after which a title boundary cannot be proven either way.
+_AMBIGUOUS_CONTINUATIONS = frozenset({
+    "with", "without", "using", "that", "which", "who", "whom", "whose",
+    "for", "from", "in", "on", "at", "about", "to", "by", "into", "over",
+    "under", "when", "while", "if", "unless", "until", "so", "because",
+})
+
+#: Connectives that can introduce a first-person requirement clause. Broader than
+#: `_ACTION_CONNECTIVES` because "but I want it simple" and "so I can run it
+#: offline" are requirements too.
+_CLAUSE_CONNECTIVES = frozenset({"and", "then", "plus", "also", "but", "so",
+                                 "or", "while", "although", "though"})
+
+#: A title does not continue into a clause about the speaker or the thing.
+_SUBJECT_PRONOUNS = frozenset({"i", "we", "you", "it", "they", "he", "she",
+                               "there", "that's", "its", "lets", "let's"})
+
+NAME_AMBIGUOUS = "__NOVA_PROJECT_NAME_AMBIGUOUS__"
+
+
+def resolve_name_boundary(name: str) -> str:
+    """Where the title ends. Returns the name, or NAME_AMBIGUOUS to ask.
+
+    Case-insensitive by construction: every comparison lowercases first, so the
+    same words produce the same answer however they were capitalised.
+    """
+    words = (name or "").split()
+    if len(words) <= 1:
+        return (name or "").strip()
+
+    for i, w in enumerate(words[1:], start=1):   # never cut at the first word
+        low = w.lower().strip(".,;:!?")
+        nxt = words[i + 1].lower().strip(".,;:!?") if i + 1 < len(words) else ""
+
+        # (2a) a connective followed by an imperative verb ends the title.
+        if low in _ACTION_CONNECTIVES and nxt in _ACTION_VERBS:
+            return " ".join(words[:i]).strip()
+
+        # (2b) a connective followed by a SUBJECT PRONOUN also ends it:
+        # "and I want Python", "and it should run offline", "but I want it
+        # simple", "and we should add levels". This is the grammar of the
+        # original live failure — "…and I want you to…" — and a title does not
+        # continue into a first-person clause.
+        if low in _CLAUSE_CONNECTIVES and nxt in _SUBJECT_PRONOUNS:
+            return " ".join(words[:i]).strip()
+
+        # (4) anything else that could open a requirement is unprovable.
+        if low in _AMBIGUOUS_CONTINUATIONS:
+            return NAME_AMBIGUOUS
+
+    # (3) nothing ambiguous anywhere: the whole capture is the title.
+    return (name or "").strip()
+
+
+#: Re-exported for callers that already imported it from this module.
+_WIN_RESERVED = WIN_RESERVED
+
+
 def slugify(name: str) -> str:
-    s = (name or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s[:48] or "untitled"
+    """Compatibility wrapper. The contract lives in `core/project_names.py`.
+
+    Kept because call sites and tests import it, but it no longer OWNS anything:
+    ProjectBuilder and ProjectManager must agree on what a live project directory
+    is called, and two independent implementations of that had already drifted.
+    """
+    return canonical_project_slug(name)
 
 
 def _now_str() -> str:
@@ -228,7 +391,14 @@ class ProjectBuilder:
     # ── Path safety ──────────────────────────────────────────────────────────
 
     def _project_path(self, slug: str) -> Path:
-        slug = slugify(slug)
+        # `slug` here is an identity Nova already has — from `list_projects()`,
+        # `known_slug_in_text()`, `last_active`, or one it just canonicalised. It
+        # must resolve to ITSELF. Re-canonicalising it turned a legacy directory
+        # `My_Old.Project` into `my-old-project`, so an existence check reported
+        # the pointer stale and a status read went looking in the wrong place —
+        # and with both directories present it could verify against the sibling.
+        # A canonical slug passes through `safe_live_component` unchanged.
+        slug = safe_live_component(slug)
         path = (self._projects_dir / slug).resolve()
         if path.parent != self._projects_dir:
             raise ValueError(f"invalid project name: {slug}")
@@ -280,7 +450,10 @@ class ProjectBuilder:
         return max(compact_only, key=len) if compact_only else None
 
     def is_building(self, slug: str) -> bool:
-        task = self._active.get(slugify(slug))
+        # `slug` is an EXISTING identity (a builder slug, or one resolved from a
+        # request), so it must resolve to itself. Canonicalising here would make a
+        # legacy project's build invisible to the guard.
+        task = self._active.get(safe_live_component(slug))
         return task is not None and not task.done()
 
     # ── Chat pre-pass detection ──────────────────────────────────────────────
@@ -298,14 +471,63 @@ class ProjectBuilder:
         t = (text or "").strip()
         if not START_RE.search(t):
             return None
+
+        # QUOTED FIRST, with its own parser. The generic regexes cap the capture
+        # around 41 characters and only allow [A-Za-z0-9 _-], so a quoted title
+        # was never actually exact: "Rock & Roll Tracker" came back as "Rock",
+        # "My.Project_Name" as "My", and a 43-character title as a 41-character
+        # PREFIX. A prefix silently accepted as a complete name is the same class
+        # of bug as swallowing a requirement.
+        #
+        # The 48-character DIRECTORY limit belongs to the identity layer, not to
+        # an accidental regex bound, so the human title is captured whole and
+        # `canonical_project_slug` bounds the slug afterwards.
+        # Try each delimiter, and prefer the match that starts EARLIEST — for
+        # `'The "Best" Game'` both patterns can match, and the single-quoted one
+        # is the real boundary.
+        best = None
+        for pat in QUOTED_NAME_RES:
+            q = pat.search(t)
+            if q and (best is None or q.start() < best.start()):
+                best = q
+        if best:
+            quoted_name = best.group("qname").strip()
+            if quoted_name:
+                return quoted_name, t
+
+        # An opening quote with no matching close is not a name Nova can trust.
+        # Falling through to the generic parser here would accept a PREFIX of the
+        # intended title, which is exactly what "quoted means exact" forbids.
+        if _OPEN_QUOTE_RE.search(t):
+            return NEEDS_NAME, t
+
         m = NAME_RE.search(t)
         if m:
-            return m.group(1).strip(), t
+            raw = m.group(1).strip()
+            # An unquoted capture that ran into the regex's own length limit is a
+            # PREFIX, not a name. Fail closed rather than name a project after a
+            # truncated fragment.
+            if len(raw) >= _MAX_RAW_NAME:
+                return NEEDS_NAME, t
+            name = resolve_name_boundary(raw)
+            if name == NAME_AMBIGUOUS or not name:
+                return NEEDS_NAME, t
+            return name, t
         m2 = PROJECT_NAME_RE.search(t)
-        if m2 and m2.group(1).strip():
-            name = re.sub(r"^(?:a|an|the|new|simple|small|little|basic)\s+", "", m2.group(1).strip(), flags=re.IGNORECASE)
-            if name:
-                return name, t
+        if m2 and m2.group("name").strip():
+            name = re.sub(r"^(?:a|an|the|new|simple|small|little|basic)\s+", "",
+                          m2.group("name").strip(), flags=re.IGNORECASE)
+            # An unmarked capture must still look like a title; a marked one
+            # ("called X" / "named X") is taken at its word.
+            if name and (m2.group("marker") or _looks_like_a_title(name)):
+                quoted = bool(re.search(r"[\"']" + re.escape(name) + r"[\"']", t))
+                if quoted:
+                    return name, t
+                resolved = resolve_name_boundary(name)
+                if (resolved != NAME_AMBIGUOUS and resolved
+                        and _looks_like_a_title(resolved)):
+                    return resolved, t
+                return NEEDS_NAME, t
         return NEEDS_NAME, t
 
     # ── Memory + PROJECT.md state ────────────────────────────────────────────
@@ -323,11 +545,35 @@ class ProjectBuilder:
             pass
 
     async def last_active(self) -> str | None:
+        """The current project, or None — never one that no longer exists.
+
+        The pointer lives in memory and the project is a directory, and those can
+        disagree: a delete whose memory update failed, a manual removal, a crash,
+        an older bug. Trusting the pointer made "resume where we left off" resolve
+        to a deleted project, so existence is VERIFIED here rather than assumed.
+
+        Self-healing the stale value is best-effort; correctness does not depend on
+        it succeeding. The property that matters is that a stale pointer is never
+        returned as the current project.
+        """
         try:
             fact = await self._memory.get_latest_fact(entity="projects", attribute="last_active")
-            return fact.value.strip() if fact and fact.value.strip() else None
         except Exception:
             return None
+        slug = (fact.value or "").strip() if fact else ""
+        if not slug:
+            return None
+        try:
+            if self._project_path(slug).is_dir():
+                return slug
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            await self._memory.add_fact(entity="projects", attribute="last_active",
+                                        value="", confidence=0.95)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     def _read_project_md(self, slug: str) -> str:
         path = self._project_path(slug) / "PROJECT.md"
@@ -937,7 +1183,10 @@ class ProjectBuilder:
     # ── Improve pipeline ─────────────────────────────────────────────────────
 
     async def improve(self, *, slug: str, instructions: str) -> dict[str, Any]:
-        slug = slugify(slug)
+        # An EXISTING identity, from list_projects()/known_slug_in_text()/
+        # last_active — resolve it to itself, do not re-canonicalise it into a
+        # different project.
+        slug = safe_live_component(slug)
         path = self._project_path(slug)
         if not (path / "PROJECT.md").exists():
             return {"project": slug, "started": False, "reason": "unknown project"}
@@ -1071,7 +1320,8 @@ class ProjectBuilder:
     # ── Status for chat ──────────────────────────────────────────────────────
 
     def status_text(self, slug: str) -> str:
-        slug = slugify(slug)
+        # Same rule: an existing identity resolves to itself.
+        slug = safe_live_component(slug)
         md = self._read_project_md(slug)
         if not md:
             return f"I don't have a project called {slug} yet."

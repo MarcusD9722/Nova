@@ -278,6 +278,12 @@ async def test_every_personal_grounding_signal_is_gated():
         await m.add_fact(entity="user", attribute="interest", value=S["interest"], confidence=.9)
         await m.add_fact(entity="insight", attribute="pattern", value=S["insight"], confidence=.8)
         await m.add_fact(entity="projects", attribute="last_active", value=S["project"], confidence=.9)
+        # The active-project pointer is only honoured for a project that actually
+        # EXISTS — `ProjectBuilder.last_active()` verifies the directory now, so a
+        # pointer with nothing behind it is treated as stale and returns None.
+        # This fixture has to reflect that, otherwise the project sentinel simply
+        # never reaches grounding and the privacy claim below is untested.
+        (nova.runtime._projects_dir / S["project"]).mkdir(parents=True, exist_ok=True)
         with active_turn(TurnIdentity.typed()):
             await m.record_mood(S["mood"])
 
