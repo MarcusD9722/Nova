@@ -70,11 +70,22 @@ _MAX_RAW_NAME = 40
 #: Quoted names get their own pass, before anything generic. An explicit opening
 #: and matching closing quote states the boundary, so the whole span is taken —
 #: punctuation, dots and ampersands included. Bounded only for input safety.
-QUOTED_NAME_RE = re.compile(
-    r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?"
-    r"(?P<q>[\"'])(?P<qname>[^\"'\n]{1,200})(?P=q)",
-    re.IGNORECASE,
+#: DELIMITER-SPECIFIC. Only the matching quote closes the name, so the OTHER
+#: quote character is ordinary text inside it. A single pattern with
+#: `[^"'\n]` excluded both, which meant `"Marcus's Game"` did not match the
+#: quoted parser at all and fell through to the generic one — returning the
+#: prefix `Marcus` while the contract promised an exact quoted span.
+QUOTED_NAME_RES = (
+    re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?\"(?P<qname>[^\"\n]{1,200})\"",
+               re.IGNORECASE),
+    re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?'(?P<qname>[^'\n]{1,200})'",
+               re.IGNORECASE),
 )
+
+#: An opening quote right after the marker. Used only to detect an UNMATCHED
+#: quote, which must fail closed rather than fall through to a prefix.
+_OPEN_QUOTE_RE = re.compile(r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?(?P<q>[\"'])",
+                            re.IGNORECASE)
 NAME_RE = re.compile(
     r"\b(?:call(?:ed)?|named?)\s+(?:it\s+)?[\"']?"
     rf"([A-Za-z0-9][A-Za-z0-9 _\-]{{1,{_MAX_RAW_NAME}}})[\"']?",
@@ -471,11 +482,24 @@ class ProjectBuilder:
         # The 48-character DIRECTORY limit belongs to the identity layer, not to
         # an accidental regex bound, so the human title is captured whole and
         # `canonical_project_slug` bounds the slug afterwards.
-        q = QUOTED_NAME_RE.search(t)
-        if q:
-            quoted_name = q.group("qname").strip()
+        # Try each delimiter, and prefer the match that starts EARLIEST — for
+        # `'The "Best" Game'` both patterns can match, and the single-quoted one
+        # is the real boundary.
+        best = None
+        for pat in QUOTED_NAME_RES:
+            q = pat.search(t)
+            if q and (best is None or q.start() < best.start()):
+                best = q
+        if best:
+            quoted_name = best.group("qname").strip()
             if quoted_name:
                 return quoted_name, t
+
+        # An opening quote with no matching close is not a name Nova can trust.
+        # Falling through to the generic parser here would accept a PREFIX of the
+        # intended title, which is exactly what "quoted means exact" forbids.
+        if _OPEN_QUOTE_RE.search(t):
+            return NEEDS_NAME, t
 
         m = NAME_RE.search(t)
         if m:

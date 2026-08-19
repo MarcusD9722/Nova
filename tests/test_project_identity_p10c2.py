@@ -781,6 +781,269 @@ async def test_every_existing_identity_operation_resolves_to_itself():
               f"improve resolves the legacy project ({res.get('reason')!r})")
 
 
+# ── ROUND 4 ─────────────────────────────────────────────────────────────────
+LONG_LEGACY = "Legacy_Project_" + ("X" * 95)          # 110 chars
+PREFIX_96 = LONG_LEGACY[:96]                           # the truncated sibling
+
+
+async def test_existing_identity_is_never_truncated():
+    """BUG 1: `safe_live_component` shortened a stored identity at 96 chars.
+
+    The helper exists to PRESERVE legacy identities, and the old ProjectManager
+    had no length cap — so a directory longer than any bound invented here can
+    genuinely exist. Truncating it made Nova check, read, delete and status a
+    DIFFERENT path, and with a shorter sibling present, the wrong project.
+    """
+    check.section("Round 4.1: a stored identity is never silently shortened")
+
+    from core.project_names import MAX_COMPONENT_LEN, safe_live_component
+    from core.tool_router import ToolCall
+
+    check(len(LONG_LEGACY) > MAX_SLUG_LEN * 2,
+          f"the fixture exceeds the old 96-char cap ({len(LONG_LEGACY)})")
+    check(safe_live_component(LONG_LEGACY) == LONG_LEGACY,
+          f"the full identity survives ({len(safe_live_component(LONG_LEGACY))} chars)")
+
+    # Beyond a REAL filesystem limit it fails explicitly rather than renaming.
+    raised = ""
+    try:
+        safe_live_component("Y" * (MAX_COMPONENT_LEN + 5))
+    except ValueError as e:
+        raised = str(e)
+    check(bool(raised), f"past {MAX_COMPONENT_LEN} chars it FAILS ({raised[:70]})")
+    check("shortened" in raised or "cannot" in raised,
+          "and says why rather than guessing")
+
+    # Full lifecycle on a genuinely long legacy directory.
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        legacy = projects / LONG_LEGACY
+        legacy.mkdir(parents=True)
+        (legacy / "PROJECT.md").write_text("# long legacy\n", encoding="utf-8")
+
+        pb = rt._project_builder
+        pm = ProjectManager(repo_root=Path(td), projects_dir=projects)
+
+        check(LONG_LEGACY in pm.list_projects(),
+              "list_projects returns the exact long name")
+        check(pb._project_path(LONG_LEGACY).name == LONG_LEGACY,
+              "_project_path resolves the exact directory")
+
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value=LONG_LEGACY, confidence=0.95)
+        check(await pb.last_active() == LONG_LEGACY,
+              "last_active honours the exact long identity")
+        check((pb._project_path(LONG_LEGACY) / "PROJECT.md").read_text(
+              encoding="utf-8") == "# long legacy\n",
+              "status/read reaches the exact contents")
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": LONG_LEGACY}), retries=0))
+        await _approve_next(rt)
+        res = await task
+        entry = (res.result or {}).get("moved_to_trash", "")
+        check(res.ok and (res.result or {}).get("project") == LONG_LEGACY,
+              f"delete moves the exact directory ({(res.result or {}).get('project')!r})")
+        check(entry.startswith(LONG_LEGACY + "--"),
+              "and the trash id keeps the full original")
+
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.restore", args={"entry": entry}), retries=0))
+        await _approve_next(rt)
+        res = await task
+        check(res.ok and (projects / LONG_LEGACY).is_dir(),
+              "restore brings the exact directory back")
+        check((res.result or {}).get("restored") == LONG_LEGACY,
+              "reporting the full identity")
+        names = [x.name for x in projects.iterdir()
+                 if x.is_dir() and not x.name.startswith(".")]
+        check(names == [LONG_LEGACY],
+              f"and NO truncated sibling was created ({[n[:20] for n in names]})")
+
+
+async def test_long_and_truncated_siblings_stay_apart():
+    check.section("Round 4.1: a 96-char sibling is a different project")
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        for name, body in ((LONG_LEGACY, "# LONG\n"), (PREFIX_96, "# PREFIX\n")):
+            d = projects / name
+            d.mkdir(parents=True)
+            (d / "PROJECT.md").write_text(body, encoding="utf-8")
+
+        pb = rt._project_builder
+        for stored, marker in ((LONG_LEGACY, "# LONG\n"), (PREFIX_96, "# PREFIX\n")):
+            resolved = pb._project_path(stored)
+            check(resolved.name == stored,
+                  f"{len(stored)}-char identity resolves to itself")
+            check((resolved / "PROJECT.md").read_text(encoding="utf-8") == marker,
+                  f"{len(stored)}-char identity reads ITS OWN content")
+
+
+async def test_case_variant_resolves_to_the_actual_disk_identity():
+    """BUG 2: a case-insensitive match returned the CALLER's spelling.
+
+    On Windows `(projects/"my_old.project").is_dir()` is True when the real
+    directory is `My_Old.Project`. Handing back the caller's spelling produces an
+    identity that does not exist as written, and every exact comparison then fails
+    — `active_projects()` membership among them, which is what stops a delete
+    racing a build.
+
+    `Path.resolve()` happens to repair this on Windows today; that is a platform
+    side effect, not a contract, so the identity is now recovered explicitly.
+    """
+    check.section("Round 4.2: case variants resolve to the real disk identity")
+
+    from core.project_names import resolve_existing_identity
+    from core.tool_router import ToolCall
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        actual = "My_Old.Project"
+        (projects / actual).mkdir(parents=True)
+        (projects / actual / "PROJECT.md").write_text("# legacy\n", encoding="utf-8")
+        pm = ProjectManager(repo_root=Path(td), projects_dir=projects)
+
+        for req in [actual, "my_old.project", "MY_OLD.PROJECT"]:
+            got = resolve_existing_identity(projects, req)
+            check(got == actual,
+                  f"resolver: {req!r} -> {got!r} (want {actual!r})")
+            check(pm.project_path(req).name == actual,
+                  f"manager:  {req!r} -> {pm.project_path(req).name!r}")
+            # Assert the SANITIZER's own return, not just the resolved path.
+            # `Path.resolve()` repairs casing on Windows, so going only through
+            # `project_path()` hides whether the identity string itself is right —
+            # and that string is what `active_projects()` membership compares.
+            check(pm._sanitize(req) == actual,
+                  f"_sanitize: {req!r} -> {pm._sanitize(req)!r} (want {actual!r})")
+
+        # A name that does not exist stays unresolved.
+        check(resolve_existing_identity(projects, "not-there") is None,
+              "an unknown name resolves to None")
+
+    # AMBIGUITY. Two entries whose names differ only under `.lower()` must never
+    # resolve to a guess. On NTFS this is constructible with the Kelvin sign
+    # (U+212A), which is a distinct character on disk but lowercases to plain
+    # "k" — so the case-insensitive branch sees two candidates. A platform
+    # `if` would have skipped this branch entirely on Windows and left the guard
+    # unfalsifiable here.
+    with _tmp() as td:
+        projects = Path(td) / "projects"
+        projects.mkdir(parents=True)
+        kelvin = "Kelvin".replace("K", "K")
+        (projects / kelvin).mkdir()
+        (projects / "kelvin").mkdir()
+        entries = sorted(x.name for x in projects.iterdir())
+        check(len(entries) == 2,
+              f"both case-folding siblings exist on this filesystem ({len(entries)})")
+        check(kelvin.lower() == "kelvin",
+              "and they collide under .lower()")
+        check(resolve_existing_identity(projects, "KELVIN") is None,
+              f"an ambiguous match returns None, never a guess "
+              f"({resolve_existing_identity(projects, 'KELVIN')!r})")
+        # An EXACT match still wins over the ambiguity.
+        check(resolve_existing_identity(projects, "kelvin") == "kelvin",
+              "while an exact match resolves unambiguously")
+        check(resolve_existing_identity(projects, kelvin) == kelvin,
+              "for either sibling")
+
+
+async def test_case_variant_delete_respects_the_active_build():
+    check.section("Round 4.2: a case-variant delete cannot race an active build")
+
+    from core.tool_router import ToolCall
+
+    with _tmp() as td:
+        rt, m, projects = await _runtime(td)
+        actual = "My_Old.Project"
+        (projects / actual).mkdir(parents=True)
+        (projects / actual / "main.py").write_text("print(1)\n", encoding="utf-8")
+        await m.add_fact(entity="projects", attribute="last_active",
+                         value=actual, confidence=0.95)
+
+        pb = rt._project_builder
+        done = asyncio.Event()
+
+        async def _never():
+            await done.wait()
+
+        pb._active[actual] = asyncio.create_task(_never())
+        try:
+            before = len(rt.permission_broker.audit_log(limit=50))
+            res = await rt._router.execute(
+                ToolCall(name="project.delete", args={"name": "my_old.project"}),
+                retries=0)
+            check((res.result or {}).get("error") == "build_in_progress",
+                  f"a lowercase request hits the guard "
+                  f"({(res.result or {}).get('error')!r})")
+            check(rt.permission_broker.pending() == []
+                  and len(rt.permission_broker.audit_log(limit=50)) == before,
+                  "no permission was requested")
+            trash = projects / ".trash"
+            check(not trash.exists() or not any(trash.iterdir()),
+                  "and nothing was moved to trash")
+        finally:
+            done.set()
+            pb._active.pop(actual, None)
+
+        # Build finished: a case-variant delete now works and clears the pointer
+        # that memory stored under the ACTUAL identity.
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.delete", args={"name": "MY_OLD.PROJECT"}),
+            retries=0))
+        await _approve_next(rt)
+        res = await task
+        check(res.ok and (res.result or {}).get("project") == actual,
+              f"the result reports the actual identity "
+              f"({(res.result or {}).get('project')!r})")
+        ptr = await m.get_latest_fact(entity="projects", attribute="last_active")
+        check((ptr.value if ptr else "") == "",
+              f"and last_active cleared despite the casing difference "
+              f"({ptr.value if ptr else None!r})")
+
+        entry = (res.result or {}).get("moved_to_trash", "")
+        task = asyncio.create_task(rt._router.execute(
+            ToolCall(name="project.restore", args={"entry": entry}), retries=0))
+        await _approve_next(rt)
+        res = await task
+        check(res.ok and (res.result or {}).get("restored") == actual,
+              f"restore returns the exact identity "
+              f"({(res.result or {}).get('restored')!r})")
+
+
+async def test_quoted_names_handle_both_delimiters():
+    """BUG 3: the body class excluded BOTH quote characters."""
+    check.section("Round 4.3: only the matching quote closes a name")
+
+    cases = [
+        ('create a project called "Marcus\'s Game"', "Marcus's Game"),
+        ('create a project called "John\'s Rock & Roll Tracker"',
+         "John's Rock & Roll Tracker"),
+        ("""create a project called 'The "Best" Game'""", 'The "Best" Game'),
+        ("""create a project named 'Nova "Mini" Assistant'""",
+         'Nova "Mini" Assistant'),
+        ('create a project called "Marcus\'s Game" and use Python', "Marcus's Game"),
+        ('create a project called "Serpent and I Want Python"',
+         "Serpent and I Want Python"),
+    ]
+    for text, want in cases:
+        got = _name(text)
+        check(got == want, f"{text[24:60]!r} -> {got!r} (want {want!r})")
+
+    # The slug is still sanitised afterwards — a separate step.
+    marcus_slug = canonical_project_slug("Marcus's Game")
+    check(marcus_slug == "marcus-s-game",
+          f"the slug sanitises punctuation later ({marcus_slug!r})")
+
+    # An unmatched quote must fail closed, never accept a prefix.
+    for text in ['create a project called "Unclosed Name',
+                 "create a project called 'Also unclosed",
+                 'create a project named "Half quoted and use Python']:
+        got = _name(text)
+        check(got == NEEDS_NAME,
+              f"unmatched quote asks rather than taking a prefix ({got!r})")
+
+
 async def main():
     await test_case_invariance_of_the_name_boundary()
     await test_case_invariance_end_to_end()
@@ -799,6 +1062,11 @@ async def main():
     await test_quoted_and_long_names_are_exact()
     await test_requirement_clauses_with_pronouns()
     await test_every_existing_identity_operation_resolves_to_itself()
+    await test_existing_identity_is_never_truncated()
+    await test_long_and_truncated_siblings_stay_apart()
+    await test_case_variant_resolves_to_the_actual_disk_identity()
+    await test_case_variant_delete_respects_the_active_build()
+    await test_quoted_names_handle_both_delimiters()
     check.finish()
 
 

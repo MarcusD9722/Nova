@@ -25,13 +25,21 @@ separately.
 import re
 
 __all__ = [
+    "MAX_COMPONENT_LEN",
     "MAX_SLUG_LEN",
     "WIN_RESERVED",
     "canonical_project_slug",
     "is_canonical_slug",
+    "resolve_existing_identity",
     "safe_live_component",
     "safe_trash_entry",
 ]
+
+#: The longest single path component every filesystem Nova runs on accepts. NTFS
+#: and ext4 both stop at 255. This bounds an EXISTING identity, which is a very
+#: different job from `MAX_SLUG_LEN` bounding a NEW one: 48 keeps new directory
+#: names tidy, 255 is the point past which the name cannot exist at all.
+MAX_COMPONENT_LEN = 255
 
 #: A live project directory component is exactly this.
 _SLUG_RE = re.compile(r"\A[a-z0-9-]+\Z")
@@ -96,7 +104,55 @@ def safe_live_component(value: str) -> str:
         raise ValueError("project identity is empty after sanitization")
     if v.lower() in WIN_RESERVED:
         v = f"project-{v.lower()}"
-    return v[:MAX_SLUG_LEN * 2]
+    # NEVER truncate. This helper existed to preserve legacy identities, and the
+    # old ProjectManager had no length cap at all, so a directory longer than any
+    # bound we invent here can genuinely exist on disk. Silently shortening it
+    # made Nova check, read, delete and status a DIFFERENT path — and if a
+    # shorter sibling happened to exist, the wrong project.
+    #
+    # The bound below is a real platform limit, not a style choice, and exceeding
+    # it FAILS rather than quietly producing a different identity.
+    if len(v) > MAX_COMPONENT_LEN:
+        raise ValueError(
+            f"project identity is {len(v)} characters, beyond the "
+            f"{MAX_COMPONENT_LEN}-character filesystem component limit; it cannot "
+            f"be shortened without naming a different project")
+    return v
+
+
+def resolve_existing_identity(projects_dir: Path, candidate: str) -> str | None:
+    """The ACTUAL on-disk identity for `candidate`, or None if no live project.
+
+    Windows matches paths case-insensitively, so `(projects_dir / "my_old.project")
+    .is_dir()` is True when the real directory is `My_Old.Project`. Returning the
+    CALLER's spelling after such a match hands back an identity that does not exist
+    as written, and every later exact comparison then fails —
+    `active_projects()` membership (which is what stops a delete racing a build)
+    and the `last_active` pointer comparison among them.
+
+    `Path.resolve()` happens to repair this on Windows today, but that is a
+    platform side effect, not a stated contract, and it behaves differently on a
+    case-sensitive filesystem. So the identity is recovered EXPLICITLY here, by
+    looking at what is actually on disk.
+
+    Exact match wins. A unique case-insensitive match resolves to the real entry.
+    An AMBIGUOUS case-insensitive match — possible only on a case-sensitive
+    filesystem, where several siblings differ solely by case — returns None rather
+    than picking one, because guessing between real distinct projects is worse
+    than declining.
+    """
+    try:
+        entries = [p.name for p in projects_dir.iterdir() if p.is_dir()]
+    except (OSError, FileNotFoundError):
+        return None
+
+    if candidate in entries:
+        return candidate
+    lowered = candidate.lower()
+    hits = [n for n in entries if n.lower() == lowered]
+    if len(hits) == 1:
+        return hits[0]
+    return None
 
 
 def safe_trash_entry(entry: str) -> str:

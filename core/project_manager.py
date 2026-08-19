@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core.project_names import (
-    canonical_project_slug, safe_live_component, safe_trash_entry,
+    canonical_project_slug, resolve_existing_identity, safe_live_component,
+    safe_trash_entry,
 )
 from core.safety import ensure_safe_subdir
 
@@ -50,8 +51,11 @@ class ProjectManager:
         # a project on one surface and an error on the other.
         try:
             legacy = safe_live_component(raw)
-            if (self._projects_dir / legacy).is_dir():
-                return legacy
+            # Ask the filesystem which entry this actually IS, rather than
+            # trusting the caller's spelling after a case-insensitive match.
+            actual = resolve_existing_identity(self._projects_dir, legacy)
+            if actual:
+                return actual
         except (ValueError, OSError):
             pass
 
