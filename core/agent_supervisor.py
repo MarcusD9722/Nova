@@ -250,6 +250,24 @@ Return JSON only.
                     result, failure = None, str(e)
 
                 if failure is not None:
+                    # A SECOND retry loop lives here, above the router's. Fixing
+                    # only the router's meant a side-effecting tool still ran
+                    # once, failed, and was requeued to run again later — the same
+                    # invariant broken one layer up. Requeue only what the router
+                    # says is safe to re-invoke.
+                    if not self._router.is_retry_safe(tool_name):
+                        await self._memory.complete_goal_task(
+                            task_id=task_id, status="failed", result={},
+                            error=f"{failure} (not retried: '{tool_name}' may have "
+                                  f"side effects, so it is never re-run "
+                                  f"automatically)")
+                        await self._memory.add_progress_event(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            kind="blocked",
+                            message=f"{tool_name} failed and was NOT retried "
+                                    f"automatically: {failure}")
+                        continue
+
                     attempts += 1
                     if attempts <= self._cfg.max_retries:
                         backoff = timedelta(seconds=min(60, 2 ** attempts))

@@ -129,6 +129,21 @@ class ToolRouter:
             try:
                 coro = self._tools[call.name](call.args)
                 result = await asyncio.wait_for(coro, timeout=budget)
+
+                # A tool that RETURNS a structured failure has not succeeded.
+                # Nova's tools use a top-level `ok` convention — `missing_fact`,
+                # `unverified_speaker`, `scoped_unavailable`, `not_approved` — and
+                # every one of them used to arrive as ToolResult(ok=True), so the
+                # orchestrator was told the step worked and carried on.
+                failure = self._structured_failure(result)
+                if failure:
+                    BUS.publish("tool.error", {"tool": call.name, "error": clip(failure, 200)})
+                    # The structured payload is KEPT: a caller often needs the
+                    # status or detail to decide what to do next, and discarding
+                    # it would trade one silent failure for another.
+                    return ToolResult(name=call.name, ok=False, result=result,
+                                      error=failure)
+
                 BUS.publish("tool.result", {"tool": call.name, "ok": True, "summary": clip(result, 200)})
                 return ToolResult(name=call.name, ok=True, result=result, error=None)
             except Exception as e:  # noqa: BLE001
@@ -159,6 +174,25 @@ class ToolRouter:
         else:
             BUS.publish("tool.error", {"tool": call.name, "error": clip(last_text, 200) or "tool_failed"})
         return ToolResult(name=call.name, ok=False, result=None, error=last_text or "tool_failed")
+
+    @staticmethod
+    def _structured_failure(result: Any) -> str:
+        """The failure text if `result` explicitly says it failed, else "".
+
+        ONLY a top-level `ok` that is exactly False counts. A dict without an `ok`
+        key, or one whose `ok` is truthy, keeps its existing success semantics —
+        many tools return plain data and must not start failing because they
+        happen to contain the word "error" somewhere.
+        """
+        if not isinstance(result, dict):
+            return ""
+        if result.get("ok", True) is not False:
+            return ""
+        for key in ("error", "reason", "detail", "note", "status"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:300]
+        return "tool reported failure"
 
     @staticmethod
     def _error_text(exc: BaseException, name: str, budget: float,

@@ -119,11 +119,32 @@ class AutonomySupervisorWorker:
                     continue
 
                 if plan.action == "tool":
+                    # An ORDERED plan. If step B fails, step C must not run: the
+                    # loop used to execute every call regardless and then mark the
+                    # task `tools_done`, so a plan whose second step failed was
+                    # reported as finished and its third step ran on a
+                    # precondition that never held.
                     tool_results: list[dict[str, object]] = []
+                    blocked: dict[str, object] | None = None
                     for tc in plan.tool_calls:
                         call = ToolCall(name=tc.tool, args=tc.args)
                         res = await self._router.execute(call, timeout_s=30.0, retries=1)
                         tool_results.append({"tool": call.name, "ok": res.ok, "error": res.error, "result": res.result})
+                        if not res.ok:
+                            blocked = {"tool": call.name,
+                                       "error": res.error or "tool reported failure"}
+                            break
+
+                    if blocked is not None:
+                        remaining = [tc.tool for tc in plan.tool_calls][len(tool_results):]
+                        await self._memory.mark_task_done(
+                            task_id=task_id,
+                            result={"status": "tools_blocked", "tools": tool_results,
+                                    "failed_tool": blocked["tool"],
+                                    "error": blocked["error"],
+                                    "not_attempted": remaining, **result_payload})
+                        continue
+
                     await self._memory.mark_task_done(task_id=task_id, result={"status": "tools_done", "tools": tool_results, **result_payload})
                     continue
 
