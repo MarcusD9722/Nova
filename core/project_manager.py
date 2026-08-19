@@ -113,8 +113,18 @@ class ProjectManager:
         files, size = self._measure(proj)
         trash = self._trash_dir()
         trash.mkdir(parents=True, exist_ok=True)
+        # The trash id is timestamped to the SECOND, so deleting the same project
+        # twice within one second collided. `shutil.move` onto an existing
+        # directory does not fail cleanly — it moves the source INSIDE it — so the
+        # entry became `p4--<ts>/p4` and a later restore would have brought back a
+        # nested wreck. Found by seeded sequence fuzzing (seed 7, step 38), which
+        # is exactly the interleaving nobody writes by hand.
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         target = trash / f"{proj.name}--{stamp}"
+        suffix = 2
+        while target.exists():
+            target = trash / f"{proj.name}--{stamp}-{suffix}"
+            suffix += 1
         shutil.move(str(proj), str(target))
         return {
             "project": proj.name, "moved_to_trash": target.name,

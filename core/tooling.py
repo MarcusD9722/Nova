@@ -1263,6 +1263,25 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         descriptions.update(plugin_descriptions)
 
     router = ToolRouter(tools, descriptions=descriptions)
+
+    # RETRY SAFETY. The router refuses to re-invoke a tool automatically unless it
+    # is declared safe, because a timeout says a call did not FINISH — never that
+    # it did not happen. `agent_supervisor` and `autonomy_supervisor` run
+    # arbitrary tools with `retries=1`, so without this a timed-out
+    # `project.delete`, `code.write` or `shell.exec` was simply run a second time.
+    #
+    # Only READ-ONLY tools go on this list. Anything that writes a file, spends
+    # money, sends something, or changes memory is deliberately absent: losing one
+    # flaky read costs a retry, and repeating one write can cost the work.
+    for _read_only in (
+        "memory.recall", "memory.recall_person", "memory.related", "memory.path",
+        "memory.timeline", "code.read", "self.read_code", "self.list_code",
+        "project.status", "project.trash", "plan.status", "research.list",
+        "research.findings", "experiment.list", "experiment.analyze",
+        "agents.roster", "agent.recall", "executive.brief", "skill.detect",
+    ):
+        if _read_only in tools:
+            router.set_retry_safe(_read_only, True)
     # Expose the shared self-editing surface so the /dev/* endpoints operate on
     # the same proposal store Nova writes to via self.propose_change.
     router.dev_mode = dev_mode  # type: ignore[attr-defined]
