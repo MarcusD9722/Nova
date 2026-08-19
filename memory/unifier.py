@@ -2442,11 +2442,20 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="fired")
 
-    async def cancel_reminder(self, *, reminder_id: str) -> None:
+    async def cancel_reminder(self, *, reminder_id: str) -> bool:
+        """True if a real reminder was cancelled.
+
+        It used to return None either way and publish `reminder.cancelled`
+        regardless, so an unknown id produced a cancellation event for a
+        reminder that never existed and `DELETE /reminders/<anything>` answered
+        `{"status": "cancelled"}`.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="cancelled")
-        BUS.publish("reminder.cancelled", {"reminder_id": reminder_id})
+            changed = await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="cancelled")
+        if changed:
+            BUS.publish("reminder.cancelled", {"reminder_id": reminder_id})
+        return changed
 
     # --- Local file / photo recall (indexed documents) ----------------------
 
@@ -3235,10 +3244,11 @@ class MemoryUnifier:
             )
         return gid
 
-    async def update_goal_status(self, *, goal_id: UUID, status: str) -> None:
+    async def update_goal_status(self, *, goal_id: UUID, status: str) -> bool:
+        """True if the goal existed and changed status. See the backend method."""
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.update_goal_status(goal_id=goal_id, status=status)
+            return await self._sqlite.update_goal_status(goal_id=goal_id, status=status)
 
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()

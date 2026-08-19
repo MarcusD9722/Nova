@@ -125,18 +125,38 @@ async def goals_list(project: str | None = Query(None), limit: int = Query(50)) 
     return {"goals": await STATE.memory.list_goals(project_name=project, limit=int(limit))}
 
 
+def _goal_uuid(goal_id: str) -> UUID:
+    """The path parameter as a UUID, or an honest 422.
+
+    `UUID(goal_id)` sat unguarded in the cancel and resume routes, so any id
+    that was not a UUID — a stale link, a typo, anything at all — raised
+    ValueError inside the handler and the client got `500 Internal Server
+    Error`. Malformed input is the client's mistake to see, not a server fault
+    to hide.
+    """
+    try:
+        return UUID(str(goal_id))
+    except (AttributeError, TypeError, ValueError):
+        raise HTTPException(status_code=422, detail=f"Not a goal id: {goal_id}") from None
+
+
 @router.get("/goals/{goal_id}/tasks")
 async def goals_tasks(goal_id: str, limit: int = Query(50)) -> dict:
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    return {"goal_id": goal_id, "tasks": await STATE.memory.list_goal_tasks(goal_id=goal_id, limit=int(limit))}
+    gid = _goal_uuid(goal_id)
+    return {"goal_id": goal_id, "tasks": await STATE.memory.list_goal_tasks(goal_id=str(gid), limit=int(limit))}
 
 
 @router.post("/goals/{goal_id}/cancel")
 async def goals_cancel(goal_id: str) -> dict:
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    await STATE.memory.update_goal_status(goal_id=UUID(goal_id), status="cancelled")
+    # A goal that does not exist was answered `{"status": "cancelled"}` — a
+    # report of work that never happened, which is the one thing Nova's status
+    # replies must never be.
+    if not await STATE.memory.update_goal_status(goal_id=_goal_uuid(goal_id), status="cancelled"):
+        raise HTTPException(status_code=404, detail=f"No such goal: {goal_id}")
     return {"goal_id": goal_id, "status": "cancelled"}
 
 
@@ -144,6 +164,11 @@ async def goals_cancel(goal_id: str) -> dict:
 async def goals_resume(goal_id: str, project: str = Query("general")) -> dict:
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    await STATE.memory.update_goal_status(goal_id=UUID(goal_id), status="active")
-    await STATE.memory.enqueue_goal_task(goal_id=UUID(goal_id), project_name=project, tool_name="__decide__", args={})
+    gid = _goal_uuid(goal_id)
+    # Worse than a false "active": resuming an unknown goal ENQUEUED a
+    # `__decide__` task against it, so the supervisor picked up work for a goal
+    # that does not exist. Nothing is enqueued unless a real goal moved.
+    if not await STATE.memory.update_goal_status(goal_id=gid, status="active"):
+        raise HTTPException(status_code=404, detail=f"No such goal: {goal_id}")
+    await STATE.memory.enqueue_goal_task(goal_id=gid, project_name=project, tool_name="__decide__", args={})
     return {"goal_id": goal_id, "status": "active"}

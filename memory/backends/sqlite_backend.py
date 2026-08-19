@@ -13,6 +13,11 @@ from memory.episodic_schema import EPISODIC_DDL, EPISODIC_MIGRATION
 
 
 class SQLiteMemoryBackend:
+    #: How many candidate rows a claimer will try before giving up for this tick.
+    #: A claim can legitimately lose the race to another worker; it should then
+    #: look at the next runnable task rather than return "queue empty".
+    _CLAIM_ATTEMPTS = 8
+
     def __init__(self, db_path: Path):
         self._db_path = db_path
         self._init_lock = asyncio.Lock()
@@ -615,30 +620,40 @@ class SQLiteMemoryBackend:
             await db.commit()
 
     async def claim_next_autonomy_task(self) -> dict[str, Any] | None:
+        """Claim one background task. See claim_next_task: same defect, same fix.
+
+        Measured before the fix: 17 claims over 10 queued tasks. A duplicated
+        claim here runs a whole planner tool plan twice.
+        """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            cur = await db.execute(
-                "SELECT task_id, conversation_id, project_name, title, details, priority, attempts, initiated_by_user FROM autonomy_tasks WHERE status='queued' AND run_after <= ? ORDER BY priority ASC, updated_at ASC LIMIT 1",
-                (now,),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            task_id = str(row[0])
-            await db.execute("UPDATE autonomy_tasks SET status='running', updated_at=? WHERE task_id=?", (now, task_id))
-            await db.commit()
-
-        return {
-            "task_id": row[0],
-            "conversation_id": row[1],
-            "project_name": row[2],
-            "title": row[3],
-            "details": row[4],
-            "priority": row[5],
-            "attempts": row[6],
-            "initiated_by_user": bool(int(row[7] or 0)),
-        }
+            for _ in range(self._CLAIM_ATTEMPTS):
+                cur = await db.execute(
+                    "SELECT task_id, conversation_id, project_name, title, details, priority, attempts, initiated_by_user FROM autonomy_tasks WHERE status='queued' AND run_after <= ? ORDER BY priority ASC, updated_at ASC LIMIT 1",
+                    (now,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                claimed = await db.execute(
+                    "UPDATE autonomy_tasks SET status='running', updated_at=? WHERE task_id=? AND status='queued'",
+                    (now, str(row[0])),
+                )
+                await db.commit()
+                if claimed.rowcount != 1:
+                    continue
+                return {
+                    "task_id": row[0],
+                    "conversation_id": row[1],
+                    "project_name": row[2],
+                    "title": row[3],
+                    "details": row[4],
+                    "priority": row[5],
+                    "attempts": row[6],
+                    "initiated_by_user": bool(int(row[7] or 0)),
+                }
+        return None
 
     async def complete_autonomy_task(
         self,
@@ -1259,15 +1274,17 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def set_reminder_status(self, *, reminder_id: str, status: str) -> None:
+    async def set_reminder_status(self, *, reminder_id: str, status: str) -> bool:
+        """True if a reminder actually changed status; False if there is none."""
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
+            cur = await db.execute(
                 "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
                 (status, now, reminder_id),
             )
             await db.commit()
+            return cur.rowcount == 1
 
     # --- Local file / photo recall (indexed documents) -------------------------
 
@@ -1499,12 +1516,19 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def update_goal_status(self, *, goal_id: UUID, status: str) -> None:
+    async def update_goal_status(self, *, goal_id: UUID, status: str) -> bool:
+        """True if a goal actually changed status; False if there is no such goal.
+
+        The caller needs to know. `POST /goals/<unknown-uuid>/cancel` used to
+        answer `{"status": "cancelled"}` for a goal that does not exist, and the
+        resume route went on to enqueue a `__decide__` task against it.
+        """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute("UPDATE goals SET status=?, updated_at=? WHERE goal_id=?", (status, now, str(goal_id)))
+            cur = await db.execute("UPDATE goals SET status=?, updated_at=? WHERE goal_id=?", (status, now, str(goal_id)))
             await db.commit()
+            return cur.rowcount == 1
 
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
@@ -1571,21 +1595,40 @@ class SQLiteMemoryBackend:
             await db.commit()
 
     async def claim_next_task(self) -> dict[str, Any] | None:
+        """Claim one runnable goal task. Never hands the same row to two callers.
+
+        This used to SELECT the next row and then UPDATE it in two separate
+        statements — "atomically-ish (SQLite single writer)", which is not a
+        thing. Every claimer opens its OWN connection, so each statement is its
+        own transaction and two claimers simply selected the same row: measured
+        19 claims over 10 queued tasks. Both would then run the same tool plan,
+        which is precisely the delete-twice / write-twice / spend-twice hazard
+        the router's retry guard exists to prevent, one layer further down.
+
+        The UPDATE now carries the state it expects, so the row is claimed by
+        exactly one caller and everyone else moves on to the next candidate.
+        """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            # Claim a single runnable task atomically-ish (SQLite single writer).
-            cur = await db.execute(
-                "SELECT task_id, goal_id, project_name, tool_name, args_json, attempts FROM tasks WHERE status='queued' AND run_after <= ? ORDER BY updated_at ASC LIMIT 1",
-                (now,),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            task_id = row[0]
-            await db.execute("UPDATE tasks SET status='running', updated_at=? WHERE task_id=?", (now, task_id))
-            await db.commit()
-        return dict(task_id=row[0], goal_id=row[1], project_name=row[2], tool_name=row[3], args_json=row[4], attempts=row[5])
+            for _ in range(self._CLAIM_ATTEMPTS):
+                cur = await db.execute(
+                    "SELECT task_id, goal_id, project_name, tool_name, args_json, attempts FROM tasks WHERE status='queued' AND run_after <= ? ORDER BY updated_at ASC LIMIT 1",
+                    (now,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                claimed = await db.execute(
+                    "UPDATE tasks SET status='running', updated_at=? WHERE task_id=? AND status='queued'",
+                    (now, row[0]),
+                )
+                await db.commit()
+                if claimed.rowcount == 1:
+                    return dict(task_id=row[0], goal_id=row[1], project_name=row[2], tool_name=row[3], args_json=row[4], attempts=row[5])
+                # Someone else took it between the SELECT and the UPDATE. The
+                # next iteration reads whatever is genuinely still queued.
+        return None
 
     async def complete_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
         await self.initialize()
