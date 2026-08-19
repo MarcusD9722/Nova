@@ -73,13 +73,15 @@ class AgentSupervisor:
     def _iso(self, dt: datetime) -> str:
         return dt.isoformat()
 
-    async def _enqueue_decide(self, *, goal_id: UUID, project_name: str) -> None:
-        await self._memory.enqueue_goal_task(
+    async def _enqueue_decide(self, *, goal_id: UUID, project_name: str) -> bool:
+        """Queue the next decision. False if the goal no longer accepts work."""
+        queued = await self._memory.enqueue_goal_task(
             goal_id=goal_id,
             project_name=project_name,
             tool_name="__decide__",
             args={},
         )
+        return queued is not None
 
     async def _decide_next(self, *, goal_id: str, project_name: str) -> dict[str, Any]:
         """
@@ -206,11 +208,22 @@ Return JSON only.
                         name = str(decision.get("name", "")).strip()
                         if not name:
                             raise ValueError("Decision missing tool name")
-                        await self._memory.enqueue_goal_task(goal_id=UUID(goal_id), project_name=project_name, tool_name=name, args=decision.get("args") or {})
+                        queued = await self._memory.enqueue_goal_task(goal_id=UUID(goal_id), project_name=project_name, tool_name=name, args=decision.get("args") or {})
                         # enqueue next decision step
                         await self._enqueue_decide(goal_id=UUID(goal_id), project_name=project_name)
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"decision": decision})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="plan", message=f"Next: {name}")
+                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"decision": decision, "scheduled": queued is not None})
+                        if queued is None:
+                            # The goal was cancelled or completed while this step
+                            # was in flight, so nothing was scheduled. Saying
+                            # "Next: <tool>" here would report a plan that does
+                            # not exist.
+                            await self._memory.add_progress_event(
+                                goal_id=UUID(goal_id), project_name=project_name,
+                                kind="blocked",
+                                message=f"{name} was NOT scheduled: the goal is no "
+                                        f"longer accepting work.")
+                        else:
+                            await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="plan", message=f"Next: {name}")
                         continue
 
                     if t == "question":
@@ -255,12 +268,27 @@ Return JSON only.
                     # once, failed, and was requeued to run again later — the same
                     # invariant broken one layer up. Requeue only what the router
                     # says is safe to re-invoke.
-                    if not self._router.is_retry_safe(tool_name):
+                    #
+                    # And only when the failure is TRANSIENT. A tool that
+                    # answers `{"ok": false, "error": "missing_query"}` has
+                    # decided; running the identical refused request again can
+                    # only be refused again. Measured before this check: a
+                    # retry-safe tool returning `missing_query` was invoked 116
+                    # times for one goal, every task carrying attempts=2. The
+                    # structured payload is what distinguishes the two cases —
+                    # no string matching on the error text.
+                    refused = (result is not None
+                               and isinstance(result.result, dict)
+                               and result.result.get("ok") is False)
+                    if refused or not self._router.is_retry_safe(tool_name):
+                        why = ("it reported a refusal, so re-running the same "
+                               "request would only be refused again"
+                               if refused else
+                               f"'{tool_name}' may have side effects, so it is "
+                               f"never re-run automatically")
                         await self._memory.complete_goal_task(
                             task_id=task_id, status="failed", result={},
-                            error=f"{failure} (not retried: '{tool_name}' may have "
-                                  f"side effects, so it is never re-run "
-                                  f"automatically)")
+                            error=f"{failure} (not retried: {why})")
                         await self._memory.add_progress_event(
                             goal_id=UUID(goal_id), project_name=project_name,
                             kind="blocked",
