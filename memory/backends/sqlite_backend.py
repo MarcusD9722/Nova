@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import aiosqlite
 
@@ -1530,6 +1530,128 @@ class SQLiteMemoryBackend:
             await db.commit()
             return cur.rowcount == 1
 
+    async def get_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """One goal, or None. The stored row is the authority on its project."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at FROM goals WHERE goal_id=?",
+                (str(goal_id),),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return {
+            "goal_id": row[0], "project_name": row[1], "title": row[2],
+            "objective": row[3], "success_criteria": row[4], "status": row[5],
+            "priority": row[6], "created_at": row[7], "updated_at": row[8],
+        }
+
+    async def cancel_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """Cancel a goal AND stop the work it had queued. None if no such goal.
+
+        Cancelling used to set `goals.status` and nothing else, so every task
+        already queued for that goal stayed runnable. Stopping the queued rows
+        here and refusing to claim a non-active goal's tasks (see
+        claim_next_task) are two halves of the same invariant: after this
+        returns, no NEW work for the goal can start.
+
+        What it does NOT claim: a task already claimed and mid-flight cannot be
+        un-executed. That count is reported rather than hidden.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("SELECT project_name, status FROM goals WHERE goal_id=?",
+                                   (str(goal_id),))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            project_name, previous = str(row[0]), str(row[1])
+            await db.execute(
+                "UPDATE goals SET status='cancelled', updated_at=? WHERE goal_id=?",
+                (now, str(goal_id)),
+            )
+            stopped = await db.execute(
+                "UPDATE tasks SET status='cancelled', last_error='goal cancelled', updated_at=? "
+                "WHERE goal_id=? AND status='queued'",
+                (now, str(goal_id)),
+            )
+            cancelled_tasks = int(stopped.rowcount or 0)
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE goal_id=? AND status='running'",
+                (str(goal_id),),
+            )
+            running = int((await cur.fetchone())[0] or 0)
+            await db.commit()
+        return {
+            "goal_id": str(goal_id), "project_name": project_name,
+            "previous_status": previous, "status": "cancelled",
+            "cancelled_tasks": cancelled_tasks, "already_running": running,
+        }
+
+    async def resume_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """Make a goal active with AT MOST ONE runnable continuation. None if absent.
+
+        Two defects in one place. Resume used to enqueue a `__decide__`
+        unconditionally, so three resumes produced three independent
+        continuations (and eight concurrent ones produced eight — different
+        rows, so the duplicate-claim fix does not touch it). And it took the
+        project from a `?project=` query parameter defaulting to "general", so
+        a goal created under "alpha" resumed into "general".
+
+        Both are fixed by the same single statement: the INSERT selects the
+        project FROM the goals row and only fires when no runnable continuation
+        exists. One statement is one implicit transaction in SQLite, so
+        concurrent callers serialise on the write lock and the second sees the
+        first's row.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            activated = await db.execute(
+                "UPDATE goals SET status='active', updated_at=? WHERE goal_id=?",
+                (now, str(goal_id)),
+            )
+            if int(activated.rowcount or 0) != 1:
+                await db.rollback()
+                return None
+            created = await db.execute(
+                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, "
+                "status, attempts, run_after, last_error, result_json, created_at, updated_at) "
+                "SELECT ?, g.goal_id, g.project_name, '__decide__', '{}', 'queued', 0, ?, '', '{}', ?, ? "
+                "FROM goals g WHERE g.goal_id = ? AND NOT EXISTS ("
+                "  SELECT 1 FROM tasks t WHERE t.goal_id = g.goal_id "
+                "  AND t.tool_name = '__decide__' AND t.status IN ('queued', 'running'))",
+                (str(uuid4()), now, now, now, str(goal_id)),
+            )
+            enqueued = int(created.rowcount or 0) == 1
+            existing = None
+            if not enqueued:
+                # Say WHICH continuation already exists. `queued` means a
+                # supervisor will pick it up; `running` means one already has
+                # it — and if that claimer died, the goal has no runnable step
+                # until boot recovery releases the row
+                # (cancel_pending_background_work). Reporting only "not
+                # enqueued" would make those two states look identical to the
+                # caller.
+                cur = await db.execute(
+                    "SELECT status FROM tasks WHERE goal_id=? AND tool_name='__decide__' "
+                    "AND status IN ('queued', 'running') ORDER BY updated_at ASC LIMIT 1",
+                    (str(goal_id),),
+                )
+                found = await cur.fetchone()
+                existing = str(found[0]) if found else None
+            cur = await db.execute("SELECT project_name FROM goals WHERE goal_id=?",
+                                   (str(goal_id),))
+            project_name = str((await cur.fetchone())[0])
+            await db.commit()
+        return {
+            "goal_id": str(goal_id), "project_name": project_name,
+            "status": "active", "continuation_enqueued": enqueued,
+            "existing_continuation": existing,
+        }
+
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
         q = "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at FROM goals"
@@ -1570,13 +1692,30 @@ class SQLiteMemoryBackend:
         status: str = "queued",
         attempts: int = 0,
         run_after_iso: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Queue one goal task. False if the goal is no longer accepting work.
+
+        Found by the seeded fuzz (seeds 13, 99, 31337) after the cancel fix: a
+        goal could be CANCELLED and then still be given new work. Nothing ran —
+        the claim refuses a non-active goal — but the row sat there runnable,
+        and resuming the goal later would have executed a step planned before
+        the user cancelled it. In production the window is real: the supervisor
+        claims a step, the user cancels mid-flight, and the supervisor then
+        enqueues the next one.
+
+        The INSERT carries the condition so there is no check-then-act gap. A
+        task whose goal row does not exist at all is inserted exactly as before
+        — this narrows one state, it does not add a foreign key.
+        """
         await self.initialize()
         now = self._now_iso()
         run_after = run_after_iso or now
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, status, attempts, run_after, last_error, result_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            cur = await db.execute(
+                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, status, attempts, run_after, last_error, result_json, created_at, updated_at) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+                "WHERE NOT EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = ? "
+                "                  AND g.status IN ('cancelled', 'completed'))",
                 (
                     str(task_id),
                     str(goal_id),
@@ -1590,9 +1729,11 @@ class SQLiteMemoryBackend:
                     "{}",
                     now,
                     now,
+                    str(goal_id),
                 ),
             )
             await db.commit()
+            return int(cur.rowcount or 0) == 1
 
     async def claim_next_task(self) -> dict[str, Any] | None:
         """Claim one runnable goal task. Never hands the same row to two callers.
@@ -1613,7 +1754,19 @@ class SQLiteMemoryBackend:
         async with aiosqlite.connect(self._db_path) as db:
             for _ in range(self._CLAIM_ATTEMPTS):
                 cur = await db.execute(
-                    "SELECT task_id, goal_id, project_name, tool_name, args_json, attempts FROM tasks WHERE status='queued' AND run_after <= ? ORDER BY updated_at ASC LIMIT 1",
+                    # The parent goal's state is part of what makes a task
+                    # runnable. Cancelling a goal used to change only the goals
+                    # row, so its queued tasks stayed claimable and the
+                    # supervisor went on executing a goal the user had
+                    # cancelled — measured: 3 tool calls after cancellation,
+                    # and the goal's own status then overwritten to 'paused'.
+                    # A LEFT JOIN so a task whose goal row is missing behaves
+                    # exactly as it did before rather than becoming unclaimable.
+                    "SELECT t.task_id, t.goal_id, t.project_name, t.tool_name, t.args_json, t.attempts "
+                    "FROM tasks t LEFT JOIN goals g ON g.goal_id = t.goal_id "
+                    "WHERE t.status='queued' AND t.run_after <= ? "
+                    "AND (g.goal_id IS NULL OR g.status='active') "
+                    "ORDER BY t.updated_at ASC LIMIT 1",
                     (now,),
                 )
                 row = await cur.fetchone()

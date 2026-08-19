@@ -150,25 +150,63 @@ async def goals_tasks(goal_id: str, limit: int = Query(50)) -> dict:
 
 @router.post("/goals/{goal_id}/cancel")
 async def goals_cancel(goal_id: str) -> dict:
+    """Cancel a goal and stop the work it had queued.
+
+    The transition belongs to the store, not to this route: cancelling used to
+    set `goals.status` here and leave every queued task runnable, so the
+    supervisor kept executing a goal the user had cancelled. Route-level
+    check-then-act cannot fix that — a claimer racing between two statements
+    would still win — so `cancel_goal` owns existence, the status change and
+    the queued rows together, and the claim itself refuses a non-active goal.
+    """
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
     # A goal that does not exist was answered `{"status": "cancelled"}` — a
     # report of work that never happened, which is the one thing Nova's status
     # replies must never be.
-    if not await STATE.memory.update_goal_status(goal_id=_goal_uuid(goal_id), status="cancelled"):
+    out = await STATE.memory.cancel_goal(goal_id=_goal_uuid(goal_id))
+    if out is None:
         raise HTTPException(status_code=404, detail=f"No such goal: {goal_id}")
-    return {"goal_id": goal_id, "status": "cancelled"}
+    # `already_running` is reported, not hidden: a tool call already in flight
+    # cannot be un-executed, and saying otherwise would be the same dishonesty
+    # this route was fixed for.
+    return {"goal_id": goal_id, "status": "cancelled",
+            "project": out["project_name"],
+            "cancelled_tasks": out["cancelled_tasks"],
+            "already_running": out["already_running"]}
 
 
 @router.post("/goals/{goal_id}/resume")
-async def goals_resume(goal_id: str, project: str = Query("general")) -> dict:
+async def goals_resume(goal_id: str, project: str | None = Query(None)) -> dict:
+    """Resume a goal — idempotently, and in the goal's OWN project.
+
+    `project` used to default to "general" and was used to enqueue the
+    continuation, so a goal created under "alpha" resumed into "general"
+    merely because the caller omitted the parameter. The stored goal row is
+    authoritative; the parameter now only gets to DISAGREE, and a disagreement
+    is an error rather than a silent change of ownership. Changing a goal's
+    project, if ever wanted, is a different operation with its own semantics.
+    """
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
     gid = _goal_uuid(goal_id)
+    goal = await STATE.memory.get_goal(goal_id=gid)
+    if goal is None:
+        raise HTTPException(status_code=404, detail=f"No such goal: {goal_id}")
+    if project is not None and project != goal["project_name"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Goal {goal_id} belongs to project "
+                    f"'{goal['project_name']}', not '{project}'. Resuming does "
+                    f"not move a goal between projects."))
     # Worse than a false "active": resuming an unknown goal ENQUEUED a
     # `__decide__` task against it, so the supervisor picked up work for a goal
-    # that does not exist. Nothing is enqueued unless a real goal moved.
-    if not await STATE.memory.update_goal_status(goal_id=gid, status="active"):
+    # that does not exist. And an unconditional enqueue meant three resumes
+    # produced three continuations. Both are the store's job now.
+    out = await STATE.memory.resume_goal(goal_id=gid)
+    if out is None:
         raise HTTPException(status_code=404, detail=f"No such goal: {goal_id}")
-    await STATE.memory.enqueue_goal_task(goal_id=gid, project_name=project, tool_name="__decide__", args={})
-    return {"goal_id": goal_id, "status": "active"}
+    return {"goal_id": goal_id, "status": "active",
+            "project": out["project_name"],
+            "continuation_enqueued": out["continuation_enqueued"],
+            "existing_continuation": out["existing_continuation"]}

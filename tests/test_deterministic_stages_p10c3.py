@@ -23,6 +23,7 @@ import random
 import sys
 import tempfile
 from pathlib import Path
+from uuid import UUID, uuid4
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -521,7 +522,9 @@ async def test_seeded_sequence_fuzzing():
     ACTIONS = ["create", "delete", "restore", "purge", "remember", "recall",
                "approve", "deny", "timeout", "tool_ok", "tool_fail",
                "tool_refuse", "tool_timeout", "chain", "list", "switch",
-               "enqueue", "work", "work_fail"]
+               "enqueue", "work", "work_fail",
+               "goal_create", "goal_cancel", "goal_resume",
+               "goal_resume_duplicate", "goal_enqueue", "goal_claim"]
 
     for seed in SEEDS:
         rng = random.Random(seed)
@@ -577,6 +580,7 @@ async def test_seeded_sequence_fuzzing():
 
             trash_entries: list[str] = []
             errors: list[str] = []
+            goal_ids: list[str] = []
             active: str | None = None
             #: what the fuzz BELIEVES about each task it drove, to compare
             #: against what memory actually recorded.
@@ -667,6 +671,50 @@ async def test_seeded_sequence_fuzzing():
                         await m.enqueue_task(title=f"task-{step}", details="d",
                                              priority=3, project_name="temp",
                                              initiated_by_user=True)
+                    elif action == "goal_create":
+                        proj = f"P{rng.randint(0, 4)}"
+                        g = await m.create_goal(project_name=proj,
+                                                title=f"g{step}", objective="o",
+                                                success_criteria="c")
+                        goal_ids.append(str(g))
+                        await m.enqueue_goal_task(goal_id=g, project_name=proj,
+                                                  tool_name="__decide__", args={})
+                    elif action == "goal_cancel":
+                        if goal_ids:
+                            await m.cancel_goal(
+                                goal_id=UUID(rng.choice(goal_ids)))
+                            performed["goal_cancel"] = performed.get("goal_cancel", 0) + 1
+                    elif action in ("goal_resume", "goal_resume_duplicate"):
+                        if goal_ids:
+                            g = UUID(rng.choice(goal_ids))
+                            await m.resume_goal(goal_id=g)
+                            performed["goal_resume"] = performed.get("goal_resume", 0) + 1
+                            if action == "goal_resume_duplicate":
+                                await m.resume_goal(goal_id=g)
+                                await m.resume_goal(goal_id=g)
+                    elif action == "goal_enqueue":
+                        if goal_ids:
+                            g = UUID(rng.choice(goal_ids))
+                            row = await m.get_goal(goal_id=g)
+                            if row:
+                                # Deliberately enqueue with the goal's OWN
+                                # project; nothing in Nova may write another.
+                                await m.enqueue_goal_task(
+                                    goal_id=g, project_name=row["project_name"],
+                                    tool_name="t.ok", args={})
+                    elif action == "goal_claim":
+                        claimed_task = await m.claim_next_goal_task()
+                        if claimed_task:
+                            performed["goal_claim"] = performed.get("goal_claim", 0) + 1
+                            row = await m.get_goal(
+                                goal_id=UUID(str(claimed_task["goal_id"])))
+                            if row and row["status"] != "active":
+                                errors.append(
+                                    f"step {step}: claimed work for a "
+                                    f"{row['status']} goal")
+                            await m.complete_goal_task(
+                                task_id=str(claimed_task["task_id"]),
+                                status="done", result={})
                     elif action in ("work", "work_fail"):
                         t = await m.claim_next_task()
                         if t:
@@ -705,6 +753,32 @@ async def test_seeded_sequence_fuzzing():
                 for entry in (projects / ".trash").iterdir() if (projects / ".trash").exists() else []:
                     if not entry.is_dir():
                         errors.append(f"step {step}: junk in trash: {entry.name}")
+
+                # ── GOAL LIFECYCLE INVARIANTS ──────────────────────────────
+                for raw_gid in goal_ids:
+                    goal = await m.get_goal(goal_id=UUID(raw_gid))
+                    if goal is None:
+                        errors.append(f"step {step}: goal {raw_gid[:8]} vanished")
+                        continue
+                    rows = await m.list_goal_tasks(goal_id=raw_gid, limit=100)
+                    runnable = [t for t in rows if t["status"] == "queued"]
+                    live_decides = [t for t in rows
+                                    if t["tool_name"] == "__decide__"
+                                    and t["status"] in ("queued", "running")]
+                    if goal["status"] == "cancelled" and runnable:
+                        errors.append(
+                            f"step {step}: cancelled goal {raw_gid[:8]} still has "
+                            f"{len(runnable)} runnable task(s)")
+                    if len(live_decides) > 1:
+                        errors.append(
+                            f"step {step}: goal {raw_gid[:8]} accumulated "
+                            f"{len(live_decides)} runnable continuations")
+                    wrong = [t for t in rows
+                             if t["project_name"] != goal["project_name"]]
+                    if wrong:
+                        errors.append(
+                            f"step {step}: {len(wrong)} task(s) of goal "
+                            f"{raw_gid[:8]} are not in {goal['project_name']!r}")
 
             # ── END OF SEED: the expensive checks ──────────────────────────
             # 1. Every trash entry is INDIVIDUALLY restorable — or honestly
@@ -750,7 +824,8 @@ async def test_seeded_sequence_fuzzing():
 
     # The fuzz has to have REACHED the states it claims to have cleared.
     required = ["delete", "restore", "purge", "chain_fail", "chain_ok",
-                "work", "work_failed", "tool_fail", "tool_refuse", "tool_timeout"]
+                "work", "work_failed", "tool_fail", "tool_refuse", "tool_timeout",
+                "goal_cancel", "goal_resume", "goal_claim"]
     missing = [k for k in required if performed.get(k, 0) < 1]
     check(not missing,
           f"the sequences actually reached every interesting state "
@@ -880,6 +955,581 @@ async def test_failed_delete_leaves_no_mislabelled_entry():
               f"({len(listed)} entries)")
         check(pm.restore_project(entry)["restored"] == long_name,
               "and it restores under that same exact name")
+
+
+async def test_supervisor_never_retries_a_refusal():
+    """BUG 10, in the stage suite: a refusal is final, an exception is not.
+
+    The router stopped retrying explicit refusals; AgentSupervisor kept its own
+    loop and saw only `ok is False` + `is_retry_safe(name)`. Measured with a
+    read-only tool answering `missing_query`: 116 invocations for one goal.
+    """
+    check.section("Stage 10: a refusal is final at the supervisor too")
+
+    from harness import ScriptedLLM
+
+    from core.agent_supervisor import AgentSupervisor, SupervisorConfig
+
+    async def run(tool_impl, retry_safe: bool) -> tuple[int, list[dict]]:
+        with _tmp() as td:
+            mem = MemoryUnifier(Path(td), enable_chroma=False)
+            await mem.initialize()
+            llm = ScriptedLLM()
+            step = {"n": 0}
+
+            def decide(_p: str) -> str:
+                step["n"] += 1
+                return ('{"type":"tool","name":"demo.t","args":{}}' if step["n"] == 1
+                        else '{"type":"final","message":"done"}')
+
+            llm.when(lambda _p: True, decide)
+            router = ToolRouter({"demo.t": tool_impl}, {"demo.t": "a tool"})
+            router.set_retry_safe("demo.t", retry_safe)
+            sup = AgentSupervisor(memory=mem, llm=llm, router=router,
+                                  tool_descriptions={"demo.t": "a tool"},
+                                  cfg=SupervisorConfig(tick_seconds=0.05,
+                                                       max_retries=3,
+                                                       max_steps_per_goal=6))
+            gid = await mem.create_goal(project_name="temp", title="t",
+                                        objective="o", success_criteria="c")
+            await mem.enqueue_goal_task(goal_id=gid, project_name="temp",
+                                        tool_name="__decide__", args={})
+            sup.start()
+            await asyncio.sleep(7.0)
+            await sup.stop()
+            rows = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+            return len([t for t in rows if t["tool_name"] == "demo.t"]), rows
+
+    calls = {"n": 0}
+
+    async def refuses(_args):
+        calls["n"] += 1
+        return {"ok": False, "error": "missing_query"}
+
+    n_tasks, rows = await run(refuses, retry_safe=True)
+    check(calls["n"] == 1,
+          f"a retry-safe tool's refusal is executed ONCE ({calls['n']}x)")
+    check(n_tasks == 1,
+          f"and produces exactly one task, never a requeue ({n_tasks})")
+    bad = [t for t in rows if t["tool_name"] == "demo.t"]
+    check(all(int(t.get("attempts") or 0) == 0 for t in bad),
+          f"with no attempt consumed ({[t.get('attempts') for t in bad]})")
+    check(all(t["status"] == "failed" for t in bad),
+          f"recorded as failed, not done ({[t['status'] for t in bad]})")
+
+    calls["n"] = 0
+
+    async def blips(_args):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("transient")
+        return {"ok": True}
+
+    n_tasks, rows = await run(blips, retry_safe=True)
+    check(calls["n"] >= 2,
+          f"but a transient EXCEPTION still retries ({calls['n']}x)")
+    ok = [t for t in rows if t["tool_name"] == "demo.t" and t["status"] == "done"]
+    check(bool(ok), f"and recovers ({[t['status'] for t in rows if t['tool_name'] == 'demo.t']})")
+
+    calls["n"] = 0
+
+    async def unsafe_boom(_args):
+        calls["n"] += 1
+        raise RuntimeError("side effect may have landed")
+
+    n_tasks, _ = await run(unsafe_boom, retry_safe=False)
+    check(calls["n"] == 1,
+          f"an UNSAFE tool's exception is still never retried ({calls['n']}x)")
+
+
+# ══ ROUND 3: THE GOAL LIFECYCLE ═════════════════════════════════════════════
+async def _goal_app():
+    """The real autonomy router over a real MemoryUnifier, no HTTP server."""
+    import httpx
+    from fastapi import FastAPI
+
+    from backend.state import STATE
+    from backend.routers import autonomy
+
+    app = FastAPI()
+    app.include_router(autonomy.router)
+    return app, httpx.ASGITransport(app=app), STATE
+
+
+async def test_cancelled_goal_starts_no_new_work():
+    """BUG 11A: a CANCELLED goal kept executing.
+
+    Cancel changed `goals.status` and nothing else. Its queued tasks stayed
+    `queued`, and the claim looked only at the task row — so the supervisor
+    went on running a goal the user had cancelled. Measured: 3 tool calls after
+    cancellation, and the supervisor then overwrote the goal's own status with
+    `paused`, so even the cancellation did not survive.
+    """
+    check.section("Stage 9: a cancelled goal starts no new work")
+
+    from harness import ScriptedLLM
+
+    from core.agent_supervisor import AgentSupervisor, SupervisorConfig
+
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        llm = ScriptedLLM()
+        llm.default_reply = '{"type":"tool","name":"demo.act","args":{}}'
+        acts = {"n": 0}
+
+        async def act(_args):
+            acts["n"] += 1
+            return {"ok": True}
+
+        router = ToolRouter({"demo.act": act}, {"demo.act": "acts"})
+        sup = AgentSupervisor(memory=mem, llm=llm, router=router,
+                              tool_descriptions={"demo.act": "acts"},
+                              cfg=SupervisorConfig(tick_seconds=0.05, max_retries=1,
+                                                   max_steps_per_goal=6))
+        gid = await mem.create_goal(project_name="alpha", title="t", objective="o",
+                                    success_criteria="c")
+        # Several queued steps, cancelled before the supervisor ever runs.
+        for name in ("__decide__", "demo.act", "demo.act"):
+            await mem.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                        tool_name=name, args={})
+        out = await mem.cancel_goal(goal_id=gid)
+        check(out is not None and out["cancelled_tasks"] == 3,
+              f"cancel stops every queued task ({out and out['cancelled_tasks']})")
+        check(out["already_running"] == 0,
+              f"and reports nothing was mid-flight ({out['already_running']})")
+
+        sup.start()
+        await asyncio.sleep(3.0)
+        await sup.stop()
+
+        check(acts["n"] == 0, f"NOTHING executed after cancellation ({acts['n']})")
+        check(len(llm.prompts) == 0,
+              f"the planner was never even consulted ({len(llm.prompts)} calls)")
+        goals = await mem.list_goals(project_name="alpha")
+        g = next(x for x in goals if x["goal_id"] == str(gid))
+        check(g["status"] == "cancelled",
+              f"the goal is still cancelled afterwards ({g['status']})")
+        tasks = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+        check(len(tasks) == 3 and all(t["status"] == "cancelled" for t in tasks),
+              f"no new task was spawned and none ran "
+              f"({[(t['tool_name'], t['status']) for t in tasks]})")
+        check(await mem.claim_next_goal_task() is None,
+              "and nothing is claimable")
+
+        # Cancelling twice is honest about having nothing left to stop.
+        again = await mem.cancel_goal(goal_id=gid)
+        check(again is not None and again["cancelled_tasks"] == 0,
+              f"a second cancel stops 0 more ({again and again['cancelled_tasks']})")
+        check(await mem.cancel_goal(goal_id=uuid4()) is None,
+              "and cancelling a goal that does not exist says so")
+
+
+async def test_cancel_races_the_claim():
+    """Either the claim wins ONE task, or the cancel does — never more."""
+    check.section("Stage 9: cancel racing the claim")
+
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        gid = await mem.create_goal(project_name="alpha", title="t", objective="o",
+                                    success_criteria="c")
+        for _ in range(4):
+            await mem.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                        tool_name="demo.act", args={})
+        barrier = asyncio.Barrier(2)
+        claimed: list[dict | None] = []
+
+        async def claimer():
+            await barrier.wait()
+            claimed.append(await mem.claim_next_goal_task())
+
+        async def canceller():
+            await barrier.wait()
+            await mem.cancel_goal(goal_id=gid)
+
+        await asyncio.gather(claimer(), canceller())
+
+        got = [c for c in claimed if c]
+        check(len(got) <= 1,
+              f"at most ONE task was claimed in the race ({len(got)})")
+        # Whoever won, nothing further may start.
+        check(await mem.claim_next_goal_task() is None,
+              "and no further task is claimable after the cancel")
+        tasks = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+        started = [t for t in tasks if t["status"] == "running"]
+        check(len(started) == len(got),
+              f"the record matches what actually started "
+              f"({len(started)} running, {len(got)} claimed)")
+        # An already-running task is NOT pretended to be undone.
+        goals = await mem.list_goals(project_name="alpha")
+        g = next(x for x in goals if x["goal_id"] == str(gid))
+        check(g["status"] == "cancelled", f"the goal is cancelled ({g['status']})")
+
+
+async def test_resume_is_idempotent_and_keeps_its_project():
+    """BUG 11B + 11C, over real HTTP."""
+    check.section("Stage 7: resume is idempotent and project-authoritative")
+
+    import httpx
+
+    app, transport, STATE = await _goal_app()
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        saved = STATE.memory
+        STATE.memory = mem
+        try:
+            async with httpx.AsyncClient(transport=transport,
+                                         base_url="http://t") as client:
+                async def runnable(gid):
+                    rows = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+                    return [t for t in rows
+                            if t["tool_name"] == "__decide__"
+                            and t["status"] in ("queued", "running")]
+
+                # ── sequential duplicates ───────────────────────────────────
+                gid = await mem.create_goal(project_name="alpha", title="t",
+                                            objective="o", success_criteria="c")
+                await mem.update_goal_status(goal_id=gid, status="paused")
+                codes = []
+                for _ in range(3):
+                    r = await client.post(f"/goals/{gid}/resume")
+                    codes.append(r.status_code)
+                check(codes == [200, 200, 200], f"three resumes all answer 200 ({codes})")
+                live = await runnable(gid)
+                check(len(live) == 1,
+                      f"but leave exactly ONE runnable continuation ({len(live)})")
+                check(live[0]["project_name"] == "alpha",
+                      f"in the goal's OWN project ({live[0]['project_name']})")
+
+                # ── concurrent duplicates ──────────────────────────────────
+                gid2 = await mem.create_goal(project_name="alpha", title="t2",
+                                             objective="o", success_criteria="c")
+                await mem.update_goal_status(goal_id=gid2, status="paused")
+                results = await asyncio.gather(
+                    *[client.post(f"/goals/{gid2}/resume") for _ in range(8)])
+                check(all(r.status_code == 200 for r in results),
+                      f"8 concurrent resumes all answer 200 "
+                      f"({sorted({r.status_code for r in results})})")
+                created = [r for r in results
+                           if r.json().get("continuation_enqueued") is True]
+                check(len(created) == 1,
+                      f"exactly one of them reports that it created the "
+                      f"continuation ({len(created)})")
+                live2 = await runnable(gid2)
+                check(len(live2) == 1,
+                      f"and exactly one runnable __decide__ exists ({len(live2)})")
+                rows2 = await mem.list_goal_tasks(goal_id=str(gid2), limit=50)
+                ids = [t["task_id"] for t in rows2]
+                check(len(ids) == len(set(ids)) == 1,
+                      f"with no duplicate task identities ({len(ids)} rows)")
+
+                # ── project authority ──────────────────────────────────────
+                gid3 = await mem.create_goal(project_name="alpha", title="t3",
+                                             objective="o", success_criteria="c")
+                await mem.update_goal_status(goal_id=gid3, status="paused")
+                r = await client.post(f"/goals/{gid3}/resume",
+                                      params={"project": "beta"})
+                check(r.status_code == 409,
+                      f"resuming into a DIFFERENT project is refused ({r.status_code})")
+                rows3 = await mem.list_goal_tasks(goal_id=str(gid3), limit=50)
+                check(not rows3, f"and enqueues nothing at all ({len(rows3)} tasks)")
+                r = await client.post(f"/goals/{gid3}/resume",
+                                      params={"project": "alpha"})
+                check(r.status_code == 200,
+                      f"naming the goal's real project is fine ({r.status_code})")
+                rows3 = await mem.list_goal_tasks(goal_id=str(gid3), limit=50)
+                check({t["project_name"] for t in rows3} == {"alpha"},
+                      f"and the work lands in alpha "
+                      f"({sorted({t['project_name'] for t in rows3})})")
+
+                # ── cancel over the wire, with queued work ─────────────────
+                gid4 = await mem.create_goal(project_name="alpha", title="t4",
+                                             objective="o", success_criteria="c")
+                for name in ("__decide__", "demo.act"):
+                    await mem.enqueue_goal_task(goal_id=gid4, project_name="alpha",
+                                                tool_name=name, args={})
+                r = await client.post(f"/goals/{gid4}/cancel")
+                body = r.json()
+                check(r.status_code == 200 and body["cancelled_tasks"] == 2,
+                      f"cancel reports the work it stopped ({body})")
+                check(body["already_running"] == 0,
+                      f"and that nothing was mid-flight ({body['already_running']})")
+                rows4 = await mem.list_goal_tasks(goal_id=str(gid4), limit=50)
+                check(all(t["status"] == "cancelled" for t in rows4),
+                      f"the state matches the response "
+                      f"({[t['status'] for t in rows4]})")
+                r = await client.post(f"/goals/{gid4}/cancel")
+                check(r.status_code == 200 and r.json()["cancelled_tasks"] == 0,
+                      f"a repeat cancel stops nothing more ({r.json()})")
+
+                # ── resuming a cancelled goal is allowed and singular ──────
+                r = await client.post(f"/goals/{gid4}/resume")
+                check(r.status_code == 200 and r.json()["continuation_enqueued"] is True,
+                      f"a cancelled goal can be resumed deliberately ({r.json()})")
+                check(len(await runnable(gid4)) == 1,
+                      "with exactly one continuation")
+
+                # ── the absent and the malformed ───────────────────────────
+                missing = "00000000-0000-4000-8000-000000000000"
+                for path in (f"/goals/{missing}/resume", f"/goals/{missing}/cancel"):
+                    r = await client.post(path)
+                    check(r.status_code == 404, f"{path[:28]}… -> 404 ({r.status_code})")
+                for path in ("/goals/not-a-uuid/resume", "/goals/not-a-uuid/cancel"):
+                    r = await client.post(path)
+                    check(r.status_code == 422, f"{path[:28]}… -> 422 ({r.status_code})")
+                orphans = await mem.list_goal_tasks(goal_id=missing, limit=10)
+                check(not orphans,
+                      f"and none of that enqueued anything ({len(orphans)})")
+        finally:
+            STATE.memory = saved
+
+
+async def test_supervisor_honours_the_wire_lifecycle():
+    """The state a 200 reports is the state the supervisor then acts on."""
+    check.section("Stage 9: the supervisor obeys cancel/resume from the wire")
+
+    import httpx
+    from harness import ScriptedLLM
+
+    from core.agent_supervisor import AgentSupervisor, SupervisorConfig
+
+    app, transport, STATE = await _goal_app()
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        saved = STATE.memory
+        STATE.memory = mem
+        try:
+            llm = ScriptedLLM()
+            llm.default_reply = '{"type":"tool","name":"demo.act","args":{}}'
+            acts = {"n": 0}
+
+            async def act(_args):
+                acts["n"] += 1
+                return {"ok": True}
+
+            router = ToolRouter({"demo.act": act}, {"demo.act": "acts"})
+            sup = AgentSupervisor(memory=mem, llm=llm, router=router,
+                                  tool_descriptions={"demo.act": "acts"},
+                                  cfg=SupervisorConfig(tick_seconds=0.05,
+                                                       max_retries=1,
+                                                       max_steps_per_goal=6))
+            async with httpx.AsyncClient(transport=transport,
+                                         base_url="http://t") as client:
+                r = await client.post("/goals", json={"objective": "do the thing",
+                                                      "project": "alpha"})
+                gid = r.json()["goal_id"]
+                await client.post(f"/goals/{gid}/cancel")
+                sup.start()
+                await asyncio.sleep(2.5)
+                await sup.stop()
+                check(acts["n"] == 0,
+                      f"a goal cancelled over HTTP executes nothing ({acts['n']})")
+
+                # Resumed over HTTP, it runs again — the guard is a gate, not a wall.
+                await client.post(f"/goals/{gid}/resume")
+                sup.start()
+                await asyncio.sleep(2.5)
+                await sup.stop()
+                check(acts["n"] >= 1,
+                      f"and resuming it lets the work proceed ({acts['n']})")
+                rows = await mem.list_goal_tasks(goal_id=gid, limit=50)
+                check({t["project_name"] for t in rows} == {"alpha"},
+                      f"all of it under the goal's own project "
+                      f"({sorted({t['project_name'] for t in rows})})")
+        finally:
+            STATE.memory = saved
+
+
+async def test_cancelled_goal_accepts_no_new_work():
+    """Found by the widened fuzz (seeds 13, 99, 31337) AFTER the cancel fix.
+
+    Cancelling stopped the queued rows and the claim refused a non-active
+    goal — but nothing stopped new rows being ADDED. In production the window
+    is real: the supervisor claims a step, the user cancels while it runs, and
+    the supervisor then enqueues the next one. Nothing executed, because the
+    claim still refused it, so the only visible symptom was a cancelled goal
+    quietly accumulating queued work — until someone resumed the goal, at which
+    point a step planned BEFORE the cancellation would run.
+    """
+    check.section("Stage 11 finding: a cancelled goal accepts no new work")
+
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        gid = await mem.create_goal(project_name="alpha", title="t", objective="o",
+                                    success_criteria="c")
+        first = await mem.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                            tool_name="__decide__", args={})
+        check(first is not None, "an ACTIVE goal accepts work")
+
+        await mem.cancel_goal(goal_id=gid)
+        refused = await mem.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                              tool_name="demo.act", args={})
+        check(refused is None,
+              f"a CANCELLED goal refuses new work, and says so ({refused})")
+        rows = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+        check(len(rows) == 1,
+              f"nothing was written ({len(rows)} row(s))")
+        check(not [t for t in rows if t["status"] == "queued"],
+              f"and nothing is runnable ({[t['status'] for t in rows]})")
+
+        # The decisive part: RESUMING must not resurrect pre-cancellation work.
+        out = await mem.resume_goal(goal_id=gid)
+        check(out is not None and out["continuation_enqueued"] is True,
+              f"resume starts a FRESH continuation ({out})")
+        rows = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+        runnable = [t for t in rows if t["status"] == "queued"]
+        check(len(runnable) == 1 and runnable[0]["tool_name"] == "__decide__",
+              f"and the only runnable step is that fresh decision "
+              f"({[(t['tool_name'], t['status']) for t in runnable]})")
+        check(await mem.claim_next_goal_task() is not None,
+              "which is claimable again, because the goal is active")
+
+        # A COMPLETED goal is equally closed.
+        gid2 = await mem.create_goal(project_name="alpha", title="t2",
+                                     objective="o", success_criteria="c")
+        await mem.update_goal_status(goal_id=gid2, status="completed")
+        check(await mem.enqueue_goal_task(goal_id=gid2, project_name="alpha",
+                                          tool_name="demo.act", args={}) is None,
+              "a COMPLETED goal refuses new work too")
+
+        # A PAUSED goal still accepts it — pause is a hold, not an ending, and
+        # resume is meant to continue the plan.
+        gid3 = await mem.create_goal(project_name="alpha", title="t3",
+                                     objective="o", success_criteria="c")
+        await mem.update_goal_status(goal_id=gid3, status="paused")
+        check(await mem.enqueue_goal_task(goal_id=gid3, project_name="alpha",
+                                          tool_name="demo.act", args={}) is not None,
+              "a PAUSED goal still accepts work (pause is a hold, not an end)")
+
+
+async def test_the_claim_itself_refuses_a_non_active_goal():
+    """The claim is the SECOND half of the cancel invariant, and stands alone.
+
+    `cancel_goal` marks the queued rows, so a test that always cancels through
+    it can pass with the claim guard removed — which is exactly what happened:
+    the mutant that deletes `AND g.status='active'` survived the first round of
+    this suite. It matters independently because the supervisor pauses a goal
+    ITSELF (step budget, or a question for Marcus) without touching its task
+    rows, and a task queued before that pause must not be picked up.
+    """
+    check.section("Stage 9: the claim refuses a non-active goal on its own")
+
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        gid = await mem.create_goal(project_name="alpha", title="t", objective="o",
+                                    success_criteria="c")
+        await mem.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                    tool_name="demo.act", args={})
+
+        # Status changed WITHOUT cancel_goal: the rows stay `queued`.
+        for status in ("paused", "cancelled", "completed"):
+            await mem.update_goal_status(goal_id=gid, status=status)
+            rows = await mem.list_goal_tasks(goal_id=str(gid), limit=10)
+            check(any(t["status"] == "queued" for t in rows),
+                  f"{status}: the task row is still queued "
+                  f"({[t['status'] for t in rows]})")
+            check(await mem.claim_next_goal_task() is None,
+                  f"{status}: and the claim refuses it anyway")
+
+        await mem.update_goal_status(goal_id=gid, status="active")
+        got = await mem.claim_next_goal_task()
+        check(got is not None and str(got["tool_name"]) == "demo.act",
+              f"active again -> the same task is claimable ({got and got['tool_name']})")
+
+        # A task with no goal row at all behaves exactly as it did before.
+        orphan = uuid4()
+        await mem.enqueue_goal_task(goal_id=orphan, project_name="alpha",
+                                    tool_name="demo.orphan", args={})
+        got = await mem.claim_next_goal_task()
+        check(got is not None and str(got["tool_name"]) == "demo.orphan",
+              f"an orphan task is still claimable ({got and got['tool_name']})")
+
+
+async def test_supervisor_does_not_report_a_step_it_could_not_schedule():
+    """The mid-flight window: cancelled WHILE the decision was being made.
+
+    The supervisor decides, then enqueues the chosen tool and the next
+    decision. If the goal was cancelled in between, the enqueue is refused —
+    and writing "Next: <tool>" to the goal's progress at that point would
+    report a plan that does not exist. Driven through the REAL supervisor by
+    cancelling from inside the planner call, which is precisely the window.
+    """
+    check.section("Stage 10: no report of a step that was never scheduled")
+
+    import sqlite3
+
+    from harness import ScriptedLLM
+
+    from core.agent_supervisor import AgentSupervisor, SupervisorConfig
+
+    with _tmp() as td:
+        mem = MemoryUnifier(Path(td), enable_chroma=False)
+        await mem.initialize()
+        gid = await mem.create_goal(project_name="alpha", title="t", objective="o",
+                                    success_criteria="c")
+        await mem.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                    tool_name="__decide__", args={})
+
+        acts = {"n": 0}
+
+        async def act(_args):
+            acts["n"] += 1
+            return {"ok": True}
+
+        llm = ScriptedLLM()
+        llm.default_reply = '{"type":"tool","name":"demo.act","args":{}}'
+        router = ToolRouter({"demo.act": act}, {"demo.act": "acts"})
+        sup = AgentSupervisor(memory=mem, llm=llm, router=router,
+                              tool_descriptions={"demo.act": "acts"},
+                              cfg=SupervisorConfig(tick_seconds=0.05,
+                                                   max_retries=1,
+                                                   max_steps_per_goal=6))
+
+        # Cancel from OUTSIDE, between the claim and the enqueue: hold the
+        # planner until the cancel has landed.
+        gate = asyncio.Event()
+        original_decide = sup._decide_next
+
+        async def gated_decide(**kw):
+            out = await original_decide(**kw)
+            await mem.cancel_goal(goal_id=gid)     # the window, deterministically
+            gate.set()
+            return out
+
+        sup._decide_next = gated_decide
+        sup.start()
+        try:
+            await asyncio.wait_for(gate.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            check(False, "the supervisor never reached the decision step")
+        await asyncio.sleep(1.0)
+        await sup.stop()
+
+        check(acts["n"] == 0,
+              f"the chosen tool never ran ({acts['n']}x)")
+        rows = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+        check(not [t for t in rows if t["tool_name"] == "demo.act"],
+              f"and was never even queued "
+              f"({[t['tool_name'] for t in rows]})")
+
+        con = sqlite3.connect(str(mem._sqlite._db_path))
+        try:
+            events = con.execute(
+                "SELECT kind, message FROM progress_events WHERE goal_id=?",
+                (str(gid),)).fetchall()
+        finally:
+            con.close()
+        plans = [m for k, m in events if k == "plan"]
+        blocked = [m for k, m in events if k == "blocked"]
+        check(not plans,
+              f"nothing claims a next step was planned ({plans})")
+        check(any("NOT scheduled" in m for m in blocked),
+              f"and the record says it was not scheduled ({blocked})")
 
 
 async def test_wire_contracts():
@@ -1581,6 +2231,14 @@ async def main():
     await test_autonomy_supervisor_blocks_the_rest_of_the_plan()
     await test_long_legacy_trash_lifecycle()
     await test_failed_delete_leaves_no_mislabelled_entry()
+    await test_supervisor_never_retries_a_refusal()
+    await test_cancelled_goal_starts_no_new_work()
+    await test_cancel_races_the_claim()
+    await test_resume_is_idempotent_and_keeps_its_project()
+    await test_supervisor_honours_the_wire_lifecycle()
+    await test_cancelled_goal_accepts_no_new_work()
+    await test_the_claim_itself_refuses_a_non_active_goal()
+    await test_supervisor_does_not_report_a_step_it_could_not_schedule()
     await test_wire_contracts()
     check.finish()
 

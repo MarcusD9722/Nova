@@ -3250,6 +3250,27 @@ class MemoryUnifier:
         async with self._write_lock:
             return await self._sqlite.update_goal_status(goal_id=goal_id, status=status)
 
+    async def get_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """One goal row, or None. Authoritative for its project_name."""
+        await self.initialize()
+        return await self._sqlite.get_goal(goal_id=goal_id)
+
+    async def cancel_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """Cancel a goal and stop its queued work. See the backend method."""
+        await self.initialize()
+        async with self._write_lock:
+            out = await self._sqlite.cancel_goal(goal_id=goal_id)
+        if out:
+            BUS.publish("goal.cancelled", {"goal_id": str(goal_id),
+                                           "cancelled_tasks": out["cancelled_tasks"]})
+        return out
+
+    async def resume_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """Activate a goal with at most one runnable continuation."""
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.resume_goal(goal_id=goal_id)
+
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
         return await self._sqlite.list_goals(project_name=project_name, limit=limit)
@@ -3262,11 +3283,17 @@ class MemoryUnifier:
         tool_name: str,
         args: dict[str, Any] | None = None,
         run_after_iso: str | None = None,
-    ) -> UUID:
+    ) -> UUID | None:
+        """Queue a step for a goal. None if the goal accepts no more work.
+
+        A cancelled goal must not acquire new runnable steps: the claim
+        already refuses them, but a later resume would have executed a step
+        planned before the user cancelled. See the backend method.
+        """
         await self.initialize()
         tid = uuid4()
         async with self._write_lock:
-            await self._sqlite.enqueue_task(
+            queued = await self._sqlite.enqueue_task(
                 task_id=tid,
                 goal_id=goal_id,
                 project_name=project_name,
@@ -3274,7 +3301,7 @@ class MemoryUnifier:
                 args=args or {},
                 run_after_iso=run_after_iso,
             )
-        return tid
+        return tid if queued else None
 
     async def claim_next_goal_task(self) -> dict[str, Any] | None:
         await self.initialize()
