@@ -2058,6 +2058,86 @@ class RuntimeManager:
             out.append(vv)
         return out
 
+    # ── Authoritative personal dates (structured, no model) ─────────────────
+    async def _stored_person_date(self, subject: str, attribute: str) -> "PersonDate":
+        """What memory actually holds for one subject. Never guesses."""
+        from core.personal_dates import PersonDate, parse_stored_date
+
+        value = ""
+        # The speaker's own record lives in the fact store under `user`; other
+        # people live in the people table. Both are SQLite, both authoritative.
+        if not subject:
+            fact = await self._memory.get_latest_fact(entity="user", attribute=attribute)
+            value = str(getattr(fact, "value", "") or "") if fact else ""
+        else:
+            rec = await self._memory.recall_person(subject)
+            attrs = (rec or {}).get("attributes") or {}
+            value = str(attrs.get(attribute) or "")
+            if not value:
+                # A person may also have been recorded as a plain fact.
+                fact = await self._memory.get_latest_fact(entity=subject, attribute=attribute)
+                value = str(getattr(fact, "value", "") or "") if fact else ""
+            if not value:
+                birth = str(attrs.get("birth_date") or "")
+                if birth and attribute == "birthday":
+                    value = birth
+
+        parsed = parse_stored_date(value) if value else None
+        if not parsed:
+            return PersonDate(subject=subject, known=False)
+        year, month, day = parsed
+        derived = False
+        if subject:
+            rec = await self._memory.recall_person(subject)
+            attrs = (rec or {}).get("attributes") or {}
+            derived = str(attrs.get("birth_date_source") or "") == "derived"
+        return PersonDate(subject=subject, known=True, month=month, day=day,
+                          year=year, derived_year=derived)
+
+    async def _personal_date_reply(self, text: str) -> str | None:
+        """Answer "when is X's birthday" from the authoritative store.
+
+        Returns None when this is not that question, so every other message is
+        untouched. Returns a sentence — including an honest "I don't have it" —
+        when it is, because the failure this fixes was a stored fact being
+        routed through generation and coming back as a generic apology.
+        """
+        from core.personal_dates import format_month_day, parse_date_query
+
+        query = parse_date_query(text)
+        if not query:
+            return None
+
+        # Privacy scoping is unchanged: an unidentified speaker gets no
+        # personal record, exactly as the rest of the runtime treats them.
+        if current_identity().is_unverified:
+            return None
+
+        parts: list[str] = []
+        missing: list[str] = []
+        for subject in query.subjects:
+            found = await self._stored_person_date(subject, query.attribute)
+            who = "Your" if not subject else f"{subject}'s"
+            if not found.known:
+                missing.append("yours" if not subject else subject)
+                continue
+            when = format_month_day(found.month, found.day,
+                                    None if found.derived_year else found.year)
+            parts.append(f"{who} {query.attribute} is {when}")
+
+        if not parts and not missing:
+            return None
+        reply = ""
+        if parts:
+            reply = ", and ".join(parts) + "."
+        if missing:
+            names = " or ".join(missing)
+            note = (f"I don't have {names} on file — tell me and I'll remember it."
+                    if not parts else
+                    f" I don't have {names} on file yet, though.")
+            reply = (reply + note) if parts else note
+        return reply.strip()
+
     async def _direct_live_reply(
         self,
         user_text: str,
@@ -2099,6 +2179,15 @@ class RuntimeManager:
             return ("I don't recognise your voice, so I can't connect you to any "
                     "personal history. If you tell me what you need, I'm happy to "
                     "help with it right now."), [], "smalltalk"
+
+        # A stored date is a row, not a generation. Answered here so a
+        # question like "When is Leslie's birthday and when is my birthday?"
+        # cannot depend on the model emitting tokens — live, that exact
+        # sentence returned "Sorry — I came up empty on that one" while both
+        # dates sat in SQLite.
+        dated = await self._personal_date_reply(text)
+        if dated is not None:
+            return dated, [], "smalltalk"
 
         if _looks_like_name_query(text):
             # V3 P5.1d. This read bypassed grounding entirely and answered
