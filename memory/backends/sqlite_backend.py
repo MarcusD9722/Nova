@@ -245,7 +245,12 @@ class SQLiteMemoryBackend:
                         status TEXT NOT NULL,
                         priority INTEGER NOT NULL,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        -- Bumped by every cancel and resume. A decision that
+                        -- was already in flight belongs to the generation it
+                        -- was claimed under, and may only be applied while the
+                        -- goal is still on that generation. See cancel_goal.
+                        generation INTEGER NOT NULL DEFAULT 0
                     );
                     '''
                 )
@@ -263,7 +268,9 @@ class SQLiteMemoryBackend:
                         last_error TEXT NOT NULL,
                         result_json TEXT NOT NULL,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        -- The goal generation this task was created under.
+                        generation INTEGER NOT NULL DEFAULT 0
                     );
                     '''
                 )
@@ -511,6 +518,19 @@ class SQLiteMemoryBackend:
                 # the reason you remember where you were for the big moments.
                 "ALTER TABLE facts ADD COLUMN salience REAL NOT NULL DEFAULT 0.0;",
                 "CREATE INDEX IF NOT EXISTS idx_facts_accessed ON facts(last_accessed_at);",
+            ],
+        ),
+        (
+            7,
+            "Goal lifecycle generation: fence decisions that were in flight across a cancel",
+            [
+                # WHY: a __decide__ claimed before a cancel could still be
+                # applied after an immediate resume, because the goal was
+                # active again by the time the model answered. The decision
+                # now carries the generation it was claimed under and is
+                # refused if the goal has moved on.
+                "ALTER TABLE goals ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
             ],
         ),
         (
@@ -1516,17 +1536,30 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def update_goal_status(self, *, goal_id: UUID, status: str) -> bool:
+    async def update_goal_status(self, *, goal_id: UUID, status: str,
+                                 expected_generation: int | None = None) -> bool:
         """True if a goal actually changed status; False if there is no such goal.
 
         The caller needs to know. `POST /goals/<unknown-uuid>/cancel` used to
         answer `{"status": "cancelled"}` for a goal that does not exist, and the
         resume route went on to enqueue a `__decide__` task against it.
+
+        `expected_generation` fences the write to one lifecycle run: a decision
+        made before a cancel must not pause or complete the goal the user
+        resumed afterwards. Checked IN the UPDATE, so there is no gap between
+        verifying and mutating.
         """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            cur = await db.execute("UPDATE goals SET status=?, updated_at=? WHERE goal_id=?", (status, now, str(goal_id)))
+            if expected_generation is None:
+                cur = await db.execute(
+                    "UPDATE goals SET status=?, updated_at=? WHERE goal_id=?",
+                    (status, now, str(goal_id)))
+            else:
+                cur = await db.execute(
+                    "UPDATE goals SET status=?, updated_at=? WHERE goal_id=? AND generation=?",
+                    (status, now, str(goal_id), int(expected_generation)))
             await db.commit()
             return cur.rowcount == 1
 
@@ -1535,7 +1568,7 @@ class SQLiteMemoryBackend:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at FROM goals WHERE goal_id=?",
+                "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at, generation FROM goals WHERE goal_id=?",
                 (str(goal_id),),
             )
             row = await cur.fetchone()
@@ -1545,6 +1578,7 @@ class SQLiteMemoryBackend:
             "goal_id": row[0], "project_name": row[1], "title": row[2],
             "objective": row[3], "success_criteria": row[4], "status": row[5],
             "priority": row[6], "created_at": row[7], "updated_at": row[8],
+            "generation": int(row[9] or 0),
         }
 
     async def cancel_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
@@ -1568,8 +1602,14 @@ class SQLiteMemoryBackend:
             if not row:
                 return None
             project_name, previous = str(row[0]), str(row[1])
+            # The generation bump is what makes an in-flight decision stale.
+            # Without it, "cancel then immediately resume" left the goal active
+            # again by the time a pre-cancel model call returned, and that old
+            # decision could enqueue a tool, pause, or complete the RESUMED
+            # goal. Cancelling has to invalidate work already in the air, not
+            # just work already queued.
             await db.execute(
-                "UPDATE goals SET status='cancelled', updated_at=? WHERE goal_id=?",
+                "UPDATE goals SET status='cancelled', generation=generation+1, updated_at=? WHERE goal_id=?",
                 (now, str(goal_id)),
             )
             stopped = await db.execute(
@@ -1609,6 +1649,10 @@ class SQLiteMemoryBackend:
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
+            # Resume deliberately does NOT bump the generation. Cancel already
+            # opened the new run, and bumping here would break idempotency:
+            # eight concurrent resumes would each open their own generation and
+            # each insert their own continuation.
             activated = await db.execute(
                 "UPDATE goals SET status='active', updated_at=? WHERE goal_id=?",
                 (now, str(goal_id)),
@@ -1618,11 +1662,15 @@ class SQLiteMemoryBackend:
                 return None
             created = await db.execute(
                 "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, "
-                "status, attempts, run_after, last_error, result_json, created_at, updated_at) "
-                "SELECT ?, g.goal_id, g.project_name, '__decide__', '{}', 'queued', 0, ?, '', '{}', ?, ? "
+                "status, attempts, run_after, last_error, result_json, created_at, updated_at, generation) "
+                "SELECT ?, g.goal_id, g.project_name, '__decide__', '{}', 'queued', 0, ?, '', '{}', ?, ?, g.generation "
                 "FROM goals g WHERE g.goal_id = ? AND NOT EXISTS ("
                 "  SELECT 1 FROM tasks t WHERE t.goal_id = g.goal_id "
-                "  AND t.tool_name = '__decide__' AND t.status IN ('queued', 'running'))",
+                "  AND t.tool_name = '__decide__' AND t.status IN ('queued', 'running') "
+                # Only a continuation from THIS run counts. A decide left
+                # running by the run the user cancelled must not stop the
+                # resumed run from getting one of its own.
+                "  AND t.generation = g.generation)",
                 (str(uuid4()), now, now, now, str(goal_id)),
             )
             enqueued = int(created.rowcount or 0) == 1
@@ -1692,6 +1740,7 @@ class SQLiteMemoryBackend:
         status: str = "queued",
         attempts: int = 0,
         run_after_iso: str | None = None,
+        expected_generation: int | None = None,
     ) -> bool:
         """Queue one goal task. False if the goal is no longer accepting work.
 
@@ -1712,10 +1761,16 @@ class SQLiteMemoryBackend:
         run_after = run_after_iso or now
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, status, attempts, run_after, last_error, result_json, created_at, updated_at) "
-                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, status, attempts, run_after, last_error, result_json, created_at, updated_at, generation) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "       COALESCE((SELECT g.generation FROM goals g WHERE g.goal_id = ?), 0) "
                 "WHERE NOT EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = ? "
-                "                  AND g.status IN ('cancelled', 'completed'))",
+                "                  AND g.status IN ('cancelled', 'completed')) "
+                # The fence: when the caller says which generation it is acting
+                # for, the row only appears if the goal is still on it. One
+                # statement, so there is no window between checking and writing.
+                "  AND (? IS NULL OR EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = ? "
+                "                            AND g.generation = ?))",
                 (
                     str(task_id),
                     str(goal_id),
@@ -1730,6 +1785,10 @@ class SQLiteMemoryBackend:
                     now,
                     now,
                     str(goal_id),
+                    str(goal_id),
+                    expected_generation,
+                    str(goal_id),
+                    expected_generation,
                 ),
             )
             await db.commit()
@@ -1762,7 +1821,8 @@ class SQLiteMemoryBackend:
                     # and the goal's own status then overwritten to 'paused'.
                     # A LEFT JOIN so a task whose goal row is missing behaves
                     # exactly as it did before rather than becoming unclaimable.
-                    "SELECT t.task_id, t.goal_id, t.project_name, t.tool_name, t.args_json, t.attempts "
+                    "SELECT t.task_id, t.goal_id, t.project_name, t.tool_name, t.args_json, t.attempts, "
+                    "       COALESCE(g.generation, 0) "
                     "FROM tasks t LEFT JOIN goals g ON g.goal_id = t.goal_id "
                     "WHERE t.status='queued' AND t.run_after <= ? "
                     "AND (g.goal_id IS NULL OR g.status='active') "
@@ -1778,7 +1838,9 @@ class SQLiteMemoryBackend:
                 )
                 await db.commit()
                 if claimed.rowcount == 1:
-                    return dict(task_id=row[0], goal_id=row[1], project_name=row[2], tool_name=row[3], args_json=row[4], attempts=row[5])
+                    return dict(task_id=row[0], goal_id=row[1], project_name=row[2],
+                                tool_name=row[3], args_json=row[4], attempts=row[5],
+                                generation=int(row[6] or 0))
                 # Someone else took it between the SELECT and the UPDATE. The
                 # next iteration reads whatever is genuinely still queued.
         return None

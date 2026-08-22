@@ -3244,11 +3244,18 @@ class MemoryUnifier:
             )
         return gid
 
-    async def update_goal_status(self, *, goal_id: UUID, status: str) -> bool:
-        """True if the goal existed and changed status. See the backend method."""
+    async def update_goal_status(self, *, goal_id: UUID, status: str,
+                                 expected_generation: int | None = None) -> bool:
+        """True if the goal existed and changed status. See the backend method.
+
+        `expected_generation` refuses the change if the goal has moved on to a
+        new lifecycle run since the caller decided to make it.
+        """
         await self.initialize()
         async with self._write_lock:
-            return await self._sqlite.update_goal_status(goal_id=goal_id, status=status)
+            return await self._sqlite.update_goal_status(
+                goal_id=goal_id, status=status,
+                expected_generation=expected_generation)
 
     async def get_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
         """One goal row, or None. Authoritative for its project_name."""
@@ -3283,12 +3290,17 @@ class MemoryUnifier:
         tool_name: str,
         args: dict[str, Any] | None = None,
         run_after_iso: str | None = None,
+        expected_generation: int | None = None,
     ) -> UUID | None:
         """Queue a step for a goal. None if the goal accepts no more work.
 
         A cancelled goal must not acquire new runnable steps: the claim
         already refuses them, but a later resume would have executed a step
         planned before the user cancelled. See the backend method.
+
+        `expected_generation` additionally refuses work decided during a
+        lifecycle run the goal has since left — cancel-then-resume opens a new
+        one, and a decision from before the cancel belongs to the old.
         """
         await self.initialize()
         tid = uuid4()
@@ -3300,6 +3312,7 @@ class MemoryUnifier:
                 tool_name=tool_name,
                 args=args or {},
                 run_after_iso=run_after_iso,
+                expected_generation=expected_generation,
             )
         return tid if queued else None
 
