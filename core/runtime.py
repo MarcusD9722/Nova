@@ -1650,14 +1650,10 @@ class RuntimeManager:
                 {"role": "user", "content": clean_user},
             ]
             story_budget = int(os.getenv("NOVA_STORY_TOKENS", "1200").strip() or "1200")
-            parts: list[str] = []
-            async with self._llm_sem:
-                async for token in self._llm.chat_stream(
-                    messages, max_tokens=story_budget, temperature=0.7, thinking=True
-                ):
-                    parts.append(token)
-                    yield {"type": "token", "text": token}
-            story_reply = "".join(parts).strip()
+            self._last_story_text = ""
+            async for ev in self._stream_story(messages, budget=story_budget):
+                yield ev
+            story_reply = (self._last_story_text or "").strip()
             if not story_reply:
                 async with self._llm_sem:
                     retry = await self._llm.chat(messages, max_tokens=story_budget, temperature=0.7, thinking=True)
@@ -2253,6 +2249,64 @@ class RuntimeManager:
                   "again in a different way?")
         yield {"type": "token", "text": honest}
         self._last_stream_text = honest
+
+    #: How many extra segments a long story may take after running out of
+    #: budget. Bounded so a model that never emits a natural stop cannot loop.
+    _STORY_MAX_CONTINUATIONS = int(os.getenv("NOVA_STORY_MAX_CONTINUATIONS", "3").strip() or "3")
+
+    async def _stream_story(self, messages: list[dict[str, Any]], *, budget: int):
+        """Stream a story, continuing it when the model runs out of budget.
+
+        A requested long story ended mid-sentence live. Story mode used one
+        fixed budget and treated any non-empty stream as success — and the
+        stream discarded `finish_reason`, so "finished" and "hit the token
+        limit" were indistinguishable. They are different endings and only one
+        of them deserves a continuation.
+
+        Sets `self._last_story_text` to the complete visible story, so the
+        story bible is updated from the WHOLE thing rather than its first
+        segment.
+        """
+        whole: list[str] = []
+        convo = list(messages)
+
+        for segment in range(self._STORY_MAX_CONTINUATIONS + 1):
+            piece: list[str] = []
+            reason = "stop"
+            async with self._llm_sem:
+                async for ev in self._llm.chat_stream_ex(
+                    convo, max_tokens=budget, temperature=0.7, thinking=True
+                ):
+                    if ev.get("type") == "token":
+                        piece.append(ev["text"])
+                        yield {"type": "token", "text": ev["text"]}
+                    elif ev.get("type") == "done":
+                        reason = str(ev.get("finish_reason") or "stop")
+
+            text = "".join(piece)
+            whole.append(text)
+            # `length` is the ONLY reason to continue. A natural stop is a
+            # finished story, and continuing it would pad something already
+            # complete. Punctuation is a secondary sanity check, never the
+            # primary signal, precisely because it cannot tell those apart.
+            if reason != "length" or not text.strip():
+                break
+            if segment == self._STORY_MAX_CONTINUATIONS:
+                logger.info("story_continuation_bound_reached",
+                            segments=segment + 1)
+                break
+
+            so_far = "".join(whole)
+            convo = list(messages) + [
+                {"role": "assistant", "content": so_far},
+                {"role": "user", "content": (
+                    "Continue the story from exactly where it stopped. Do not "
+                    "restart it, do not summarise or repeat what you already "
+                    "wrote, and keep the same characters, setting and voice. "
+                    "Bring it to a natural ending.")},
+            ]
+
+        self._last_story_text = "".join(whole).strip()
 
     async def _direct_live_reply(
         self,

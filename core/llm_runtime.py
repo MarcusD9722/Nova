@@ -15,6 +15,18 @@ from core.logging_setup import get_logger
 logger = get_logger(__name__)
 
 
+@dataclass(frozen=True)
+class _FinishReason:
+    """Why llama.cpp stopped, carried through the token queue.
+
+    Not stored on the runtime instance: two concurrent generations would
+    overwrite each other's completion state, and the whole point of knowing the
+    reason is to trust it.
+    """
+
+    reason: str
+
+
 class GPUEnforcementError(RuntimeError):
     pass
 
@@ -512,6 +524,25 @@ class LLMRuntime:
         stop: list[str] | None = None,
         thinking: bool = False,
     ):
+        """Yield response text deltas. Unchanged contract for every caller.
+
+        Callers that need to know WHY generation ended use `chat_stream_ex`.
+        """
+        async for event in self.chat_stream_ex(
+            messages, max_tokens=max_tokens, temperature=temperature,
+            stop=stop, thinking=thinking,
+        ):
+            if event.get("type") == "token":
+                yield event["text"]
+
+    async def chat_stream_ex(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 512,
+        temperature: float = 0.2,
+        stop: list[str] | None = None,
+        thinking: bool = False,
+    ):
         """Async generator yielding response text deltas as llama.cpp produces them.
 
         Runs the blocking llama-cpp stream in a worker thread and hands tokens
@@ -596,8 +627,13 @@ class LLMRuntime:
                     )
                     for chunk in stream:
                         try:
-                            delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                            choice = (chunk.get("choices") or [{}])[0]
+                            delta = choice.get("delta") or {}
                             token = delta.get("content")
+                            reason = choice.get("finish_reason")
+                            if reason:
+                                loop.call_soon_threadsafe(
+                                    q.put_nowait, _FinishReason(str(reason)))
                         except Exception:
                             token = None
                         if token:
@@ -626,24 +662,35 @@ class LLMRuntime:
             )
             think_filter = _ThinkStreamFilter()
             produced_any = False
+            finish_reason = ""
             try:
                 while True:
                     item = await queue.get()
                     if item is None:
                         break
+                    if isinstance(item, _FinishReason):
+                        # WHY this travels IN the stream rather than on the
+                        # instance: two concurrent generations would otherwise
+                        # overwrite each other's completion state.
+                        finish_reason = item.reason
+                        continue
                     if isinstance(item, Exception):
                         raise item
                     visible = think_filter.feed(item)
                     if visible:
                         produced_any = True
-                        yield visible
+                        yield {"type": "token", "text": visible}
                 tail = think_filter.flush()
                 if tail:
                     produced_any = True
-                    yield tail
+                    yield {"type": "token", "text": tail}
             finally:
                 await producer
             if produced_any:
+                # A caller cannot otherwise tell "the model finished" from "the
+                # model ran out of budget mid-sentence" — which is exactly how a
+                # long story ended mid-sentence with nothing downstream noticing.
+                yield {"type": "done", "finish_reason": finish_reason or "stop"}
                 return
             if attempt == 2:
                 # All three attempts produced nothing visible. The caller gets an
@@ -651,7 +698,10 @@ class LLMRuntime:
                 # failure is countable rather than invisible.
                 self._usage["empty_exhausted"] = int(self._usage["empty_exhausted"]) + 1
                 logger.warning("llm_chat_stream_empty_exhausted", attempts=3,
-                               max_tokens=int(max_tokens))
+                               max_tokens=int(max_tokens),
+                               finish_reason=finish_reason or "unknown")
+                yield {"type": "done", "finish_reason": "empty",
+                       "model_finish_reason": finish_reason or "unknown"}
                 return
             self._usage["empty_retries"] = int(self._usage["empty_retries"]) + 1
             logger.debug("llm_chat_stream_empty_retry", attempt=attempt + 1)
