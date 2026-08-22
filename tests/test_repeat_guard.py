@@ -104,14 +104,24 @@ async def _runtime(td: str):
                           llm=_NoLLM(), router=router, memory_dir=mem_dir)
 
 
-async def _collect(rt, model, *, user_text, previous):
+#: The final text now arrives as an EVENT rather than on a RuntimeManager
+#: attribute — see core/runtime.py: one shared STATE.runtime means two
+#: concurrent turns would overwrite each other's answer.
+_LAST_FINAL: dict = {}
+
+
+async def _collect(rt, model, *, user_text, previous, previous_user_text=""):
     out: list[str] = []
+    _LAST_FINAL.clear()
     async for ev in rt._stream_guarded_reply(
         model, [{"role": "user", "content": user_text}],
         budget=512, user_text=user_text, previous_replies=previous,
+        previous_user_text=previous_user_text,
     ):
         if ev.get("type") == "token":
             out.append(ev["text"])
+        elif ev.get("type") == "reply_final":
+            _LAST_FINAL["text"] = ev.get("text", "")
     return "".join(out)
 
 
@@ -164,8 +174,9 @@ async def test_the_live_failure_is_rejected_and_regenerated():
         nudge = model.calls[1][-1]["content"]
         check("repeated" in nudge and NEW_MESSAGE in nudge,
               f"the retry names the repeat AND the current message ({nudge[:70]!r})")
-        check(rt._last_stream_text.strip() == fresh,
-              "and the committed text is the new reply, not the stale one")
+        check(_LAST_FINAL.get("text", "").strip() == fresh,
+              f"and the committed text is the new reply, not the stale one "
+              f"({_LAST_FINAL.get('text', '')[:40]!r})")
 
 
 async def test_a_second_repeat_fails_honestly():
@@ -207,7 +218,8 @@ async def test_a_repeated_fact_is_not_suppressed():
         second = "It's March 14 — Robin's birthday is coming up in a few weeks."
         model = _ScriptedModel([second])
         got = await _collect(rt, model, user_text="When is Robin's birthday again?",
-                             previous=[first])
+                             previous=[first],
+                             previous_user_text="Tell me about Robin.")
         check(got.strip() == second,
               f"a re-stated fact is delivered ({got[:50]!r})")
         check(len(model.calls) == 1, "with no regeneration")

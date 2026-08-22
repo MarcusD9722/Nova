@@ -1650,10 +1650,12 @@ class RuntimeManager:
                 {"role": "user", "content": clean_user},
             ]
             story_budget = int(os.getenv("NOVA_STORY_TOKENS", "1200").strip() or "1200")
-            self._last_story_text = ""
+            story_reply = ""
             async for ev in self._stream_story(messages, budget=story_budget):
+                if ev.get("type") == "story_final":
+                    story_reply = (ev.get("text") or "").strip()
+                    continue          # internal: never forwarded to the client
                 yield ev
-            story_reply = (self._last_story_text or "").strip()
             if not story_reply:
                 async with self._llm_sem:
                     retry = await self._llm.chat(messages, max_tokens=story_budget, temperature=0.7, thinking=True)
@@ -2013,19 +2015,29 @@ class RuntimeManager:
         # Prior replies stay in the prompt for continuity; the guard is on the
         # OUTPUT. Live, a new personal statement was answered with the previous
         # capability answer almost verbatim.
+        previous_replies: list[str] = []
+        previous_user_text = ""
         try:
             prior_state = await self._state_store.load(conversation_id)
             previous_replies = list(prior_state.last_assistant_replies or [])[-4:]
+            # The message BEFORE this one. This turn has not been recorded yet
+            # (that happens in _finish), so the last entry is the previous user
+            # turn — which is what decides whether the user has moved on.
+            prior_users = list(prior_state.last_user_messages or [])
+            previous_user_text = prior_users[-1] if prior_users else ""
         except Exception:
-            previous_replies = []
-        self._last_stream_text = ""
+            previous_replies, previous_user_text = [], ""
+        reply = ""
         async for ev in self._stream_guarded_reply(
             chat_model, messages, budget=reply_budget,
             user_text=clean_user, previous_replies=previous_replies,
+            previous_user_text=previous_user_text,
         ):
+            if ev.get("type") == "reply_final":
+                reply = (ev.get("text") or "").strip()
+                continue              # internal: never forwarded to the client
             yield ev
 
-        reply = (self._last_stream_text or "").strip()
         if not reply:
             # The stream produced nothing visible. By the time we are here,
             # `chat_stream` has already escalated through its three attempts and
@@ -2202,22 +2214,46 @@ class RuntimeManager:
     _REPEAT_PROBE_CHARS = 160
 
     async def _stream_guarded_reply(self, chat_model, messages, *, budget: int,
-                                    user_text: str, previous_replies: list[str]):
-        """Stream a reply, refusing to replay a recent one. Yields token dicts.
+                                    user_text: str, previous_replies: list[str],
+                                    previous_user_text: str = ""):
+        """Stream a reply, refusing to replay a recent one.
 
-        Sets `self._last_stream_text` to the reply that was actually emitted.
+        Yields `{"type": "token", ...}` as tokens arrive, then exactly one
+        `{"type": "reply_final", "text": ...}`. The caller consumes that final
+        event and does NOT forward it.
+
+        WHY a final EVENT and not an attribute: `backend/state.py` keeps one
+        process-wide RuntimeManager (`STATE.runtime`), so two concurrent turns
+        share this object. An earlier version parked the answer in
+        `self._last_stream_text` and the second turn to finish overwrote the
+        first turn's reply. Completion data travels with the stream for the same
+        reason `chat_stream_ex` carries finish_reason there.
+
+        WHY it streams: an earlier version collected every token into a list and
+        yielded only after the generation finished, so the user waited a whole
+        generation for the first character. Only the repeat PROBE is held back
+        now; after it clears, token N is yielded before token N+1 exists.
         """
-        from core.repetition import is_near_duplicate, wants_repeat
+        from core.repetition import (
+            is_near_duplicate, materially_different, wants_repeat,
+        )
 
-        # An explicit "say that again" is a request for exactly this, so the
-        # guard steps aside — the target is ACCIDENTAL reuse, not repetition.
-        guard_on = bool(previous_replies) and not wants_repeat(user_text)
+        # Three conditions, all required:
+        #   - there is something to accidentally replay
+        #   - the user did not ASK for a repeat ("say that again")
+        #   - the user actually moved on. Asking "Explain RAID 5" twice should
+        #     get the same answer twice; that is not a stale reply, and
+        #     rejecting it was the reason `materially_different` exists.
+        guard_on = (
+            bool(previous_replies)
+            and not wants_repeat(user_text)
+            and materially_different(user_text, previous_user_text)
+        )
 
-        async def _once(msgs):
-            """One generation. Returns (text, emitted_events)."""
+        async def _generate(msgs):
+            """One generation. Yields token events, then a private outcome."""
             collected: list[str] = []
             held: list[str] = []
-            events: list[dict] = []
             releasing = not guard_on
             async with chat_model.semaphore:
                 async for token in chat_model.runtime.chat_stream(
@@ -2225,35 +2261,57 @@ class RuntimeManager:
                 ):
                     collected.append(token)
                     if releasing:
-                        events.append({"type": "token", "text": token})
+                        yield {"type": "token", "text": token}
                         continue
                     held.append(token)
                     if sum(len(x) for x in held) >= self._REPEAT_PROBE_CHARS:
                         probe = "".join(held)
-                        if is_near_duplicate(probe, [p[:len(probe)] for p in previous_replies]):
-                            return "".join(collected), None      # abandoned
+                        if is_near_duplicate(
+                            probe, [p[:len(probe)] for p in previous_replies]
+                        ):
+                            yield {"type": "_abandoned", "text": "".join(collected)}
+                            return
                         releasing = True
-                        events.append({"type": "token", "text": probe})
+                        yield {"type": "token", "text": probe}
                         held = []
+                # Anything still held means the probe never cleared, so NOTHING
+                # has been emitted yet and abandoning here is still invisible.
                 if held:
                     tail = "".join(held)
                     if is_near_duplicate(tail, previous_replies):
-                        return "".join(collected), None          # abandoned
-                    events.append({"type": "token", "text": tail})
-            return "".join(collected), events
+                        yield {"type": "_abandoned", "text": "".join(collected)}
+                        return
+                    yield {"type": "token", "text": tail}
+            yield {"type": "_complete", "text": "".join(collected)}
 
-        text, events = await _once(messages)
-        if events is not None:
-            for ev in events:
+        async def _run(msgs):
+            """Forward tokens as they arrive; return (text, abandoned)."""
+            text, abandoned = "", False
+            async for ev in _generate(msgs):
+                kind = ev.get("type")
+                if kind == "token":
+                    yield ev
+                elif kind == "_abandoned":
+                    text, abandoned = ev["text"], True
+                elif kind == "_complete":
+                    text = ev["text"]
+            yield {"type": "_outcome", "text": text, "abandoned": abandoned}
+
+        first_text, abandoned = "", False
+        async for ev in _run(messages):
+            if ev.get("type") == "_outcome":
+                first_text, abandoned = ev["text"], ev["abandoned"]
+            else:
                 yield ev
-            self._last_stream_text = text
+        if not abandoned:
+            yield {"type": "reply_final", "text": first_text}
             return
 
         # Exactly ONE retry, and it is told what it just repeated rather than
         # asked to "be different" — naming the offending text is what actually
         # moves the model off it.
-        logger.info("chat_repeat_rejected", chars=len(text))
-        BUS.publish("chat.repeat_rejected", {"chars": len(text)})
+        logger.info("chat_repeat_rejected", chars=len(first_text))
+        BUS.publish("chat.repeat_rejected", {"chars": len(first_text)})
         retry_msgs = messages + [{
             "role": "user",
             "content": (
@@ -2261,24 +2319,28 @@ class RuntimeManager:
                 "conversation. Do not repeat it. Respond to what was just said:\n"
                 f"{user_text}"),
         }]
-        text2, events2 = await _once(retry_msgs)
-        if events2 is not None:
-            for ev in events2:
+        second_text, abandoned2 = "", False
+        async for ev in _run(retry_msgs):
+            if ev.get("type") == "_outcome":
+                second_text, abandoned2 = ev["text"], ev["abandoned"]
+            else:
                 yield ev
-            self._last_stream_text = text2
+        if not abandoned2:
+            yield {"type": "reply_final", "text": second_text}
             return
 
         # Still a replay. Say so rather than silently serving stale text.
         honest = ("Sorry — I started repeating myself there. Could you say that "
                   "again in a different way?")
         yield {"type": "token", "text": honest}
-        self._last_stream_text = honest
+        yield {"type": "reply_final", "text": honest}
 
     #: How many extra segments a long story may take after running out of
     #: budget. Bounded so a model that never emits a natural stop cannot loop.
     _STORY_MAX_CONTINUATIONS = int(os.getenv("NOVA_STORY_MAX_CONTINUATIONS", "3").strip() or "3")
 
-    async def _stream_story(self, messages: list[dict[str, Any]], *, budget: int):
+    async def _stream_story(self, messages: list[dict[str, Any]], *, budget: int,
+                            llm=None):
         """Stream a story, continuing it when the model runs out of budget.
 
         A requested long story ended mid-sentence live. Story mode used one
@@ -2287,10 +2349,15 @@ class RuntimeManager:
         limit" were indistinguishable. They are different endings and only one
         of them deserves a continuation.
 
-        Sets `self._last_story_text` to the complete visible story, so the
-        story bible is updated from the WHOLE thing rather than its first
-        segment.
+        Yields token events, then exactly one
+        `{"type": "story_final", "text": ...}` carrying the COMPLETE story, so
+        the bible is updated from the whole thing rather than the first segment.
+
+        That final text is an EVENT rather than `self._last_story_text` because
+        `STATE.runtime` is one shared instance: two concurrent stories parked on
+        the same attribute overwrote each other.
         """
+        model = llm or self._llm
         whole: list[str] = []
         convo = list(messages)
 
@@ -2298,7 +2365,7 @@ class RuntimeManager:
             piece: list[str] = []
             reason = "stop"
             async with self._llm_sem:
-                async for ev in self._llm.chat_stream_ex(
+                async for ev in model.chat_stream_ex(
                     convo, max_tokens=budget, temperature=0.7, thinking=True
                 ):
                     if ev.get("type") == "token":
@@ -2330,7 +2397,7 @@ class RuntimeManager:
                     "Bring it to a natural ending.")},
             ]
 
-        self._last_story_text = "".join(whole).strip()
+        yield {"type": "story_final", "text": "".join(whole).strip()}
 
     async def _direct_live_reply(
         self,

@@ -84,12 +84,21 @@ async def _runtime(td: str, llm):
                           llm=llm, router=router, memory_dir=mem_dir)
 
 
+#: The complete story arrives as an EVENT, not on a RuntimeManager attribute:
+#: two concurrent stories on the one shared STATE.runtime would otherwise
+#: overwrite each other before the bible was written.
+_LAST_STORY: dict = {}
+
+
 async def _tell(rt, messages=None):
     msgs = messages or [{"role": "user", "content": "Tell me a long story about Rex"}]
     out: list[str] = []
+    _LAST_STORY.clear()
     async for ev in rt._stream_story(msgs, budget=1200):
         if ev.get("type") == "token":
             out.append(ev["text"])
+        elif ev.get("type") == "story_final":
+            _LAST_STORY["text"] = ev.get("text", "")
     return "".join(out)
 
 
@@ -117,7 +126,7 @@ async def test_a_length_stop_is_continued():
               and "Do not restart" in cont[-1]["content"],
               f"and tells it not to restart ({cont[-1]['content'][:60]!r})")
 
-        check(rt._last_story_text == SEG1 + SEG2,
+        check(_LAST_STORY.get("text") == SEG1 + SEG2,
               "the story bible receives the COMPLETE story, not the first segment")
 
 
@@ -148,8 +157,9 @@ async def test_repeated_length_cannot_loop_forever():
               f"it stops at the bound ({len(llm.calls)} generations, bound {bound})")
         check(story.startswith("segment 0."),
               f"and returns what it did produce ({story[:40]!r})")
-        check(rt._last_story_text == story.strip(),
-              f"with the accumulated text recorded ({rt._last_story_text[-20:]!r})")
+        check(_LAST_STORY.get("text") == story.strip(),
+              f"with the accumulated text recorded "
+              f"({_LAST_STORY.get('text', '')[-20:]!r})")
 
 
 async def test_an_empty_segment_is_safe():
