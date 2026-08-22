@@ -37,6 +37,7 @@ and reset around one logical turn, in a `finally`.
 """
 
 import contextvars
+import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -590,6 +591,88 @@ def scoped_conversation_key(conversation_id: Any,
     cid = str(conversation_id)
     scope = conversation_storage_scope(identity)
     return cid if scope == OWNER_ENTITY else f"{cid}#{scope}"
+
+
+# ── Where one PERSON's record lives (V3 P10 closure) ─────────────────────────
+#
+# `memory_entity` answers "where do this speaker's own facts go". It does not
+# answer "where does this speaker's record of SOMEBODY ELSE go", and that second
+# question had four independent answers in the codebase: the remember tool, the
+# recall tool, deterministic age capture, and structured birthday lookup. Three
+# of the four were wrong — age capture and date lookup went straight to the
+# global `people` table for every verified speaker, so a guest could read
+# Marcus's Robin and, worse, overwrite him.
+#
+# One helper now answers it for all four, so the boundary cannot drift apart
+# again.
+
+
+def person_key(name: str) -> str:
+    """Canonical slug for a person inside a speaker's namespace."""
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")[:48]
+
+
+@dataclass(frozen=True)
+class PersonScope:
+    """Where THIS speaker's record of one named person lives.
+
+    Three genuinely different stores, so three explicit states rather than a
+    nullable string a caller can quietly treat as a default:
+
+        global_people   the `people` table — Marcus's social map, owner only
+        scoped_facts    `speaker:<id>:person:<key>` — a guest's own people
+        refused         nowhere; an unverified speaker neither reads nor writes
+
+    `entity` is set only for `scoped_facts`. Reading it in the other states is
+    meaningless and the predicates exist so nobody has to.
+    """
+
+    store: str                      # "global_people" | "scoped_facts" | "refused"
+    entity: str | None = None
+    name: str = ""
+
+    @property
+    def is_global_people(self) -> bool:
+        return self.store == "global_people"
+
+    @property
+    def is_scoped_facts(self) -> bool:
+        return self.store == "scoped_facts"
+
+    @property
+    def refused(self) -> bool:
+        return self.store == "refused"
+
+
+def scoped_person_entity(name: str,
+                         identity: "TurnIdentity | None" = None) -> PersonScope:
+    """The one answer to "where does this speaker's <name> record live?".
+
+    Used by `memory.remember_person`, `memory.recall_person`, deterministic age
+    capture and structured date lookup — the same rule in all four, which is the
+    point. A guest's Robin and Marcus's Robin are different people who happen to
+    share a name, and merging them is both a privacy leak and a corruption of
+    Marcus's data.
+    """
+    ident = identity or current_identity()
+    who = str(name or "").strip()
+    if ident.is_unverified:
+        return PersonScope("refused", None, who)
+    if ident.is_owner:
+        return PersonScope("global_people", None, who)
+    root = f"{speaker_entity(ident.profile_id or '')}:person:{person_key(who)}"
+    return PersonScope("scoped_facts", root, who)
+
+
+def self_person_entity(identity: "TurnIdentity | None" = None) -> str | None:
+    """Where THIS speaker's own personal facts live, or None.
+
+    A thin, deliberately-named alias for `memory_entity`: the date path read a
+    hardcoded `"user"` for "my birthday", which is Marcus, so a guest asking
+    about themselves got his answer. Naming the concept makes that substitution
+    visible at the call site instead of looking like a table name.
+    """
+    return (identity or current_identity()).memory_entity
 
 
 def personal_scope_note(identity: "TurnIdentity | None" = None) -> str:

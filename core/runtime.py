@@ -2099,23 +2099,54 @@ class RuntimeManager:
 
     # ── Authoritative personal dates (structured, no model) ─────────────────
     async def _stored_person_date(self, subject: str, attribute: str) -> "PersonDate":
-        """What memory actually holds for one subject. Never guesses."""
+        """What memory actually holds for one subject. Never guesses.
+
+        SCOPED BY SPEAKER. This read used to be two hardcoded stores — `user`
+        for "my birthday" and the global `people` table for everyone else —
+        both of which mean Marcus. A known guest asking "when is my birthday?"
+        was answered with his, and one asking "when is Robin's birthday?" was
+        answered from his social map even when they had a Robin of their own.
+
+        The routing is `scoped_person_entity`, the same helper the remember and
+        recall tools use, so there is one rule rather than four.
+        """
         from core.personal_dates import PersonDate, parse_stored_date
+        from core.turn_identity import scoped_person_entity, self_person_entity
+
+        async def _scoped_attrs(scope) -> dict[str, str]:
+            """A guest's own record of this person, as an attribute map."""
+            rows = await self._memory.get_facts(entity=scope.entity or "", limit=40)
+            return {r.attribute: str(r.value or "") for r in rows}
 
         value = ""
-        # The speaker's own record lives in the fact store under `user`; other
-        # people live in the people table. Both are SQLite, both authoritative.
+        attrs: dict[str, str] = {}
         if not subject:
-            fact = await self._memory.get_latest_fact(entity="user", attribute=attribute)
+            # "my birthday" — the speaker's OWN root, never a literal "user".
+            own = self_person_entity()
+            if own is None:
+                return PersonDate(subject=subject, known=False)
+            fact = await self._memory.get_latest_fact(entity=own, attribute=attribute)
             value = str(getattr(fact, "value", "") or "") if fact else ""
         else:
-            rec = await self._memory.recall_person(subject)
-            attrs = (rec or {}).get("attributes") or {}
-            value = str(attrs.get(attribute) or "")
-            if not value:
-                # A person may also have been recorded as a plain fact.
-                fact = await self._memory.get_latest_fact(entity=subject, attribute=attribute)
-                value = str(getattr(fact, "value", "") or "") if fact else ""
+            scope = scoped_person_entity(subject)
+            if scope.refused:
+                # Unverified: no personal record of anybody, theirs or Marcus's.
+                return PersonDate(subject=subject, known=False)
+            if scope.is_global_people:
+                rec = await self._memory.recall_person(subject)
+                attrs = {k: str(v) for k, v in
+                         ((rec or {}).get("attributes") or {}).items()}
+                value = str(attrs.get(attribute) or "")
+                if not value:
+                    # A person may also have been recorded as a plain fact.
+                    fact = await self._memory.get_latest_fact(
+                        entity=subject, attribute=attribute)
+                    value = str(getattr(fact, "value", "") or "") if fact else ""
+            else:
+                # A known guest reads only the people THEY told Nova about.
+                # No fallback to the global table: that fallback IS the leak.
+                attrs = await _scoped_attrs(scope)
+                value = str(attrs.get(attribute) or "")
             if not value:
                 birth = str(attrs.get("birth_date") or "")
                 if birth and attribute == "birthday":
@@ -2125,11 +2156,7 @@ class RuntimeManager:
         if not parsed:
             return PersonDate(subject=subject, known=False)
         year, month, day = parsed
-        derived = False
-        if subject:
-            rec = await self._memory.recall_person(subject)
-            attrs = (rec or {}).get("attributes") or {}
-            derived = str(attrs.get("birth_date_source") or "") == "derived"
+        derived = str(attrs.get("birth_date_source") or "") == "derived"
         return PersonDate(subject=subject, known=True, month=month, day=day,
                           year=year, derived_year=derived)
 
@@ -3175,15 +3202,40 @@ class RuntimeManager:
         # authority for one. Stored as a normalized person record — the
         # established shape for people — never as a bare `age`, which would be
         # wrong within months.
+        #
+        # SCOPED BY SPEAKER, via the same helper the person tools use. This
+        # block honoured `target` for nothing: it called `upsert_person` for
+        # every verified speaker, so a guest saying "Robin is three" rewrote
+        # Marcus's Robin — measured, his age_observation went 10 -> 3 and his
+        # birthday 03-14 -> 12-05. That is corruption of his data, not merely a
+        # leak, which is why the guest branch writes facts under their own root.
         try:
             from datetime import date as _date
 
             from core.personal_dates import parse_age_statements
+            from core.turn_identity import scoped_person_entity
 
             for said in parse_age_statements(msg, today=_date.today()):
-                await self._memory.upsert_person(said.name, said.attributes())
+                said_attrs = said.attributes()
+                scope = scoped_person_entity(said.name)
+                if scope.refused:
+                    continue                      # unreachable here; explicit anyway
+                if scope.is_global_people:
+                    await self._memory.upsert_person(said.name, said_attrs)
+                else:
+                    root = scope.entity or ""
+                    await self._memory.add_fact(
+                        entity=root, attribute="name", value=said.name[:200],
+                        confidence=0.9, source="user",
+                        verification_status="stated")
+                    for attr, val in said_attrs.items():
+                        await self._memory.add_fact(
+                            entity=root, attribute=attr, value=str(val)[:300],
+                            confidence=0.9, source="user",
+                            verification_status="stated")
                 logger.info("age_observation_recorded", person=said.name,
-                            age=said.age, derived=said.birth_year is not None)
+                            age=said.age, derived=said.birth_year is not None,
+                            scope=scope.store)
         except Exception as e:  # noqa: BLE001
             logger.debug("age_capture_failed", error=str(e)[:160])
 
