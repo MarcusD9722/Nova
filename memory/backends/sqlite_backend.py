@@ -1564,6 +1564,17 @@ class SQLiteMemoryBackend:
         made before a cancel must not pause or complete the goal the user
         resumed afterwards. Checked IN the UPDATE, so there is no gap between
         verifying and mutating.
+
+        A fenced write ALSO requires the goal to be `active`. Generation
+        equality says "the same run"; it does not say "a run still accepting
+        decisions". A goal paused on generation 4 is on run 4 and must still
+        refuse a decision that would complete it — the pause is exactly the
+        state where Nova is waiting on the user, and honouring a queued decision
+        there resumes work nobody asked to resume.
+
+        Unfenced callers (`expected_generation=None`) are untouched: cancel,
+        resume and the operator routes legitimately move a goal out of states
+        other than active, and they are not applying a decision.
         """
         await self.initialize()
         now = self._now_iso()
@@ -1574,10 +1585,168 @@ class SQLiteMemoryBackend:
                     (status, now, str(goal_id)))
             else:
                 cur = await db.execute(
-                    "UPDATE goals SET status=?, updated_at=? WHERE goal_id=? AND generation=?",
+                    self._DECISION_GATE,
                     (status, now, str(goal_id), int(expected_generation)))
             await db.commit()
             return cur.rowcount == 1
+
+    # ── Atomic decision application (V3 P10 C5) ─────────────────────────────
+    #
+    # A supervisor decision is ONE act with several consequences: the goal
+    # changes state, the decision task finishes, history records what happened,
+    # and a question additionally leaves a proposal. Those were four separate
+    # transactions, so a cancel landing between them left a coherent-looking
+    # database describing something that never happened — a pending proposal
+    # from a run the user had already cancelled, or a `complete` event arriving
+    # after the goal had moved to a new generation.
+    #
+    # Two things make each method below atomic:
+    #
+    #   * ONE connection, ONE commit. aiosqlite opens an implicit transaction at
+    #     the first write and holds it until commit, so every statement here
+    #     lands together or not at all.
+    #   * The FIRST statement is always the fenced UPDATE on `goals`. It is both
+    #     the authority check and the lock: it takes the write lock for the whole
+    #     transaction, so a concurrent cancel must wait for this to commit. The
+    #     user's cancel is not lost — it is ordered after a decision that had
+    #     already earned the right to apply.
+    #
+    # The gate requires `status='active'` as well as the generation. Generation
+    # equality alone says "the same run", not "a run still accepting decisions":
+    # a PAUSED goal on generation 4 must not be completed by a decision that
+    # also carries generation 4.
+
+    #: The one condition under which a decision may be applied.
+    _DECISION_GATE = (
+        "UPDATE goals SET status=?, updated_at=? "
+        "WHERE goal_id=? AND generation=? AND status='active'"
+    )
+
+    async def _complete_decision_task(self, db, *, task_id: str,
+                                      result: dict[str, Any], now: str) -> None:
+        await db.execute(
+            "UPDATE tasks SET status='done', result_json=?, last_error='', updated_at=? "
+            "WHERE task_id=?",
+            (json.dumps(result or {}, ensure_ascii=False), now, task_id))
+
+    async def _add_event(self, db, *, event_id: UUID, goal_id: UUID,
+                         project_name: str, kind: str, message: str,
+                         now: str) -> None:
+        await db.execute(
+            "INSERT INTO progress_events(event_id, goal_id, project_name, kind, "
+            "message, created_at, acknowledged) VALUES(?, ?, ?, ?, ?, ?, 0)",
+            (str(event_id), str(goal_id), project_name, kind, message, now))
+
+    async def apply_question_decision(
+        self, *, goal_id: UUID, project_name: str, expected_generation: int,
+        task_id: str, proposal_id: UUID, event_id: UUID, message: str,
+    ) -> bool:
+        """Pause, record the question, finish the task, log it — or none of it.
+
+        The measured split: the fenced pause committed, the user cancelled, and
+        the proposal, task completion and `question` event then landed against a
+        cancelled goal on a newer generation. Nova was waiting for an answer to
+        a question belonging to a run that no longer existed.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                self._DECISION_GATE,
+                ("paused", now, str(goal_id), int(expected_generation)))
+            if int(cur.rowcount or 0) != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO proposals(proposal_id, goal_id, project_name, "
+                "suggestion, rationale, status, created_at, decided_at) "
+                "VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL)",
+                (str(proposal_id), str(goal_id), project_name, message,
+                 "Needed to proceed with the active goal.", now))
+            await self._complete_decision_task(
+                db, task_id=task_id, result={"question": message}, now=now)
+            await self._add_event(db, event_id=event_id, goal_id=goal_id,
+                                  project_name=project_name, kind="question",
+                                  message=message, now=now)
+            await db.commit()
+            return True
+
+    async def apply_final_decision(
+        self, *, goal_id: UUID, project_name: str, expected_generation: int,
+        task_id: str, event_id: UUID, message: str,
+    ) -> bool:
+        """Complete the goal, finish the task, log it — or none of it.
+
+        A `complete` event is the authoritative record that the goal finished.
+        It must not be able to arrive after the goal has been cancelled and
+        moved to a new run.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                self._DECISION_GATE,
+                ("completed", now, str(goal_id), int(expected_generation)))
+            if int(cur.rowcount or 0) != 1:
+                await db.rollback()
+                return False
+            await self._complete_decision_task(
+                db, task_id=task_id, result={"final": message}, now=now)
+            await self._add_event(db, event_id=event_id, goal_id=goal_id,
+                                  project_name=project_name, kind="complete",
+                                  message=message, now=now)
+            await db.commit()
+            return True
+
+    async def apply_tool_decision(
+        self, *, goal_id: UUID, project_name: str, expected_generation: int,
+        task_id: str, tool_task_id: UUID, decide_task_id: UUID, event_id: UUID,
+        tool_name: str, args: dict[str, Any],
+    ) -> bool:
+        """Schedule the tool AND its continuation, finish the task, log it.
+
+        The scheduled tool and the `__decide__` that follows it are two halves
+        of one plan. Committed separately, a cancel in between left a runnable
+        tool with no continuation, or a continuation for work that was never
+        scheduled — and the supervisor announced "Next: <tool>" either way.
+
+        The goal keeps its status here; this decision does not end the run. The
+        gate is still a write, because it is what takes the lock and proves the
+        goal is on this generation AND still active.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            # 'active' -> 'active': a touch, not a transition. It is the gate
+            # and the lock, in the one statement.
+            cur = await db.execute(
+                self._DECISION_GATE,
+                ("active", now, str(goal_id), int(expected_generation)))
+            if int(cur.rowcount or 0) != 1:
+                await db.rollback()
+                return False
+            insert = (
+                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, "
+                "args_json, status, attempts, run_after, last_error, result_json, "
+                "created_at, updated_at, generation) "
+                "VALUES(?, ?, ?, ?, ?, 'queued', 0, ?, '', '{}', ?, ?, ?)")
+            await db.execute(insert, (
+                str(tool_task_id), str(goal_id), project_name, tool_name,
+                json.dumps(args or {}, ensure_ascii=False), now, now, now,
+                int(expected_generation)))
+            await db.execute(insert, (
+                str(decide_task_id), str(goal_id), project_name, "__decide__",
+                "{}", now, now, now, int(expected_generation)))
+            await self._complete_decision_task(
+                db, task_id=task_id,
+                result={"decision": {"type": "tool", "name": tool_name,
+                                     "args": args or {}}, "scheduled": True},
+                now=now)
+            await self._add_event(db, event_id=event_id, goal_id=goal_id,
+                                  project_name=project_name, kind="plan",
+                                  message=f"Next: {tool_name}", now=now)
+            await db.commit()
+            return True
 
     async def get_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
         """One goal, or None. The stored row is the authority on its project."""

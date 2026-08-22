@@ -3316,6 +3316,45 @@ class MemoryUnifier:
             )
         return tid if queued else None
 
+    # ── Atomic decision application (V3 P10 C5) ─────────────────────────────
+    #
+    # One supervisor decision is one act. These apply all of its consequences
+    # in a single storage transaction, fenced to the lifecycle run the decision
+    # was made for, or apply none of them. `False` means the run moved on and
+    # the caller must discard the decision — never that half of it landed.
+
+    async def apply_question_decision(self, *, goal_id: UUID, project_name: str,
+                                      expected_generation: int, task_id: str,
+                                      message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_question_decision(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                proposal_id=uuid4(), event_id=uuid4(), message=message)
+
+    async def apply_final_decision(self, *, goal_id: UUID, project_name: str,
+                                   expected_generation: int, task_id: str,
+                                   message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_final_decision(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                event_id=uuid4(), message=message)
+
+    async def apply_tool_decision(self, *, goal_id: UUID, project_name: str,
+                                  expected_generation: int, task_id: str,
+                                  tool_name: str,
+                                  args: dict[str, Any] | None = None) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_tool_decision(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                tool_task_id=uuid4(), decide_task_id=uuid4(), event_id=uuid4(),
+                tool_name=tool_name, args=args or {})
+
     async def claim_next_goal_task(self) -> dict[str, Any] | None:
         await self.initialize()
         return await self._sqlite.claim_next_task()

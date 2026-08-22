@@ -73,26 +73,16 @@ class AgentSupervisor:
     def _iso(self, dt: datetime) -> str:
         return dt.isoformat()
 
-    async def _enqueue_decide(self, *, goal_id: UUID, project_name: str,
-                              expected_generation: int | None = None) -> bool:
-        """Queue the next decision. False if the goal no longer accepts work."""
-        queued = await self._memory.enqueue_goal_task(
-            goal_id=goal_id,
-            project_name=project_name,
-            tool_name="__decide__",
-            args={},
-            expected_generation=expected_generation,
-        )
-        return queued is not None
-
     async def _generation_is_current(self, goal_id: str, generation: int) -> bool:
         """Is the goal still in the lifecycle run this decision was made for?
 
         A cheap pre-check so a stale decision is discarded with a clear reason
-        instead of failing three separate writes. It is NOT the safety
-        boundary: every write below carries `expected_generation` and is
-        fenced inside its own statement, because anything checked here could
-        change before the write lands.
+        rather than as a bare refusal. It is NOT the safety boundary: the goal
+        can be cancelled between this SELECT and the write. What actually
+        decides is the fenced `UPDATE ... WHERE generation=? AND status='active'`
+        that opens each `apply_*_decision` transaction — same condition, but
+        inside the statement that mutates, and holding the lock for the rest of
+        the decision.
         """
         try:
             goal = await self._memory.get_goal(goal_id=UUID(goal_id))
@@ -253,70 +243,58 @@ Return JSON only.
                     # The model call above can take tens of seconds. In that
                     # window the goal may have been cancelled and resumed, which
                     # opens a NEW generation — and this decision belongs to the
-                    # old one. Verified atomically inside each write below
-                    # rather than by a SELECT here, so there is no gap between
-                    # checking and acting.
+                    # old one. This is a cheap pre-check that produces a clear
+                    # reason; the SAFETY boundary is the fenced, single-
+                    # transaction apply below, which re-verifies generation and
+                    # status inside the statement that mutates.
                     if not await self._generation_is_current(goal_id, generation):
                         await self._discard_stale_decision(
                             task_id=task_id, goal_id=goal_id,
                             project_name=project_name, generation=generation)
                         continue
 
+                    # Each branch applies its WHOLE decision in one storage
+                    # transaction, fenced to this generation and to the goal
+                    # still being active. `False` means the lifecycle moved on
+                    # and NOTHING was written, so the decision is discarded —
+                    # there is no partial state to reconcile.
                     t = decision.get("type")
                     if t == "tool":
                         name = str(decision.get("name", "")).strip()
                         if not name:
                             raise ValueError("Decision missing tool name")
-                        queued = await self._memory.enqueue_goal_task(goal_id=UUID(goal_id), project_name=project_name, tool_name=name, args=decision.get("args") or {}, expected_generation=generation)
-                        # enqueue next decision step
-                        await self._enqueue_decide(goal_id=UUID(goal_id), project_name=project_name,
-                                                   expected_generation=generation)
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"decision": decision, "scheduled": queued is not None})
-                        if queued is None:
-                            # The goal was cancelled or completed while this step
-                            # was in flight, so nothing was scheduled. Saying
-                            # "Next: <tool>" here would report a plan that does
-                            # not exist.
-                            await self._memory.add_progress_event(
-                                goal_id=UUID(goal_id), project_name=project_name,
-                                kind="blocked",
-                                message=f"{name} was NOT scheduled: the goal is no "
-                                        f"longer accepting work.")
-                        else:
-                            await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="plan", message=f"Next: {name}")
+                        applied = await self._memory.apply_tool_decision(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            tool_name=name, args=decision.get("args") or {})
+                        if not applied:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
                         continue
 
                     if t == "question":
                         msg = str(decision.get("message", "")).strip() or "I need your input to proceed."
-                        # Pause FIRST, fenced to this generation. If the goal
-                        # has moved on, a stale question must not pause the run
-                        # the user just resumed — and must not leave a proposal
-                        # behind claiming to be what it is waiting on.
-                        if not await self._memory.update_goal_status(
-                            goal_id=UUID(goal_id), status="paused",
-                            expected_generation=generation,
-                        ):
+                        applied = await self._memory.apply_question_decision(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            message=msg)
+                        if not applied:
                             await self._discard_stale_decision(
                                 task_id=task_id, goal_id=goal_id,
                                 project_name=project_name, generation=generation)
-                            continue
-                        await self._memory.create_proposal(goal_id=UUID(goal_id), project_name=project_name, suggestion=msg, rationale="Needed to proceed with the active goal.")
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"question": msg})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="question", message=msg)
                         continue
 
                     if t == "final":
                         msg = str(decision.get("message", "")).strip() or "Completed."
-                        if not await self._memory.update_goal_status(
-                            goal_id=UUID(goal_id), status="completed",
-                            expected_generation=generation,
-                        ):
+                        applied = await self._memory.apply_final_decision(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            message=msg)
+                        if not applied:
                             await self._discard_stale_decision(
                                 task_id=task_id, goal_id=goal_id,
                                 project_name=project_name, generation=generation)
-                            continue
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"final": msg})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="complete", message=msg)
                         continue
 
                     raise ValueError(f"Unknown decision type: {t}")
