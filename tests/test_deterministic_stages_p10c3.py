@@ -1528,8 +1528,15 @@ async def test_supervisor_does_not_report_a_step_it_could_not_schedule():
         blocked = [m for k, m in events if k == "blocked"]
         check(not plans,
               f"nothing claims a next step was planned ({plans})")
-        check(any("NOT scheduled" in m for m in blocked),
-              f"and the record says it was not scheduled ({blocked})")
+        # Either honest explanation is acceptable, and which one appears
+        # depends on WHEN the cancel landed. Cancelling from inside the
+        # decision now also moves the goal's lifecycle generation, so the
+        # supervisor discards the whole decision as stale before it gets as far
+        # as trying to schedule the step — a strictly more specific reason than
+        # "could not schedule it". What must never appear is a claim that the
+        # step WAS planned, which `plans` above asserts.
+        check(any(("NOT scheduled" in m) or ("discarded" in m) for m in blocked),
+              f"and the record explains why nothing was scheduled ({blocked})")
 
 
 async def test_wire_contracts():
