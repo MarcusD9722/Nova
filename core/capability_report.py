@@ -23,7 +23,7 @@ is how an assistant ends up promising to send an email it cannot send.
 That distinction was got wrong once already here, which is why it is spelled
 out: computer-control tools ARE registered, and `RuntimeManager` constructs
 `ComputerControl(..., adapter=None)` — no platform adapter ships, so
-`can_execute()` is false and every action is a dry run. The report called the
+`.available` is false and every action is a dry run. The report called the
 whole category "available" anyway, because it looked only at an environment
 flag. Permission/configuration and an execution backend are SEPARATE axes and
 both have to hold.
@@ -181,7 +181,7 @@ def summarize_capabilities(tool_names: list[str] | None,
     `probes` carries what the RUNTIME measured, because registration alone
     cannot answer "can you do this now":
 
-        computer_can_execute   bool  — ComputerControl.can_execute()
+        computer_can_execute   bool  — ComputerControl.available
                                        (false when no platform adapter exists)
 
     Anything absent from `probes` is simply not known, and an unknown never

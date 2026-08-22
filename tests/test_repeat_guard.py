@@ -154,6 +154,16 @@ async def test_explicit_repeat_requests_are_allowed():
     check(materially_different(NEW_MESSAGE, "What are you capable of?"),
           "and the new message IS materially different from the old one")
 
+    # The FALSE direction is the one the guard actually depends on: asking the
+    # same thing twice must be allowed to get the same answer, so a function
+    # that only ever says "yes, different" would silently re-enable the bug.
+    for same in ("Explain RAID 5.", "what are you capable of?",
+                 "How does a heat pump work?"):
+        check(not materially_different(same, same),
+              f"the identical question is NOT materially different ({same!r})")
+    check(not materially_different("Explain RAID 5.", "explain raid 5"),
+          "and neither is the same question typed differently")
+
 
 async def test_the_live_failure_is_rejected_and_regenerated():
     check.section("Phase 4: the repeated reply is rejected, then replaced")

@@ -149,6 +149,14 @@ async def test_tokens_arrive_before_generation_finishes():
         check("VISIBLE_NOW" in got_early,
               f"the marker token reached the consumer while the model was still "
               f"blocked ({len(got_early)} chars so far)")
+        # Streaming is an ORDERING claim as well as a timing one. Holding the
+        # probe back and appending it after the rest would still deliver every
+        # character "early" while scrambling the reply on screen, so the text
+        # released at the moment the probe cleared must be the text that opens
+        # the reply.
+        check(got_early.startswith(prefix[:40]),
+              f"and the reply opens with its own first words "
+              f"({got_early[:40]!r})")
         check(not model.release.is_set(),
               "and the generation was genuinely still incomplete at that moment")
         check("the rest arrives later" not in got_early,
@@ -351,6 +359,12 @@ async def test_two_concurrent_stories_do_not_cross():
               f"story B's bible text has both of its segments ({len(b_final)} chars)")
         check("Aardvark" not in b_final,
               f"and none of story A ({b_final[:28]!r})")
+
+        # The reply path is checked the same way at the end of the previous
+        # test. Both halves of C2 need it: "no shared scratch" is a property of
+        # the RuntimeManager, not of one helper.
+        check(not hasattr(rt, "_last_story_text") or not getattr(rt, "_last_story_text", ""),
+              "and no story text is parked on the shared RuntimeManager")
 
 
 # ── CORRECTION 3: material difference ───────────────────────────────────────
