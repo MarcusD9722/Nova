@@ -1979,6 +1979,21 @@ class SQLiteMemoryBackend:
             await db.commit()
             return int(cur.rowcount or 0) == 1
 
+    #: The statement that actually CLAIMS a row.
+    #:
+    #: It repeats the runnable condition rather than trusting the SELECT that
+    #: chose the candidate: those are two statements, and a cancel landing
+    #: between them would otherwise hand out a superseded row. Named so the
+    #: guard can be exercised directly instead of only through the race.
+    _CLAIM_UPDATE = (
+        "UPDATE tasks SET status='running', updated_at=? "
+        "WHERE task_id=? AND status='queued' "
+        "AND (NOT EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id) "
+        "     OR EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id "
+        "                AND g.status='active' "
+        "                AND g.generation = tasks.generation))"
+    )
+
     async def claim_next_task(self) -> dict[str, Any] | None:
         """Claim one runnable goal task. Never hands the same row to two callers.
 
@@ -1992,6 +2007,15 @@ class SQLiteMemoryBackend:
 
         The UPDATE now carries the state it expects, so the row is claimed by
         exactly one caller and everyone else moves on to the next candidate.
+
+        GENERATION IS A PROPERTY OF THE TASK ROW, not of the goal at claim time.
+        This returned `COALESCE(g.generation, 0)` — the goal's CURRENT
+        generation — so a task created in run N that survived a cancel was
+        handed to the supervisor labelled as run N+1. Combined with a runnable
+        predicate that never compared the two, a stale task was laundered into
+        the resumed lifecycle and executed as though it belonged there
+        (measured: one tool ran 3 times across a cancel/resume). The row owns
+        the run it was created under; nothing may relabel it.
         """
         await self.initialize()
         now = self._now_iso()
@@ -2007,27 +2031,28 @@ class SQLiteMemoryBackend:
                     # A LEFT JOIN so a task whose goal row is missing behaves
                     # exactly as it did before rather than becoming unclaimable.
                     "SELECT t.task_id, t.goal_id, t.project_name, t.tool_name, t.args_json, t.attempts, "
-                    "       COALESCE(g.generation, 0) "
+                    "       t.generation "
                     "FROM tasks t LEFT JOIN goals g ON g.goal_id = t.goal_id "
                     "WHERE t.status='queued' AND t.run_after <= ? "
-                    "AND (g.goal_id IS NULL OR g.status='active') "
+                    "AND (g.goal_id IS NULL "
+                    "     OR (g.status='active' AND t.generation = g.generation)) "
                     "ORDER BY t.updated_at ASC LIMIT 1",
                     (now,),
                 )
                 row = await cur.fetchone()
                 if not row:
                     return None
-                claimed = await db.execute(
-                    "UPDATE tasks SET status='running', updated_at=? WHERE task_id=? AND status='queued'",
-                    (now, row[0]),
-                )
+                claimed = await db.execute(self._CLAIM_UPDATE, (now, row[0]))
                 await db.commit()
                 if claimed.rowcount == 1:
                     return dict(task_id=row[0], goal_id=row[1], project_name=row[2],
                                 tool_name=row[3], args_json=row[4], attempts=row[5],
+                                # t.generation — the run this task was CREATED
+                                # under, never whatever the goal is on now.
                                 generation=int(row[6] or 0))
-                # Someone else took it between the SELECT and the UPDATE. The
-                # next iteration reads whatever is genuinely still queued.
+                # Someone else took it between the SELECT and the UPDATE, or the
+                # goal moved on. The next iteration reads what is genuinely
+                # still runnable.
         return None
 
     async def complete_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
@@ -2046,15 +2071,54 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def bump_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
+    async def bump_task_attempt(self, *, task_id: str, attempts: int,
+                                run_after_iso: str, error: str,
+                                expected_generation: int | None = None) -> bool:
+        """Requeue a running task for one more attempt. False if it may not be.
+
+        A retry creates FUTURE runnable work, so it is a lifecycle decision, not
+        bookkeeping about what already happened. This was an unconditional
+        `UPDATE tasks SET status='queued' ... WHERE task_id=?`, which meant:
+
+            tool from run N is claimed and starts
+            user cancels           -> goal cancelled, generation N+1
+            the running tool fails transiently
+            the retry path requeues it ANYWAY
+            user resumes           -> goal active, generation N+1
+            the run-N task is runnable again and executes
+
+        Measured on 31150da: the tool ran 3 times. An in-flight side effect
+        cannot be undone and nobody claims otherwise — but scheduling it to run
+        AGAIN after the user cancelled is a different thing entirely.
+
+        With `expected_generation` the requeue lands only if, in one statement:
+        the task is still the running one the caller claimed, on that same run,
+        and its goal still exists, is active, and is still on that run.
+
+        `expected_generation=None` keeps the old unconditional behaviour for any
+        caller that is not a goal task.
+        """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
+            if expected_generation is not None:
+                cur = await db.execute(
+                    "UPDATE tasks SET status='queued', attempts=?, run_after=?, "
+                    "last_error=?, updated_at=? "
+                    "WHERE task_id=? AND status='running' AND generation=? "
+                    "AND EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id "
+                    "            AND g.status='active' AND g.generation=?)",
+                    (int(attempts), run_after_iso, error, now, task_id,
+                     int(expected_generation), int(expected_generation)),
+                )
+                await db.commit()
+                return int(cur.rowcount or 0) == 1
             await db.execute(
                 "UPDATE tasks SET status='queued', attempts=?, run_after=?, last_error=?, updated_at=? WHERE task_id=?",
                 (int(attempts), run_after_iso, error, now, task_id),
             )
             await db.commit()
+            return True
 
     async def list_tasks(self, *, goal_id: str | None = None, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()

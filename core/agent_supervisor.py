@@ -233,6 +233,7 @@ Return JSON only.
                         # A malformed decision must not leave the claimed task
                         # stuck forever (silent stalled goal). Fail it explicitly
                         # so the loop moves on and the goal can be retried/paused.
+                        #
                         logger.warning("agent_decide_failed", goal_id=goal_id, error=str(decide_err)[:200])
                         await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=str(decide_err)[:300])
                         await self._memory.add_progress_event(
@@ -354,12 +355,34 @@ Return JSON only.
                     attempts += 1
                     if attempts <= self._cfg.max_retries:
                         backoff = timedelta(seconds=min(60, 2 ** attempts))
-                        await self._memory.bump_goal_task_attempt(
+                        # Fenced to the run this task was claimed under. A retry
+                        # is FUTURE work: the tool already ran once and that
+                        # cannot be undone, but scheduling it to run AGAIN after
+                        # the user cancelled is a different thing, and it is what
+                        # resurrected a run-N task into run N+1 after a resume.
+                        requeued = await self._memory.bump_goal_task_attempt(
                             task_id=task_id,
                             attempts=attempts,
                             run_after_iso=self._iso(self._now() + backoff),
                             error=failure,
+                            expected_generation=generation,
                         )
+                        if not requeued:
+                            # Nothing was scheduled, so nothing may announce a
+                            # retry. Finalise the task truthfully instead.
+                            await self._memory.complete_goal_task(
+                                task_id=task_id, status="failed", result={"stale": True},
+                                error=(f"{failure} (not retried: the goal left "
+                                       f"lifecycle run {generation} while this was "
+                                       f"running, so re-running it would execute "
+                                       f"work from before it was cancelled)"))
+                            await self._memory.add_progress_event(
+                                goal_id=UUID(goal_id), project_name=project_name,
+                                kind="blocked",
+                                message=(f"{tool_name} failed and was NOT retried: "
+                                         f"the goal was cancelled or resumed while "
+                                         f"it was running."))
+                            continue
                         await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {failure}")
                     else:
                         await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=failure)

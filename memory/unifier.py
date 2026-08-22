@@ -3364,10 +3364,19 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.complete_task(task_id=task_id, status=status, result=result, error=error)
 
-    async def bump_goal_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
+    async def bump_goal_task_attempt(self, *, task_id: str, attempts: int,
+                                     run_after_iso: str, error: str,
+                                     expected_generation: int | None = None) -> bool:
+        """Requeue a running goal task. False when the lifecycle refuses it.
+
+        A retry schedules FUTURE work, so it is fenced to the run the task was
+        claimed under. See the backend method for the race this closes.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.bump_task_attempt(task_id=task_id, attempts=attempts, run_after_iso=run_after_iso, error=error)
+            return await self._sqlite.bump_task_attempt(
+                task_id=task_id, attempts=attempts, run_after_iso=run_after_iso,
+                error=error, expected_generation=expected_generation)
 
     async def list_goal_tasks(self, *, goal_id: str | None = None, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
