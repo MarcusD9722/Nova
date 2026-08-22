@@ -221,9 +221,20 @@ Return JSON only.
                             f"Goal paused after {executed} steps without completion. "
                             "Review progress and resume or cancel it."
                         )
-                        await self._memory.update_goal_status(goal_id=UUID(goal_id), status="paused")
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"paused": msg})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="paused", message=msg)
+                        # One fenced transaction, exactly like a decision: this
+                        # ENDS the run the claimed __decide__ belongs to. It was
+                        # an unfenced update_goal_status plus two more commits,
+                        # so a cancel arriving first was overwritten by `paused`
+                        # on a run that had already ended.
+                        paused = await self._memory.apply_step_budget_pause(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            message=msg)
+                        if not paused:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
+                            continue
                         logger.info("agent_goal_step_budget_hit", goal_id=goal_id, steps=executed)
                         continue
 
@@ -234,7 +245,19 @@ Return JSON only.
                         # stuck forever (silent stalled goal). Fail it explicitly
                         # so the loop moves on and the goal can be retried/paused.
                         #
+                        # But the failure belongs to the run this task was
+                        # claimed under. The generation check used to happen only
+                        # AFTER a SUCCESSFUL decision, so a planner call that
+                        # started before a cancel and raised after the resume
+                        # published "Could not decide next step" into the
+                        # resumed lifecycle — a stale run reporting an error as
+                        # if it were current work.
                         logger.warning("agent_decide_failed", goal_id=goal_id, error=str(decide_err)[:200])
+                        if not await self._generation_is_current(goal_id, generation):
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
+                            continue
                         await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=str(decide_err)[:300])
                         await self._memory.add_progress_event(
                             goal_id=UUID(goal_id), project_name=project_name, kind="error",

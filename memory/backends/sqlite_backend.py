@@ -1698,6 +1698,39 @@ class SQLiteMemoryBackend:
             await db.commit()
             return True
 
+    async def apply_step_budget_pause(
+        self, *, goal_id: UUID, project_name: str, expected_generation: int,
+        task_id: str, message: str,
+    ) -> bool:
+        """Pause a goal that has spent its step budget — atomically, or not.
+
+        This transition sits BEFORE the model is consulted, so it never went
+        through the decision path and kept its own unfenced
+        `update_goal_status(status="paused")` plus two more commits. Same
+        defect class as the original cancelled -> paused bug: the budget is hit,
+        the user cancels, and the unfenced write then overwrites the
+        cancellation with `paused` on a run that had already ended.
+
+        Gated exactly like a decision, because it is one: it ends the run the
+        claimed `__decide__` belongs to.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                self._DECISION_GATE,
+                ("paused", now, str(goal_id), int(expected_generation)))
+            if int(cur.rowcount or 0) != 1:
+                await db.rollback()
+                return False
+            await self._complete_decision_task(
+                db, task_id=task_id, result={"paused": message}, now=now)
+            await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
+                                  project_name=project_name, kind="paused",
+                                  message=message, now=now)
+            await db.commit()
+            return True
+
     async def apply_tool_decision(
         self, *, goal_id: UUID, project_name: str, expected_generation: int,
         task_id: str, tool_task_id: UUID, decide_task_id: UUID, event_id: UUID,
