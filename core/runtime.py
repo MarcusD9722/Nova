@@ -2014,15 +2014,22 @@ class RuntimeManager:
         # does not need to re-derive them.
         reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
         chat_model = self._models.for_role("chat")
-        full: list[str] = []
-        async with chat_model.semaphore:
-            async for token in chat_model.runtime.chat_stream(
-                messages, max_tokens=reply_budget, temperature=0.4, thinking=False
-            ):
-                full.append(token)
-                yield {"type": "token", "text": token}
+        # Prior replies stay in the prompt for continuity; the guard is on the
+        # OUTPUT. Live, a new personal statement was answered with the previous
+        # capability answer almost verbatim.
+        try:
+            prior_state = await self._state_store.load(conversation_id)
+            previous_replies = list(prior_state.last_assistant_replies or [])[-4:]
+        except Exception:
+            previous_replies = []
+        self._last_stream_text = ""
+        async for ev in self._stream_guarded_reply(
+            chat_model, messages, budget=reply_budget,
+            user_text=clean_user, previous_replies=previous_replies,
+        ):
+            yield ev
 
-        reply = "".join(full).strip()
+        reply = (self._last_stream_text or "").strip()
         if not reply:
             # Rare overflow (the model reasoned past the budget without closing
             # the think block). The non-streaming chat() retries internally; give
@@ -2166,6 +2173,86 @@ class RuntimeManager:
         if not self._INTROSPECTION_RE.search(text or ""):
             return None
         return self._capability_report().sentence()
+
+    #: How much of a reply to hold back before letting it stream.
+    #:
+    #: The guard has to decide BEFORE tokens reach the user — retracting text
+    #: already on screen is worse than the bug. A short probe is enough: an
+    #: accidental replay of a previous answer repeats it from the beginning.
+    _REPEAT_PROBE_CHARS = 160
+
+    async def _stream_guarded_reply(self, chat_model, messages, *, budget: int,
+                                    user_text: str, previous_replies: list[str]):
+        """Stream a reply, refusing to replay a recent one. Yields token dicts.
+
+        Sets `self._last_stream_text` to the reply that was actually emitted.
+        """
+        from core.repetition import is_near_duplicate, wants_repeat
+
+        # An explicit "say that again" is a request for exactly this, so the
+        # guard steps aside — the target is ACCIDENTAL reuse, not repetition.
+        guard_on = bool(previous_replies) and not wants_repeat(user_text)
+
+        async def _once(msgs):
+            """One generation. Returns (text, emitted_events)."""
+            collected: list[str] = []
+            held: list[str] = []
+            events: list[dict] = []
+            releasing = not guard_on
+            async with chat_model.semaphore:
+                async for token in chat_model.runtime.chat_stream(
+                    msgs, max_tokens=budget, temperature=0.4, thinking=False
+                ):
+                    collected.append(token)
+                    if releasing:
+                        events.append({"type": "token", "text": token})
+                        continue
+                    held.append(token)
+                    if sum(len(x) for x in held) >= self._REPEAT_PROBE_CHARS:
+                        probe = "".join(held)
+                        if is_near_duplicate(probe, [p[:len(probe)] for p in previous_replies]):
+                            return "".join(collected), None      # abandoned
+                        releasing = True
+                        events.append({"type": "token", "text": probe})
+                        held = []
+                if held:
+                    tail = "".join(held)
+                    if is_near_duplicate(tail, previous_replies):
+                        return "".join(collected), None          # abandoned
+                    events.append({"type": "token", "text": tail})
+            return "".join(collected), events
+
+        text, events = await _once(messages)
+        if events is not None:
+            for ev in events:
+                yield ev
+            self._last_stream_text = text
+            return
+
+        # Exactly ONE retry, and it is told what it just repeated rather than
+        # asked to "be different" — naming the offending text is what actually
+        # moves the model off it.
+        logger.info("chat_repeat_rejected", chars=len(text))
+        BUS.publish("chat.repeat_rejected", {"chars": len(text)})
+        retry_msgs = messages + [{
+            "role": "user",
+            "content": (
+                "That reply repeated something you already said earlier in this "
+                "conversation. Do not repeat it. Respond to what was just said:\n"
+                f"{user_text}"),
+        }]
+        text2, events2 = await _once(retry_msgs)
+        if events2 is not None:
+            for ev in events2:
+                yield ev
+            self._last_stream_text = text2
+            return
+
+        # Still a replay. Say so rather than silently serving stale text.
+        honest = ("Sorry — I started repeating myself there. Could you say that "
+                  "again in a different way?")
+        yield {"type": "token", "text": honest}
+        self._last_stream_text = honest
 
     async def _direct_live_reply(
         self,
