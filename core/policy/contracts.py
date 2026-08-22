@@ -74,18 +74,30 @@ class MemoryFact(_StrictModel):
         "anniversary",
         "important_date",
         "trip",
-        # ── age, WITHOUT the staleness ──
-        # A bare `age = 3` is true for a few months and silently false after
-        # that, so age is never stored as a timeless scalar. What is stored is
-        # the observation and the day it was made (`age_observation` +
-        # `age_observed_on`), from which today's age is computed. `birth_date`
-        # is recorded only when it can be derived unambiguously, and
-        # `birth_date_source` says whether it was stated or derived — Marcus
-        # gives an age and a day, almost never a year.
-        "age_observation",
-        "age_observed_on",
-        "birth_date",
-        "birth_date_source",
+        # NOT HERE, deliberately: `age`, `age_observation`, `age_observed_on`,
+        # `birth_date`, `birth_date_source`.
+        #
+        # This model is the LLM EXTRACTOR's contract — every attribute in it is
+        # something a model is invited to assert. Age is not, for three separate
+        # reasons:
+        #
+        #   * a bare `age = 3` is true for a few months and silently false
+        #     afterwards, so it must never be stored as a timeless scalar;
+        #   * `age_observed_on` is the day the statement was MADE. Code knows
+        #     that; a model guesses it, and a wrong stamp silently corrupts
+        #     every age computed from it afterwards;
+        #   * `birth_date_source="derived"` is a claim that arithmetic was
+        #     checked. A model asserting it makes a provenance label
+        #     probabilistic, which is worse than having no label.
+        #
+        # So ages are captured deterministically by `core.personal_dates`
+        # during ingestion, which stamps the observation date itself and only
+        # derives a birth year when the arithmetic is unambiguous. The prompt in
+        # `memory_extractor.py` tells the model this explicitly; the Literal
+        # here is what enforces it if a model emits one anyway.
+        #
+        # `birthday` above IS extractable: a stated MM-DD is a fact the speaker
+        # gave, not a computation.
         # ── people detail: the "physical traits" gap ──
         "appearance",
         "vehicle",

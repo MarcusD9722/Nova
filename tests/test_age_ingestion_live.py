@@ -10,6 +10,19 @@ the helpers, not the pipeline.
 So this suite says the sentence and then reads authoritative storage. Nothing
 is pre-populated.
 
+ONE ARCHITECTURE, STATED (V3 P10 C6). Age normalization belongs to the
+DETERMINISTIC layer, not to the LLM extractor:
+
+  * `age_observed_on` records WHEN a statement was made. Code knows that; a
+    model guesses it, and a wrong stamp silently corrupts every age derived
+    from it afterwards.
+  * `birth_date_source="derived"` asserts that arithmetic was checked. A model
+    asserting it makes a provenance label probabilistic.
+
+So the extractor is told not to extract ages, `MemoryFact` refuses every age
+attribute, and `core.personal_dates` owns them. A stated `birthday` remains
+extractable — that is a fact the speaker gave, not a computation.
+
 Run:  venv\\Scripts\\python.exe tests\\test_age_ingestion_live.py
 """
 
@@ -160,31 +173,86 @@ async def test_contradictory_input_derives_nothing():
               "and no provenance for a value that does not exist")
 
 
-async def test_the_extractor_contract_allows_these_attributes():
-    check.section("C4: the contract can actually carry them")
+async def test_the_extractor_is_not_the_author_of_age_fields():
+    """Option A: deterministic ingestion owns age; the model is told so.
+
+    This suite used to assert the opposite — that `MemoryFact` ACCEPTED the
+    normalized age attributes — while the extractor's own system prompt never
+    mentioned them and no model could emit them. That is a contract that agrees
+    with nothing. Ages are captured deterministically because `age_observed_on`
+    is a fact about WHEN something was said (code knows it, a model guesses)
+    and `birth_date_source="derived"` asserts that arithmetic was checked.
+    """
+    check.section("C4: age is not an extractable attribute")
 
     from core.policy.contracts import MemoryFact
 
-    for attribute in ("age_observation", "age_observed_on", "birth_date",
-                      "birth_date_source"):
+    for attribute in ("age", "age_observation", "age_observed_on",
+                      "birth_date", "birth_date_source"):
         try:
-            fact = MemoryFact(entity="Fenwick", attribute=attribute, value="3",
-                              confidence=0.9)
-            ok = fact.attribute == attribute
-        except Exception as e:  # noqa: BLE001
-            ok = False
-            check(False, f"{attribute} rejected by the contract: {str(e)[:60]}")
-        if ok:
-            check(True, f"{attribute} is accepted by MemoryFact")
+            MemoryFact(entity="Fenwick", attribute=attribute, value="3",
+                       confidence=0.9)
+            accepted = True
+        except Exception:
+            accepted = False
+        check(not accepted,
+              f"{attribute!r} is refused by the extractor contract")
 
-    # A bare timeless age must still NOT be a storable attribute.
-    try:
-        MemoryFact(entity="Fenwick", attribute="age", value="3", confidence=0.9)
-        bare_ok = True
-    except Exception:
-        bare_ok = False
-    check(not bare_ok,
-          "a timeless `age` is still refused by the contract")
+    # A stated birthday is a different thing and stays extractable.
+    fact = MemoryFact(entity="Fenwick", attribute="birthday", value="09-16",
+                      confidence=0.9)
+    check(fact.attribute == "birthday",
+          "a stated birthday IS still extractable")
+
+
+async def test_the_actual_prompt_says_what_the_contract_enforces():
+    check.section("C4: the prompt and the contract agree")
+
+    import inspect
+
+    from core.policy.contracts import MemoryFact
+    from core.policy.memory_extractor import MemoryExtractorLLM
+
+    src = inspect.getsource(MemoryExtractorLLM.extract)
+    # The prompt string is built inline; read what the model would actually see.
+    lowered = src.lower()
+    check("do not extract ages" in lowered,
+          "the system prompt tells the model ages are not extracted here")
+    check("birthday" in lowered,
+          "and that a stated birthday still is")
+
+    # Whatever the prompt says, the contract is what enforces it.
+    allowed = set(MemoryFact.model_fields["attribute"].annotation.__args__)
+    leaked = {a for a in allowed if a.startswith("age") or a.startswith("birth_date")}
+    check(not leaked, f"no age attribute is reachable through the contract ({leaked})")
+    check("birthday" in allowed, "birthday remains reachable")
+
+
+async def test_a_model_emitting_an_age_loses_only_that_fact():
+    check.section("C4: an age from the model is dropped, the rest survives")
+
+    from core.policy.contracts import MemoryFact
+
+    batch = [
+        {"entity": "user", "attribute": "spouse", "value": "Leslie",
+         "confidence": 0.9, "persist": True},
+        {"entity": "Fenwick", "attribute": "age", "value": "3",
+         "confidence": 0.9, "persist": True},
+        {"entity": "Fenwick", "attribute": "birthday", "value": "09-16",
+         "confidence": 0.9, "persist": True},
+    ]
+    kept = []
+    dropped = 0
+    for item in batch:
+        try:
+            kept.append(MemoryFact.model_validate(item))
+        except Exception:
+            dropped += 1
+
+    check(dropped == 1, f"exactly the age fact is dropped ({dropped})")
+    attrs = sorted(f.attribute for f in kept)
+    check(attrs == ["birthday", "spouse"],
+          f"and the good facts beside it survive ({attrs})")
 
 
 async def test_the_date_answer_uses_the_ingested_record():
@@ -207,7 +275,9 @@ async def main():
     await test_a_second_child_in_the_same_message()
     await test_the_stored_record_does_not_go_stale()
     await test_contradictory_input_derives_nothing()
-    await test_the_extractor_contract_allows_these_attributes()
+    await test_the_extractor_is_not_the_author_of_age_fields()
+    await test_the_actual_prompt_says_what_the_contract_enforces()
+    await test_a_model_emitting_an_age_loses_only_that_fact()
     await test_the_date_answer_uses_the_ingested_record()
     check.finish()
 

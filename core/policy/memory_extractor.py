@@ -34,6 +34,12 @@ class MemoryExtractorLLM:
             "  person detail:   appearance, vehicle, hometown\n\n"
             "Rules:\n"
             "- Extract ONLY explicitly stated facts. Never guess.\n"
+            "- Do NOT extract ages. 'Mateo is three years old' is handled\n"
+            "  elsewhere, deterministically, because an age is only true for a\n"
+            "  few months and the date it was said has to be recorded with it.\n"
+            "  There is no `age` attribute and adding one will be dropped. A\n"
+            "  stated birthday IS wanted: 'his birthday is September 16' =>\n"
+            "  attribute=birthday, value=09-16.\n"
             "- Capture family relations robustly, e.g. 'I also have a mom named Tara' => mother=Tara.\n"
             "- Capture sibling/friend/cousin names when explicitly stated (lists are ok).\n"
             "- Capture pets when explicitly stated; value can be like 'Mochi|cat' or just 'Mochi'.\n"
@@ -70,9 +76,11 @@ class MemoryExtractorLLM:
             logger.debug("memory_extractor_no_facts_list", raw=raw[:400])
             return MemoryExtractorOutput(facts=[])
 
-        # Age needs care: "Mateo is three" must not become a timeless
-        # `age = 3`. Emit `age_observation` (the number) and let ingestion
-        # stamp the date it was said; a birthday goes in `birthday` as MM-DD.
+        # Ages are NOT this extractor's job — see the rule in the prompt above
+        # and the note in `contracts.MemoryFact`. `core.personal_dates` captures
+        # them deterministically during ingestion, stamping the observation date
+        # itself. If a model emits `age` or one of the normalized age fields
+        # anyway, validation drops that one fact here and keeps the rest.
         kept: list[MemoryFact] = []
         dropped = 0
         for item in raw_facts:
