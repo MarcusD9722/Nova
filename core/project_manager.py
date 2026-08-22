@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core.project_names import (
-    canonical_project_slug, resolve_existing_identity, safe_live_component,
-    safe_trash_entry,
+    MAX_COMPONENT_LEN, canonical_project_slug, resolve_existing_identity,
+    safe_live_component, safe_trash_entry,
 )
 from core.safety import ensure_safe_subdir
 
@@ -76,8 +76,71 @@ class ProjectManager:
 
     TRASH_DIRNAME = ".trash"
 
+    #: Sidecar naming the original project, used only by the nested form below.
+    ORIGINAL_MARKER = ".nova_original_name"
+
     def _trash_dir(self) -> Path:
         return self._projects_dir / self.TRASH_DIRNAME
+
+    def _trash_target(self, trash: Path, name: str, stamp: str) -> tuple[Path, bool]:
+        """Where this project goes in the trash, and whether it is the NESTED form.
+
+        The flat form `<name>--<stamp>` is kept for every normal project, so
+        existing trash entries and every existing test stay valid.
+
+        But #59 deliberately allows an EXISTING legacy identity right up to the
+        filesystem component limit, and appending `--20260818-211140` to one of
+        those overflows it — a real `WinError 123` on this machine. Truncating the
+        project name to make it fit would undo #59, so instead a too-long entry
+        becomes a DIRECTORY holding the project under its exact name:
+
+            .trash/<truncated-label>--<stamp>/          <- the entry
+                   .nova_original_name                  <- the exact identity
+                   <full original name>/                <- the project itself
+
+        Nothing about the original identity is lost; only the ENTRY label is
+        shortened, and the label is Nova's own bookkeeping.
+        """
+        flat = f"{name}--{stamp}"
+        if len(flat) <= MAX_COMPONENT_LEN:
+            target = trash / flat
+            suffix = 2
+            while target.exists():
+                target = trash / f"{name}--{stamp}-{suffix}"
+                suffix += 1
+            return target, False
+
+        # Nested: label is bounded, the project keeps its exact name inside.
+        room = MAX_COMPONENT_LEN - len(stamp) - 2 - 8      # leave room for -NN
+        label = f"{name[:max(8, room)]}--{stamp}"
+        holder = trash / label
+        suffix = 2
+        while holder.exists():
+            holder = trash / f"{label}-{suffix}"
+            suffix += 1
+        holder.mkdir(parents=True, exist_ok=True)
+        return holder / name, True
+
+    def _trash_original(self, entry_dir: Path) -> str:
+        """The exact project identity an entry restores to."""
+        marker = entry_dir / self.ORIGINAL_MARKER
+        if marker.is_file():
+            try:
+                recorded = marker.read_text(encoding="utf-8").strip()
+                if recorded:
+                    return recorded
+            except OSError:
+                pass
+        return entry_dir.name.rsplit("--", 1)[0]
+
+    def _trash_payload(self, entry_dir: Path) -> Path:
+        """The directory to move back — the entry itself, or its nested child."""
+        if (entry_dir / self.ORIGINAL_MARKER).is_file():
+            original = self._trash_original(entry_dir)
+            nested = entry_dir / original
+            if nested.is_dir():
+                return nested
+        return entry_dir
 
     @staticmethod
     def _measure(path: Path) -> tuple[int, int]:
@@ -113,11 +176,38 @@ class ProjectManager:
         files, size = self._measure(proj)
         trash = self._trash_dir()
         trash.mkdir(parents=True, exist_ok=True)
+        # The trash id is timestamped to the SECOND, so deleting the same project
+        # twice within one second collided. `shutil.move` onto an existing
+        # directory does not fail cleanly — it moves the source INSIDE it — so the
+        # entry became `p4--<ts>/p4` and a later restore would have brought back a
+        # nested wreck. Found by seeded sequence fuzzing (seed 7, step 38), which
+        # is exactly the interleaving nobody writes by hand.
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = trash / f"{proj.name}--{stamp}"
-        shutil.move(str(proj), str(target))
+        target, nested = self._trash_target(trash, proj.name, stamp)
+        if nested:
+            # The entry is a directory holding the project under its EXACT name,
+            # plus a sidecar naming it. See `_trash_target`.
+            #
+            # Written BEFORE the move, deliberately. `_trash_target` has already
+            # created the holder, so a move that fails between the two would
+            # leave an entry whose only clue to its identity is the TRUNCATED
+            # label — and restoring that would rename the project, which is the
+            # one thing the legacy contract forbids.
+            (target.parent / self.ORIGINAL_MARKER).write_text(proj.name,
+                                                              encoding="utf-8")
+        try:
+            shutil.move(str(proj), str(target))
+        except Exception:
+            # Nothing moved: take the empty holder back out rather than leave a
+            # trash entry that restores nothing.
+            if nested and not target.exists():
+                shutil.rmtree(target.parent, ignore_errors=True)
+            raise
+        # The ENTRY id is what `restore`/`purge` take, so for the nested form that
+        # is the holder, not the project sitting inside it.
+        entry_name = target.parent.name if nested else target.name
         return {
-            "project": proj.name, "moved_to_trash": target.name,
+            "project": proj.name, "moved_to_trash": entry_name,
             "files": files, "bytes": size, "recoverable": True,
         }
 
@@ -129,8 +219,9 @@ class ProjectManager:
         for p in sorted(trash.iterdir(), reverse=True):
             if not p.is_dir():
                 continue
-            files, size = self._measure(p)
-            out.append({"entry": p.name, "original": p.name.rsplit("--", 1)[0],
+            payload = self._trash_payload(p)
+            files, size = self._measure(payload)
+            out.append({"entry": p.name, "original": self._trash_original(p),
                         "files": files, "bytes": size})
         return out
 
@@ -148,13 +239,17 @@ class ProjectManager:
         # directory no longer exists (it is in the trash), the legacy probe misses
         # and `My_Old.Project` came back as `my-old-project`. That silently renamed
         # a project during restore, contradicting the legacy contract outright.
-        original = src.name.rsplit("--", 1)[0]
+        original = self._trash_original(src)
+        payload = self._trash_payload(src)
         component = safe_live_component(original)
         dest = ensure_safe_subdir(self._repo_root, self._projects_dir,
                                   self._projects_dir / component)
         if dest.exists():
             raise FileExistsError(f"'{original}' already exists — rename or delete it first")
-        shutil.move(str(src), str(dest))
+        shutil.move(str(payload), str(dest))
+        if payload != src:
+            # The nested holder has served its purpose; the project is out.
+            shutil.rmtree(src, ignore_errors=True)
         return {"restored": dest.name, "from_trash": src.name}
 
     def purge_trash(self, entry: str | None = None) -> dict[str, Any]:

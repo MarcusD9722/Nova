@@ -303,5 +303,6 @@ async def reminders_list(status: str | None = Query(None), limit: int = Query(50
 async def reminders_cancel(reminder_id: str) -> dict:
     if STATE.memory is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    await STATE.memory.cancel_reminder(reminder_id=reminder_id)
+    if not await STATE.memory.cancel_reminder(reminder_id=reminder_id):
+        raise HTTPException(status_code=404, detail=f"No such reminder: {reminder_id}")
     return {"reminder_id": reminder_id, "status": "cancelled"}

@@ -415,14 +415,21 @@ def case_c() -> None:
                                           timeout_s=OLD_BOUNDARY, retries=0)
             dt = time.perf_counter() - t0
 
+            # A refusal is a FAILURE now, not a success carrying a sad
+            # payload: the router reports `ok=False` for any tool that returns a
+            # top-level `ok: False`. Both halves matter — the caller must be able
+            # to see that it did not happen AND why, so the structured payload is
+            # still asserted alongside.
             check("C1 the tool returns a clean not_approved",
-                  res.ok is True and (res.result or {}).get("status") == "not_approved",
+                  res.ok is False and (res.result or {}).get("status") == "not_approved",
                   f"ok={res.ok} result={res.result}")
             check("C2 the OUTER tool did not preempt the broker",
-                  dt > OLD_BOUNDARY * 1.5 and dt < BUDGET and (res.error or "") == "",
+                  dt > OLD_BOUNDARY * 1.5 and dt < BUDGET
+                  and res.error == (res.result or {}).get("note"),
                   f"returned after {dt:.3f}s with error={res.error!r}; the broker's "
                   f"{window:g}s window closed first, well past the {OLD_BOUNDARY:g}s "
-                  f"the call site asked for")
+                  f"the call site asked for, and the message is the TOOL's own "
+                  f"refusal rather than the router's timeout")
             check("C3 nothing was deleted", fx.deletes == [] and (fx.projects / "toy").exists())
             check("C4 audited as a timeout", count_outcome(fx.broker, "timeout") == 1,
                   str(outcomes(fx.broker)))
@@ -449,8 +456,8 @@ def case_d() -> None:
             res = await task
 
             check("D1 the tool reports not_approved",
-                  res.ok is True and (res.result or {}).get("status") == "not_approved",
-                  f"result={res.result}")
+                  res.ok is False and (res.result or {}).get("status") == "not_approved",
+                  f"ok={res.ok} result={res.result}")
             check("D2 nothing executed", fx.deletes == [])
             check("D3 the project is untouched", (fx.projects / "toy" / "main.py").exists())
             check("D4 audited as rejected, exactly once",

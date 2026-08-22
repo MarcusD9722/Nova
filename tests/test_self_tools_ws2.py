@@ -27,7 +27,11 @@ async def main():
 
         # Gated: with dev mode OFF, tools return an error, not data
         r = await router.execute(ToolCall(name="self.read_code", args={"path": "core/dev_mode.py"}), timeout_s=15, retries=0)
-        gated = r.ok and isinstance(r.result, dict) and not r.result.get("ok") and "disabled" in str(r.result.get("error", "")).lower()
+        # A refused tool is a FAILED tool (the router normalises a top-level
+        # `ok: False`), and the payload must still say why.
+        gated = (r.ok is False and isinstance(r.result, dict)
+                 and r.result.get("ok") is False
+                 and "disabled" in str(r.result.get("error", "")).lower())
         check(gated, "self.read_code refused when dev mode disabled")
 
         # Now enable dev mode and re-test (same instance honors env at call time)
@@ -56,7 +60,8 @@ async def main():
             # SECURITY via tool: proposing to .env is refused
             r5 = await router.execute(ToolCall(name="self.propose_change",
                     args={"path": str(REPO / ".env"), "new_content": "SECRET=x", "reason": "bad"}), timeout_s=15, retries=0)
-            denied = r5.ok and not r5.result.get("ok")
+            denied = (r5.ok is False and isinstance(r5.result, dict)
+                      and r5.result.get("ok") is False)
             check(denied, "self.propose_change refuses .env")
         finally:
             sbx.unlink(missing_ok=True)

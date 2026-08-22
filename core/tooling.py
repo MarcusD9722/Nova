@@ -284,9 +284,6 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         await memory.add_lesson(lesson, topic=topic)
         return {"ok": True, "learned": lesson[:200], "topic": topic}
 
-    def _person_key(name: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")[:48]
-
     async def _memory_remember_person(args: dict[str, Any]) -> dict[str, Any]:
         """Save someone the speaker mentions.
 
@@ -294,8 +291,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         guest does not write there (measured: they could). They get the
         fact-backed representation the canonical hierarchy already provides —
         `speaker:<id>:person:<key>` — which needs no new store and no migration.
+
+        The routing rule lives in `scoped_person_entity` so this tool, the
+        recall tool, deterministic age capture and structured date lookup all
+        share one implementation.
         """
-        from core.turn_identity import current_identity, speaker_entity
+        from core.turn_identity import scoped_person_entity
 
         name = str(args.get("name") or "").strip()
         if not name:
@@ -306,15 +307,15 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             attrs = {k: str(v) for k, v in args.items() if k not in {"name", "attributes"} and v}
         attrs = {str(k): str(v)[:300] for k, v in (attrs or {}).items() if str(v).strip()}
 
-        ident = current_identity()
-        if ident.is_owner:
+        scope = scoped_person_entity(name)
+        if scope.is_global_people:
             await memory.upsert_person(name=name, attributes=attrs)
             return {"ok": True, "person": name, "attributes": attrs}
-        if ident.is_unverified:
+        if scope.refused:
             return {"ok": False, "error": "unverified_speaker", "person": None,
                     "detail": ("I can't save someone to memory without knowing "
                                "who's telling me about them.")}
-        root = f"{speaker_entity(ident.profile_id or '')}:person:{_person_key(name)}"
+        root = scope.entity or ""
         await memory.add_fact(entity=root, attribute="name", value=name[:200],
                               confidence=0.9, source="user",
                               verification_status="stated")
@@ -341,24 +342,23 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         return {"ok": True, "event": note[:200], "date": date or "unspecified"}
 
     async def _memory_recall_person(args: dict[str, Any]) -> dict[str, Any]:
-        from core.turn_identity import current_identity, speaker_entity
+        from core.turn_identity import scoped_person_entity
 
         name = str(args.get("name") or "").strip()
         if not name:
             return {"ok": False, "error": "missing_name"}
-        ident = current_identity()
-        if ident.is_owner:
+        scope = scoped_person_entity(name)
+        if scope.is_global_people:
             person = await memory.recall_person(name)
             if person is None:
                 return {"ok": False, "error": "not_found", "name": name}
             return {"ok": True, **person}
-        if ident.is_unverified:
+        if scope.refused:
             return {"ok": False, "error": "unverified_speaker", "name": name,
                     "detail": ("I don't know who I'm speaking with, so I can't "
                                "look anyone up.")}
         # A known guest reads only the people THEY told Nova about.
-        root = f"{speaker_entity(ident.profile_id or '')}:person:{_person_key(name)}"
-        rows = await memory.get_facts(entity=root, limit=40)
+        rows = await memory.get_facts(entity=scope.entity or "", limit=40)
         if not rows:
             return {"ok": False, "error": "not_found", "name": name}
         return {"ok": True, "name": name,
@@ -1263,6 +1263,25 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         descriptions.update(plugin_descriptions)
 
     router = ToolRouter(tools, descriptions=descriptions)
+
+    # RETRY SAFETY. The router refuses to re-invoke a tool automatically unless it
+    # is declared safe, because a timeout says a call did not FINISH — never that
+    # it did not happen. `agent_supervisor` and `autonomy_supervisor` run
+    # arbitrary tools with `retries=1`, so without this a timed-out
+    # `project.delete`, `code.write` or `shell.exec` was simply run a second time.
+    #
+    # Only READ-ONLY tools go on this list. Anything that writes a file, spends
+    # money, sends something, or changes memory is deliberately absent: losing one
+    # flaky read costs a retry, and repeating one write can cost the work.
+    for _read_only in (
+        "memory.recall", "memory.recall_person", "memory.related", "memory.path",
+        "memory.timeline", "code.read", "self.read_code", "self.list_code",
+        "project.status", "project.trash", "plan.status", "research.list",
+        "research.findings", "experiment.list", "experiment.analyze",
+        "agents.roster", "agent.recall", "executive.brief", "skill.detect",
+    ):
+        if _read_only in tools:
+            router.set_retry_safe(_read_only, True)
     # Expose the shared self-editing surface so the /dev/* endpoints operate on
     # the same proposal store Nova writes to via self.propose_change.
     router.dev_mode = dev_mode  # type: ignore[attr-defined]

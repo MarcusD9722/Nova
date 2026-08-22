@@ -57,6 +57,10 @@ class ToolRouter:
         #: name -> execution budget. ONE authoritative timeout per tool, owned by
         #: the router, so there is no second conflicting number at a call site.
         self._timeouts: dict[str, float] = {}
+        #: name -> may this tool be re-invoked automatically after a failure.
+        #: Absent means NO: a tool is assumed to change something until it says
+        #: otherwise, because that is the direction whose mistakes are cheap.
+        self._retry_safe: dict[str, bool] = {}
 
     def timeout_for(self, name: str, fallback: float | None = None) -> float:
         """The authoritative execution budget for `name`."""
@@ -68,6 +72,10 @@ class ToolRouter:
     def set_timeout(self, name: str, timeout_s: float) -> None:
         self._timeouts[str(name)] = float(timeout_s)
 
+    def set_retry_safe(self, name: str, safe: bool = True) -> None:
+        """Declare a tool safe to re-invoke automatically. READ-ONLY tools only."""
+        self._retry_safe[str(name)] = bool(safe)
+
     def list_tools(self) -> list[str]:
         return sorted(self._tools.keys())
 
@@ -75,8 +83,20 @@ class ToolRouter:
         """name -> human/LLM-readable description (used for function calling)."""
         return {name: self._descriptions.get(name, "") for name in self.list_tools()}
 
+    def is_retry_safe(self, name: str) -> bool:
+        """May this tool be re-invoked automatically after a failure?
+
+        FALSE unless declared. A retry is only safe for a tool that changes
+        nothing — and a timeout tells you the call did not finish, never that it
+        did not happen. `agent_supervisor` and `autonomy_supervisor` call
+        arbitrary tools with `retries=1`, so before this a timed-out
+        `project.delete`, `code.write` or `shell.exec` was simply run again.
+        """
+        return bool(self._retry_safe.get(str(name), False))
+
     def register(self, name: str, fn: AsyncTool, description: str = "",
-                 timeout_s: float | None = None) -> None:
+                 timeout_s: float | None = None,
+                 retry_safe: bool = False) -> None:
         """Register an additional tool after construction (e.g. project builder).
 
         `timeout_s` declares this tool's authoritative budget. Pass it for any
@@ -88,6 +108,7 @@ class ToolRouter:
             self._descriptions[str(name)] = description
         if timeout_s is not None:
             self.set_timeout(name, timeout_s)
+        self._retry_safe[str(name)] = bool(retry_safe)
 
     async def execute(self, call: ToolCall, timeout_s: float | None = None, retries: int = 1) -> ToolResult:
         if call.name not in self._tools:
@@ -108,12 +129,33 @@ class ToolRouter:
             try:
                 coro = self._tools[call.name](call.args)
                 result = await asyncio.wait_for(coro, timeout=budget)
+
+                # A tool that RETURNS a structured failure has not succeeded.
+                # Nova's tools use a top-level `ok` convention — `missing_fact`,
+                # `unverified_speaker`, `scoped_unavailable`, `not_approved` — and
+                # every one of them used to arrive as ToolResult(ok=True), so the
+                # orchestrator was told the step worked and carried on.
+                failure = self._structured_failure(result)
+                if failure:
+                    BUS.publish("tool.error", {"tool": call.name, "error": clip(failure, 200)})
+                    # The structured payload is KEPT: a caller often needs the
+                    # status or detail to decide what to do next, and discarding
+                    # it would trade one silent failure for another.
+                    return ToolResult(name=call.name, ok=False, result=result,
+                                      error=failure)
+
                 BUS.publish("tool.result", {"tool": call.name, "ok": True, "summary": clip(result, 200)})
                 return ToolResult(name=call.name, ok=True, result=result, error=None)
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 last_text = self._error_text(e, call.name, budget, attempt, attempts)
                 logger.warning("tool_failed", tool=call.name, attempt=attempt, error=last_text)
+                # NEVER retry a tool that has not declared itself safe to
+                # re-invoke. A timeout says the call did not FINISH; it says
+                # nothing about whether the side effect landed, so running it
+                # again can delete twice, write twice, or spend twice.
+                if not self.is_retry_safe(call.name):
+                    break
                 # Back off only if another attempt is actually coming. The sleep
                 # used to run after the LAST failure too, adding 0.2s of dead wait
                 # to every failing tool call — including the retries=0 path the
@@ -132,6 +174,25 @@ class ToolRouter:
         else:
             BUS.publish("tool.error", {"tool": call.name, "error": clip(last_text, 200) or "tool_failed"})
         return ToolResult(name=call.name, ok=False, result=None, error=last_text or "tool_failed")
+
+    @staticmethod
+    def _structured_failure(result: Any) -> str:
+        """The failure text if `result` explicitly says it failed, else "".
+
+        ONLY a top-level `ok` that is exactly False counts. A dict without an `ok`
+        key, or one whose `ok` is truthy, keeps its existing success semantics —
+        many tools return plain data and must not start failing because they
+        happen to contain the word "error" somewhere.
+        """
+        if not isinstance(result, dict):
+            return ""
+        if result.get("ok", True) is not False:
+            return ""
+        for key in ("error", "reason", "detail", "note", "status"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:300]
+        return "tool reported failure"
 
     @staticmethod
     def _error_text(exc: BaseException, name: str, budget: float,
