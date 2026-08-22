@@ -23,6 +23,7 @@ from core.policy.storyteller import StorytellerLLM, is_story_request, story_syst
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.intent import is_question, is_purely_conversational
+from core.project_intent import authorize_project_mutation
 from core.gpu import GPU_SEM
 from core.turn_gate import GATE
 from core.capabilities.navigation import Navigation, extract_directions
@@ -1397,8 +1398,16 @@ class RuntimeManager:
         # the exact gap that spawned the junk "what-other-improvements-…" slug.
         looks_like_question = is_question(t)
 
+        # THE side-effect gate. Everything below that can write to disk asks
+        # this first, and it is deterministic on purpose — see
+        # core/project_intent.py for the three live messages that made Nova
+        # edit a project during ordinary conversation. A keyword like
+        # "improve" is NOT authority; an affirmative instruction is.
+        is_complaint = bool(CONTINUATION_COMPLAINT_RE.search(t))
+        may_mutate = authorize_project_mutation(t, complaint=is_complaint)
+
         # "implement those suggestions" (uses last active project when unnamed)
-        if IMPLEMENT_SUGG_RE.search(t):
+        if IMPLEMENT_SUGG_RE.search(t) and may_mutate:
             slug = pb.known_slug_in_text(t) or await pb.last_active()
             if slug:
                 res = await pb.improve(
@@ -1415,18 +1424,19 @@ class RuntimeManager:
         # intent is detected but the name wasn't repeated — unless the message
         # looks like it's naming a brand new project ("called X"/"named X").
         slug = pb.known_slug_in_text(t)
-        direct_mention = slug is not None
-        is_complaint = bool(CONTINUATION_COMPLAINT_RE.search(t))
-        has_continuation_intent = bool(
-            STATUS_WORDS_RE.search(t) or RESUME_WORDS_RE.search(t) or IMPROVE_WORDS_RE.search(t)
-            or BUILD_ACTION_RE.search(t) or is_complaint
-        )
-        if slug is None and has_continuation_intent and not looks_like_question and not NAME_RE.search(t):
-            slug = await pb.last_active()
+        if slug is None and not looks_like_question and not NAME_RE.search(t):
+            # Falling back to the last-active project is how an unnamed message
+            # acquires a mutation target, so it is gated by the same
+            # authorisation. Reading STATUS is exempt: `status_text()` only
+            # reports, and "where did we leave off" names no project by nature.
+            if STATUS_WORDS_RE.search(t):
+                slug = await pb.last_active()
+            elif may_mutate:
+                slug = await pb.last_active()
         if slug:
             if STATUS_WORDS_RE.search(t):
                 return pb.status_text(slug)
-            if RESUME_WORDS_RE.search(t):
+            if RESUME_WORDS_RE.search(t) and may_mutate:
                 if pb.is_building(slug):
                     return f"I'm already working on {slug} — I'll report when it's done."
                 res = await pb.improve(
@@ -1436,15 +1446,18 @@ class RuntimeManager:
                 if res.get("started"):
                     return f"Resuming {slug} from where we left off. I'll report when finished."
                 return f"I couldn't resume {slug}: {res.get('reason', 'unknown')}."
-            # Any non-question message that names/points at a known project and
-            # carries a work signal (improve/build verb, complaint, or just a
-            # direct mention with an instruction) works on it. Questions about a
-            # project ("is flappybird a good game?", "what could we add?") are
-            # for DISCUSSION — the whole condition is gated behind the question
-            # check so a question can never kick off an autonomous change.
-            if not looks_like_question and (
-                IMPROVE_WORDS_RE.search(t) or BUILD_ACTION_RE.search(t) or is_complaint or direct_mention
-            ):
+            # Work on it only when the message actually INSTRUCTS it.
+            #
+            # This condition used to be "improve-ish keyword OR build verb OR
+            # complaint OR the project was merely mentioned". Two of those were
+            # enough on their own to write to disk: a keyword anywhere in the
+            # sentence, and — worse — a bare mention, so
+            # "flappy-bird is a project I made earlier" was an edit request.
+            # Both now go through the same deterministic authorisation, which
+            # requires an affirmative instruction and vetoes prohibitions,
+            # denials, retrospectives, deliberation, and messages whose subject
+            # is Nova herself rather than a project.
+            if may_mutate:
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
                 res = await pb.improve(slug=slug, instructions=t)
