@@ -3353,6 +3353,13 @@ class MemoryUnifier:
                 expected_generation=int(expected_generation), task_id=task_id,
                 error=error, message=message)
 
+    async def count_finished_goal_steps(self, *, goal_id: UUID,
+                                        generation: int) -> int:
+        """Finished steps in ONE run — the window the step budget applies to."""
+        await self.initialize()
+        return await self._sqlite.count_finished_steps(
+            goal_id=goal_id, generation=int(generation))
+
     async def apply_step_budget_pause(self, *, goal_id: UUID, project_name: str,
                                       expected_generation: int, task_id: str,
                                       message: str) -> bool:

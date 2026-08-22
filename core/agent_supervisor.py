@@ -213,9 +213,16 @@ Return JSON only.
                     args = {}
 
                 if tool_name == "__decide__":
-                    # Enforce the per-goal step budget before spending an LLM call.
-                    done_steps = await self._memory.list_goal_tasks(goal_id=goal_id, limit=self._cfg.max_steps_per_goal + 4)
-                    executed = sum(1 for t in done_steps if t.get("status") in ("done", "failed"))
+                    # Enforce the per-goal step budget before spending an LLM
+                    # call — counted PER RUN. Counting every finished step the
+                    # goal ever had made the budget permanent: a resume landed
+                    # in a run whose history already exceeded it and paused
+                    # again immediately, so "resume or cancel it" could only
+                    # ever mean cancel. Each run gets its own bounded window;
+                    # the budget is not reset globally and never becomes
+                    # unlimited.
+                    executed = await self._memory.count_finished_goal_steps(
+                        goal_id=UUID(goal_id), generation=generation)
                     if executed >= self._cfg.max_steps_per_goal:
                         msg = (
                             f"Goal paused after {executed} steps without completion. "

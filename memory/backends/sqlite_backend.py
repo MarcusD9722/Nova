@@ -1735,6 +1735,24 @@ class SQLiteMemoryBackend:
             await db.commit()
             return True
 
+    async def count_finished_steps(self, *, goal_id: UUID, generation: int) -> int:
+        """Finished steps in ONE lifecycle run — the step budget's window.
+
+        The budget counted every done/failed task the goal had ever had, across
+        all runs. Combined with a resume that did not open a new run, a goal
+        that hit the budget paused, resumed, counted the same history, and
+        paused again without ever reaching the model — so the "resume or
+        cancel it" Nova offers was not actually resumable.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE goal_id=? AND generation=? "
+                "AND status IN ('done', 'failed')",
+                (str(goal_id), int(generation)))
+            row = await cur.fetchone()
+        return int((row or [0])[0] or 0)
+
     async def apply_step_budget_pause(
         self, *, goal_id: UUID, project_name: str, expected_generation: int,
         task_id: str, message: str,
