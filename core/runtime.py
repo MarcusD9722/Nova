@@ -2138,6 +2138,35 @@ class RuntimeManager:
             reply = (reply + note) if parts else note
         return reply.strip()
 
+    #: "what can you do", "what are you capable of", "what features do you have"
+    _INTROSPECTION_RE = re.compile(
+        r"\b(?:what|which)\s+(?:can|could)\s+you\s+do\b"
+        r"|\bwhat\s+are\s+you\s+(?:capable\s+of|able\s+to\s+do)\b"
+        r"|\bwhat\s+(?:features|capabilities|tools|abilities|skills)\s+"
+        r"(?:do\s+you\s+have|are\s+(?:there|available))\b"
+        r"|\bwhat\s+can\s+you\s+help\s+(?:me\s+)?with\b"
+        r"|\blist\s+your\s+(?:capabilities|features|tools)\b",
+        re.IGNORECASE,
+    )
+
+    def _capability_report(self):
+        """The runtime's own view of what is wired up right now."""
+        from core.capability_report import summarize_capabilities
+
+        return summarize_capabilities(self._router.list_tools())
+
+    def _capability_reply(self, text: str) -> str | None:
+        """Answer an introspection question from the REGISTRY, not the README.
+
+        Live, "What are you capable of?" was answered from whatever the model
+        remembered about itself, because the tool inventory was collected into
+        the grounding context and then never rendered into it. There is one
+        source of truth for this question now, and it is the router.
+        """
+        if not self._INTROSPECTION_RE.search(text or ""):
+            return None
+        return self._capability_report().sentence()
+
     async def _direct_live_reply(
         self,
         user_text: str,
@@ -2188,6 +2217,13 @@ class RuntimeManager:
         dated = await self._personal_date_reply(text)
         if dated is not None:
             return dated, [], "smalltalk"
+
+        # "What are you capable of?" is a question about this process, and the
+        # process knows the answer exactly. Answered from the tool registry so
+        # it cannot drift from what is actually wired up.
+        caps = self._capability_reply(text)
+        if caps is not None:
+            return caps, [], "smalltalk"
 
         if _looks_like_name_query(text):
             # V3 P5.1d. This read bypassed grounding entirely and answered
@@ -2312,7 +2348,9 @@ class RuntimeManager:
         available_tools: list[str],
         conversation_id: UUID | None = None,
     ) -> str:
-        del user_text
+        # `user_text` used to be discarded here (`del user_text`). It is read
+        # now, but for exactly one thing: deciding whether this turn is ASKING
+        # what Nova can do, so the capability summary is added only then.
         context: dict[str, Any] = {
             "known_user": {},
             "known_family": {},
@@ -2611,6 +2649,15 @@ class RuntimeManager:
         tool_names = sorted({str(t).strip() for t in (available_tools or []) if str(t).strip()})
         if tool_names:
             context["available_tools"] = tool_names
+            # `available_tools` was collected here and then never rendered by
+            # `_grounding_to_natural`, so the response model never saw it and
+            # under-reported Nova to her own user. It is summarised (not dumped
+            # tool by tool) and only when the message is actually asking what
+            # she can do — an ordinary turn should not carry the inventory.
+            if self._INTROSPECTION_RE.search(user_text or ""):
+                from core.capability_report import summarize_capabilities
+
+                context["capability_summary"] = summarize_capabilities(tool_names).prompt_line()
 
         smart_home_tools = [t for t in tool_names if ("smart" in t.lower() or "home" in t.lower())]
         if smart_home_tools:
@@ -2736,6 +2783,10 @@ class RuntimeManager:
                 "proactive context you MAY raise if it fits naturally (don't force it, don't list all of it): "
                 + " | ".join(str(r) for r in exec_recs)
             )
+
+        summary = context.get("capability_summary")
+        if summary:
+            parts.append(str(summary))
 
         caps = context.get("capabilities") or {}
         if caps.get("smart_home_control") == "available":
