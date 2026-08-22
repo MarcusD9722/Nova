@@ -1698,6 +1698,43 @@ class SQLiteMemoryBackend:
             await db.commit()
             return True
 
+    async def apply_decision_error(
+        self, *, goal_id: UUID, project_name: str, expected_generation: int,
+        task_id: str, error: str, message: str,
+    ) -> bool:
+        """Record a planner failure — atomically, against the run that had it.
+
+        The supervisor used to consult `_generation_is_current()` and then, if
+        it said yes, perform two unfenced writes. That is a check-then-write,
+        and `_generation_is_current` says so about itself: the goal can be
+        cancelled between the SELECT and the write. Measured on e9183c2 by
+        blocking between them: a run-0 planner failure published "Could not
+        decide next step" into the run-1 lifecycle the user had just resumed.
+
+        A failure is a report about what happened, but the report is ADDRESSED
+        to a lifecycle run — so it is gated exactly like a decision. The goal's
+        status is unchanged; the gate is an active->active touch that both
+        proves authority and holds the row for the rest of the transaction.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                self._DECISION_GATE,
+                ("active", now, str(goal_id), int(expected_generation)))
+            if int(cur.rowcount or 0) != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                "UPDATE tasks SET status='failed', result_json='{}', "
+                "last_error=?, updated_at=? WHERE task_id=?",
+                (error, now, task_id))
+            await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
+                                  project_name=project_name, kind="error",
+                                  message=message, now=now)
+            await db.commit()
+            return True
+
     async def apply_step_budget_pause(
         self, *, goal_id: UUID, project_name: str, expected_generation: int,
         task_id: str, message: str,
@@ -1867,12 +1904,30 @@ class SQLiteMemoryBackend:
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            # Resume deliberately does NOT bump the generation. Cancel already
-            # opened the new run, and bumping here would break idempotency:
-            # eight concurrent resumes would each open their own generation and
-            # each insert their own continuation.
+            # WHICH run a resume lands in depends on where it is resuming FROM,
+            # and the difference is decided inside the one UPDATE so concurrent
+            # resumes cannot each reach their own answer:
+            #
+            #   cancelled -> cancel already opened the new run. Bumping again
+            #                would give eight concurrent resumes eight runs and
+            #                eight continuations.
+            #   paused    -> nothing has opened a run yet, and the step budget
+            #                is counted per run. Without a bump here, a goal
+            #                paused ON the budget resumes into the same run,
+            #                counts the same finished steps, and pauses again
+            #                without ever reaching the model — measured: two
+            #                `paused` events, zero planner calls. Nova offers
+            #                "resume or cancel it", so resume has to mean
+            #                something: it opens exactly ONE new bounded run.
+            #   active    -> already running; no churn.
+            #
+            # The CASE reads the status in the same statement that changes it,
+            # so the first caller bumps and every later one sees 'active' and
+            # does not.
             activated = await db.execute(
-                "UPDATE goals SET status='active', updated_at=? WHERE goal_id=?",
+                "UPDATE goals SET status='active', "
+                "generation = generation + (CASE WHEN status='paused' THEN 1 ELSE 0 END), "
+                "updated_at=? WHERE goal_id=?",
                 (now, str(goal_id)),
             )
             if int(activated.rowcount or 0) != 1:
@@ -1970,9 +2025,16 @@ class SQLiteMemoryBackend:
         claims a step, the user cancels mid-flight, and the supervisor then
         enqueues the next one.
 
-        The INSERT carries the condition so there is no check-then-act gap. A
-        task whose goal row does not exist at all is inserted exactly as before
-        — this narrows one state, it does not add a foreign key.
+        The INSERT carries the condition so there is no check-then-act gap.
+
+        The goal must EXIST. This used to insert happily against a goal_id no
+        row matched, so a bug anywhere upstream produced runnable work owned by
+        nothing. Both production callers create the goal immediately before
+        calling this, so requiring it costs nothing and closes the door.
+
+        A PAUSED goal still accepts work: pause is a hold, not an ending, and
+        resume is meant to continue the plan that was already laid. Only
+        `cancelled` and `completed` are closed.
         """
         await self.initialize()
         now = self._now_iso()
@@ -1982,8 +2044,8 @@ class SQLiteMemoryBackend:
                 "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, args_json, status, attempts, run_after, last_error, result_json, created_at, updated_at, generation) "
                 "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "       COALESCE((SELECT g.generation FROM goals g WHERE g.goal_id = ?), 0) "
-                "WHERE NOT EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = ? "
-                "                  AND g.status IN ('cancelled', 'completed')) "
+                "WHERE EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = ? "
+                "              AND g.status NOT IN ('cancelled', 'completed')) "
                 # The fence: when the caller says which generation it is acting
                 # for, the row only appears if the goal is still on it. One
                 # statement, so there is no window between checking and writing.
@@ -2021,10 +2083,31 @@ class SQLiteMemoryBackend:
     _CLAIM_UPDATE = (
         "UPDATE tasks SET status='running', updated_at=? "
         "WHERE task_id=? AND status='queued' "
-        "AND (NOT EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id) "
-        "     OR EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id "
-        "                AND g.status='active' "
-        "                AND g.generation = tasks.generation))"
+        "AND EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id "
+        "            AND g.status='active' "
+        "            AND g.generation = tasks.generation)"
+    )
+
+    #: The candidate SELECT. Named alongside `_CLAIM_UPDATE` so each half of the
+    #: claim can be exercised on its own: with both in place either one alone
+    #: keeps an unrunnable row out, which is the point of having both — and also
+    #: means a defect in one is invisible through `claim_next_task`.
+    #:
+    #: An INNER join: no authoritative goal, no execution. This was a LEFT JOIN
+    #: with `g.goal_id IS NULL` treated as runnable, kept for compatibility —
+    #: but this is the GOAL task queue, and the supervisor hands a claimed real
+    #: tool straight to ToolRouter.execute without ever looking the parent up.
+    #: So a row naming a nonexistent goal and a side-effecting tool ran on
+    #: nothing's authority (measured: an orphan `demo.spy` executed). Rows left
+    #: by older builds that created work against goals which never existed are
+    #: exactly what must not run.
+    _CLAIM_SELECT = (
+        "SELECT t.task_id, t.goal_id, t.project_name, t.tool_name, t.args_json, "
+        "       t.attempts, t.generation "
+        "FROM tasks t JOIN goals g ON g.goal_id = t.goal_id "
+        "WHERE t.status='queued' AND t.run_after <= ? "
+        "AND g.status='active' AND t.generation = g.generation "
+        "ORDER BY t.updated_at ASC LIMIT 1"
     )
 
     async def claim_next_task(self) -> dict[str, Any] | None:
@@ -2054,24 +2137,13 @@ class SQLiteMemoryBackend:
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             for _ in range(self._CLAIM_ATTEMPTS):
-                cur = await db.execute(
-                    # The parent goal's state is part of what makes a task
-                    # runnable. Cancelling a goal used to change only the goals
-                    # row, so its queued tasks stayed claimable and the
-                    # supervisor went on executing a goal the user had
-                    # cancelled — measured: 3 tool calls after cancellation,
-                    # and the goal's own status then overwritten to 'paused'.
-                    # A LEFT JOIN so a task whose goal row is missing behaves
-                    # exactly as it did before rather than becoming unclaimable.
-                    "SELECT t.task_id, t.goal_id, t.project_name, t.tool_name, t.args_json, t.attempts, "
-                    "       t.generation "
-                    "FROM tasks t LEFT JOIN goals g ON g.goal_id = t.goal_id "
-                    "WHERE t.status='queued' AND t.run_after <= ? "
-                    "AND (g.goal_id IS NULL "
-                    "     OR (g.status='active' AND t.generation = g.generation)) "
-                    "ORDER BY t.updated_at ASC LIMIT 1",
-                    (now,),
-                )
+                # The parent goal's state is part of what makes a task runnable.
+                # Cancelling a goal used to change only the goals row, so its
+                # queued tasks stayed claimable and the supervisor went on
+                # executing a goal the user had cancelled — measured: 3 tool
+                # calls after cancellation, and the goal's own status then
+                # overwritten to 'paused'. See `_CLAIM_SELECT`.
+                cur = await db.execute(self._CLAIM_SELECT, (now,))
                 row = await cur.fetchone()
                 if not row:
                     return None

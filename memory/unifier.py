@@ -3343,6 +3343,16 @@ class MemoryUnifier:
                 expected_generation=int(expected_generation), task_id=task_id,
                 event_id=uuid4(), message=message)
 
+    async def apply_decision_error(self, *, goal_id: UUID, project_name: str,
+                                   expected_generation: int, task_id: str,
+                                   error: str, message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_decision_error(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                error=error, message=message)
+
     async def apply_step_budget_pause(self, *, goal_id: UUID, project_name: str,
                                       expected_generation: int, task_id: str,
                                       message: str) -> bool:

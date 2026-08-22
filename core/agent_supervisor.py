@@ -253,16 +253,20 @@ Return JSON only.
                         # resumed lifecycle — a stale run reporting an error as
                         # if it were current work.
                         logger.warning("agent_decide_failed", goal_id=goal_id, error=str(decide_err)[:200])
-                        if not await self._generation_is_current(goal_id, generation):
+                        # ONE fenced transaction, not a pre-check followed by
+                        # two unfenced writes. `_generation_is_current` is a
+                        # SELECT and says of itself that the goal can be
+                        # cancelled before the write lands; measured, that gap
+                        # published a run-0 failure into a resumed run 1.
+                        recorded = await self._memory.apply_decision_error(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            error=str(decide_err)[:300],
+                            message=f"Could not decide next step: {str(decide_err)[:160]}")
+                        if not recorded:
                             await self._discard_stale_decision(
                                 task_id=task_id, goal_id=goal_id,
                                 project_name=project_name, generation=generation)
-                            continue
-                        await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=str(decide_err)[:300])
-                        await self._memory.add_progress_event(
-                            goal_id=UUID(goal_id), project_name=project_name, kind="error",
-                            message=f"Could not decide next step: {str(decide_err)[:160]}",
-                        )
                         continue
                     # The model call above can take tens of seconds. In that
                     # window the goal may have been cancelled and resumed, which
