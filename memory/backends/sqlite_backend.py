@@ -521,19 +521,6 @@ class SQLiteMemoryBackend:
             ],
         ),
         (
-            7,
-            "Goal lifecycle generation: fence decisions that were in flight across a cancel",
-            [
-                # WHY: a __decide__ claimed before a cancel could still be
-                # applied after an immediate resume, because the goal was
-                # active again by the time the model answered. The decision
-                # now carries the generation it was claimed under and is
-                # refused if the goal has moved on.
-                "ALTER TABLE goals ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
-                "ALTER TABLE tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
-            ],
-        ),
-        (
             6,
             "Backfill salience for facts written before v5 (mirrors unifier._default_salience)",
             [
@@ -561,6 +548,19 @@ class SQLiteMemoryBackend:
             ],
         ),
         EPISODIC_MIGRATION,
+        (
+            8,
+            "Goal lifecycle generation: fence decisions that were in flight across a cancel",
+            [
+                # WHY: a __decide__ claimed before a cancel could still be
+                # applied after an immediate resume, because the goal was
+                # active again by the time the model answered. The decision
+                # now carries the generation it was claimed under and is
+                # refused if the goal has moved on.
+                "ALTER TABLE goals ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+            ],
+        ),
     ]
 
     async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
@@ -585,7 +585,23 @@ class SQLiteMemoryBackend:
             if version <= current:
                 continue
             for sql in statements:
-                await db.execute(sql)
+                try:
+                    await db.execute(sql)
+                except Exception as e:  # noqa: BLE001
+                    # `ADD COLUMN` on a column that is already there.
+                    #
+                    # This is inherent to the design, not a one-off: the create
+                    # block above always builds the LATEST schema, so a table
+                    # an older database never had is created complete — and the
+                    # migration that introduces its new column then finds the
+                    # column present. SQLite has no ADD COLUMN IF NOT EXISTS.
+                    #
+                    # Only that exact case is tolerated; every other migration
+                    # error still raises, because a migration that silently
+                    # half-applies is worse than one that stops.
+                    if "duplicate column name" in str(e).lower():
+                        continue
+                    raise
             await db.execute(
                 "INSERT INTO schema_version(version, description, applied_at) VALUES(?, ?, ?)",
                 (version, description, self._now_iso()),
