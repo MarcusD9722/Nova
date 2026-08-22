@@ -33,6 +33,7 @@ import asyncio
 import os
 import sys
 import tempfile
+
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -102,6 +103,12 @@ class _EventLog:
 async def _kinds(m, project="alpha"):
     evs = await m.fetch_unacked_progress(project_name=project, limit=100)
     return [e["kind"] for e in evs]
+
+
+def _claim_select_sql() -> str:
+    """The candidate SELECT itself — the SQL, not the prose around it."""
+    from memory.backends.sqlite_backend import SQLiteMemoryBackend
+    return SQLiteMemoryBackend._CLAIM_SELECT
 
 
 def _supervisor(m, *, router, decide=None, max_retries=3, max_steps=8):
@@ -320,8 +327,17 @@ async def test_the_claimed_generation_is_not_the_goals_current_one():
               f"matched runs claim normally ({(claimed or {}).get('generation')})")
 
 
-async def test_a_goalless_task_is_unaffected():
-    check.section("C7: orphan-compatible rows behave exactly as before")
+async def test_a_goalless_task_never_runs():
+    """No authoritative goal row, no execution (V3 P10 C8).
+
+    This previously asserted the opposite — that an orphan stayed claimable —
+    kept as compatibility. But this is the GOAL task queue, and the supervisor
+    hands a claimed real tool straight to `ToolRouter.execute` without ever
+    looking the parent goal up. So a row naming a nonexistent goal and a
+    side-effecting tool executed on nothing's authority. Measured on e9183c2:
+    an orphan `demo.spy` ran.
+    """
+    check.section("C8: a task whose goal does not exist is never runnable")
 
     with _tmp() as td:
         m = await _mem(td)
@@ -329,30 +345,98 @@ async def test_a_goalless_task_is_unaffected():
         tid = await _seed_task(m, orphan, tool="orphan.tool", status="queued",
                                generation=0, created="2020-01-01T00:00:00+00:00")
         claimed = await m.claim_next_goal_task()
-        check(claimed is not None and claimed["task_id"] == tid,
-              "a task with no goal row is still claimable")
+        check(claimed is None,
+              f"an orphan row is not claimable ({(claimed or {}).get('tool_name')})")
+
+        rows = await _rows(m, orphan)
+        check(rows and rows[0]["status"] == "queued",
+              f"and is left as evidence rather than deleted ({rows[0]['status']})")
+
+        # BOTH halves of the claim refuse it independently. With both in place
+        # either one alone keeps the row out, which is the point of having two
+        # — and also means a defect in one is invisible through
+        # `claim_next_goal_task`, so each is exercised on its own.
+        now = m._sqlite._now_iso()
+        async with aiosqlite.connect(m._sqlite._db_path) as db:
+            cur = await db.execute(m._sqlite._CLAIM_SELECT, (now,))
+            check(await cur.fetchone() is None,
+                  "the candidate SELECT does not offer it")
+            cur = await db.execute(m._sqlite._CLAIM_UPDATE, (now, tid))
+            await db.commit()
+            check(int(cur.rowcount or 0) == 0,
+                  "and the claiming UPDATE refuses it by itself")
 
 
-async def test_the_returned_generation_is_the_rows_own():
-    """The one state where the two sources genuinely differ.
-
-    While a goal exists, a claimable task always has `t.generation ==
-    g.generation` — so reading either yields the same number and no assertion
-    can tell them apart. An ORPHAN row is the discriminating case: there is no
-    goal, so `COALESCE(g.generation, 0)` is 0 while the row's own generation is
-    whatever it was created with.
-    """
-    check.section("C7: the claimed generation comes from the task row itself")
+async def test_an_orphan_real_tool_never_reaches_the_router():
+    check.section("C8: an orphan side-effecting tool never executes")
 
     with _tmp() as td:
         m = await _mem(td)
+        spy: list[int] = []
+
+        async def demo_spy(_args):
+            spy.append(1)
+            return {"ok": True}
+
+        router = ToolRouter({"demo.spy": demo_spy}, {"demo.spy": "spy"})
+        sup = _supervisor(m, router=router, decide=_inert)
+
         orphan = uuid4()
-        await _seed_task(m, orphan, tool="orphan.tool", status="queued",
-                         generation=3, created="2020-01-01T00:00:00+00:00")
-        claimed = await m.claim_next_goal_task()
-        check(claimed is not None and int(claimed["generation"]) == 3,
-              f"an orphan row reports ITS generation, not a goal's "
-              f"({(claimed or {}).get('generation')})")
+        await _seed_task(m, orphan, tool="demo.spy", status="queued",
+                         generation=0, created="2020-01-01T00:00:00+00:00")
+        sup.start()
+        try:
+            for _ in range(60):
+                await asyncio.sleep(0.05)
+                if spy:
+                    break
+        finally:
+            await sup.stop()
+
+        check(not spy, f"demo.spy was never invoked ({len(spy)})")
+        kinds = await _kinds(m)
+        check("tool" not in kinds and "plan" not in kinds,
+              f"and no success or plan event was fabricated ({kinds})")
+
+
+async def test_enqueueing_against_a_missing_goal_is_refused():
+    check.section("C8: storage refuses work for a goal that does not exist")
+
+    with _tmp() as td:
+        m = await _mem(td)
+        made = await m.enqueue_goal_task(goal_id=uuid4(), project_name="alpha",
+                                         tool_name="demo.spy", args={})
+        check(made is None, f"enqueue on a nonexistent goal is refused ({made})")
+
+        # A real goal still works, and a paused one still accepts work: pause
+        # is a hold, not an ending, and resume continues the plan already laid.
+        gid = await _goal(m)
+        check(await m.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                        tool_name="demo.spy", args={}) is not None,
+              "an active goal still accepts work")
+        await m.update_goal_status(goal_id=gid, status="paused")
+        check(await m.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                        tool_name="demo.spy", args={}) is not None,
+              "and a paused goal does too")
+
+
+async def test_the_claim_projects_the_tasks_own_generation():
+    """Guards against future drift rather than a live difference.
+
+    Once the runnable predicate requires `t.generation = g.generation`, any
+    claimable task satisfies both, so projecting either column yields the same
+    number — the two are now provably equal and no behavioural test can
+    separate them. It mattered when orphans were claimable, and it would matter
+    again the moment the predicate were loosened, so the projection is pinned
+    here explicitly.
+    """
+    check.section("C8: the claim still reads generation from the task row")
+
+    sql = _claim_select_sql()
+    check("t.generation" in sql,
+          "the claim SELECT projects t.generation")
+    check("COALESCE(g.generation" not in sql,
+          "and not the goal's current generation")
 
 
 async def test_the_claim_update_re_checks_the_condition_itself():
@@ -705,6 +789,179 @@ async def test_a_stale_planner_error_does_not_reach_the_resumed_run():
           f"({(failed[0]['last_error'][:60] if failed else None)!r})")
 
 
+async def test_a_planner_failure_cannot_be_overtaken_between_check_and_write():
+    """The window the pre-check cannot close (V3 P10 C8).
+
+    The previous round cancelled BEFORE releasing the exception, which proves
+    the pre-check works. It does not prove the check->write race is closed:
+    `_generation_is_current` is a SELECT, and it documents itself that the goal
+    can be cancelled before the write lands. Measured on e9183c2 by blocking
+    in exactly that window: a run-0 planner failure published "Could not decide
+    next step" into the run-1 lifecycle the user had just resumed.
+
+    The block now sits immediately before the atomic apply, which IS that
+    window.
+    """
+    check.section("C8: a superseded planner failure loses the race at the write")
+
+    with _tmp() as td:
+        m = await _mem(td)
+        router = ToolRouter({}, {})
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = {"n": 0}
+
+        async def planner(**kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("old planner failed")
+            # Later runs must NOT raise, or their own legitimate failure would
+            # be mistaken for the stale one leaking through.
+            return {"type": "question", "message": "run 1 is fine"}
+
+        sup = _supervisor(m, router=router, decide=planner)
+        original = m.apply_decision_error
+
+        async def gated(**kw):
+            entered.set()
+            await release.wait()
+            return await original(**kw)
+
+        m.apply_decision_error = gated
+
+        gid = await _goal(m)
+        await m.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                  tool_name="__decide__", args={})
+        log = _EventLog(m)
+        sup.start()
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=20.0)
+            await m.cancel_goal(goal_id=gid)
+            await m.resume_goal(goal_id=gid)
+            release.set()
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                await log.drain()
+                if any(t["status"] == "failed" for t in await _rows(m, gid)):
+                    break
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                await log.drain()
+        finally:
+            release.set()
+            await sup.stop()
+            m.apply_decision_error = original
+
+        goal = await m.get_goal(goal_id=gid)
+        rows = await _rows(m, gid)
+        kinds = log.kinds
+
+        check("error" not in kinds,
+              f"no ordinary planner-error event from the superseded run ({kinds})")
+        stale = [t for t in rows if t["generation"] == 0]
+        check(stale and stale[0]["status"] == "failed"
+              and "discarded" in stale[0]["last_error"],
+              f"the run-0 task is terminal and marked stale "
+              f"({(stale[0]['last_error'][:50] if stale else None)!r})")
+        check(goal["status"] in ("active", "paused"),
+              f"the resumed run is untouched by it ({goal['status']})")
+        check(goal["generation"] == 1, f"and is run 1 ({goal['generation']})")
+
+
+async def test_a_planner_error_that_wins_applies_whole_then_cancel_lands():
+    check.section("C8: error first — it applies atomically, cancel follows")
+
+    with _tmp() as td:
+        m = await _mem(td)
+        router = ToolRouter({}, {})
+        inside, release = asyncio.Event(), asyncio.Event()
+        backend = m._sqlite
+        original = backend._add_event
+
+        async def gated(db, **kw):
+            inside.set()
+            await release.wait()
+            return await original(db, **kw)
+
+        backend._add_event = gated
+        gid = await _goal(m)
+        tid = await _seed_task(m, gid, tool="__decide__", status="running",
+                               generation=0, created="2020-01-01T00:00:00+00:00")
+        try:
+            apply = asyncio.create_task(m.apply_decision_error(
+                goal_id=gid, project_name="alpha", expected_generation=0,
+                task_id=tid, error="boom", message="Could not decide next step: boom"))
+            await asyncio.wait_for(inside.wait(), timeout=15.0)
+            for _ in range(50):
+                await asyncio.sleep(0)
+
+            # Mid-transaction: none of it is visible.
+            mid_rows = await _rows(m, gid)
+            mid_kinds = await _kinds(m)
+            check(mid_rows[0]["status"] == "running",
+                  f"mid-transaction the task is not yet failed ({mid_rows[0]['status']})")
+            check(not mid_kinds, f"and no error event is visible ({mid_kinds})")
+
+            cancel = asyncio.create_task(m.cancel_goal(goal_id=gid))
+            for _ in range(50):
+                await asyncio.sleep(0)
+            check(not cancel.done(),
+                  "a concurrent cancel is ordered after the error, not through it")
+
+            release.set()
+            check(await asyncio.wait_for(apply, timeout=15.0) is True,
+                  "the error then applies whole")
+            await asyncio.wait_for(cancel, timeout=15.0)
+        finally:
+            release.set()
+            backend._add_event = original
+
+        goal = await m.get_goal(goal_id=gid)
+        rows = await _rows(m, gid)
+        kinds = await _kinds(m)
+        check(rows[0]["status"] == "failed", f"task failed ({rows[0]['status']})")
+        check("error" in kinds, f"with its event ({kinds})")
+        check(goal["status"] == "cancelled",
+              f"and the cancel landed afterwards ({goal['status']})")
+
+
+async def test_the_planner_error_gate_needs_generation_and_active():
+    check.section("C8: the planner-error gate is fenced like a decision")
+
+    with _tmp() as td:
+        m = await _mem(td)
+        gid = await _goal(m)
+        tid = await _seed_task(m, gid, tool="__decide__", status="running",
+                               generation=0, created="2020-01-01T00:00:00+00:00")
+
+        async def _set(status, generation):
+            async with aiosqlite.connect(m._sqlite._db_path) as db:
+                await db.execute(
+                    "UPDATE goals SET status=?, generation=? WHERE goal_id=?",
+                    (status, generation, str(gid)))
+                await db.commit()
+
+        async def _try(expected):
+            return await m.apply_decision_error(
+                goal_id=gid, project_name="alpha", expected_generation=expected,
+                task_id=tid, error="boom", message="Could not decide next step: boom")
+
+        await _set("active", 1)                 # right status, wrong run
+        check(await _try(0) is False, "a run-0 error is refused on run 1")
+
+        await _set("paused", 0)                 # right run, not active
+        check(await _try(0) is False, "and refused while the goal is paused")
+
+        await _set("cancelled", 0)
+        check(await _try(0) is False, "and while it is cancelled")
+
+        rows = await _rows(m, gid)
+        check(rows[0]["status"] == "running", "nothing was written by any refusal")
+        check(not await _kinds(m), "and no event escaped")
+
+        await _set("active", 0)
+        check(await _try(0) is True, "while the matching live run records it")
+
+
 async def test_a_current_planner_error_is_still_recorded():
     check.section("C7: an ordinary planner failure still reports normally")
 
@@ -717,13 +974,162 @@ async def test_a_current_planner_error_is_still_recorded():
           f"({(failed[0]['last_error'][:50] if failed else None)!r})")
 
 
+# ── The step budget must actually be resumable ──────────────────────────────
+
+async def test_a_budget_pause_can_really_be_resumed():
+    """Nova offers "resume or cancel it", so resume has to mean something.
+
+    Measured on e9183c2: budget reached -> paused -> resume -> the supervisor
+    counted the SAME finished steps (the budget spanned all runs, and resume
+    did not open one) -> paused again, zero planner calls. Resume could only
+    ever mean cancel.
+    """
+    check.section("C8: resuming after the step budget gets a fresh window")
+
+    with _tmp() as td:
+        m = await _mem(td)
+        router = ToolRouter({}, {})
+        calls = {"n": 0}
+
+        async def planner(**kw):
+            calls["n"] += 1
+            return {"type": "final", "message": "continued successfully"}
+
+        sup = _supervisor(m, router=router, decide=planner, max_steps=2)
+        gid = await _goal(m)
+        for i in range(2):                       # spend the budget of run 0
+            await _seed_task(m, gid, tool=f"spent{i}", status="done",
+                             generation=0, created=f"2020-01-0{i+1}T00:00:00+00:00")
+        await m.enqueue_goal_task(goal_id=gid, project_name="alpha",
+                                  tool_name="__decide__", args={})
+        log = _EventLog(m)
+        sup.start()
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                await log.drain()
+                if (await m.get_goal(goal_id=gid))["status"] == "paused":
+                    break
+            # The pause and its event commit together, so the drain that ran
+            # BEFORE the status check on the breaking iteration missed it.
+            await log.drain()
+            goal = await m.get_goal(goal_id=gid)
+            check(goal["status"] == "paused", f"the budget pauses it ({goal['status']})")
+            check(log.kinds.count("paused") == 1,
+                  f"with one paused event ({log.kinds})")
+            check(calls["n"] == 0,
+                  f"and without spending a planner call ({calls['n']})")
+
+            resumed = await m.resume_goal(goal_id=gid)
+            check(resumed is not None, "resume succeeds")
+            goal = await m.get_goal(goal_id=gid)
+            check(goal["generation"] == 1,
+                  f"and opens exactly one new run ({goal['generation']})")
+
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                await log.drain()
+                if (await m.get_goal(goal_id=gid))["status"] == "completed":
+                    break
+            await log.drain()
+        finally:
+            await sup.stop()
+
+        await log.drain()
+        goal = await m.get_goal(goal_id=gid)
+        rows = await _rows(m, gid)
+        check(calls["n"] >= 1,
+              f"the planner is ACTUALLY consulted after resume ({calls['n']})")
+        check(log.kinds.count("paused") == 1,
+              f"the goal does not immediately re-pause ({log.kinds})")
+        check(goal["status"] == "completed",
+              f"and the goal can reach completion ({goal['status']})")
+        fresh = [t for t in rows if t["generation"] == 1]
+        check(any(t["tool_name"] == "__decide__" for t in fresh),
+              f"the continuation belongs to the fresh run ({len(fresh)})")
+
+
+async def test_the_budget_still_bounds_each_run():
+    check.section("C8: a resumed run is bounded too, not unlimited")
+
+    with _tmp() as td:
+        m = await _mem(td)
+        gid = await _goal(m)
+        for i in range(2):
+            await _seed_task(m, gid, tool=f"old{i}", status="done", generation=0,
+                             created=f"2020-01-0{i+1}T00:00:00+00:00")
+        await m.resume_goal(goal_id=gid)          # goal was active; no bump
+        await m.update_goal_status(goal_id=gid, status="paused")
+        await m.resume_goal(goal_id=gid)          # paused -> run 1
+        goal = await m.get_goal(goal_id=gid)
+        check(goal["generation"] == 1, f"on run 1 ({goal['generation']})")
+
+        check(await m.count_finished_goal_steps(goal_id=gid, generation=1) == 0,
+              "run 1 starts with a clean budget")
+        check(await m.count_finished_goal_steps(goal_id=gid, generation=0) == 2,
+              "and run 0's history is still counted against run 0")
+
+        for i in range(2):                        # spend run 1 as well
+            await _seed_task(m, gid, tool=f"new{i}", status="failed", generation=1,
+                             created=f"2021-01-0{i+1}T00:00:00+00:00")
+        check(await m.count_finished_goal_steps(goal_id=gid, generation=1) == 2,
+              "a resumed run spends its own budget and can pause again")
+
+
+async def test_concurrent_resumes_are_idempotent_per_state():
+    check.section("C8: eight concurrent resumes, three starting states")
+
+    async def _matrix(start: str):
+        with _tmp() as td:
+            m = await _mem(td)
+            gid = await _goal(m)
+            if start == "paused":
+                await m.update_goal_status(goal_id=gid, status="paused")
+            elif start == "cancelled":
+                await m.cancel_goal(goal_id=gid)
+            before = (await m.get_goal(goal_id=gid))["generation"]
+
+            await asyncio.gather(*[m.resume_goal(goal_id=gid) for _ in range(8)])
+
+            goal = await m.get_goal(goal_id=gid)
+            rows = await _rows(m, gid)
+            runnable = [t for t in rows
+                        if t["tool_name"] == "__decide__"
+                        and t["status"] in ("queued", "running")]
+            return before, goal, runnable
+
+    before, goal, runnable = await _matrix("paused")
+    check(goal["generation"] == before + 1,
+          f"PAUSED: the generation moves exactly once ({before} -> {goal['generation']})")
+    check(len(runnable) == 1,
+          f"PAUSED: exactly one continuation ({len(runnable)})")
+    check(runnable and runnable[0]["generation"] == goal["generation"],
+          "PAUSED: and it belongs to the new run")
+    check(goal["status"] == "active", f"PAUSED: goal is active ({goal['status']})")
+
+    before, goal, runnable = await _matrix("cancelled")
+    check(goal["generation"] == before,
+          f"CANCELLED: cancel's run is retained, not bumped again "
+          f"({before} -> {goal['generation']})")
+    check(len(runnable) == 1,
+          f"CANCELLED: exactly one continuation ({len(runnable)})")
+
+    before, goal, runnable = await _matrix("active")
+    check(goal["generation"] == before,
+          f"ACTIVE: no generation churn ({before} -> {goal['generation']})")
+    check(len(runnable) == 1,
+          f"ACTIVE: no duplicate continuation ({len(runnable)})")
+
+
 async def main():
     await test_a_transient_failure_after_cancel_is_not_requeued()
     await test_a_transient_failure_on_a_live_goal_still_retries()
     await test_only_a_task_of_the_current_run_is_claimable()
     await test_the_claimed_generation_is_not_the_goals_current_one()
-    await test_a_goalless_task_is_unaffected()
-    await test_the_returned_generation_is_the_rows_own()
+    await test_a_goalless_task_never_runs()
+    await test_an_orphan_real_tool_never_reaches_the_router()
+    await test_enqueueing_against_a_missing_goal_is_refused()
+    await test_the_claim_projects_the_tasks_own_generation()
     await test_the_claim_update_re_checks_the_condition_itself()
     await test_each_retry_requeue_condition_refuses_on_its_own()
     await test_a_cancel_beats_a_step_budget_pause()
@@ -731,7 +1137,13 @@ async def main():
     await test_the_step_budget_gate_needs_active_as_well_as_generation()
     await test_a_step_budget_pause_that_wins_applies_whole()
     await test_a_stale_planner_error_does_not_reach_the_resumed_run()
+    await test_a_planner_failure_cannot_be_overtaken_between_check_and_write()
+    await test_a_planner_error_that_wins_applies_whole_then_cancel_lands()
+    await test_the_planner_error_gate_needs_generation_and_active()
     await test_a_current_planner_error_is_still_recorded()
+    await test_a_budget_pause_can_really_be_resumed()
+    await test_the_budget_still_bounds_each_run()
+    await test_concurrent_resumes_are_idempotent_per_state()
     check.finish()
 
 

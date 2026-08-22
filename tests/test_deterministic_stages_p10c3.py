@@ -1441,13 +1441,35 @@ async def test_the_claim_itself_refuses_a_non_active_goal():
         check(got is not None and str(got["tool_name"]) == "demo.act",
               f"active again -> the same task is claimable ({got and got['tool_name']})")
 
-        # A task with no goal row at all behaves exactly as it did before.
+        # A task with no goal row at all FAILS CLOSED (V3 P10 C8). This used to
+        # assert the opposite, preserved as compatibility — but the supervisor
+        # hands a claimed real tool straight to the router without looking its
+        # parent up, so an orphan row naming a side-effecting tool executed on
+        # nothing's authority. Storage refuses to create one and refuses to
+        # hand one out.
         orphan = uuid4()
-        await mem.enqueue_goal_task(goal_id=orphan, project_name="alpha",
-                                    tool_name="demo.orphan", args={})
+        made = await mem.enqueue_goal_task(goal_id=orphan, project_name="alpha",
+                                           tool_name="demo.orphan", args={})
+        check(made is None,
+              f"work cannot be queued for a goal that does not exist ({made})")
+
+        # Seed one DIRECTLY as well — rows left by older builds already exist,
+        # and asserting the claim only after a refused enqueue would pass
+        # vacuously (there would be no row to claim either way).
+        import aiosqlite
+        async with aiosqlite.connect(mem._sqlite._db_path) as db:
+            await db.execute(
+                "INSERT INTO tasks(task_id, goal_id, project_name, tool_name, "
+                "args_json, status, attempts, run_after, last_error, result_json, "
+                "created_at, updated_at, generation) VALUES(?,?,?,?,'{}','queued',"
+                "0,?,'','{}',?,?,0)",
+                (str(uuid4()), str(orphan), "alpha", "demo.orphan",
+                 "2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00",
+                 "2000-01-01T00:00:00+00:00"))
+            await db.commit()
         got = await mem.claim_next_goal_task()
-        check(got is not None and str(got["tool_name"]) == "demo.orphan",
-              f"an orphan task is still claimable ({got and got['tool_name']})")
+        check(got is None,
+              f"and no orphan task is claimable ({got and got['tool_name']})")
 
 
 async def test_supervisor_does_not_report_a_step_it_could_not_schedule():
