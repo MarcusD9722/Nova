@@ -261,6 +261,11 @@ class LLMRuntime:
             # up to two wasted generations on a single conversational turn.
             "empty_retries": 0,
             "empty_exhausted": 0,
+            # A stream that produced nothing and had to be rescued by the
+            # runtime's non-streaming call. Counted separately from
+            # `empty_exhausted` so "we recovered" and "we gave up" stay
+            # distinguishable in telemetry.
+            "empty_salvaged": 0,
         }
 
     @property

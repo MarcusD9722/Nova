@@ -2027,20 +2027,44 @@ class RuntimeManager:
 
         reply = (self._last_stream_text or "").strip()
         if not reply:
-            # Rare overflow (the model reasoned past the budget without closing
-            # the think block). The non-streaming chat() retries internally; give
-            # it extra room and an explicit terse-answer nudge so it lands.
+            # The stream produced nothing visible. By the time we are here,
+            # `chat_stream` has already escalated through its three attempts and
+            # its LAST one used native reasoning — so repeating `thinking=True`
+            # here is not a retry, it is the same contract a fourth time.
+            #
+            # The direction is taken from this repo's own P2.5 measurement on
+            # the six production cases, quoted above in this method:
+            #
+            #     thinking=True    5/18 empty
+            #     thinking=False   0/18 empty
+            #
+            # `thinking=False` prefills an ALREADY-CLOSED reasoning block
+            # (core/llm_runtime._apply_no_think), and the failure being rescued
+            # from is a block that opened and never closed — one the model never
+            # opens cannot overflow. So the rescue is structurally DIFFERENT
+            # from what just failed, which is the only kind of retry worth
+            # spending a generation on.
             salvage = messages + [{
                 "role": "user",
                 "content": "Reply now in one or two warm, natural sentences. No analysis, no reasoning — just talk.",
             }]
             async with self._llm_sem:
                 retry = await self._llm.chat(
-                    salvage, max_tokens=512, temperature=0.4, thinking=True
+                    salvage, max_tokens=512, temperature=0.4, thinking=False
                 )
             reply = (retry or "").strip()
             if reply:
+                # Counted apart from `empty_exhausted` so "recovered" and
+                # "gave up" stay distinguishable in telemetry.
+                try:
+                    self._llm._usage["empty_salvaged"] = int(
+                        self._llm._usage.get("empty_salvaged", 0)) + 1
+                except Exception:
+                    pass
+                logger.info("chat_stream_salvaged", chars=len(reply))
                 yield {"type": "token", "text": reply}
+            else:
+                logger.warning("chat_stream_salvage_failed")
         if not reply:
             reply = "Sorry — I came up empty on that one."
         await _finish(reply, tool_results)
