@@ -18,11 +18,29 @@ process.
 HONESTY ABOUT STATE
 -------------------
 "Registered" and "usable right now" are different claims, and conflating them
-is how an assistant ends up promising to send an email it cannot send. A
-capability is reported as `available` only when its tools are registered AND
-nothing known-at-runtime disables it; otherwise it is reported with the reason
-(`disabled`, `needs_setup`, `not_registered`) so the answer can say "built, but
-switched off" rather than "I can do that".
+is how an assistant ends up promising to send an email it cannot send.
+
+That distinction was got wrong once already here, which is why it is spelled
+out: computer-control tools ARE registered, and `RuntimeManager` constructs
+`ComputerControl(..., adapter=None)` — no platform adapter ships, so
+`can_execute()` is false and every action is a dry run. The report called the
+whole category "available" anyway, because it looked only at an environment
+flag. Permission/configuration and an execution backend are SEPARATE axes and
+both have to hold.
+
+So availability is decided from runtime probes the caller actually measures,
+not from environment variables alone:
+
+    available       registered, permitted, and a working backend exists
+    dry_run_only    registered and permitted, but nothing can execute it
+    disabled        switched off by configuration
+    needs_setup     registered, but required credentials are absent
+    not_registered  no such tools in this build
+
+Where the runtime genuinely cannot tell, the category keeps `available` rather
+than acquiring an invented caveat — but anything with a KNOWN negative signal
+must report it. Claiming an ability Nova does not have is the failure mode
+being designed against.
 """
 
 import os
@@ -70,13 +88,18 @@ _CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 
+#: Every state a capability can be in. `available` is the ONLY one that means
+#: "I can do this right now".
+STATES = ("available", "dry_run_only", "disabled", "needs_setup", "not_registered")
+
+
 @dataclass
 class Capability:
     """One category of things Nova can do, and whether she can do it now."""
 
     key: str
     label: str
-    state: str                      # available | disabled | needs_setup | not_registered
+    state: str
     tools: list[str] = field(default_factory=list)
     note: str = ""
 
@@ -97,7 +120,7 @@ class CapabilityReport:
 
     def unavailable(self) -> list[Capability]:
         return [c for c in self.capabilities
-                if c.state in ("disabled", "needs_setup") and c.tools]
+                if c.state in ("disabled", "needs_setup", "dry_run_only") and c.tools]
 
     def sentence(self) -> str:
         """A compact, honest summary — the deterministic answer's backbone."""
@@ -111,6 +134,13 @@ class CapabilityReport:
             bits = [f"{c.label} ({c.note or c.state.replace('_', ' ')})" for c in held]
             out += f" Built but not usable right now: {'; '.join(bits)}."
         return out
+
+    def state_of(self, key: str) -> str:
+        """The state of one category, for callers that need the raw answer."""
+        for c in self.capabilities:
+            if c.key == key:
+                return c.state
+        return "not_registered"
 
     def prompt_line(self) -> str:
         """One line for the grounding context when introspection was asked."""
@@ -126,12 +156,38 @@ def _env_off(name: str, default: str = "1") -> bool:
     return (os.getenv(name, default).strip().lower() in {"0", "false", "no", "off"})
 
 
-def summarize_capabilities(tool_names: list[str] | None) -> CapabilityReport:
+#: Credentials a category CANNOT work without. Checked by presence only — Nova
+#: never reads the value, and an unlisted category is simply not credential-
+#: checked rather than assumed broken.
+_REQUIRED_CREDENTIALS: dict[str, tuple[str, ...]] = {
+    "communication": ("DISCORD_BOT_TOKEN",),
+    "weather_maps": ("OPENWEATHER_API_KEY", "GOOGLE_MAPS_API_KEY"),
+}
+
+
+def _missing_credentials(key: str) -> list[str]:
+    """Required credentials that are absent. Empty when nothing is required."""
+    required = _REQUIRED_CREDENTIALS.get(key, ())
+    return [name for name in required if not (os.getenv(name) or "").strip()]
+
+
+def summarize_capabilities(tool_names: list[str] | None,
+                           probes: dict[str, object] | None = None) -> CapabilityReport:
     """Group the REGISTERED tool names and judge each category's state.
 
     `tool_names` comes from `ToolRouter.list_tools()` — the same registry the
     agent loop calls — so the answer cannot drift from what is wired up.
+
+    `probes` carries what the RUNTIME measured, because registration alone
+    cannot answer "can you do this now":
+
+        computer_can_execute   bool  — ComputerControl.can_execute()
+                                       (false when no platform adapter exists)
+
+    Anything absent from `probes` is simply not known, and an unknown never
+    invents a caveat — but it never overrides a known negative either.
     """
+    facts = dict(probes or {})
     names = sorted({str(t).strip() for t in (tool_names or []) if str(t).strip()})
     report = CapabilityReport(total_tools=len(names))
 
@@ -144,15 +200,27 @@ def summarize_capabilities(tool_names: list[str] | None) -> CapabilityReport:
             continue
 
         state, note = "available", ""
-        # Runtime switches Nova can actually read. Anything not checkable here
-        # stays "available" rather than being guessed at — an unknown is not
-        # evidence of being broken, and inventing a caveat is its own dishonesty.
-        if key == "computer_control" and _env_off("NOVA_ALLOW_SHELL"):
-            state, note = "disabled", "shell access is switched off"
+        # Runtime facts Nova can actually check. An unknown is not evidence of
+        # being broken and gets no invented caveat; a KNOWN negative always wins.
+        if key == "computer_control":
+            if _env_off("NOVA_ALLOW_SHELL"):
+                state, note = "disabled", "shell access is switched off"
+            elif facts.get("computer_can_execute") is False:
+                # The tools exist and are permitted, but ComputerControl has no
+                # platform adapter, so every action is a dry run. Saying
+                # "available" here would promise something that cannot happen.
+                state, note = ("dry_run_only",
+                               "no platform adapter is installed, so actions are "
+                               "dry runs only")
         elif key == "research" and _env_off("NOVA_ALLOW_NETWORK_TOOLS"):
             state, note = "disabled", "network tools are switched off"
         elif key == "self_inspection" and _env_off("NOVA_DEV_MODE", "0"):
             state, note = "disabled", "developer mode is off"
+        else:
+            missing = _missing_credentials(key)
+            if missing:
+                state, note = ("needs_setup",
+                               f"not connected yet ({', '.join(missing)} not set)")
 
         report.capabilities.append(
             Capability(key=key, label=label, state=state, tools=owned, note=note))

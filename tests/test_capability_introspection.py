@@ -131,9 +131,17 @@ async def test_disabled_is_reported_as_disabled():
               f"and only offers what is usable ({sentence[:80]})")
 
         os.environ["NOVA_ALLOW_SHELL"] = "1"
-        again = summarize_capabilities(tools)
-        check({c.key: c.state for c in again.capabilities}.get("computer_control") == "available",
-              "turning it back on flips the report, so this is runtime truth")
+        # Permission alone is NOT enough any more: without an execution backend
+        # the category is dry_run_only. Asserting "available" here was exactly
+        # the defect independent review found — ComputerControl ships with
+        # adapter=None, so nothing could ever run.
+        again = summarize_capabilities(tools, {"computer_can_execute": False})
+        check(again.state_of("computer_control") == "dry_run_only",
+              f"permitted but with no adapter -> dry_run_only "
+              f"({again.state_of('computer_control')})")
+        with_backend = summarize_capabilities(tools, {"computer_can_execute": True})
+        check(with_backend.state_of("computer_control") == "available",
+              "and only a real execution backend makes it available")
     finally:
         for k, v in prev.items():
             if v is None:
@@ -202,6 +210,132 @@ async def test_smart_home_behaviour_is_unchanged():
               f"absent -> unavailable ({ctx['capabilities']})")
 
 
+# ── CORRECTION 5: registered is not operational ─────────────────────────────
+async def test_registered_but_unexecutable_is_not_claimed():
+    """`ComputerControl(adapter=None)` cannot act, so Nova must not say she can.
+
+    Independent review found the report calling computer control "available"
+    whenever NOVA_ALLOW_SHELL was on — while production constructs
+    ComputerControl with no platform adapter, so `can_execute()` is false and
+    every action is a dry run. Permission and an execution backend are separate
+    axes; both must hold.
+    """
+    check.section("C5: no adapter means no claim of computer control")
+
+    from core.capability_report import summarize_capabilities
+
+    tools = ["computer.observe", "computer.act", "memory.recall"]
+    prev = os.environ.get("NOVA_ALLOW_SHELL")
+    try:
+        os.environ["NOVA_ALLOW_SHELL"] = "1"        # permitted...
+
+        no_adapter = summarize_capabilities(tools, {"computer_can_execute": False})
+        check(no_adapter.state_of("computer_control") == "dry_run_only",
+              f"...but with no adapter it is dry_run_only "
+              f"({no_adapter.state_of('computer_control')})")
+        check("controlling this computer" not in
+              ", ".join(c.label for c in no_adapter.usable()),
+              "and it is NOT listed among what she can do now")
+        check("dry runs only" in no_adapter.sentence(),
+              f"the answer says why ({no_adapter.sentence()[-90:]!r})")
+
+        with_adapter = summarize_capabilities(tools, {"computer_can_execute": True})
+        check(with_adapter.state_of("computer_control") == "available",
+              f"a working adapter flips it to available "
+              f"({with_adapter.state_of('computer_control')})")
+        check("controlling this computer" in with_adapter.sentence(),
+              "and then it IS offered")
+
+        os.environ["NOVA_ALLOW_SHELL"] = "0"
+        off = summarize_capabilities(tools, {"computer_can_execute": True})
+        check(off.state_of("computer_control") == "disabled",
+              f"permission still wins when switched off "
+              f"({off.state_of('computer_control')})")
+    finally:
+        if prev is None:
+            os.environ.pop("NOVA_ALLOW_SHELL", None)
+        else:
+            os.environ["NOVA_ALLOW_SHELL"] = prev
+
+
+async def test_an_unconfigured_integration_is_not_claimed():
+    check.section("C5: a registered integration without credentials")
+
+    from core.capability_report import summarize_capabilities
+
+    tools = ["discord.send", "memory.recall"]
+    prev = os.environ.get("DISCORD_BOT_TOKEN")
+    try:
+        os.environ.pop("DISCORD_BOT_TOKEN", None)
+        report = summarize_capabilities(tools)
+        check(report.state_of("communication") == "needs_setup",
+              f"no token -> needs_setup ({report.state_of('communication')})")
+        check("email, calendar and messaging" not in
+              ", ".join(c.label for c in report.usable()),
+              "and messaging is not offered as available")
+        check("not connected yet" in report.sentence(),
+              f"the answer says it is not connected ({report.sentence()[-80:]!r})")
+
+        os.environ["DISCORD_BOT_TOKEN"] = "x" * 12
+        connected = summarize_capabilities(tools)
+        check(connected.state_of("communication") == "available",
+              f"with the token present it becomes available "
+              f"({connected.state_of('communication')})")
+    finally:
+        if prev is None:
+            os.environ.pop("DISCORD_BOT_TOKEN", None)
+        else:
+            os.environ["DISCORD_BOT_TOKEN"] = prev
+
+
+async def test_the_real_runtime_probes_its_own_adapter():
+    """Through the REAL RuntimeManager, not a hand-made probe dict."""
+    check.section("C5: the production report measures the real ComputerControl")
+
+    with _tmp() as td:
+        rt, m, router = await _runtime(td)
+        check(rt._computer.available is False,
+              f"production ComputerControl cannot execute "
+              f"({rt._computer.available})")
+
+        state = rt._capability_report().state_of("computer_control")
+        check(state != "available", f"so the report does not claim it ({state})")
+
+        answer = rt._capability_reply("What are you capable of?") or ""
+        check("Right now I can help with" in answer, "an answer is produced")
+        can_half = answer.split("Built but not usable")[0]
+        check("controlling this computer" not in can_half,
+              f"and does not offer computer control ({can_half[-70:]!r})")
+
+        class _Adapter:
+            def observe(self, what):
+                return {"windows": []}
+
+            def execute(self, kind, target, details):
+                return {"ok": True}
+
+        prev_shell = os.environ.get("NOVA_ALLOW_SHELL")
+        prev_cc = os.environ.get("NOVA_COMPUTER_CONTROL")
+        try:
+            os.environ["NOVA_ALLOW_SHELL"] = "1"
+            os.environ["NOVA_COMPUTER_CONTROL"] = "1"
+            rt._computer._adapter = _Adapter()
+            if rt._computer.available:
+                check(rt._capability_report().state_of("computer_control") == "available",
+                      "with a working adapter installed it becomes available")
+            else:
+                check(rt._capability_report().state_of("computer_control") != "available",
+                      "execution still gated by configuration — and still not claimed")
+        finally:
+            rt._computer._adapter = None
+            for k, v in (("NOVA_ALLOW_SHELL", prev_shell),
+                         ("NOVA_COMPUTER_CONTROL", prev_cc)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 async def main():
     await test_the_answer_covers_what_is_registered()
     await test_nothing_unregistered_is_claimed()
@@ -209,6 +343,9 @@ async def main():
     await test_the_registry_can_grow_without_edits()
     await test_ordinary_turns_are_not_bloated()
     await test_smart_home_behaviour_is_unchanged()
+    await test_registered_but_unexecutable_is_not_claimed()
+    await test_an_unconfigured_integration_is_not_claimed()
+    await test_the_real_runtime_probes_its_own_adapter()
     check.finish()
 
 

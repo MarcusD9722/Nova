@@ -2189,10 +2189,26 @@ class RuntimeManager:
     )
 
     def _capability_report(self):
-        """The runtime's own view of what is wired up right now."""
+        """The runtime's own view of what is wired up right now.
+
+        Registration is not operability: `ComputerControl` is constructed with
+        `adapter=None` because no platform adapter ships, so its tools exist
+        and permission may be granted while nothing can actually execute. That
+        is measured here and passed in, rather than inferred from a flag.
+        """
         from core.capability_report import summarize_capabilities
 
-        return summarize_capabilities(self._router.list_tools())
+        probes: dict[str, object] = {}
+        try:
+            # `ComputerControl.available` is a PROPERTY: flag AND adapter. An
+            # earlier version of this called a `can_execute()` that does not
+            # exist, and the except below swallowed the AttributeError — so the
+            # probe was silently absent and the category went back to claiming
+            # availability. The test that drives the real runtime caught it.
+            probes["computer_can_execute"] = bool(self._computer.available)
+        except Exception:  # noqa: BLE001 — a genuine unknown stays unknown
+            pass
+        return summarize_capabilities(self._router.list_tools(), probes)
 
     def _capability_reply(self, text: str) -> str | None:
         """Answer an introspection question from the REGISTRY, not the README.
@@ -2887,9 +2903,9 @@ class RuntimeManager:
             # tool by tool) and only when the message is actually asking what
             # she can do — an ordinary turn should not carry the inventory.
             if self._INTROSPECTION_RE.search(user_text or ""):
-                from core.capability_report import summarize_capabilities
-
-                context["capability_summary"] = summarize_capabilities(tool_names).prompt_line()
+                # The same runtime-probed report the deterministic answer uses,
+                # so the prompt cannot claim more than the runtime can do.
+                context["capability_summary"] = self._capability_report().prompt_line()
 
         smart_home_tools = [t for t in tool_names if ("smart" in t.lower() or "home" in t.lower())]
         if smart_home_tools:
