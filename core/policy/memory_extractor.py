@@ -70,6 +70,9 @@ class MemoryExtractorLLM:
             logger.debug("memory_extractor_no_facts_list", raw=raw[:400])
             return MemoryExtractorOutput(facts=[])
 
+        # Age needs care: "Mateo is three" must not become a timeless
+        # `age = 3`. Emit `age_observation` (the number) and let ingestion
+        # stamp the date it was said; a birthday goes in `birthday` as MM-DD.
         kept: list[MemoryFact] = []
         dropped = 0
         for item in raw_facts:

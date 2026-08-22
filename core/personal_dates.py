@@ -217,3 +217,88 @@ def derive_birth_year(*, stated_age: int, birth_month: int, birth_day: int,
     if (birth_month, birth_day) < (observed_on.month, observed_on.day):
         next_year += 1
     return next_year - (stated_age + 1)
+
+
+# ── Age statements: "X is three and turns four on September 16th" ───────────
+
+_NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+
+
+def _as_int(token: str) -> int | None:
+    t = (token or "").strip().lower()
+    if t.isdigit():
+        return int(t)
+    return _NUMBER_WORDS.get(t)
+
+
+_AGE_NUM = r"(?:\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")"
+
+#: "Mateo is three years old and he turns four on September 16th."
+#: "Liam is a year old and turns two on November 8th."
+_AGE_STATEMENT_RE = re.compile(
+    r"\b(?P<name>[A-Z][\w'-]+)\s+is\s+(?P<age>" + _AGE_NUM + r"|a)\s*"
+    r"(?:years?\s*old|year\s*old)?"
+    r"[^.]{0,40}?\bturn(?:s|ing)?\s+(?P<next>" + _AGE_NUM + r")\s+"
+    r"(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class AgeStatement:
+    """An age said out loud, with the day it was said — never a bare number."""
+
+    name: str
+    age: int
+    month: int
+    day: int
+    observed_on: date
+    birth_year: int | None = None       # derived, only when unambiguous
+
+    def attributes(self) -> dict[str, str]:
+        """The durable, non-staling representation.
+
+        `age` is deliberately NOT among these. A stored `age = 3` is true for a
+        few months and silently false afterwards; an observation plus the date
+        it was made stays true forever and still yields today's age.
+        """
+        attrs = {
+            BIRTHDAY_KEY: f"{self.month:02d}-{self.day:02d}",
+            AGE_OBSERVATION_KEY: str(self.age),
+            AGE_OBSERVED_ON_KEY: self.observed_on.isoformat(),
+        }
+        if self.birth_year is not None:
+            attrs[BIRTH_DATE_KEY] = f"{self.birth_year:04d}-{self.month:02d}-{self.day:02d}"
+            # Marcus said an age and a day; he never said a year. Recording the
+            # derivation as "derived" keeps that distinction honest.
+            attrs[BIRTH_DATE_SOURCE_KEY] = "derived"
+        return attrs
+
+
+def parse_age_statements(text: str, *, today: date) -> list[AgeStatement]:
+    """Every "<Name> is N and turns N+1 on <month day>" in the message.
+
+    Deterministic on purpose: this is the ingestion path for a durable personal
+    record, and a stochastic extractor is the wrong authority for one.
+    """
+    out: list[AgeStatement] = []
+    for m in _AGE_STATEMENT_RE.finditer(text or ""):
+        raw_age = m.group("age")
+        age = 1 if raw_age.lower() == "a" else _as_int(raw_age)
+        nxt = _as_int(m.group("next"))
+        month = _MONTHS.get(m.group("month").lower())
+        if age is None or nxt is None or month is None:
+            continue
+        day = int(m.group("day"))
+        if not (1 <= day <= 31):
+            continue
+        year = derive_birth_year(stated_age=age, birth_month=month, birth_day=day,
+                                 observed_on=today, turns_next=nxt)
+        out.append(AgeStatement(name=m.group("name"), age=age, month=month,
+                                day=day, observed_on=today, birth_year=year))
+    return out

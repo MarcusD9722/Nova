@@ -3151,6 +3151,26 @@ class RuntimeManager:
         if not msg:
             return
 
+        # ── Age statements ──────────────────────────────────────────────
+        # "Mateo is three years old and he turns four on September 16th."
+        #
+        # Deterministic rather than model-extracted, because this writes a
+        # DURABLE personal record and a stochastic extractor is the wrong
+        # authority for one. Stored as a normalized person record — the
+        # established shape for people — never as a bare `age`, which would be
+        # wrong within months.
+        try:
+            from datetime import date as _date
+
+            from core.personal_dates import parse_age_statements
+
+            for said in parse_age_statements(msg, today=_date.today()):
+                await self._memory.upsert_person(said.name, said.attributes())
+                logger.info("age_observation_recorded", person=said.name,
+                            age=said.age, derived=said.birth_year is not None)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("age_capture_failed", error=str(e)[:160])
+
         user_name = _extract_user_name(msg)
         if user_name:
             await self._replace_user_name_fact(user_name)

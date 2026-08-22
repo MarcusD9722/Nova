@@ -74,6 +74,18 @@ class MemoryFact(_StrictModel):
         "anniversary",
         "important_date",
         "trip",
+        # ── age, WITHOUT the staleness ──
+        # A bare `age = 3` is true for a few months and silently false after
+        # that, so age is never stored as a timeless scalar. What is stored is
+        # the observation and the day it was made (`age_observation` +
+        # `age_observed_on`), from which today's age is computed. `birth_date`
+        # is recorded only when it can be derived unambiguously, and
+        # `birth_date_source` says whether it was stated or derived — Marcus
+        # gives an age and a day, almost never a year.
+        "age_observation",
+        "age_observed_on",
+        "birth_date",
+        "birth_date_source",
         # ── people detail: the "physical traits" gap ──
         "appearance",
         "vehicle",
