@@ -130,6 +130,28 @@ _IMPERATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A sentence that OPENS with an -ing form is a gerund subject, not a command.
+#:
+#: English imperatives take the bare stem — "Delete the project", never
+#: "Deleting the project". But the action-verb alternation is stem-plus-`\w*`,
+#: so `delet\w*` happily matched "Deleting" and `_IMPERATIVE_RE` read
+#:
+#:     "Deleting the old project was probably a bad idea."
+#:
+#: as an instruction to delete a project. Measured on c5d7a88, and the same for
+#: "Adding the menu was a mistake", "Changing the physics broke it",
+#: "Improving the UI took ages" — an entire class of retrospective remarks
+#: authorising a mutation. This is the fail-OPEN direction, which is the one
+#: this module exists to prevent, so it is checked before any affirmative
+#: evidence is considered.
+#:
+#: No English imperative begins with an -ing word, so nothing legitimate is
+#: lost. "Keep working on it" opens with "Keep" and is unaffected.
+_GERUND_OPENING_RE = re.compile(
+    r"^\s*(?:please\s+|now\s+|then\s+|also\s+|and\s+)*\w+ing\b",
+    re.IGNORECASE,
+)
+
 #: "Can you fix the collision bug", "let's add a restart button", "I want you
 #: to refactor it" — a request rather than a bare imperative.
 _REQUEST_RE = re.compile(
@@ -139,9 +161,43 @@ _REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Verbs that open a project without changing it. On their own they authorise
+#: nothing, which is why they are not action verbs.
+_OPENER_VERB = (
+    r"(?:open|look\s+at|go\s+to|pull\s+up|bring\s+up|check|read|review|"
+    r"inspect|load)"
+)
+
+#: "Open the flappy-bird project and add a pause button." — one imperative
+#: sentence whose FIRST verb merely opens something and whose SECOND clause is
+#: the real instruction.
+#:
+#: `_IMPERATIVE_RE` only ever looked at the opening verb, so this whole shape
+#: was refused as "no affirmative instruction" (measured in Stage 13A). Nova
+#: then discussed a change the user had plainly asked her to make.
+#:
+#: The action verb must come directly after `and`/`then` — i.e. in an
+#: imperative clause of its own. Requiring it merely to appear SOMEWHERE would
+#: authorise "Open the project and tell me what you would change", which
+#: contains "change" and is a question about intent, not an instruction.
+_COMPOUND_IMPERATIVE_RE = re.compile(
+    r"^\s*(?:please\s+|now\s+|then\s+|also\s+)*" + _OPENER_VERB + r"\b"
+    r".*?\b(?:and|then)\s+(?:please\s+|also\s+|now\s+)*" + _ACTION_VERB + r"\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 #: "Go ahead and apply those improvements." / "Yes, implement it." — approval
 #: of something already proposed. Requires an action verb as well, so a bare
 #: "yes" never authorises anything on its own.
+#:
+#: KNOWN GAP, deliberately left closed (Stage 13A): a bare "Go ahead." / "Do
+#: that." / "Yes, do it." carries no action verb and is refused. Those are
+#: genuine approvals when Nova has just proposed something, but this gate is
+#: context-free by design, and the message alone cannot tell an approval of a
+#: pending proposal from an idle "go ahead" in conversation. Closing it needs a
+#: pending-proposal signal threaded in from conversation state, not a looser
+#: pattern here — loosening would let "go ahead" in small talk mutate a project,
+#: which is the exact failure this module exists to prevent.
 _AFFIRMATIVE_LEAD_RE = re.compile(
     r"^\s*(?:yes|yeah|yep|yup|sure|ok|okay|alright|go\s+ahead|go\s+for\s+it|"
     r"do\s+it|please)\b",
@@ -182,8 +238,13 @@ def authorize_project_mutation(text: str, *, complaint: bool = False) -> Mutatio
         return MutationVerdict(False, "vetoed: question")
 
     core = strip_preamble(raw)
+    # A gerund subject is not a command, whatever verb it is built from.
+    if _GERUND_OPENING_RE.match(core):
+        return MutationVerdict(False, "vetoed: gerund subject, not an instruction")
     if _IMPERATIVE_RE.match(core):
         return MutationVerdict(True, "affirmative: imperative instruction")
+    if _COMPOUND_IMPERATIVE_RE.match(core):
+        return MutationVerdict(True, "affirmative: compound imperative instruction")
     if _REQUEST_RE.match(core):
         return MutationVerdict(True, "affirmative: direct request")
     if _AFFIRMATIVE_LEAD_RE.match(core) and _ACTION_VERB_RE.search(core):
