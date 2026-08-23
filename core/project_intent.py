@@ -51,6 +51,7 @@ __all__ = [
     "cancels_pending_change",
     "defers_a_change",
     "withdraws_pending_change",
+    "carries_a_proposal",
     "is_bare_approval",
     "approves_without_naming_a_change",
     "qualified_project_name",
@@ -532,9 +533,57 @@ _GENERIC_PROHIBITION_RE = re.compile(
 #: object is what separates them.
 _PROHIBITION_TARGET_RE = re.compile(
     r"\b(?:don'?t|do\s+not|never|stop|no\s+need\s+to)\s+"
-    r"(?:\w+\s+){0,3}?" + _IMPERATIVE_VERB + r"\b(?P<target>[^.;!?]*)",
+    r"(?:\w+\s+){0,3}?(?P<verb>" + _IMPERATIVE_VERB + r")\b"
+    r"(?P<target>[^.;!?]*)",
     re.IGNORECASE,
 )
+
+#: An action verb under negation, used to find the parts of a sentence that are
+#: NOT proposing anything.
+_NEGATED_ACTION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|never|stop|no\s+need\s+to|can'?t|cannot)\s+"
+    r"(?:\w+\s+){0,3}?" + _ACTION_VERB + r"\b",
+    re.IGNORECASE,
+)
+
+# WHAT KIND of change, not just what it is about.
+#
+# Cancellation compared TARGET NOUNS only, so "Don't remove the menu." withdrew
+# "Add a pause button to the menu." — both say "menu". Withdrawing an action
+# nobody proposed is not a withdrawal, so the action family has to match too.
+#
+# Stems, because the vocabulary is inflected: "changing" and "changed" belong to
+# the same family as "change".
+_FAMILY_STEMS = (
+    ("add", ("implement", "creat", "build", "extend", "wire", "hook", "add")),
+    ("remove", ("remov", "delet")),
+    ("modify", ("improv", "enhanc", "upgrad", "polish", "refactor", "rewrit",
+                "chang", "updat", "appl", "fix", "mak")),
+    ("continue", ("continu", "resum", "finish", "complet", "work", "keep")),
+)
+
+
+def _family_of(word: str) -> str:
+    w = (word or "").lower().strip()
+    for family, stems in _FAMILY_STEMS:
+        for stem in stems:
+            if w.startswith(stem):
+                return family
+    return ""
+
+
+def _positive_families(text: str) -> set:
+    """Action families the message PROPOSES, ignoring anything negated."""
+    raw = (text or "")
+    spans = [m.span() for m in _NEGATED_ACTION_RE.finditer(raw)]
+    out = set()
+    for m in _ACTION_VERB_RE.finditer(raw):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        family = _family_of(m.group(0))
+        if family:
+            out.add(family)
+    return out
 
 #: Words that carry no identity, so they cannot decide what a withdrawal is
 #: about. A target made only of these is a GENERIC withdrawal ("don't change
@@ -564,6 +613,32 @@ def defers_a_change(text: str) -> bool:
     return bool(_DEFERRED_PROHIBITION_RE.search((text or "").strip()))
 
 
+def carries_a_proposal(text: str) -> bool:
+    """Does this turn say WHAT to change, or only WHEN NOT to?
+
+    A deferral answers "not now". On its own it proposes nothing:
+
+        "Don't change it yet."          only timing
+        "Don't build it for now."       only timing
+        "Add a parallax background, but don't change anything yet."
+                                        a proposal AND its timing
+
+    The capture accepted the whole deferral bucket, so a standalone deferral
+    became the pending proposal — replacing a real one, or creating an
+    executable one out of nothing. Measured on e88104c: with a parallax
+    proposal pending, "Don't build it yet." replaced it and a later "Go ahead."
+    ran the words "Don't build it yet."
+
+    Structural, not a list of phrases: remove the deferral clause and see
+    whether anything describing a change is left.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw)
+    return bool(_content_words(rest))
+
+
 def withdraws_pending_change(text: str, pending: str) -> bool:
     """Does this prohibition call off the change that is actually pending?
 
@@ -581,8 +656,21 @@ def withdraws_pending_change(text: str, pending: str) -> bool:
         return False
     target = _content_words(m.group("target"))
     if not target:
+        # Anaphoric: "don't change it" names nothing, so it refers to whatever
+        # is on the table and the action family cannot narrow it.
         return True
-    return bool(target & _content_words(pending))
+    if not (target & _content_words(pending)):
+        return False
+    # The ACTION has to match as well. Sharing a noun is not withdrawal:
+    # "Don't remove the menu." does not call off "Add a pause button to the
+    # menu.", and cancelling on the noun alone silently dropped the proposal.
+    proposed = _positive_families(pending)
+    if not proposed:
+        # A proposal with no action verb of its own ("I'd like a dark mode,
+        # but don't change it yet") gives nothing to compare, so the target
+        # match stands on its own rather than blocking every withdrawal.
+        return True
+    return _family_of(m.group("verb")) in proposed
 
 
 def cancels_pending_change(text: str, pending: str = "") -> bool:

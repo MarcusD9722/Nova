@@ -416,17 +416,174 @@ async def test_a_deferral_qualifier_must_modify_the_prohibition():
 
         # The legitimate deferral still survives the whole round trip, or the
         # fix would have closed the feature instead of the ambiguity.
+        #
+        # `bool(pending)` and "an improve call happened" are NOT evidence: this
+        # assertion was exactly that, and it passed while the deferral was
+        # REPLACING the proposal. The payload is what has to be checked.
         for text in ("Don't change it yet.", "Don't build that for now."):
             rec.prompts.clear()
             cid = str(uuid4())
-            await _chat(nova, cid, "I'd like a parallax background.")
+            # A real proposal: "I'd like a parallax background." carries no
+            # action verb the vocabulary knows, so it never created one -
+            # this block used to pass only because the DEFERRAL was being
+            # stored as the proposal, which is the defect under test.
+            await _chat(nova, cid, "Add a parallax background, but don't "
+                                   "change anything yet.")
             await _chat(nova, cid, text)
-            check(bool(_pending(nova, cid, "flappy-bird")),
-                  f"a proposal survives {text!r}")
+            held = _pending(nova, cid, "flappy-bird")
+            check("parallax background" in held.lower(),
+                  f"the PROPOSAL survives {text!r}, not the deferral ({held!r})")
+            check(text.lower().rstrip(".") not in held.lower(),
+                  f"and {text!r} did not become the proposal")
             n = len(rec.prompts)
             await _chat(nova, cid, "Go ahead.")
             check(await _settled(nova, rec, n),
                   f"and is approvable after {text!r}")
+            check("parallax background" in rec.prompts[-1].lower(),
+                  f"and PARALLAX is what reached improve() ({rec.tails()})")
+
+
+async def test_a_standalone_deferral_is_not_a_proposal():
+    """A deferral says WHEN NOT to act. It does not say what to build.
+
+    The capture accepted the whole deferral bucket, so a sentence carrying only
+    timing became the pending proposal. Measured on e88104c:
+
+        "Add a parallax background, but don't change anything yet."
+        "Don't build it yet."      -> REPLACED the parallax proposal
+        "Go ahead."                -> improve() ran with "Don't build it yet."
+
+    and with nothing pending at all, "Don't change it yet." CREATED an
+    executable proposal out of a sentence that proposes nothing.
+
+    Every assertion here reads the payload — the exact pending text and the
+    exact instruction that reached improve(). `bool(pending)` and "an improve
+    call happened" are what let this through in the first place.
+    """
+    check.section("pending plan: a deferral alone proposes nothing")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        # A. a COMPLETE proposal plus its deferral
+        cid = str(uuid4())
+        await _chat(nova, cid, "Add a parallax background, but don't change "
+                               "anything yet.")
+        held = _pending(nova, cid, "flappy-bird")
+        check("parallax background" in held.lower(),
+              f"A: the proposal is pending ({held[:50]!r})")
+        await _quiet(nova, rec, ticks=20)
+        check(not rec.prompts, f"A: and nothing ran yet ({rec.tails()})")
+
+        # B. a STANDALONE deferral on top of it
+        await _chat(nova, cid, "Don't build it yet.")
+        held = _pending(nova, cid, "flappy-bird")
+        check("parallax background" in held.lower(),
+              f"B: the proposal is still the pending one ({held[:50]!r})")
+        check("don't build it yet" not in held.lower(),
+              f"B: the deferral did not replace it ({held[:50]!r})")
+        await _quiet(nova, rec, ticks=20)
+        check(not rec.prompts, f"B: and still nothing ran ({rec.tails()})")
+
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Go ahead.")
+        check(await _settled(nova, rec, n), "B: the approval executed")
+        ran = rec.prompts[-1].lower()
+        check("parallax background" in ran,
+              f"B: PARALLAX is what reached improve() ({rec.tails()})")
+        check("don't build it yet" not in ran,
+              f"B: and the deferral text did not ({rec.tails()})")
+
+        # C. a standalone deferral with NOTHING pending
+        for text in ("Don't change it yet.", "Don't build it for now.",
+                     "Don't implement that until later."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held,
+                  f"C: {text!r} created no proposal ({held[:40]!r})")
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"C: {text!r}: and a later approval ran nothing "
+                  f"({rec.tails()})")
+
+
+async def test_a_withdrawal_must_match_the_action_not_just_the_noun():
+    """Withdrawing an action nobody proposed is not a withdrawal.
+
+    Cancellation compared TARGET NOUNS only. Measured on e88104c:
+
+        "Add a pause button to the menu, but don't change anything yet."
+        "Don't remove the menu."   -> cancelled the pause-button proposal
+
+    Both sentences say "menu", and that was enough. The action family has to
+    match as well — and generic or anaphoric withdrawals stay different,
+    because they name no action to compare.
+    """
+    check.section("pending plan: a withdrawal matches the action, not a noun")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        cancels = (
+            ("Change the physics, but don't change anything yet.",
+             "Don't change the physics.", "physics"),
+            ("Add a pause button, but don't change anything yet.",
+             "Don't add the pause button.", "pause button"),
+            ("Update the README, but don't change anything yet.",
+             "Don't update the README.", "readme"),
+        )
+        for proposal, withdrawal, token in cancels:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, proposal)
+            check(token in _pending(nova, cid, "flappy-bird").lower(),
+                  f"[{withdrawal}] proposed first")
+            await _chat(nova, cid, withdrawal)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{withdrawal!r} withdrew it ({held[:40]!r})")
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{withdrawal!r}: nothing ran afterwards ({rec.tails()})")
+
+        survives = (
+            ("Add a pause button to the menu, but don't change anything yet.",
+             "Don't remove the menu.", "pause button"),
+            ("Change menu colors, but don't change anything yet.",
+             "Don't delete the menu.", "menu colors"),
+        )
+        for proposal, withdrawal, token in survives:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, proposal)
+            await _chat(nova, cid, withdrawal)
+            held = _pending(nova, cid, "flappy-bird")
+            check(token in held.lower(),
+                  f"{withdrawal!r} did NOT withdraw {token!r} ({held[:50]!r})")
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Go ahead.")
+            check(await _settled(nova, rec, n),
+                  f"{withdrawal!r}: the proposal is still approvable")
+            check(token in rec.prompts[-1].lower(),
+                  f"and {token!r} is what reached improve() ({rec.tails()})")
+
+        # Generic and anaphoric withdrawals name no action, so they still apply
+        # to whatever is on the table.
+        for withdrawal in ("Never mind.", "Cancel that.", "Don't do that.",
+                           "Don't change anything.", "Don't change it."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, "Add a pause button, but don't change "
+                                   "anything yet.")
+            await _chat(nova, cid, withdrawal)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held,
+                  f"{withdrawal!r} still withdraws the proposal ({held[:40]!r})")
 
 
 async def main():
@@ -435,6 +592,8 @@ async def main():
     await test_a_prohibition_never_becomes_a_proposal()
     await test_a_specific_withdrawal_cancels_the_proposal_it_names()
     await test_a_deferral_qualifier_must_modify_the_prohibition()
+    await test_a_standalone_deferral_is_not_a_proposal()
+    await test_a_withdrawal_must_match_the_action_not_just_the_noun()
     check.finish()
 
 

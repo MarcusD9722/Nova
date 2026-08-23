@@ -30,6 +30,7 @@ from core.project_intent import (
     approves_without_naming_a_change,
     authorize_project_mutation,
     cancels_pending_change,
+    carries_a_proposal,
     defers_a_change,
     is_bare_approval,
     is_project_selection,
@@ -1536,9 +1537,15 @@ class RuntimeManager:
             # is scoped in time: deferred means "later", unqualified
             # means "not at all".
             reason = may_mutate.reason
+            # A deferral says WHEN NOT to act; it does not say what to
+            # build. Storing one on its own replaced a real proposal, or
+            # created an executable one out of nothing - measured on
+            # e88104c, "Don't build it yet." replaced a pending parallax
+            # background and a later "Go ahead." ran those words.
             is_proposal = (reason == "no affirmative instruction"
                            or (reason == "vetoed: prohibition"
-                               and defers_a_change(t)))
+                               and defers_a_change(t)
+                               and carries_a_proposal(t)))
             if is_proposal and in_play:
                 self._pending_plan.setdefault(conv, {})[in_play] = t
                 self._bound_pending_plans()
