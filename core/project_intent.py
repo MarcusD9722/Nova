@@ -613,6 +613,18 @@ def defers_a_change(text: str) -> bool:
     return bool(_DEFERRED_PROHIBITION_RE.search((text or "").strip()))
 
 
+#: "I'd like a dark mode" / "I want a pause menu" — a change proposed without
+#: any of the action verbs. The OBJECT is what makes it a proposal: "I'd like a
+#: dark mode" names one, "I was thinking about it" names a pronoun.
+_DESIRE_FRAME_RE = re.compile(
+    r"\b(?:i\s*(?:'?d|\swould)?\s*(?:like|love|want|need)|"
+    r"we\s*(?:'?d|\swould)?\s*(?:like|love|want|need)|"
+    r"(?:it|that)\s+would\s+be\s+(?:nice|good|great|better))"
+    r"\b(?P<object>[^.;!?]*)",
+    re.IGNORECASE,
+)
+
+
 def carries_a_proposal(text: str) -> bool:
     """Does this turn say WHAT to change, or only WHEN NOT to?
 
@@ -636,7 +648,20 @@ def carries_a_proposal(text: str) -> bool:
     if not raw:
         return False
     rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw)
-    return bool(_content_words(rest))
+    # POSITIVE CHANGE INTENT, not merely leftover prose. Asking only whether
+    # content words remain meant "The game looks pretty good, so don't change
+    # anything yet." proposed something — it has "game" and "good" in it — and
+    # it replaced a real parallax proposal that a later approval then failed to
+    # execute. Measured on da27c9d.
+    #
+    # An action verb the module knows is the strong form. The weak one is a
+    # DESIRE naming a concrete object: "I'd like a dark mode" proposes a dark
+    # mode without using one of those verbs, while "I was thinking about it"
+    # names only a pronoun and proposes nothing.
+    if _positive_families(rest):
+        return True
+    m = _DESIRE_FRAME_RE.search(rest)
+    return bool(m and _content_words(m.group("object")))
 
 
 def withdraws_pending_change(text: str, pending: str) -> bool:
@@ -659,7 +684,16 @@ def withdraws_pending_change(text: str, pending: str) -> bool:
         # Anaphoric: "don't change it" names nothing, so it refers to whatever
         # is on the table and the action family cannot narrow it.
         return True
-    if not (target & _content_words(pending)):
+    # EVERY content word of the withdrawal has to be in the proposal, not just
+    # one. Intersection let a shared container noun do the work: "Don't add a
+    # settings icon to the menu." cancelled "Add a pause button to the menu."
+    # on "menu" alone, and "Don't remove the reset button from the settings
+    # screen." cancelled the debug-button proposal on three shared words while
+    # disagreeing about the only one that mattered. Measured on da27c9d.
+    #
+    # Subset, not ratio: the reset-button case shares 3 of its 4 words and must
+    # still not cancel. What disqualifies it is the word it does NOT share.
+    if not target <= _content_words(pending):
         return False
     # The ACTION has to match as well. Sharing a noun is not withdrawal:
     # "Don't remove the menu." does not call off "Add a pause button to the

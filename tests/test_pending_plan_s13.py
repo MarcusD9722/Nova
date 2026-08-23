@@ -417,6 +417,162 @@ async def test_an_independent_instruction_does_not_approve_a_proposal():
         check(not _pending(nova, cid, "flappy-bird"), "now it is consumed")
 
 
+async def test_conversation_plus_a_deferral_proposes_nothing():
+    """Ordinary talk ending in "not yet" is not a proposal.
+
+    `carries_a_proposal` asked only whether CONTENT survived stripping the
+    deferral clause, which any sentence does. Measured on da27c9d:
+
+        "Add a parallax background, but don't change anything yet."
+        "The game looks pretty good, so don't change anything yet."
+          -> the second REPLACED the first, and "Go ahead." executed the
+             conversational sentence instead of the parallax proposal
+
+    The property is intentional, not vocabulary: after the deferral clause is
+    removed there has to be POSITIVE CHANGE INTENT left — an action verb, or a
+    desire naming a concrete object. "I'd like a dark mode" proposes one;
+    "I was thinking about it" names a pronoun and proposes nothing.
+    """
+    check.section("pending plan: conversation + 'not yet' is not a proposal")
+
+    from core.project_intent import carries_a_proposal
+
+    for text in ("Don't change it yet.",
+                 "I was thinking about it, but don't change it yet.",
+                 "The game looks good, so don't change anything yet.",
+                 "We can talk about it, but don't change anything yet.",
+                 "I'm not sure, so don't change anything yet.",
+                 "It's been a long week, but don't change anything yet."):
+        check(not carries_a_proposal(text), f"proposes nothing: {text!r}")
+
+    for text in ("Add a parallax background, but don't change anything yet.",
+                 "Make the pipe gap larger, but don't change it yet.",
+                 "Improve the menu, but don't update it right now.",
+                 "I'd like a dark mode, but don't change it yet."):
+        check(carries_a_proposal(text), f"proposes a change: {text!r}")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        # Nothing pending: conversation + deferral creates nothing.
+        for text in ("The game looks pretty good, so don't change anything yet.",
+                     "I was thinking about it, but don't change anything yet."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{text[:40]!r} created no proposal ({held[:40]!r})")
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{text[:40]!r}: and a later approval ran nothing "
+                  f"({rec.tails()})")
+
+        # A real proposal pending: conversation + deferral must not replace it.
+        rec.prompts.clear()
+        cid = str(uuid4())
+        await _chat(nova, cid, "Add a parallax background, but don't change "
+                               "anything yet.")
+        await _chat(nova, cid, "The game looks pretty good, so don't change "
+                               "anything yet.")
+        held = _pending(nova, cid, "flappy-bird")
+        check("parallax background" in held.lower(),
+              f"the parallax proposal is still the pending one ({held[:50]!r})")
+        check("looks pretty good" not in held.lower(),
+              f"the conversational sentence did not replace it ({held[:50]!r})")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Go ahead.")
+        check(await _settled(nova, rec, n), "the approval executed")
+        ran = rec.prompts[-1].lower()
+        check("parallax background" in ran,
+              f"PARALLAX is what reached improve() ({rec.tails()})")
+        check("looks pretty good" not in ran,
+              f"and the chatter did not ({rec.tails()})")
+
+
+async def test_a_prohibition_never_becomes_a_proposal():
+    """A ban must not turn into executable work.
+
+    Measured on b2a931e: "Don't change the physics." was stored as the pending
+    proposal, and a later "Go ahead." CARRIED IT OUT — the exact inversion of
+    what the mutation gate exists to prevent.
+
+    The capture accepted every refusal whose reason was "vetoed: prohibition",
+    and two opposite sentences share that reason. What separates them is not the
+    verb but whether the prohibition is scoped in TIME: deferred means "later",
+    unqualified means "not at all".
+    """
+    check.section("pending plan: a prohibition is not a deferred proposal")
+
+    prohibitions = (
+        "Don't change the physics.",
+        "Don't modify the menu.",
+        "Never change the scoring.",
+        "I don't want you to change the physics.",
+        "Do not update that file.",
+        "Don't touch the collision code.",
+        "Never update the readme.",
+    )
+    async with boot() as nova:
+        rec = await _wire(nova)
+        # Selected ONCE for the whole boot. `last_active` is durable, so
+        # re-selecting per sub-case is redundant setup rather than
+        # coverage - and this suite has to stay under the harness
+        # watchdog.
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+        for text in prohibitions:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{text!r} was not stored as a proposal ({held[:40]!r})")
+
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{text!r}: and a later approval executed nothing "
+                  f"({rec.tails()})")
+
+        # KNOWN LIMIT, stated rather than hidden. What is recognised is a
+        # deferral expressed as a PROHIBITION clause: "but don't ... yet".
+        # A bare "..., but not yet." carries no prohibition and, in the
+        # cases tried, no action verb the vocabulary knows, so it is not
+        # captured. Widening the test to any sentence containing "later" or
+        # "at some point" would misfire on "Fix the bug that happens later in
+        # the level", so that is deliberately left alone.
+        # The deferral half of the same grammar still works, or the fix would
+        # have closed the feature instead of the hole.
+        for text in ("Make the pipe gap easier, but don't change anything yet.",
+                     "Add a pause menu later, but don't build it yet.",
+                     "Improve the pipe spacing, but don't change it yet.",
+                     "Change the physics, but don't change anything right now."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(bool(held), f"deferred proposal still captured: {text!r}")
+            check(not rec.prompts, f"and not executed: {text!r}")
+
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Okay, make that change.")
+            check(await _settled(nova, rec, n),
+                  f"and approving it runs it: {text!r}")
+
+        # A deferral must not read as a cancellation either — it would throw away
+        # the proposal it is half of.
+        from core.project_intent import cancels_pending_change, defers_a_change
+        for text in ("Make the pipe gap easier, but don't change anything yet.",
+                     "I'd like a dark mode, but don't change anything yet."):
+            check(defers_a_change(text), f"is a deferral: {text!r}")
+            check(not cancels_pending_change(text),
+                  f"and not a cancellation: {text!r}")
+        # …while the same prohibition WITHOUT a time qualifier withdraws.
+        for text in ("Don't change anything.", "Don't make any changes."):
+            check(cancels_pending_change(text), f"withdraws: {text!r}")
+            check(not defers_a_change(text), f"and defers nothing: {text!r}")
+
+
 async def main():
     await test_a_plan_alone_never_executes()
     await test_a_bare_approval_is_authority_only_with_a_proposal()
@@ -425,6 +581,8 @@ async def main():
     await test_the_plan_is_scoped_to_its_conversation()
     await test_the_plan_is_scoped_to_its_project()
     await test_an_independent_instruction_does_not_approve_a_proposal()
+    await test_conversation_plus_a_deferral_proposes_nothing()
+    await test_a_prohibition_never_becomes_a_proposal()
     await test_an_approved_plan_is_consumed_once()
     check.finish()
 

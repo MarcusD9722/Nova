@@ -183,88 +183,6 @@ async def test_a_cancellation_is_scoped_too():
               f"({_pending(nova, cid, 'flappy-bird')!r})")
 
 
-async def test_a_prohibition_never_becomes_a_proposal():
-    """A ban must not turn into executable work.
-
-    Measured on b2a931e: "Don't change the physics." was stored as the pending
-    proposal, and a later "Go ahead." CARRIED IT OUT — the exact inversion of
-    what the mutation gate exists to prevent.
-
-    The capture accepted every refusal whose reason was "vetoed: prohibition",
-    and two opposite sentences share that reason. What separates them is not the
-    verb but whether the prohibition is scoped in TIME: deferred means "later",
-    unqualified means "not at all".
-    """
-    check.section("pending plan: a prohibition is not a deferred proposal")
-
-    prohibitions = (
-        "Don't change the physics.",
-        "Don't modify the menu.",
-        "Never change the scoring.",
-        "I don't want you to change the physics.",
-        "Do not update that file.",
-        "Don't touch the collision code.",
-        "Never update the readme.",
-    )
-    async with boot() as nova:
-        rec = await _wire(nova)
-        # Selected ONCE for the whole boot. `last_active` is durable, so
-        # re-selecting per sub-case is redundant setup rather than
-        # coverage - and this suite has to stay under the harness
-        # watchdog.
-        await _chat(nova, str(uuid4()), "Open flappy-bird.")
-        for text in prohibitions:
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check(not held, f"{text!r} was not stored as a proposal ({held[:40]!r})")
-
-            await _chat(nova, cid, "Go ahead.")
-            await _quiet(nova, rec, ticks=40)
-            check(not rec.prompts,
-                  f"{text!r}: and a later approval executed nothing "
-                  f"({rec.tails()})")
-
-        # KNOWN LIMIT, stated rather than hidden. What is recognised is a
-        # deferral expressed as a PROHIBITION clause: "but don't ... yet".
-        # A bare "..., but not yet." carries no prohibition and, in the
-        # cases tried, no action verb the vocabulary knows, so it is not
-        # captured. Widening the test to any sentence containing "later" or
-        # "at some point" would misfire on "Fix the bug that happens later in
-        # the level", so that is deliberately left alone.
-        # The deferral half of the same grammar still works, or the fix would
-        # have closed the feature instead of the hole.
-        for text in ("Make the pipe gap easier, but don't change anything yet.",
-                     "Add a pause menu later, but don't build it yet.",
-                     "Improve the pipe spacing, but don't change it yet.",
-                     "Change the physics, but don't change anything right now."):
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check(bool(held), f"deferred proposal still captured: {text!r}")
-            check(not rec.prompts, f"and not executed: {text!r}")
-
-            n = len(rec.prompts)
-            await _chat(nova, cid, "Okay, make that change.")
-            check(await _settled(nova, rec, n),
-                  f"and approving it runs it: {text!r}")
-
-        # A deferral must not read as a cancellation either — it would throw away
-        # the proposal it is half of.
-        from core.project_intent import cancels_pending_change, defers_a_change
-        for text in ("Make the pipe gap easier, but don't change anything yet.",
-                     "I'd like a dark mode, but don't change anything yet."):
-            check(defers_a_change(text), f"is a deferral: {text!r}")
-            check(not cancels_pending_change(text),
-                  f"and not a cancellation: {text!r}")
-        # …while the same prohibition WITHOUT a time qualifier withdraws.
-        for text in ("Don't change anything.", "Don't make any changes."):
-            check(cancels_pending_change(text), f"withdraws: {text!r}")
-            check(not defers_a_change(text), f"and defers nothing: {text!r}")
-
-
 async def test_a_specific_withdrawal_cancels_the_proposal_it_names():
     """Calling a change off has to reach the change that was proposed.
 
@@ -356,161 +274,6 @@ async def test_a_specific_withdrawal_cancels_the_proposal_it_names():
               f"({_pending(nova, cid, 'calc-tool')[:40]!r})")
 
 
-async def test_a_deferral_qualifier_must_modify_the_prohibition():
-    """"later" describing the OBJECT is not a deferral.
-
-    `defers_a_change` searched the whole message for temporal words, which is
-    the ambiguity the previous round claimed to have avoided. Measured on
-    c86bfb1: "Don't fix the bug that happens later in the level." was stored as
-    a deferred proposal and a later "Go ahead." executed the ban.
-
-    The qualifier now has to modify the prohibition itself — follow the negated
-    verb across a SHORT object and finish the sentence. The four-word relative
-    clause in "the animation that appears later" is what tells the two apart,
-    and bare "later" is not a qualifier at all; only the bound "until later" is.
-    """
-    check.section("pending plan: a deferral qualifies the prohibition, not its object")
-
-    not_deferrals = (
-        "Don't fix the bug that happens later in the level.",
-        "Don't change the animation that appears later.",
-        "Don't remove the level that comes later in the game.",
-        "Don't modify the eventually-called cleanup function.",
-        "Never change that eventually.",
-        "Don't change the later animation.",
-        "Don't add the button that shows up later on.",
-    )
-    deferrals = (
-        "Don't change it yet.",
-        "Don't change anything right now.",
-        "Don't build that for now.",
-        "Don't implement it until later.",
-        "Make the gap larger, but don't change anything yet.",
-        "I'd like a dark mode, but don't change it yet.",
-    )
-
-    for text in not_deferrals:
-        check(not defers_a_change(text), f"not a deferral: {text!r}")
-    for text in deferrals:
-        check(defers_a_change(text), f"is a deferral: {text!r}")
-
-    async with boot() as nova:
-        rec = await _wire(nova)
-        # Selected ONCE for the whole boot. `last_active` is durable, so
-        # re-selecting per sub-case is redundant setup rather than
-        # coverage - and this suite has to stay under the harness
-        # watchdog.
-        await _chat(nova, str(uuid4()), "Open flappy-bird.")
-        for text in not_deferrals:
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check(not held,
-                  f"{text!r} was not stored as a proposal ({held[:40]!r})")
-            await _chat(nova, cid, "Go ahead.")
-            await _quiet(nova, rec, ticks=40)
-            check(not rec.prompts,
-                  f"{text!r}: and a later approval executed nothing "
-                  f"({rec.tails()})")
-
-        # The legitimate deferral still survives the whole round trip, or the
-        # fix would have closed the feature instead of the ambiguity.
-        #
-        # `bool(pending)` and "an improve call happened" are NOT evidence: this
-        # assertion was exactly that, and it passed while the deferral was
-        # REPLACING the proposal. The payload is what has to be checked.
-        for text in ("Don't change it yet.", "Don't build that for now."):
-            rec.prompts.clear()
-            cid = str(uuid4())
-            # A real proposal: "I'd like a parallax background." carries no
-            # action verb the vocabulary knows, so it never created one -
-            # this block used to pass only because the DEFERRAL was being
-            # stored as the proposal, which is the defect under test.
-            await _chat(nova, cid, "Add a parallax background, but don't "
-                                   "change anything yet.")
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check("parallax background" in held.lower(),
-                  f"the PROPOSAL survives {text!r}, not the deferral ({held!r})")
-            check(text.lower().rstrip(".") not in held.lower(),
-                  f"and {text!r} did not become the proposal")
-            n = len(rec.prompts)
-            await _chat(nova, cid, "Go ahead.")
-            check(await _settled(nova, rec, n),
-                  f"and is approvable after {text!r}")
-            check("parallax background" in rec.prompts[-1].lower(),
-                  f"and PARALLAX is what reached improve() ({rec.tails()})")
-
-
-async def test_a_standalone_deferral_is_not_a_proposal():
-    """A deferral says WHEN NOT to act. It does not say what to build.
-
-    The capture accepted the whole deferral bucket, so a sentence carrying only
-    timing became the pending proposal. Measured on e88104c:
-
-        "Add a parallax background, but don't change anything yet."
-        "Don't build it yet."      -> REPLACED the parallax proposal
-        "Go ahead."                -> improve() ran with "Don't build it yet."
-
-    and with nothing pending at all, "Don't change it yet." CREATED an
-    executable proposal out of a sentence that proposes nothing.
-
-    Every assertion here reads the payload — the exact pending text and the
-    exact instruction that reached improve(). `bool(pending)` and "an improve
-    call happened" are what let this through in the first place.
-    """
-    check.section("pending plan: a deferral alone proposes nothing")
-
-    async with boot() as nova:
-        rec = await _wire(nova)
-        await _chat(nova, str(uuid4()), "Open flappy-bird.")
-
-        # A. a COMPLETE proposal plus its deferral
-        cid = str(uuid4())
-        await _chat(nova, cid, "Add a parallax background, but don't change "
-                               "anything yet.")
-        held = _pending(nova, cid, "flappy-bird")
-        check("parallax background" in held.lower(),
-              f"A: the proposal is pending ({held[:50]!r})")
-        await _quiet(nova, rec, ticks=20)
-        check(not rec.prompts, f"A: and nothing ran yet ({rec.tails()})")
-
-        # B. a STANDALONE deferral on top of it
-        await _chat(nova, cid, "Don't build it yet.")
-        held = _pending(nova, cid, "flappy-bird")
-        check("parallax background" in held.lower(),
-              f"B: the proposal is still the pending one ({held[:50]!r})")
-        check("don't build it yet" not in held.lower(),
-              f"B: the deferral did not replace it ({held[:50]!r})")
-        await _quiet(nova, rec, ticks=20)
-        check(not rec.prompts, f"B: and still nothing ran ({rec.tails()})")
-
-        n = len(rec.prompts)
-        await _chat(nova, cid, "Go ahead.")
-        check(await _settled(nova, rec, n), "B: the approval executed")
-        ran = rec.prompts[-1].lower()
-        check("parallax background" in ran,
-              f"B: PARALLAX is what reached improve() ({rec.tails()})")
-        check("don't build it yet" not in ran,
-              f"B: and the deferral text did not ({rec.tails()})")
-
-        # C. a standalone deferral with NOTHING pending
-        for text in ("Don't change it yet.", "Don't build it for now.",
-                     "Don't implement that until later."):
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check(not held,
-                  f"C: {text!r} created no proposal ({held[:40]!r})")
-            await _chat(nova, cid, "Go ahead.")
-            await _quiet(nova, rec, ticks=40)
-            check(not rec.prompts,
-                  f"C: {text!r}: and a later approval ran nothing "
-                  f"({rec.tails()})")
-
-
 async def test_a_withdrawal_must_match_the_action_not_just_the_noun():
     """Withdrawing an action nobody proposed is not a withdrawal.
 
@@ -586,14 +349,81 @@ async def test_a_withdrawal_must_match_the_action_not_just_the_noun():
                   f"{withdrawal!r} still withdraws the proposal ({held[:40]!r})")
 
 
+async def test_a_withdrawal_must_account_for_all_of_itself():
+    """A shared container noun cannot cancel a different operation.
+
+    Requiring the action family plus ANY shared target word was still too
+    broad. Measured on da27c9d:
+
+        pending    "Add a pause button to the menu, but don't change anything yet."
+        withdrawal "Don't add a settings icon to the menu."   -> CANCELLED it
+
+    Same family, and "menu" in common, was enough. Every content word of the
+    withdrawal now has to appear in the proposal — subset, not overlap, and not
+    a ratio: "Don't remove the reset button from the settings screen." shares
+    three of its four words with the debug-button proposal and must still not
+    cancel. What disqualifies it is the one word it does not share.
+    """
+    check.section("pending plan: a withdrawal must account for all of itself")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        survives = (
+            ("Add a pause button to the menu, but don't change anything yet.",
+             "Don't add a settings icon to the menu.", "pause button"),
+            ("Change the menu colors, but don't change anything yet.",
+             "Don't change the menu layout.", "menu colors"),
+            ("Remove the debug button from the settings screen, but don't "
+             "change it yet.",
+             "Don't remove the reset button from the settings screen.",
+             "debug button"),
+        )
+        for proposal, withdrawal, token in survives:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, proposal)
+            check(token in _pending(nova, cid, "flappy-bird").lower(),
+                  f"[{withdrawal}] proposed first")
+            await _chat(nova, cid, withdrawal)
+            held = _pending(nova, cid, "flappy-bird")
+            check(token in held.lower(),
+                  f"{withdrawal!r} did NOT cancel {token!r} ({held[:50]!r})")
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Go ahead.")
+            check(await _settled(nova, rec, n),
+                  f"{withdrawal!r}: the proposal is still approvable")
+            check(token in rec.prompts[-1].lower(),
+                  f"and {token!r} is what reached improve() ({rec.tails()})")
+
+        cancels = (
+            ("Add a pause button to the menu, but don't change anything yet.",
+             "Don't add the pause button."),
+            ("Change the menu colors, but don't change anything yet.",
+             "Don't change the menu colors."),
+            ("Remove the debug button from the settings screen, but don't "
+             "change it yet.", "Don't remove the debug button."),
+        )
+        for proposal, withdrawal in cancels:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, proposal)
+            await _chat(nova, cid, withdrawal)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{withdrawal!r} withdrew it ({held[:40]!r})")
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{withdrawal!r}: nothing ran afterwards ({rec.tails()})")
+
+
 async def main():
     await test_cancellation_invalidates_the_proposal()
     await test_a_cancellation_is_scoped_too()
-    await test_a_prohibition_never_becomes_a_proposal()
     await test_a_specific_withdrawal_cancels_the_proposal_it_names()
-    await test_a_deferral_qualifier_must_modify_the_prohibition()
-    await test_a_standalone_deferral_is_not_a_proposal()
     await test_a_withdrawal_must_match_the_action_not_just_the_noun()
+    await test_a_withdrawal_must_account_for_all_of_itself()
     check.finish()
 
 
