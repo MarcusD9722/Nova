@@ -544,6 +544,23 @@ class ProjectBuilder:
         except Exception:
             pass
 
+    async def select(self, slug: str) -> str | None:
+        """Make an EXISTING project current. Changes nothing inside it.
+
+        The pointer was only ever written as a side effect of build/improve, so
+        a conversation that merely moved between projects left it empty and
+        "what are we working on?" had no authoritative answer. Selecting is its
+        own act now.
+
+        Returns the slug it settled on, or None if no such project exists —
+        selection must never invent one.
+        """
+        slug = safe_live_component(slug)
+        if slug not in self.list_projects():
+            return None
+        await self._set_last_active(slug)
+        return slug
+
     async def last_active(self) -> str | None:
         """The current project, or None — never one that no longer exists.
 

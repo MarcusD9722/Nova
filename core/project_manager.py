@@ -276,6 +276,31 @@ class ProjectManager:
             purged.append({"entry": t.name, "files": files, "bytes": size})
         return {"purged": purged, "permanent": True}
 
+    #: The document that MAKES a directory a project.
+    #:
+    #: There were two disagreeing definitions of "project": ProjectManager
+    #: treated any workspace directory as one, while
+    #: `ProjectBuilder.list_projects()` counts only directories containing
+    #: PROJECT.md. So `project.scaffold("calc-tool")` produced something that
+    #: existed on the tool surface and did not exist to conversation — it could
+    #: never be named, statused, selected or resumed in chat.
+    #:
+    #: One contract, and this is it: PROJECT.md is the project's identity
+    #: document, every creation path writes one, and ProjectBuilder's view is
+    #: the authoritative universe. The sections match what `status_text` parses,
+    #: so a scaffolded project reports honestly instead of "unknown" — it is a
+    #: real minimal project, not a placeholder that merely satisfies a check.
+    _MINIMAL_PROJECT_MD = (
+        "# {slug}\n\n"
+        "## Brief\n{slug}\n\n"
+        "## Status\nscaffolded\n\n"
+        "## Summary\nAn empty project created by Nova. Nothing has been built yet.\n\n"
+        "## Files\n(none yet)\n\n"
+        "## How to run\n(pending)\n\n"
+        "## Progress log\n- scaffolded\n\n"
+        "## Next steps / suggestions\n(none yet)\n"
+    )
+
     def ensure_workspace(self, name: str) -> Path:
         proj = self.project_path(name)
         proj.mkdir(parents=True, exist_ok=True)
@@ -285,6 +310,12 @@ class ProjectManager:
         chat = proj / "chat_history.jsonl"
         if not chat.exists():
             chat.write_text("", encoding="utf-8")
+        # Never overwrite: a real PROJECT.md carries the build history.
+        marker = proj / "PROJECT.md"
+        if not marker.exists():
+            marker.write_text(
+                self._MINIMAL_PROJECT_MD.format(slug=self._sanitize(name)),
+                encoding="utf-8")
         return proj
 
     def scaffold_project(self, name: str) -> Path:

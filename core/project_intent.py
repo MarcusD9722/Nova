@@ -42,10 +42,35 @@ from dataclasses import dataclass
 
 from core.intent import is_question, strip_preamble
 
-__all__ = ["MutationVerdict", "authorize_project_mutation"]
+__all__ = [
+    "MutationVerdict",
+    "authorize_project_mutation",
+    "is_project_selection",
+    "asks_current_project",
+    "describes_a_change",
+    "qualified_project_name",
+]
 
 
-#: Verbs that would actually change a project.
+# TWO VOCABULARIES, and the difference is the whole point.
+#
+# `_ACTION_VERB` is broad on purpose — stem-plus-anything — because "does this
+# sentence talk about changing something at all" is a question about topic, and
+# "improving", "deleted", "changes" all count.
+#
+# `_IMPERATIVE_VERB` is the BARE COMMAND FORM only. An English imperative is
+# always the bare stem: "Delete the project", never "Deleting the project".
+# Detection and grammar are different questions and were previously answered by
+# the same pattern, so `delet\w*` matched "Deleting" and a start-anchored
+# imperative check read a gerund SUBJECT as a command.
+#
+# An earlier fix subtracted gerunds afterwards by vetoing any opening word
+# spelled `\w+ing`. That is lexical, not grammatical, and it broke "Bring up
+# the project and add a pause button" — `bring` ends in "ing" — which also made
+# `bring up`, one of this module's own declared openers, unreachable. Encoding
+# the grammar directly means there is nothing to subtract.
+
+#: Anything that TALKS about changing a project, in any inflection.
 _ACTION_VERB = (
     r"(?:improv\w*|enhanc\w*|upgrad\w*|polish\w*|refactor\w*|fix\w*|extend\w*|"
     r"add\w*|implement\w*|appl(?:y|ies|ied)|chang\w*|updat\w*|rewrit\w*|"
@@ -54,6 +79,15 @@ _ACTION_VERB = (
     r"keep\s+(?:working|going))"
 )
 _ACTION_VERB_RE = re.compile(r"\b" + _ACTION_VERB + r"\b", re.IGNORECASE)
+
+#: The same verbs in the only form an imperative can take. No `\w*`: adding one
+#: back is what let a gerund through, so the closed list IS the safety property.
+_IMPERATIVE_VERB = (
+    r"(?:improve|enhance|upgrade|polish|refactor|fix|extend|add|implement|"
+    r"apply|change|update|rewrite|build|create|make|continue|resume|finish|"
+    r"complete|remove|delete|set\s+up|wire\s+up|hook\s+up|work\s+on|"
+    r"keep\s+(?:working|going))"
+)
 
 # ── VETOES ──────────────────────────────────────────────────────────────────
 # Each of these means "whatever else this sentence contains, it is not an
@@ -126,38 +160,17 @@ _VETOES = (
 
 #: "Improve flappy-bird's collision handling." — an imperative opening.
 _IMPERATIVE_RE = re.compile(
-    r"^\s*(?:please\s+|now\s+|then\s+|also\s+|and\s+)*" + _ACTION_VERB + r"\b",
-    re.IGNORECASE,
-)
-
-#: A sentence that OPENS with an -ing form is a gerund subject, not a command.
-#:
-#: English imperatives take the bare stem — "Delete the project", never
-#: "Deleting the project". But the action-verb alternation is stem-plus-`\w*`,
-#: so `delet\w*` happily matched "Deleting" and `_IMPERATIVE_RE` read
-#:
-#:     "Deleting the old project was probably a bad idea."
-#:
-#: as an instruction to delete a project. Measured on c5d7a88, and the same for
-#: "Adding the menu was a mistake", "Changing the physics broke it",
-#: "Improving the UI took ages" — an entire class of retrospective remarks
-#: authorising a mutation. This is the fail-OPEN direction, which is the one
-#: this module exists to prevent, so it is checked before any affirmative
-#: evidence is considered.
-#:
-#: No English imperative begins with an -ing word, so nothing legitimate is
-#: lost. "Keep working on it" opens with "Keep" and is unaffected.
-_GERUND_OPENING_RE = re.compile(
-    r"^\s*(?:please\s+|now\s+|then\s+|also\s+|and\s+)*\w+ing\b",
+    r"^\s*(?:please\s+|now\s+|then\s+|also\s+|and\s+)*" + _IMPERATIVE_VERB + r"\b",
     re.IGNORECASE,
 )
 
 #: "Can you fix the collision bug", "let's add a restart button", "I want you
-#: to refactor it" — a request rather than a bare imperative.
+#: to refactor it" — a request rather than a bare imperative. Bare forms again:
+#: every one of these frames is followed by a command verb.
 _REQUEST_RE = re.compile(
-    r"^\s*(?:can|could|would|will)\s+you\s+(?:please\s+)?" + _ACTION_VERB + r"\b"
-    r"|^\s*(?:let'?s|lets)\s+(?:please\s+)?" + _ACTION_VERB + r"\b"
-    r"|^\s*i\s+(?:want|need|would\s+like|'?d\s+like)\s+you\s+to\s+" + _ACTION_VERB + r"\b",
+    r"^\s*(?:can|could|would|will)\s+you\s+(?:please\s+)?" + _IMPERATIVE_VERB + r"\b"
+    r"|^\s*(?:let'?s|lets)\s+(?:please\s+)?" + _IMPERATIVE_VERB + r"\b"
+    r"|^\s*i\s+(?:want|need|would\s+like|'?d\s+like)\s+you\s+to\s+" + _IMPERATIVE_VERB + r"\b",
     re.IGNORECASE,
 )
 
@@ -182,7 +195,7 @@ _OPENER_VERB = (
 #: contains "change" and is a question about intent, not an instruction.
 _COMPOUND_IMPERATIVE_RE = re.compile(
     r"^\s*(?:please\s+|now\s+|then\s+|also\s+)*" + _OPENER_VERB + r"\b"
-    r".*?\b(?:and|then)\s+(?:please\s+|also\s+|now\s+)*" + _ACTION_VERB + r"\b",
+    r".*?\b(?:and|then)\s+(?:please\s+|also\s+|now\s+)*" + _IMPERATIVE_VERB + r"\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -238,9 +251,6 @@ def authorize_project_mutation(text: str, *, complaint: bool = False) -> Mutatio
         return MutationVerdict(False, "vetoed: question")
 
     core = strip_preamble(raw)
-    # A gerund subject is not a command, whatever verb it is built from.
-    if _GERUND_OPENING_RE.match(core):
-        return MutationVerdict(False, "vetoed: gerund subject, not an instruction")
     if _IMPERATIVE_RE.match(core):
         return MutationVerdict(True, "affirmative: imperative instruction")
     if _COMPOUND_IMPERATIVE_RE.match(core):
@@ -254,3 +264,127 @@ def authorize_project_mutation(text: str, *, complaint: bool = False) -> Mutatio
 
     # Nothing here says "do it". Fail closed: talk about it instead.
     return MutationVerdict(False, "no affirmative instruction")
+
+
+# ── SELECTION: which project are we on, without touching it ─────────────────
+#
+# A third answer was missing. Every message was either "change this project" or
+# "not a project message", so "Let's work on the calculator" and "Go back to
+# Flappy Bird" resolved a slug, failed the mutation gate, and fell through —
+# leaving `projects/last_active` empty. Nova could not say what she was working
+# on because nothing had ever recorded it.
+#
+# Selecting is not mutating. It records focus and writes nothing to the
+# project, so it is deliberately NOT gated by `authorize_project_mutation`: the
+# cost of wrongly selecting is that Nova is pointed at the wrong project and
+# the next sentence corrects her, which is not the cost that gate exists for.
+
+#: "Let's work on X" / "Switch to X" / "Go back to X" / "Open X".
+_SELECT_PROJECT_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?[,.]?\s+|alright[,.]?\s+|right[,.]?\s+|so[,.]?\s+|"
+    r"now[,.]?\s+|anyway[,.]?\s+)*"
+    r"(?:"
+    r"(?:let'?s|lets|let\s+us)\s+(?:please\s+)?(?:work\s+on|look\s+at|"
+    r"switch\s+to|go\s+back\s+to|return\s+to|jump\s+(?:back\s+)?(?:in)?to)"
+    r"|switch(?:\s+over)?\s+to"
+    r"|(?:go|come|head|jump)\s+back\s+(?:to|into)"
+    r"|back\s+to"
+    r"|(?:go|jump)\s+(?:in)?to"
+    r"|(?:open|pull\s+up|bring\s+up|load)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+#: "What project are we working on?" / "Which project is this?"
+_CURRENT_PROJECT_Q_RE = re.compile(
+    r"\b(?:what|which)\s+project\s+(?:are\s+we|am\s+i|are\s+you|is\s+this|"
+    r"were\s+we|do\s+we)\b"
+    r"|\bwhat(?:'?s| is)\s+(?:the\s+)?(?:current|active)\s+project\b"
+    r"|\bwhich\s+one\s+are\s+we\s+(?:on|working\s+on)\b",
+    re.IGNORECASE,
+)
+
+
+def is_project_selection(text: str) -> bool:
+    """Does this message ask to make a project current, without changing it?
+
+    False for a compound imperative — "Open flappy-bird and add a pause button"
+    names a real action, and treating it as mere selection would downgrade an
+    explicit instruction to conversation, which is the failure I2 covers.
+    False for prohibitions and questions for the same reasons the mutation gate
+    refuses them.
+
+    "Let's work on X" IS selection even though the mutation gate reads it as a
+    request: the sentence names no action to perform, so pointing at the project
+    and waiting is the honest response. Starting an autonomous edit off it is
+    the over-eager behaviour this whole module exists to stop.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _PROHIBITION_RE.search(raw) or _DENIAL_RE.search(raw):
+        return False
+    if is_question(raw):
+        return False
+    core = strip_preamble(raw)
+    if _COMPOUND_IMPERATIVE_RE.match(core):
+        return False
+    return bool(_SELECT_PROJECT_RE.match(core))
+
+
+def asks_current_project(text: str) -> bool:
+    """"What project are we working on?" — a read of the current pointer."""
+    return bool(_CURRENT_PROJECT_Q_RE.search((text or "").strip()))
+
+
+def describes_a_change(text: str) -> bool:
+    """Does this message talk about changing something, in any inflection?
+
+    Topic, not grammar — "improving", "changed", "a fix" all count. Used to
+    decide whether a refused message was a PLAN worth remembering, as opposed
+    to small talk that merely happened near a project.
+    """
+    return bool(_ACTION_VERB_RE.search((text or "").strip()))
+
+
+#: Words that make "<word> project" generic rather than a name. "the project"
+#: means whatever we are on; "the calculator project" names a specific one.
+_GENERIC_PROJECT_QUALIFIER = (
+    r"the|this|that|these|those|our|my|your|his|her|their|its|a|an|same|"
+    r"whole|entire|other|another|current|active|new|old|last|next|first|"
+    r"second|good|bad|big|small|little|main|only|what|which|whose|some|"
+    r"any|every|no|one|each|both"
+)
+
+_QUALIFIED_PROJECT_RE = re.compile(
+    r"\b(?!(?:" + _GENERIC_PROJECT_QUALIFIER + r")\s+projects?\b)"
+    r"([A-Za-z][\w-]*)\s+projects?\b",
+    re.IGNORECASE,
+)
+
+
+def qualified_project_name(text: str) -> str | None:
+    """The NAME in "the calculator project", or None for a bare "the project".
+
+    This exists because of a measured fall-through. When a message named no
+    RESOLVABLE project, the turn path substituted the last-active project as
+    the target — which is right for "continue where we left off" and badly
+    wrong for a message that names a different project by name. With
+    flappy-bird open:
+
+        "Let's work on the calculator project."
+            -> started an autonomous improve OF FLAPPY-BIRD
+
+    The user named one project and a different one got edited. Telling the two
+    cases apart is exactly the question this answers: "the project" is generic
+    and may borrow the current one, "the calculator project" may not.
+
+    Only the single word before "project" is captured, so "the tower defense
+    project" reports "defense". That is a wording limitation and not a
+    correctness one: the caller has already failed to resolve any known project
+    from the WHOLE message, and a real multi-word project resolves there
+    ("Flappy Bird" -> flappy-bird) long before this is consulted.
+    """
+    m = _QUALIFIED_PROJECT_RE.search((text or "").strip())
+    return m.group(1) if m else None
+

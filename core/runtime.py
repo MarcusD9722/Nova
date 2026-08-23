@@ -23,7 +23,13 @@ from core.policy.storyteller import StorytellerLLM, is_story_request, story_syst
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.intent import is_question, is_purely_conversational
-from core.project_intent import authorize_project_mutation
+from core.project_intent import (
+    describes_a_change,
+    asks_current_project,
+    authorize_project_mutation,
+    is_project_selection,
+    qualified_project_name,
+)
 from core.gpu import GPU_SEM
 from core.turn_gate import GATE
 from core.capabilities.navigation import Navigation, extract_directions
@@ -476,6 +482,9 @@ class RuntimeManager:
         # artifacts are the concrete things turns produced. Both are hot, bounded
         # and in-memory — SQLite remains the authoritative store.
         self._working = WorkingContextStore()
+        # conversation_id -> the most recent project change DESCRIBED but not
+        # authorised. Consumed by the approval turn; see _project_prepass.
+        self._pending_plan: dict[str, str] = {}
         # Episodic memory (V3 P4.1). The WARM tier of the same hot/warm/cold
         # structure: the artifact store below stays hot and unchanged, and what
         # it produces is promoted here. Same SQLite file as facts — deliberately
@@ -1381,12 +1390,28 @@ class RuntimeManager:
         reply = (done_full or "".join(full)).strip()
         return ChatTurnResult(conversation_id=conversation_id, assistant_text=reply, tool_calls=tool_calls)
 
-    async def _project_prepass(self, text: str) -> str | None:
+    def _no_such_project(self, wanted: str) -> str:
+        """One honest answer for "you named a project I do not have".
+
+        Both the selection path and the mutation fall-back need it, and they
+        must not drift apart: the whole point is that a named project Nova
+        cannot find is never silently replaced by the one already open.
+        """
+        known = self._project_builder.list_projects()
+        if known:
+            return (f"I don't have a project called {wanted}. "
+                    f"I've got: {', '.join(known)}.")
+        return ("I don't have any projects yet — tell me what to build and "
+                "I'll start one.")
+
+    async def _project_prepass(self, text: str,
+                               conversation_id: Any = None) -> str | None:
         """Detect project build/status/resume/improve intents and act on them."""
         t = (text or "").strip()
         if not t:
             return None
         pb = self._project_builder
+        conv = str(conversation_id or "")
 
         # Plain questions ("what improvements could we make to X?", "is X a
         # good game?", "what should we add next?") are asking Nova to DISCUSS,
@@ -1418,6 +1443,50 @@ class RuntimeManager:
                     return f"On it. I'm implementing the suggested improvements for {slug} now — I'll report when finished."
                 return f"I couldn't start improvements on {slug}: {res.get('reason', 'unknown')}."
 
+        # "What project are we working on?" — a READ of the current pointer,
+        # answered from authoritative state rather than from whatever the model
+        # remembers of the conversation.
+        if asks_current_project(t):
+            current = await pb.last_active()
+            if current:
+                return f"We're on {current} right now. {pb.status_text(current)}"
+            return ("We're not on a particular project at the moment — name one "
+                    "and I'll pick it up.")
+
+        # A PLAN, not an instruction. The message describes a change to the
+        # project in play but does not authorise it — "…but don't change
+        # anything yet", or a correction like "I meant the vertical opening".
+        # Remembering it is what lets a later "make that change" execute the
+        # plan the user actually approved. Only these two refusal shapes count:
+        # a retrospective or a message about Nova herself is not a plan.
+        if conv and describes_a_change(t) and not may_mutate.allowed:
+            if may_mutate.reason in ("no affirmative instruction",
+                                     "vetoed: prohibition"):
+                in_play = pb.known_slug_in_text(t) or await pb.last_active()
+                if in_play:
+                    self._pending_plan[conv] = t
+
+        # SELECTION: "let's work on X", "switch to X", "go back to X", "open X".
+        # Making a project current writes nothing inside it, so this is not
+        # gated by `authorize_project_mutation` — and it must be checked before
+        # the mutation branch, or "let's work on the calculator" would start an
+        # autonomous edit off a sentence that names no action.
+        named = pb.known_slug_in_text(t)
+        if named and is_project_selection(t):
+            chosen = await pb.select(named)
+            if chosen:
+                return f"Okay — we're on {chosen} now. {pb.status_text(chosen)}"
+        if not named and is_project_selection(t):
+            # "Switch to the calculator project." when there is no calculator.
+            # Answering it here rather than letting it fall through to ordinary
+            # chat is what makes an unresolved selection VISIBLE — silently
+            # replying "sure." to a request to change projects is how a
+            # conversation ends up believing it moved and Nova believing it
+            # did not.
+            wanted = qualified_project_name(t)
+            if wanted:
+                return self._no_such_project(wanted)
+
         # Mentions of a known project + status/resume/improve intent. In natural
         # conversation the project name is usually only stated once, so fall
         # back to the last-active project when a continuation/feature-request
@@ -1432,6 +1501,16 @@ class RuntimeManager:
             if STATUS_WORDS_RE.search(t):
                 slug = await pb.last_active()
             elif may_mutate:
+                # …but only when the message did not NAME a different project.
+                # Measured with flappy-bird open: "Let's work on the calculator
+                # project." resolved no slug, borrowed the last-active one, and
+                # started an autonomous improve OF FLAPPY-BIRD. The user named
+                # one project and a different one was edited. A message that
+                # names a project Nova does not have gets an honest answer
+                # instead of a substituted target.
+                wanted = qualified_project_name(t)
+                if wanted and pb.known_slug_in_text(wanted) is None:
+                    return self._no_such_project(wanted)
                 slug = await pb.last_active()
         if slug:
             if STATUS_WORDS_RE.search(t):
@@ -1460,7 +1539,19 @@ class RuntimeManager:
             if may_mutate:
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
-                res = await pb.improve(slug=slug, instructions=t)
+                # THE APPROVAL TURN. "Okay, make that change." names no change;
+                # the change was described one or two turns earlier and then
+                # corrected. Without carrying that forward, the approval reached
+                # the builder with its own text as the instruction and the plan
+                # the user actually approved was simply lost.
+                #
+                # `_pending_plan` holds the most recent project change that was
+                # DESCRIBED but not authorised, per conversation. A correction
+                # overwrites it, so what executes is the corrected plan and the
+                # superseded one never runs.
+                pending = self._pending_plan.pop(conv, "") if conv else ""
+                instructions = (f"{pending}\n\n(Approved by: {t})" if pending else t)
+                res = await pb.improve(slug=slug, instructions=instructions)
                 if res.get("started"):
                     reopen = "taking another pass at" if is_complaint else "working on those improvements to"
                     return f"Got it — {reopen} {slug} now. I'll report when it's finished."
@@ -1581,7 +1672,7 @@ class RuntimeManager:
                 logger.warning("memory_ingest_enqueue_failed", error=str(e)[:200])
 
         # ── Deterministic pre-passes (instant, no LLM) ──────────────────────
-        project_reply = await self._project_prepass(clean_user)
+        project_reply = await self._project_prepass(clean_user, conversation_id)
         if project_reply is not None:
             yield {"type": "token", "text": project_reply}
             await _finish(project_reply, [], mode="task")

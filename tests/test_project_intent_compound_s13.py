@@ -125,30 +125,35 @@ async def test_the_plain_forms_are_untouched():
 
 
 async def test_a_gerund_subject_is_not_a_command():
-    """The fail-OPEN one, and the more serious of the two (Stage 13A).
+    """The fail-OPEN defect, and the more serious of the two (Stage 13A).
 
     Measured on c5d7a88:
 
         "Deleting the old project was probably a bad idea."
             -> MutationVerdict(allowed=True, reason='affirmative: imperative')
 
-    The action-verb alternation is stem-plus-`\\w*`, so `delet\\w*` matched
-    "Deleting" and the imperative pattern — anchored at the start of the
-    sentence — read a gerund SUBJECT as a command. An entire class of
-    retrospective remarks authorised a project mutation, which is precisely the
-    failure this module was written to prevent. The phrase above is one the
-    Stage 13A brief supplies as an adversarial probe.
+    One pattern was answering two different questions. `_ACTION_VERB` is
+    stem-plus-`\w*` because "does this sentence talk about changing something"
+    is about TOPIC — "improving", "deleted" and "changes" all count. The
+    imperative check reused it, so `delet\w*` matched "Deleting" and a
+    start-anchored pattern read a gerund SUBJECT as a command. An entire class
+    of retrospective remarks authorised a mutation.
 
-    English imperatives take the bare stem, so nothing legitimate opens with
-    -ing and the check costs no real instruction.
+    The fix is grammatical, not lexical. An English imperative is always the
+    bare stem, so `_IMPERATIVE_VERB` is a CLOSED list of bare forms with no
+    `\w*` at all, and gerunds are excluded by construction rather than
+    subtracted afterwards. `test_bring_up_is_not_a_gerund` below is the reason
+    that distinction matters and is not a stylistic preference.
     """
     check.section("S13: a gerund subject never authorises a mutation")
 
     for text in (
         "Deleting the old project was probably a bad idea.",
+        "Deleting the old project was a mistake.",
         "Removing that feature turned out badly.",
         "Adding the menu was a mistake.",
         "Changing the physics broke it.",
+        "Changing that broke it.",
         "Improving the UI took ages.",
         "Building that was harder than expected.",
         "Making it harder was the wrong call.",
@@ -161,14 +166,12 @@ async def test_a_gerund_subject_is_not_a_command():
     # The bare-stem imperatives built from the very same verbs still authorise,
     # so this is a grammatical distinction and not a blanket ban on the verbs.
     for text in ("Delete the old project.", "Add the menu.",
-                 "Change the physics.", "Improve the UI.",
+                 "Change the physics.", "Change that.", "Improve the UI.",
                  "Update the readme.", "Fix the pipes."):
         check(_allowed(text), f"bare-stem imperative still authorised: {text!r}")
 
-    # It is the OPENING word that decides. An -ing word elsewhere in the
-    # sentence is just a noun, and a veto that matched one anywhere would
-    # refuse ordinary instructions — measured: dropping the start anchor left
-    # every assertion above still green, so the anchor needs its own evidence.
+    # An -ing word elsewhere in the sentence is just a noun. A veto that matched
+    # one anywhere would refuse ordinary instructions.
     for text in (
         "Add a loading screen.",
         "Fix the scrolling bug.",
@@ -179,6 +182,65 @@ async def test_a_gerund_subject_is_not_a_command():
     ):
         check(_allowed(text),
               f"an -ing word later in the sentence changes nothing: {text!r}")
+
+
+async def test_bring_up_is_not_a_gerund():
+    """The regression that a LEXICAL gerund rule introduced, pinned forever.
+
+    The first attempt at the fix above vetoed any opening word spelled
+    `\w+ing`. That does not identify gerunds; it identifies spelling. `bring`
+    ends in "ing", so
+
+        "Bring up the flappy-bird project and add a pause button."
+
+    was refused — and because the veto ran BEFORE the compound-imperative
+    check, the new code made one of the module's own supported openers
+    unreachable. No amount of special-casing "bring" fixes the shape of that
+    mistake, which is why the vocabulary is split by grammar instead.
+    """
+    check.section("S13: an opener that merely SPELLS like a gerund still works")
+
+    for text in (
+        "Bring up the flappy-bird project and add a pause button.",
+        "Bring up the project and add a pause button.",
+        "Please bring up the project and fix collision.",
+        "bring up flappy-bird and update the readme",
+    ):
+        check(_allowed(text), f"'bring up' authorised: {text!r}")
+
+    # …and it is still only an opener on its own.
+    for text in ("Bring up the flappy-bird project.",
+                 "Bring up the project and tell me what you'd change."):
+        check(not _allowed(text), f"'bring up' alone authorises nothing: {text!r}")
+
+
+async def test_every_opener_verb_carries_a_compound_imperative():
+    """EVERY opener, not a sample.
+
+    `bring up` was broken while `open`, `pull up` and `look at` were fine, and a
+    suite that spot-checked three of ten opener verbs stayed green through it.
+    So this enumerates the real vocabulary from the module rather than a
+    hand-picked subset: a future edit that breaks one opener cannot hide behind
+    the others.
+    """
+    check.section("S13: every opener verb supports a compound imperative")
+
+    openers = [
+        "open", "look at", "go to", "pull up", "bring up", "check", "read",
+        "review", "inspect", "load",
+    ]
+    # The list must BE the module's list, or this test drifts into fiction.
+    from core.project_intent import _OPENER_VERB
+    declared = {o.replace(r"\s+", " ") for o in
+                _OPENER_VERB[3:-1].split("|")}
+    check(declared == set(openers),
+          f"the enumeration matches the module ({sorted(declared)})")
+
+    for opener in openers:
+        text = f"{opener.capitalize()} the flappy-bird project and add a pause button."
+        check(_allowed(text), f"compound imperative authorised: {text!r}")
+        check(not _allowed(f"{opener.capitalize()} the flappy-bird project."),
+              f"but the opener alone is not authority: {opener!r}")
 
 
 async def test_bare_approval_remains_closed_deliberately():
@@ -208,6 +270,8 @@ async def main():
     await test_the_original_refusals_are_untouched()
     await test_the_plain_forms_are_untouched()
     await test_a_gerund_subject_is_not_a_command()
+    await test_bring_up_is_not_a_gerund()
+    await test_every_opener_verb_carries_a_compound_imperative()
     await test_bare_approval_remains_closed_deliberately()
     check.finish()
 
