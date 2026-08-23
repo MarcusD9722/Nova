@@ -48,6 +48,9 @@ __all__ = [
     "is_project_selection",
     "asks_current_project",
     "describes_a_change",
+    "cancels_pending_change",
+    "is_bare_approval",
+    "approves_without_naming_a_change",
     "qualified_project_name",
 ]
 
@@ -174,11 +177,67 @@ _REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: `re.escape` escapes spaces (they are significant under re.VERBOSE), so a
+#: phrase comes back as "switch\ to" and the separator to rewrite is that
+#: escaped pair, not a bare space. Getting this wrong produces an alternation
+#: that silently matches nothing.
+_ESCAPED_SPACE = chr(92) + " "
+
+
+def _alt(phrases: tuple[str, ...]) -> str:
+    """One alternation built FROM a list, so tests can enumerate the real thing.
+
+    Longest first: regex alternation is first-match-wins, so "switch over to"
+    has to be tried before "switch to" or the trailing "over to" is left for the
+    rest of the pattern to choke on.
+    """
+    parts = [re.escape(p).replace(_ESCAPED_SPACE, r"\s+").replace(" ", r"\s+")
+             .replace("'", "'?")
+             for p in sorted(phrases, key=len, reverse=True)]
+    return "(?:" + "|".join(parts) + ")"
+
+
 #: Verbs that open a project without changing it. On their own they authorise
 #: nothing, which is why they are not action verbs.
-_OPENER_VERB = (
-    r"(?:open|look\s+at|go\s+to|pull\s+up|bring\s+up|check|read|review|"
-    r"inspect|load)"
+OPENER_STARTERS = (
+    "open", "look at", "go to", "pull up", "bring up", "check", "read",
+    "review", "inspect", "load",
+)
+_OPENER_VERB = _alt(OPENER_STARTERS)
+
+#: Phrases that mean "make this project the one we're on". Same job as an
+#: opener — they bring a project into view and change nothing inside it — so
+#: the compound-imperative grammar below has to know about them too.
+#:
+#: It did not, and that was a defect: `_COMPOUND_IMPERATIVE_RE` only knew the
+#: OPENERS, so "Switch to calc-tool and add a memory button." did not read as
+#: an instruction, `is_project_selection()` therefore accepted it, and because
+#: selection is resolved before mutation the action half was silently dropped.
+#: Nova switched project and did nothing. "Open calc-tool and add a memory
+#: button." worked the whole time, which is why a sample-based suite missed it.
+SELECTION_STARTERS = (
+    "let's work on", "let's look at", "let's switch to", "let's go back to",
+    "let's return to", "let's jump into", "let's jump back into",
+    "let us work on", "let us look at",
+    "switch to", "switch over to",
+    "go back to", "come back to", "head back to",
+    "jump back to", "jump back into",
+    "back to", "return to",
+    "go to", "go into", "jump to", "jump into",
+    "open", "pull up", "bring up", "load",
+)
+_SELECT_VERB = _alt(SELECTION_STARTERS)
+
+#: Everything that brings a project into view without changing it. The union is
+#: what "did this sentence merely point at a project, or point AND instruct?"
+#: has to be asked against.
+_ENTRY_VERB = "(?:" + _OPENER_VERB + "|" + _SELECT_VERB + ")"
+
+#: Conversational lead-ins that carry no intent of their own.
+_LEADIN = (
+    r"(?:please\s+|now\s+|then\s+|also\s+|and\s+|"
+    r"ok(?:ay)?[,.]?\s+|alright[,.]?\s+|right[,.]?\s+|so[,.]?\s+|"
+    r"anyway[,.]?\s+)*"
 )
 
 #: "Open the flappy-bird project and add a pause button." — one imperative
@@ -194,7 +253,7 @@ _OPENER_VERB = (
 #: authorise "Open the project and tell me what you would change", which
 #: contains "change" and is a question about intent, not an instruction.
 _COMPOUND_IMPERATIVE_RE = re.compile(
-    r"^\s*(?:please\s+|now\s+|then\s+|also\s+)*" + _OPENER_VERB + r"\b"
+    r"^\s*" + _LEADIN + _ENTRY_VERB + r"\b"
     r".*?\b(?:and|then)\s+(?:please\s+|also\s+|now\s+)*" + _IMPERATIVE_VERB + r"\b",
     re.IGNORECASE | re.DOTALL,
 )
@@ -281,19 +340,7 @@ def authorize_project_mutation(text: str, *, complaint: bool = False) -> Mutatio
 
 #: "Let's work on X" / "Switch to X" / "Go back to X" / "Open X".
 _SELECT_PROJECT_RE = re.compile(
-    r"^\s*(?:ok(?:ay)?[,.]?\s+|alright[,.]?\s+|right[,.]?\s+|so[,.]?\s+|"
-    r"now[,.]?\s+|anyway[,.]?\s+)*"
-    r"(?:"
-    r"(?:let'?s|lets|let\s+us)\s+(?:please\s+)?(?:work\s+on|look\s+at|"
-    r"switch\s+to|go\s+back\s+to|return\s+to|jump\s+(?:back\s+)?(?:in)?to)"
-    r"|switch(?:\s+over)?\s+to"
-    r"|(?:go|come|head|jump)\s+back\s+(?:to|into)"
-    r"|back\s+to"
-    r"|(?:go|jump)\s+(?:in)?to"
-    r"|(?:open|pull\s+up|bring\s+up|load)"
-    r")\b",
-    re.IGNORECASE,
-)
+    r"^\s*" + _LEADIN + _SELECT_VERB + r"\b", re.IGNORECASE)
 
 #: "What project are we working on?" / "Which project is this?"
 _CURRENT_PROJECT_Q_RE = re.compile(
@@ -335,6 +382,108 @@ def is_project_selection(text: str) -> bool:
 def asks_current_project(text: str) -> bool:
     """"What project are we working on?" — a read of the current pointer."""
     return bool(_CURRENT_PROJECT_Q_RE.search((text or "").strip()))
+
+
+# ── CANCELLATION AND CONTEXTUAL APPROVAL ─────────────────────────
+#
+# A pending proposal had create, replace and consume but no CANCEL, and the two
+# halves of that failed in opposite directions:
+#
+#   "Actually don't."          left the plan pending, so a later approval ran it
+#   "Don't make that change."  was STORED as the new plan, so a later approval
+#                              executed the cancellation as an instruction
+#
+# Both measured on 3278f39. Cancelling has to invalidate the proposal, and a
+# cancellation must never become one.
+
+_CANCEL_RE = re.compile(
+    r"^\s*(?:actually[,.]?\s+|no[,.]?\s+|oh[,.]?\s+)*"
+    r"(?:don'?t|do\s+not)\s*[.!]*$"
+    # Clause-initial only: "I never mind waiting" is not a cancellation.
+    r"|(?:^|[.!?,;]\s*)(?:never\s?mind|nevermind)\b"
+    r"|\bforget\s+(?:it|that|those|the\s+(?:change|idea)|about\s+(?:it|that))\b"
+    r"|\bcancel\s+(?:that|it|the\s+change|those)\b"
+    r"|\b(?:don'?t|do\s+not)\s+(?:bother|make\s+(?:that|the|any)\s+chang\w*|"
+    r"do\s+(?:that|it))\b"
+    r"|\bleave\s+(?:it|that|them)\s+(?:the\s+way\s+(?:it|they)\s+(?:is|are|was|were)|"
+    r"as\s+(?:it\s+)?is|alone|be)\b"
+    r"|\b(?:scrap|drop|skip|shelve)\s+(?:that|it|the\s+change)\b"
+    r"|\bon\s+second\s+thought\s*,?\s*(?:no|don'?t)\b",
+    re.IGNORECASE,
+)
+
+#: "Go ahead." / "Do that." / "Yes, do it." — approval that names NO action.
+#:
+#: Context-free this is not authority and `authorize_project_mutation` still
+#: refuses it, deliberately and unchanged: an idle "go ahead" in conversation
+#: is the same string. What makes it an instruction is a valid pending proposal
+#: FOR THE CURRENT PROJECT, which only the turn path can know. Hence a separate
+#: predicate that reports the SHAPE, and a caller that supplies the context.
+#:
+#: Anchored at both ends on purpose. "Go ahead and delete everything" names an
+#: action and belongs to the ordinary gate, not here.
+_BARE_APPROVAL_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?[,.]?\s+|alright[,.]?\s+|sure[,.]?\s+|"
+    r"yes[,.]?\s+|yeah[,.]?\s+|yep[,.]?\s+|right[,.]?\s+|"
+    r"please[,.]?\s+|fine[,.]?\s+)*"
+    r"(?:go\s+ahead|go\s+for\s+it|do\s+(?:that|it|so)|"
+    r"please\s+do)"
+    r"\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+#: "Okay, make that change." / "Yes, apply that." — an approval that DOES carry
+#: an action verb, and therefore passes the ordinary gate, but whose object is a
+#: pronoun pointing at something said earlier. It names no concrete change.
+#:
+#: Same hazard as a bare approval, one step later: with no proposal to resolve
+#: "that" against, the builder was handed the approval's own words as the
+#: instruction and started an edit that could not know what to do. Measured on
+#: 3278f39 after the plan was correctly scoped away: the approval still ran, on
+#: the wrong project, instructed with the sentence "Okay, make that change."
+_ANAPHORIC_APPROVAL_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?[,.]?\s+|alright[,.]?\s+|sure[,.]?\s+|"
+    r"yes[,.]?\s+|yeah[,.]?\s+|yep[,.]?\s+|right[,.]?\s+|"
+    r"please[,.]?\s+|fine[,.]?\s+|then\s+|now\s+|and\s+)*"
+    r"(?:go\s+ahead\s+and\s+)?"
+    + _IMPERATIVE_VERB +
+    r"\s+(?:that|it|those|them|these|this)"
+    r"(?:\s+(?:chang\w*|edit|update|fix|improvement\s?))?"
+    r"\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def approves_without_naming_a_change(text: str) -> bool:
+    """Does this approve something described earlier without restating it?
+
+    True for "Okay, make that change." and "Yes, apply those." — both of which
+    the mutation gate rightly allows, and neither of which says WHAT to do. The
+    caller must resolve them against a pending proposal and refuse honestly when
+    there is none, rather than passing the sentence itself to a builder.
+    """
+    return bool(_ANAPHORIC_APPROVAL_RE.match((text or "").strip()))
+
+
+def cancels_pending_change(text: str) -> bool:
+    """Does this message call OFF a change that was proposed but not approved?
+
+    Tight shapes only. A correction ("keep the horizontal spacing, I meant the
+    vertical opening") also contains a refusal and must NOT read as a
+    cancellation — it replaces the proposal rather than withdrawing it.
+    """
+    return bool(_CANCEL_RE.search((text or "").strip()))
+
+
+def is_bare_approval(text: str) -> bool:
+    """Is this an approval that names no action?
+
+    Reports the shape only. It is NOT authority on its own and no mutation may
+    be performed on the strength of it alone — the caller has to match it
+    against a real pending proposal for the project currently in play.
+    """
+    return bool(_BARE_APPROVAL_RE.match((text or "").strip()))
 
 
 def describes_a_change(text: str) -> bool:

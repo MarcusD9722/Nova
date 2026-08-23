@@ -27,8 +27,16 @@ def check(cond, label):
 
 
 def make_project(pm: ProjectManager, name: str, files=3) -> Path:
-    p = pm.project_path(name)
-    p.mkdir(parents=True, exist_ok=True)
+    """A REAL project, i.e. one carrying the identity document.
+
+    This used to `mkdir` and stop, which made a directory rather than a
+    project. That was invisible while ProjectManager counted any directory
+    as a project; now that there is one definition and PROJECT.md is it,
+    the fixture has to build the thing it claims to build. Going through
+    `ensure_workspace` — the production creation path — also keeps it
+    honest about what a project actually looks like on disk.
+    """
+    p = pm.ensure_workspace(name)
     for i in range(files):
         (p / f"file{i}.py").write_text(f"# file {i}\nprint({i})\n", encoding="utf-8")
     return p
@@ -52,13 +60,21 @@ async def main():
         projects.mkdir()
         pm = ProjectManager(repo_root=root, projects_dir=projects)
 
-        make_project(pm, "doomed", files=3)
+        doomed = make_project(pm, "doomed", files=3)
         make_project(pm, "keeper", files=2)
+        # Counted, not assumed. A real project carries its identity
+        # document and chat log as well as the fixture's source files, and
+        # the claim worth testing is that delete/purge REPORT what they
+        # actually moved — not that a project happens to hold three files.
+        doomed_files = sum(1 for f in doomed.rglob("*") if f.is_file())
+        check(doomed_files > 3,
+              f"a real project is more than its source files ({doomed_files})")
         check(pm.list_projects() == ["doomed", "keeper"], "both projects listed")
 
         # ── delete MOVES to trash; bytes survive ──
         res = pm.delete_project("doomed")
-        check(res["files"] == 3 and res["recoverable"] is True, f"delete reports what it moved ({res['files']} files)")
+        check(res["files"] == doomed_files and res["recoverable"] is True,
+              f"delete reports what it moved ({res['files']} of {doomed_files})")
         check(not (projects / "doomed").exists(), "project folder gone from projects/")
         check(pm.list_projects() == ["keeper"], "deleted project no longer listed")
         trashed = projects / ".trash" / res["moved_to_trash"]
@@ -88,7 +104,9 @@ async def main():
 
         # ── purge is the ONLY thing that destroys data ──
         purged = pm.purge_trash(entry)
-        check(purged["permanent"] is True and purged["purged"][0]["files"] == 3, "purge reports what it erased")
+        check(purged["permanent"] is True
+              and purged["purged"][0]["files"] == doomed_files,
+              f"purge reports what it erased ({purged['purged'][0]['files']})")
         check(not (projects / ".trash" / entry).exists(), "purged entry is gone for good")
         check((projects / "doomed").is_dir(), "the live project was untouched by the purge")
 

@@ -28,6 +28,7 @@ Run:  venv\\Scripts\\python.exe tests\\test_project_selection_s13.py
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -163,6 +164,66 @@ def _tree(nova, slug: str) -> dict[str, str]:
     return {str(p.relative_to(root)).replace("\\", "/"):
             p.read_text(encoding="utf-8", errors="replace")
             for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+async def test_select_then_act_actually_acts_through_chat():
+    """The behavioural half of the select+action fix.
+
+    Asserting the predicate is not enough: the defect was that selection is
+    resolved BEFORE mutation in the turn path, so a sentence classified as a
+    bare selection had its instruction dropped on the floor no matter what any
+    regex said. Measured on 3278f39 through POST /chat — "Switch to calc-tool
+    and add a memory button." switched project and edited nothing, while "Open
+    calc-tool and add a memory button." worked, which is why sampling openers
+    missed it.
+
+    Every selection starter is exercised, and both halves are checked: the edit
+    ran, AND it ran on the project the sentence named.
+    """
+    check.section("selection: 'switch to X and do Y' edits X, through /chat")
+
+    async with boot() as nova:
+        edits: list[str] = []
+        nova.llm.when("You are Nova improving an existing project",
+                      lambda p: edits.append(p) or "{}", label="improve-tripwire")
+        nova.llm.when(lambda _p: True, lambda _p: "sure.", label="flat")
+        from core.project_intent import SELECTION_STARTERS
+        from core.tool_router import ToolCall
+
+        pb = nova.runtime._project_builder
+        for name in ("flappy-bird", "calc-tool"):
+            await nova.runtime._router.execute(
+                ToolCall("project.scaffold", {"name": name}))
+
+        for starter in SELECTION_STARTERS:
+            edits.clear()
+            # Start each one from the OTHER project, so "it edited the named
+            # project" cannot pass just because that project was already open.
+            await pb.select("flappy-bird")
+            cid = str(uuid4())
+            text = (f"{starter[0].upper()}{starter[1:]} calc-tool and add a "
+                    "memory button.")
+            reply = await _chat(nova, cid, text)
+            for _ in range(60):
+                if edits:
+                    break
+                await asyncio.sleep(0.05)
+            check(bool(edits), f"the instruction ran: {text!r} -> {reply[:50]!r}")
+            check(await pb.last_active() == "calc-tool",
+                  f"and on the project it named ({await pb.last_active()!r}): "
+                  f"{text!r}")
+
+        # …and the same starters with no second clause still only select.
+        for starter in SELECTION_STARTERS[:6]:
+            edits.clear()
+            await pb.select("flappy-bird")
+            cid = str(uuid4())
+            text = f"{starter[0].upper()}{starter[1:]} calc-tool."
+            await _chat(nova, cid, text)
+            await asyncio.sleep(0.3)
+            check(not edits, f"selection alone still edits nothing: {text!r}")
+            check(await pb.last_active() == "calc-tool",
+                  f"but does move the current project: {text!r}")
 
 
 async def test_switching_is_authoritative_end_to_end():
@@ -469,16 +530,229 @@ async def test_both_creation_paths_agree():
               "ensure_workspace did not clobber an existing PROJECT.md")
 
 
+async def test_the_manager_and_builder_agree_in_every_case():
+    """Four seeded states, and no surface may disagree about any of them.
+
+    Review found the contract still split on the READ side after the write side
+    was fixed. Measured on 3278f39 with a seeded `projects/orphan-dir/`:
+
+        ProjectManager.list_projects()   listed it
+        ProjectBuilder.list_projects()   did not
+        known_slug_in_text()             could not name it
+        status_text()                    "I don't have a project called that"
+        select()                         refused
+        last_active()                    returned it AS THE CURRENT PROJECT
+
+    One object, six answers — and the one that decided what Nova was working on
+    was the most permissive of them.
+    """
+    check.section("identity: the manager and the builder agree in every case")
+
+    async with boot() as nova:
+        nova.llm.when(lambda _p: True, lambda _p: "sure.", label="flat")
+        from core.project_manager import ProjectManager
+        from core.project_names import is_project_dir
+        from core.tool_router import ToolCall
+
+        pb = nova.runtime._project_builder
+        mgr = ProjectManager(repo_root=nova.root, projects_dir=nova.projects_dir)
+
+        # A. a real project
+        await nova.runtime._router.execute(
+            ToolCall("project.scaffold", {"name": "real-one"}))
+        # B. a raw directory with no identity document
+        raw = nova.projects_dir / "orphan-dir"
+        raw.mkdir(parents=True, exist_ok=True)
+        (raw / "main.py").write_text("x = 1\n", encoding="utf-8")
+        # D. a project that has been through delete/restore
+        await nova.runtime._router.execute(
+            ToolCall("project.scaffold", {"name": "round-trip"}))
+        info = mgr.delete_project("round-trip")
+        mgr.restore_project(info["moved_to_trash"])
+
+        for slug, is_project in (("real-one", True), ("orphan-dir", False),
+                                 ("round-trip", True)):
+            in_builder = slug in pb.list_projects()
+            in_manager = slug in mgr.list_projects()
+            by_predicate = is_project_dir(nova.projects_dir / slug)
+            check(in_builder == in_manager == by_predicate == is_project,
+                  f"{slug}: builder={in_builder} manager={in_manager} "
+                  f"predicate={by_predicate}, expected {is_project}")
+
+            named = pb.known_slug_in_text(f"open {slug}")
+            check((named == slug) is is_project,
+                  f"{slug}: conversational resolution agrees ({named!r})")
+
+            chosen = await pb.select(slug)
+            check((chosen == slug) is is_project,
+                  f"{slug}: select agrees ({chosen!r})")
+
+            unknown = "don't have a project" in pb.status_text(slug).lower()
+            check(unknown is not is_project,
+                  f"{slug}: status agrees ({pb.status_text(slug)[:50]!r})")
+
+        # C. a stale pointer aimed at the identity-less directory. This is the
+        #    one that used to escape: the pointer lives in memory and the
+        #    project is a directory, and `last_active` only ever checked that
+        #    the directory existed.
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="orphan-dir", confidence=0.95)
+        current = await pb.last_active()
+        check(current != "orphan-dir",
+              f"a stale pointer at a non-project is not the current project "
+              f"({current!r})")
+        cid = str(uuid4())
+        answer = await _chat(nova, cid, "What project are we working on?")
+        check("orphan-dir" not in answer.lower(),
+              f"and Nova does not name it either ({answer[:70]!r})")
+
+        # …and the raw directory is still on disk, untouched.
+        check((raw / "main.py").read_text(encoding="utf-8") == "x = 1\n",
+              "nothing was migrated, renamed or deleted to reach agreement")
+
+
+async def test_the_legacy_policy_is_explicit():
+    """A directory that predates the identity document has ONE answer.
+
+    Decided rather than left implicit: it is not a project on any surface, it is
+    reported under its own name by `list_unadopted()`, and `adopt_project()`
+    turns it into one by WRITING the marker. Adoption is additive and never
+    happens as a side effect of a read — a listing that writes is exactly how
+    "do not silently migrate Marcus's projects" gets violated by accident.
+    """
+    check.section("identity: legacy directories are named, not guessed at")
+
+    async with boot() as nova:
+        nova.llm.when(lambda _p: True, lambda _p: "sure.", label="flat")
+        from core.project_manager import ProjectManager
+        from core.tool_router import ToolCall
+
+        pb = nova.runtime._project_builder
+        mgr = ProjectManager(repo_root=nova.root, projects_dir=nova.projects_dir)
+        await nova.runtime._router.execute(
+            ToolCall("project.scaffold", {"name": "real-one"}))
+        legacy = nova.projects_dir / "ancient"
+        legacy.mkdir(parents=True, exist_ok=True)
+        (legacy / "notes.txt").write_text("years of work\n", encoding="utf-8")
+
+        check(mgr.list_unadopted() == ["ancient"],
+              f"the legacy directory is reported, under its own name "
+              f"({mgr.list_unadopted()})")
+        check("ancient" not in mgr.list_projects(),
+              "and is not counted as a project")
+        check("ancient" not in pb.list_projects(), "on either surface")
+
+        # Listing is a READ. It must not have adopted anything.
+        check(not (legacy / "PROJECT.md").exists(),
+              "listing did not silently write an identity document")
+
+        res = mgr.adopt_project("ancient")
+        check(res["adopted"] is True, f"adoption reports what it did ({res})")
+        check((legacy / "PROJECT.md").exists(), "and wrote the marker")
+        check((legacy / "notes.txt").read_text(encoding="utf-8")
+              == "years of work\n", "without touching the existing contents")
+        check(legacy.name == "ancient", "and without renaming the directory")
+
+        check("ancient" in pb.list_projects() and "ancient" in mgr.list_projects(),
+              "now it is a project on both surfaces")
+        check(mgr.list_unadopted() == [],
+              f"and no longer unadopted ({mgr.list_unadopted()})")
+
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open ancient.")
+        check(await pb.last_active() == "ancient",
+              f"and conversation can select it ({await pb.last_active()!r})")
+
+        # Idempotent, and never clobbers a real history.
+        (legacy / "PROJECT.md").write_text(
+            "# ancient\n\n## Progress log\n- real\n", encoding="utf-8")
+        again = mgr.adopt_project("ancient")
+        check(again["adopted"] is False, f"adopting twice is a no-op ({again})")
+        check("real" in (legacy / "PROJECT.md").read_text(encoding="utf-8"),
+              "and the existing identity document survives")
+
+
+async def test_selection_never_claims_success_it_did_not_achieve():
+    """A swallowed pointer write turned into a confident lie.
+
+    `_set_last_active` caught every persistence exception and `select()`
+    returned the slug anyway, so Nova answered "Okay — we're on calc-tool now."
+    while the authoritative pointer still said flappy-bird. The next turn then
+    acted on the OLD project, which is what makes this more than cosmetic.
+    """
+    check.section("selection: a failed write is reported, not announced as success")
+
+    async with boot() as nova:
+        edits: list[str] = []
+        nova.llm.when("You are Nova improving an existing project",
+                      lambda p: edits.append(p) or "{}", label="improve-tripwire")
+        nova.llm.when(lambda _p: True, lambda _p: "sure.", label="flat")
+        from core.project_builder import ProjectStateError
+        from core.tool_router import ToolCall
+
+        pb = nova.runtime._project_builder
+        for name in ("flappy-bird", "calc-tool"):
+            await nova.runtime._router.execute(
+                ToolCall("project.scaffold", {"name": name}))
+        before_a, before_b = _tree(nova, "flappy-bird"), _tree(nova, "calc-tool")
+
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        check(await pb.last_active() == "flappy-bird", "A is current")
+
+        original = nova.memory.add_fact
+
+        async def refuse_pointer_writes(*a, **k):
+            if k.get("attribute") == "last_active":
+                raise RuntimeError("simulated storage failure")
+            return await original(*a, **k)
+
+        nova.memory.add_fact = refuse_pointer_writes
+        try:
+            # The builder tells the two failures apart, so the turn path can too.
+            raised = False
+            try:
+                await pb.select("calc-tool")
+            except ProjectStateError:
+                raised = True
+            check(raised, "select() raises rather than reporting a phantom switch")
+            check(await pb.select("no-such-project") is None,
+                  "and still returns None for a project that does not exist")
+
+            reply = await _chat(nova, cid, "Switch to calc-tool.")
+        finally:
+            nova.memory.add_fact = original
+
+        low = reply.lower()
+        check("couldn't switch" in low or "could not switch" in low,
+              f"Nova says the switch failed ({reply[:80]!r})")
+        check("we're on calc-tool now" not in low,
+              f"and does not announce it as done ({reply[:80]!r})")
+        check("flappy-bird" in low,
+              f"and says where we actually still are ({reply[:80]!r})")
+        check(await pb.last_active() == "flappy-bird",
+              f"the old project is still authoritative "
+              f"({await pb.last_active()!r})")
+        check(_tree(nova, "flappy-bird") == before_a
+              and _tree(nova, "calc-tool") == before_b,
+              "and no project files changed")
+        check(not edits, f"no edit was started either ({len(edits)})")
+
+
 async def main():
     await test_selection_is_recognised()
     await test_selection_is_not_mutation()
     await test_a_mention_is_not_a_selection()
     await test_the_current_project_question_is_recognised()
+    await test_select_then_act_actually_acts_through_chat()
     await test_switching_is_authoritative_end_to_end()
     await test_selecting_never_starts_an_edit()
     await test_naming_an_unknown_project_never_edits_the_open_one()
     await test_the_scaffolded_project_is_addressable_all_the_way_through()
     await test_both_creation_paths_agree()
+    await test_the_manager_and_builder_agree_in_every_case()
+    await test_the_legacy_policy_is_explicit()
+    await test_selection_never_claims_success_it_did_not_achieve()
     check.finish()
 
 

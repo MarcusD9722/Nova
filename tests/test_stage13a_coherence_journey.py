@@ -378,6 +378,15 @@ def _tree(nova, slug: str) -> dict[str, str]:
     return out
 
 
+def _pending(nova, cid: str, slug: str) -> str:
+    """The proposal pending for ONE project in ONE conversation.
+
+    Project-scoped: a plan described for A is not reachable from B, which is
+    what stops "switch to B, okay make that change" running A's plan on B.
+    """
+    return nova.runtime._pending_plan.get(cid, {}).get(slug, "")
+
+
 async def _last_active(nova) -> str:
     """The AUTHORITATIVE current project, read from storage — not from prose."""
     return await nova.runtime._project_builder.last_active() or ""
@@ -540,7 +549,7 @@ async def journey(nova) -> None:
 
     plan = await j.say("Help me make the pipe spacing easier, but don't change "
                        "anything yet. First tell me what you think should change.")
-    pending = nova.runtime._pending_plan.get(j.cid, "")
+    pending = _pending(nova, j.cid, "flappy-bird")
     j.log(user="plan, do not change yet", intent="plan_only", project="flappy-bird",
           reads="project:flappy-bird", writes="pending_plan", decision="plan",
           tools="none", reply=plan, expected="plan recorded, no write",
@@ -560,7 +569,7 @@ async def journey(nova) -> None:
 
     corr = await j.say("Actually, keep the horizontal spacing the way it was. "
                        "I meant make the vertical opening 15% larger.")
-    pending = nova.runtime._pending_plan.get(j.cid, "")
+    pending = _pending(nova, j.cid, "flappy-bird")
     j.log(user="correct the plan", intent="correct_plan", project="flappy-bird",
           reads="pending_plan", writes="pending_plan", decision="replan",
           tools="none", reply=corr, expected="plan replaced",
@@ -607,7 +616,7 @@ async def journey(nova) -> None:
           f"[{j.step}] the horizontal value the correction protected is untouched")
     check("999" not in text_a,
           f"[{j.step}] and the superseded plan never ran")
-    check(not nova.runtime._pending_plan.get(j.cid, ""),
+    check(not _pending(nova, j.cid, "flappy-bird"),
           f"[{j.step}] the approved plan was consumed, not left to re-fire")
     check(_tree(nova, "calculator") == snapshot_b,
           f"[{j.step}] the other project was not touched")
@@ -740,7 +749,7 @@ async def journey(nova) -> None:
     check.section("J: discussed / planned / done are not the same word")
 
     later = await j.say("Later on I'd like a pause menu, but don't build it yet.")
-    still_planned = nova.runtime._pending_plan.get(j.cid, "")
+    still_planned = _pending(nova, j.cid, "flappy-bird")
     j.log(user="plan a pause menu, not now", intent="plan_only",
           project="flappy-bird", reads="project", writes="pending_plan",
           decision="plan", tools="none", reply=later,
@@ -830,7 +839,7 @@ async def journey(nova) -> None:
     check("999" not in final, "and the superseded plan is nowhere on disk")
 
     # 5. work that is still only planned
-    check("pause menu" in nova.runtime._pending_plan.get(j.cid, "").lower(),
+    check("pause menu" in _pending(nova, j.cid, "flappy-bird").lower(),
           "the pause menu is still planned, not built")
     check(not any("pause" in t.lower() for t in _tree(nova, "flappy-bird").values()),
           "and no pause-menu code exists")

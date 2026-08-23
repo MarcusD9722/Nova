@@ -394,7 +394,13 @@ async def test_stale_pointer_is_never_returned():
     # E2: a project removed behind Nova's back.
     with _tmp() as td:
         rt, m, projects = await _runtime(td)
+        # A LIVE project, identity document and all. The bare mkdir this
+        # used to do made a directory, not a project, and only passed while
+        # `last_active()` was the one surface that accepted any directory —
+        # which is the disagreement Stage 13A closed.
         (projects / "ghost").mkdir(parents=True)
+        (projects / "ghost" / "PROJECT.md").write_text(
+            "# ghost\n\n## Status\nlive\n", encoding="utf-8")
         await m.add_fact(entity="projects", attribute="last_active",
                          value="ghost", confidence=0.95)
         pb = rt._project_builder

@@ -22,10 +22,21 @@ if ($Filter) { $suites = $suites | Where-Object { $_.Name -match $Filter } }
 
 $failed = @()
 $passed = 0
+# A passing suite gets its usual three lines. A FAILING one gets enough to
+# name the assertion that failed: keeping only the tail made every flake
+# un-diagnosable, and "it passed when I ran it again" is not a diagnosis.
 foreach ($suite in $suites) {
     Write-Host ("-- " + $suite.Name) -ForegroundColor Cyan
-    & $python $suite.FullName 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host ("   " + $_) }
-    if ($LASTEXITCODE -eq 0) { $passed++ } else { $failed += $suite.Name }
+    $out = & $python $suite.FullName 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $passed++
+        $out | Select-Object -Last 3 | ForEach-Object { Write-Host ("   " + $_) }
+    } else {
+        $failed += $suite.Name
+        $hits = $out | Select-String -SimpleMatch "FAIL", "Error", "Traceback"
+        if ($hits) { $hits | ForEach-Object { Write-Host ("   " + $_.Line) -ForegroundColor Red } }
+        $out | Select-Object -Last 25 | ForEach-Object { Write-Host ("   " + $_) }
+    }
 }
 
 Write-Host ""

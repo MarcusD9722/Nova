@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core.project_names import (
-    MAX_COMPONENT_LEN, canonical_project_slug, resolve_existing_identity,
+    MAX_COMPONENT_LEN, PROJECT_MARKER, canonical_project_slug,
+    list_project_dirs, list_unadopted_dirs, resolve_existing_identity,
     safe_live_component, safe_trash_entry,
 )
 from core.safety import ensure_safe_subdir
@@ -157,13 +158,46 @@ class ProjectManager:
         return files, size
 
     def list_projects(self) -> list[str]:
-        """Project names, excluding the trash folder and other dot-dirs."""
-        if not self._projects_dir.exists():
-            return []
-        return sorted(
-            p.name for p in self._projects_dir.iterdir()
-            if p.is_dir() and not p.name.startswith(".")
-        )
+        """Projects, by the ONE definition in `core.project_names`.
+
+        This used to accept any non-dot directory while ProjectBuilder required
+        PROJECT.md, so the two disagreed about whether a given folder existed at
+        all. It has no production callers, which is why aligning it costs
+        nothing — but the disagreement was real and reachable through the
+        builder, and `last_active()` resolved it in the most permissive
+        direction.
+        """
+        return list_project_dirs(self._projects_dir)
+
+    def list_unadopted(self) -> list[str]:
+        """Directories under projects/ that are NOT projects.
+
+        Folders predating the identity document live here. Reported under their
+        own name rather than counted as projects on one surface and denied on
+        another.
+        """
+        return list_unadopted_dirs(self._projects_dir)
+
+    def adopt_project(self, name: str) -> dict[str, Any]:
+        """Give an existing directory the identity document. Additive only.
+
+        Nothing is renamed, moved or deleted — the directory keeps its exact
+        name, which is the constraint that rules out "canonicalise it on the way
+        in". Idempotent: adopting a real project leaves its PROJECT.md alone.
+
+        Deliberately NOT called from any listing. A read that writes is how
+        "don't silently migrate Marcus's projects" gets violated by accident.
+        """
+        proj = self.project_path(name)
+        if not proj.is_dir():
+            raise FileNotFoundError(f"no such directory: {name}")
+        marker = proj / PROJECT_MARKER
+        if marker.exists():
+            return {"project": proj.name, "adopted": False,
+                    "note": "already had an identity document"}
+        marker.write_text(
+            self._MINIMAL_PROJECT_MD.format(slug=proj.name), encoding="utf-8")
+        return {"project": proj.name, "adopted": True}
 
     def delete_project(self, name: str) -> dict[str, Any]:
         """Move a project into .trash/ (recoverable). Never deletes bytes."""

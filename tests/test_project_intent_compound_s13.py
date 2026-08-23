@@ -42,7 +42,15 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 
 from harness import Checks, run  # noqa: E402
 
-from core.project_intent import authorize_project_mutation  # noqa: E402
+from core.project_intent import (  # noqa: E402
+    OPENER_STARTERS,
+    SELECTION_STARTERS,
+    approves_without_naming_a_change,
+    authorize_project_mutation,
+    cancels_pending_change,
+    is_bare_approval,
+    is_project_selection,
+)
 
 check = Checks()
 
@@ -264,6 +272,165 @@ async def test_bare_approval_remains_closed_deliberately():
           "approval WITH an action verb is authorised")
 
 
+async def test_select_then_act_is_not_downgraded_to_select_only():
+    """EVERY starter, because the last bug here was in the ones nobody tested.
+
+    `_COMPOUND_IMPERATIVE_RE` only knew the OPENER vocabulary, so
+
+        "Open calc-tool and add a memory button."      -> authorised
+        "Switch to calc-tool and add a memory button." -> NOT authorised
+
+    and since selection is resolved before mutation, the second one read as a
+    bare selection: Nova switched project and silently dropped the instruction.
+    Measured through POST /chat on 3278f39 for every selection starter.
+
+    The fix is one union — every phrase that brings a project into view without
+    changing it, openers and selection starters alike, is an entry verb, and the
+    compound grammar is built from that union rather than from half of it.
+    """
+    check.section("S13: 'switch to X and do Y' is an instruction, not a switch")
+
+    for starter in SELECTION_STARTERS + OPENER_STARTERS:
+        opening = starter[0].upper() + starter[1:]
+        act = f"{opening} calc-tool and add a memory button."
+        check(_allowed(act), f"select+action authorised: {act!r}")
+        check(not is_project_selection(act),
+              f"and is NOT read as bare selection: {act!r}")
+
+    # …while the same starter alone still selects and authorises nothing.
+    for starter in SELECTION_STARTERS:
+        opening = starter[0].upper() + starter[1:]
+        bare = f"{opening} calc-tool."
+        check(is_project_selection(bare), f"select-only is a selection: {bare!r}")
+
+    # ONE documented exception, and it is about the message-level gate only.
+    # "Let's work on X" passes authorize_project_mutation on its own -
+    # "work on" is an action verb - so a second clause that is NOT an
+    # imperative cannot make it refuse. What protects it is that the turn
+    # path resolves selection first, which is asserted behaviourally in
+    # test_project_selection_s13.py rather than claimed here.
+    soft = "Let's work on calc-tool and think about what it needs."
+    check(is_project_selection(soft),
+          f"read as a selection, so nothing is edited: {soft!r}")
+
+    # The distinction is the second clause being a real imperative, not merely
+    # the sentence containing "and".
+    for text in (
+        "Switch to calc-tool and tell me what you would change.",
+        "Go back to flappy-bird and see whether the pipes feel unfair.",
+        "Back to flappy-bird and let me know what you reckon.",
+        "Don't switch to calc-tool and add anything.",
+        "Should we switch to calc-tool and add a button?",
+        "I switched to calc-tool and added a button yesterday.",
+    ):
+        check(not _allowed(text), f"still refused: {text!r}")
+
+
+async def test_cancellation_is_recognised_without_swallowing_corrections():
+    """Withdrawing a proposal, and the sentences that only look like it."""
+    check.section("S13: a cancellation withdraws, a correction replaces")
+
+    for text in (
+        "Actually don't.",
+        "Don't.",
+        "No, don't.",
+        "Don't make that change.",
+        "Don't do that.",
+        "Don't bother.",
+        "Never mind.",
+        "Nevermind.",
+        "Okay, never mind.",
+        "Forget it.",
+        "Forget that change.",
+        "Forget about it.",
+        "Cancel that.",
+        "Cancel the change.",
+        "Leave it the way it is.",
+        "Leave it as is.",
+        "Leave it alone.",
+        "Scrap that.",
+        "Drop it.",
+        "Skip that.",
+        "On second thought, no.",
+    ):
+        check(cancels_pending_change(text), f"cancels: {text!r}")
+
+    # A correction contains a refusal too. It REPLACES the proposal rather than
+    # withdrawing it, and reading it as a cancellation would throw away the very
+    # instruction the user just gave.
+    for text in (
+        "Actually, keep the horizontal spacing the way it was. I meant make "
+        "the vertical opening 15% larger.",
+        "Make the pipe gap larger, but don't change anything yet.",
+        "Okay, make that change.",
+        "Don't worry about the weather.",
+        "I never mind waiting.",
+        "She would never mind that.",
+        "Add a pause button.",
+        "I don't like how the menu looks.",
+    ):
+        check(not cancels_pending_change(text), f"not a cancellation: {text!r}")
+
+
+async def test_a_bare_approval_is_a_shape_not_an_authority():
+    """The predicate reports the SHAPE. Authority needs context the gate lacks.
+
+    Both facts are pinned together on purpose. `is_bare_approval` exists so the
+    turn path can pair these words with a real pending proposal for the current
+    project — and `authorize_project_mutation` must go on refusing them, because
+    an idle "go ahead" in ordinary conversation is the identical string.
+    """
+    check.section("S13: bare approval is recognised but never self-authorising")
+
+    for text in ("Go ahead.", "Do that.", "Do it.", "Yes, do it.",
+                 "Yeah, do it.", "Okay, go ahead.", "Sure, do it.",
+                 "Go for it.", "Please do.", "Alright, go ahead."):
+        check(is_bare_approval(text), f"is a bare approval: {text!r}")
+        check(not _allowed(text),
+              f"and the context-free gate still refuses it: {text!r}")
+
+    # Not bare approvals: too weak to mean anything, or they name the action
+    # and belong to the ordinary gate.
+    for text in ("Okay.", "Sure.", "Yes.", "Right.", "Mhm.",
+                 "Go ahead and apply those improvements.",
+                 "Do that thing with the pipes.",
+                 "Go ahead and delete the old project."):
+        check(not is_bare_approval(text), f"not a bare approval: {text!r}")
+
+    check(_allowed("Go ahead and apply those improvements."),
+          "approval that NAMES the action is authorised as it always was")
+
+
+async def test_an_approval_whose_object_is_a_pronoun_is_flagged():
+    """"Okay, make that change." passes the gate and still says nothing.
+
+    It has an action verb, so the mutation gate allows it — correctly, it IS an
+    instruction. What it does not have is an object: "that change" only means
+    something if a proposal exists to resolve it against. Flagging the shape is
+    what lets the turn path refuse honestly instead of handing a builder the
+    sentence itself as its instruction.
+    """
+    check.section("S13: an approval whose object is a pronoun is recognisable")
+
+    for text in ("Okay, make that change.", "Make that change.",
+                 "Yes, apply those.", "Apply that.", "Update it.",
+                 "Go ahead and make that change.", "Now make those changes.",
+                 "Then apply that edit."):
+        check(approves_without_naming_a_change(text),
+              f"names no concrete change: {text!r}")
+        check(_allowed(text),
+              f"…while still passing the mutation gate: {text!r}")
+
+    for text in ("Make the vertical opening 15% larger.",
+                 "Add a pause button.",
+                 "Update the readme.",
+                 "Add a memory button to calc-tool.",
+                 "Fix the collision bug.",
+                 "Improve the UI."):
+        check(not approves_without_naming_a_change(text),
+              f"names a concrete change: {text!r}")
+
+
 async def main():
     await test_a_compound_imperative_authorises()
     await test_the_near_misses_stay_refused()
@@ -272,6 +439,10 @@ async def main():
     await test_a_gerund_subject_is_not_a_command()
     await test_bring_up_is_not_a_gerund()
     await test_every_opener_verb_carries_a_compound_imperative()
+    await test_select_then_act_is_not_downgraded_to_select_only()
+    await test_cancellation_is_recognised_without_swallowing_corrections()
+    await test_a_bare_approval_is_a_shape_not_an_authority()
+    await test_an_approval_whose_object_is_a_pronoun_is_flagged()
     await test_bare_approval_remains_closed_deliberately()
     check.finish()
 
