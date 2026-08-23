@@ -162,6 +162,8 @@ async def test_m8_real_project_delete_vs_memory():
         root = Path(td)
         projects = root / "projects"
         (projects / "gamma").mkdir(parents=True)
+        (projects / "gamma" / "PROJECT.md").write_text(
+            "# gamma\n", encoding="utf-8")
         (projects / "gamma" / "main.py").write_text("print('hi')\n", encoding="utf-8")
         pm = ProjectManager(repo_root=root, projects_dir=projects)
 
@@ -226,6 +228,8 @@ async def test_m8_runtime_delete_clears_the_active_pointer():
         root = Path(td)
         projects = root / "projects"
         (projects / "gamma").mkdir(parents=True)
+        (projects / "gamma" / "PROJECT.md").write_text(
+            "# gamma\n", encoding="utf-8")
         (projects / "gamma" / "main.py").write_text("print('hi')\n", encoding="utf-8")
         mem_dir = root / "memory"
         mem_dir.mkdir(parents=True, exist_ok=True)
@@ -263,8 +267,12 @@ async def test_m8_runtime_delete_clears_the_active_pointer():
         # A delete of a DIFFERENT project must not clear a pointer that is still
         # valid.
         (projects / "delta").mkdir(parents=True)
+        (projects / "delta" / "PROJECT.md").write_text(
+            "# delta\n", encoding="utf-8")
         (projects / "delta" / "x.py").write_text("x=1\n", encoding="utf-8")
         (projects / "epsilon").mkdir(parents=True)
+        (projects / "epsilon" / "PROJECT.md").write_text(
+            "# epsilon\n", encoding="utf-8")
         (projects / "epsilon" / "y.py").write_text("y=1\n", encoding="utf-8")
         await m.add_fact(entity="projects", attribute="last_active",
                          value="delta", confidence=0.95)

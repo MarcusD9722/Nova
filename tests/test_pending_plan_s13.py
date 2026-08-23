@@ -415,6 +415,153 @@ async def test_an_approved_plan_is_consumed_once():
               f"a second approval does not replay it ({len(later)} later calls)")
 
 
+async def test_an_independent_instruction_does_not_approve_a_proposal():
+    """Doing one thing is not agreeing to another.
+
+    Measured on b2a931e: the proposal was popped for ANY authorised mutation on
+    the same project, so
+
+        "I'd like a dark mode, but don't change anything yet."
+        "Add a pause button."
+
+    ran improve() with BOTH, and the dark mode the user had explicitly deferred
+    was consumed as though it had been approved. An approval refers to something
+    already on the table ("make THAT change"); a concrete instruction carries its
+    own object and speaks only for itself.
+
+    The unapproved proposal is left PENDING rather than discarded — the user
+    asked for it and never withdrew it, so it stays theirs to approve later.
+    """
+    check.section("pending plan: an unrelated instruction approves nothing")
+
+    async with boot() as nova:
+        rec = await _wire(nova, "flappy-bird", "calc-tool")
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        await _chat(nova, cid, "I'd like a dark mode, but don't change anything yet.")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              "the proposal is pending")
+
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Add a pause button.")
+        check(await _settled(nova, rec, n), "the instruction itself ran")
+        last = rec.prompts[-1].lower()
+        check("pause button" in last, "and it carried its own instruction")
+        check("dark mode" not in last,
+              f"the deferred proposal did NOT ride along ({rec.tails()})")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              f"and is still pending, not silently spent "
+              f"({_pending(nova, cid, 'flappy-bird')!r})")
+
+        # Every concrete shape, not just one.
+        for text in ("Fix collision.", "Update the README."):
+            n = len(rec.prompts)
+            await _chat(nova, cid, text)
+            check(await _settled(nova, rec, n), f"{text!r} ran")
+            check("dark mode" not in rec.prompts[-1].lower(),
+                  f"{text!r} did not approve the proposal")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              "the proposal survived all of them")
+
+        # A concrete instruction while ANOTHER project holds a proposal.
+        await _chat(nova, cid, "Switch to calc-tool.")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Add a percent key.")
+        check(await _settled(nova, rec, n), "the instruction ran on B")
+        check("dark mode" not in rec.prompts[-1].lower(),
+              f"and A's proposal did not cross over ({rec.tails()})")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              "A's proposal is intact")
+
+        # …and an actual approval still consumes it.
+        await _chat(nova, cid, "Go back to flappy-bird.")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Okay, make that change.")
+        check(await _settled(nova, rec, n), "the approval ran")
+        check("dark mode" in rec.prompts[-1].lower(),
+              f"and THAT is what executes the proposal ({rec.tails()})")
+        check(not _pending(nova, cid, "flappy-bird"), "now it is consumed")
+
+
+async def test_a_prohibition_never_becomes_a_proposal():
+    """A ban must not turn into executable work.
+
+    Measured on b2a931e: "Don't change the physics." was stored as the pending
+    proposal, and a later "Go ahead." CARRIED IT OUT — the exact inversion of
+    what the mutation gate exists to prevent.
+
+    The capture accepted every refusal whose reason was "vetoed: prohibition",
+    and two opposite sentences share that reason. What separates them is not the
+    verb but whether the prohibition is scoped in TIME: deferred means "later",
+    unqualified means "not at all".
+    """
+    check.section("pending plan: a prohibition is not a deferred proposal")
+
+    prohibitions = (
+        "Don't change the physics.",
+        "Don't modify the menu.",
+        "Never change the scoring.",
+        "I don't want you to change the physics.",
+        "Do not update that file.",
+        "Don't touch the collision code.",
+        "Never update the readme.",
+    )
+    async with boot() as nova:
+        rec = await _wire(nova)
+        for text in prohibitions:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, "Open flappy-bird.")
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{text!r} was not stored as a proposal ({held[:40]!r})")
+
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{text!r}: and a later approval executed nothing "
+                  f"({rec.tails()})")
+
+        # KNOWN LIMIT, stated rather than hidden. What is recognised is a
+        # deferral expressed as a PROHIBITION clause: "but don't ... yet".
+        # A bare "..., but not yet." carries no prohibition and, in the
+        # cases tried, no action verb the vocabulary knows, so it is not
+        # captured. Widening the test to any sentence containing "later" or
+        # "at some point" would misfire on "Fix the bug that happens later in
+        # the level", so that is deliberately left alone.
+        # The deferral half of the same grammar still works, or the fix would
+        # have closed the feature instead of the hole.
+        for text in ("Make the pipe gap easier, but don't change anything yet.",
+                     "Add a pause menu later, but don't build it yet.",
+                     "Improve the pipe spacing, but don't change it yet.",
+                     "Change the physics, but don't change anything right now."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, "Open flappy-bird.")
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(bool(held), f"deferred proposal still captured: {text!r}")
+            check(not rec.prompts, f"and not executed: {text!r}")
+
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Okay, make that change.")
+            check(await _settled(nova, rec, n),
+                  f"and approving it runs it: {text!r}")
+
+        # A deferral must not read as a cancellation either — it would throw away
+        # the proposal it is half of.
+        from core.project_intent import cancels_pending_change, defers_a_change
+        for text in ("Make the pipe gap easier, but don't change anything yet.",
+                     "I'd like a dark mode, but don't change anything yet."):
+            check(defers_a_change(text), f"is a deferral: {text!r}")
+            check(not cancels_pending_change(text),
+                  f"and not a cancellation: {text!r}")
+        # …while the same prohibition WITHOUT a time qualifier withdraws.
+        for text in ("Don't change anything.", "Don't make any changes."):
+            check(cancels_pending_change(text), f"withdraws: {text!r}")
+            check(not defers_a_change(text), f"and defers nothing: {text!r}")
+
+
 async def main():
     await test_a_plan_alone_never_executes()
     await test_a_bare_approval_is_authority_only_with_a_proposal()
@@ -424,6 +571,8 @@ async def main():
     await test_the_plan_is_scoped_to_its_project()
     await test_cancellation_invalidates_the_proposal()
     await test_a_cancellation_is_scoped_too()
+    await test_an_independent_instruction_does_not_approve_a_proposal()
+    await test_a_prohibition_never_becomes_a_proposal()
     await test_an_approved_plan_is_consumed_once()
     check.finish()
 

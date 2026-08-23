@@ -23,12 +23,14 @@ from core.policy.storyteller import StorytellerLLM, is_story_request, story_syst
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.intent import is_question, is_purely_conversational
+from core.project_names import is_project_dir
 from core.project_intent import (
     describes_a_change,
     asks_current_project,
     approves_without_naming_a_change,
     authorize_project_mutation,
     cancels_pending_change,
+    defers_a_change,
     is_bare_approval,
     is_project_selection,
     qualified_project_name,
@@ -972,6 +974,20 @@ class RuntimeManager:
             if resolved in self._project_builder.active_projects():
                 return {"ok": False, "error": "build_in_progress",
                         "note": f"'{name}' is still being built — stop it before deleting."}
+            # The identity contract, checked BEFORE the approval prompt.
+            # ProjectManager enforces it too — that is the authoritative
+            # boundary — but asking a human to approve deleting a "project"
+            # that is about to be refused as not-a-project is its own small
+            # dishonesty.
+            if not is_project_dir(_projects.project_path(name)):
+                if (_projects.project_path(name)).is_dir():
+                    return {"ok": False, "error": "not_a_project",
+                            "project": resolved,
+                            "note": (f"'{resolved}' is a directory under projects/ "
+                                     "but has no PROJECT.md, so it is not a "
+                                     "project. Adopt it first if you want to "
+                                     "delete it as one.")}
+                return {"ok": False, "error": "not_found", "project": name}
             blocked = await _gate("project.delete", {"project": name, "recoverable": True})
             if blocked:
                 return blocked
@@ -1498,11 +1514,27 @@ class RuntimeManager:
                 else:
                     plans.clear()
         elif conv and describes_a_change(t) and not may_mutate.allowed:
-            if may_mutate.reason in ("no affirmative instruction",
-                                     "vetoed: prohibition"):
-                if in_play:
-                    self._pending_plan.setdefault(conv, {})[in_play] = t
-                    self._bound_pending_plans()
+            # WHICH refusals are proposals. "No affirmative instruction"
+            # is a plain description of a change and always is one.
+            # "Vetoed: prohibition" covers two opposite sentences that
+            # the gate refuses for the same reason:
+            #
+            #   "Make the pipe gap easier, but don't change anything yet."
+            #   "Don't change the physics."
+            #
+            # Accepting that whole bucket meant a BAN became executable
+            # work — measured on b2a931e, "Don't change the physics."
+            # was stored and a later "Go ahead." carried it out. What
+            # separates them is not the verb but whether the prohibition
+            # is scoped in time: deferred means "later", unqualified
+            # means "not at all".
+            reason = may_mutate.reason
+            is_proposal = (reason == "no affirmative instruction"
+                           or (reason == "vetoed: prohibition"
+                               and defers_a_change(t)))
+            if is_proposal and in_play:
+                self._pending_plan.setdefault(conv, {})[in_play] = t
+                self._bound_pending_plans()
 
         # SELECTION: "let's work on X", "switch to X", "go back to X", "open X".
         # Making a project current writes nothing inside it, so this is not
@@ -1626,12 +1658,27 @@ class RuntimeManager:
                 # DESCRIBED but not authorised, per conversation. A correction
                 # overwrites it, so what executes is the corrected plan and the
                 # superseded one never runs.
-                # Scoped to THIS project. A plan described for another one is
-                # not this turn's to execute, and switching projects must not
-                # silently re-target it.
+                # ONLY AN APPROVAL CONSUMES A PROPOSAL.
+                #
+                # This used to pop the proposal for ANY authorised mutation
+                # on the same project, so an independent instruction became
+                # implicit approval of something the user had explicitly
+                # deferred. Measured on b2a931e:
+                #
+                #   "I'd like a dark mode, but don't change anything yet."
+                #   "Add a pause button."
+                #     -> improve() ran with BOTH, and the unapproved dark
+                #        mode was consumed as though it had been agreed
+                #
+                # An approval refers to something already on the table
+                # ("make THAT change"); a concrete instruction carries its
+                # own object and speaks only for itself. A proposal that
+                # was not approved stays pending — the user asked for it and
+                # never withdrew it, so it is still theirs to approve later.
+                approving = approves_without_naming_a_change(t)
                 pending = (self._pending_plan.get(conv, {}).pop(slug, "")
-                           if conv else "")
-                if not pending and approves_without_naming_a_change(t):
+                           if conv and approving else "")
+                if approving and not pending:
                     # An approval whose object is a pronoun, with nothing to
                     # resolve it against. Handing the builder the sentence
                     # "Okay, make that change." as its instruction is an edit

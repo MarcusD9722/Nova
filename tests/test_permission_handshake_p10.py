@@ -164,8 +164,12 @@ class Fixture:
         self.router.register("project.restore", self._restore, timeout_s=BUDGET)
 
     def make_project(self, name: str) -> Path:
-        d = self.projects / name
-        d.mkdir(parents=True, exist_ok=True)
+        """A REAL project. This fixture drives the production
+        ProjectManager.delete_project, which takes the same view of a
+        project as every read surface: a bare mkdir is a directory, not a
+        project. ensure_workspace is the production creation path.
+        """
+        d = self.pm.ensure_workspace(name)
         (d / "main.py").write_text("print('hi')\n", encoding="utf-8")
         return d
 
@@ -779,8 +783,17 @@ def case_runtime() -> None:
             root = Path(td)
             projects = root / "projects"
             (projects / "toy").mkdir(parents=True)
+            # A REAL project: this exercises the production project.delete,
+            # which takes the same view of a project as every read surface.
+            (projects / "toy" / "PROJECT.md").write_text(
+                "# toy\n", encoding="utf-8")
             (projects / "toy" / "main.py").write_text("print('hi')\n", encoding="utf-8")
             (projects / "toy" / "README.md").write_text("# toy\n", encoding="utf-8")
+            # Counted, not assumed: a real project carries its identity
+            # document too, and the claim R14 makes is that the tool REPORTS
+            # what it moved.
+            toy_files = sum(1 for f in (projects / "toy").rglob("*")
+                            if f.is_file())
             mem_dir = root / "memory"
             mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -848,7 +861,7 @@ def case_runtime() -> None:
                   and (projects / ".trash" / entry / "README.md").exists())
             check("R14 the tool result is truthful about what happened",
                   (res.result or {}).get("ok") is True
-                  and (res.result or {}).get("files") == 2
+                  and (res.result or {}).get("files") == toy_files
                   and (res.result or {}).get("recoverable") is True
                   and entry in str((res.result or {}).get("note", "")),
                   f"result={res.result}")

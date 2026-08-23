@@ -739,6 +739,52 @@ async def test_selection_never_claims_success_it_did_not_achieve():
         check(not edits, f"no edit was started either ({len(edits)})")
 
 
+async def test_the_delete_tool_obeys_the_contract_too():
+    """The same answer through the router, and without asking a human first.
+
+    `project.delete` is ADMIN-gated, so the order matters as much as the
+    verdict: refusing AFTER the approval prompt would mean asking Marcus to
+    approve deleting a "project" that is about to be refused as not-a-project.
+    The check therefore runs before the gate — and this test would hang on the
+    permission broker if it did not, which is what makes the ordering testable
+    rather than merely asserted in a comment.
+    """
+    check.section("identity: the delete TOOL refuses what is not a project")
+
+    async with boot() as nova:
+        nova.llm.when(lambda _p: True, lambda _p: "sure.", label="flat")
+        from core.tool_router import ToolCall
+
+        await nova.runtime._router.execute(
+            ToolCall("project.scaffold", {"name": "keeper"}))
+        raw = nova.projects_dir / "orphan-dir"
+        raw.mkdir(parents=True, exist_ok=True)
+        (raw / "main.py").write_text("x = 1\n", encoding="utf-8")
+        before = (raw / "main.py").read_bytes()
+
+        res = await asyncio.wait_for(
+            nova.runtime._router.execute(
+                ToolCall("project.delete", {"name": "orphan-dir"})),
+            timeout=20)
+        payload = res.result if isinstance(res.result, dict) else {}
+        check(payload.get("error") == "not_a_project",
+              f"the tool refuses it by name ({str(payload)[:90]!r})")
+        check("PROJECT.md" in str(payload.get("note", "")),
+              f"and explains the contract ({str(payload.get('note'))[:70]!r})")
+        check(raw.is_dir() and (raw / "main.py").read_bytes() == before,
+              "the directory and its files are untouched")
+
+        # A name that is not there at all is still a plain not-found.
+        gone = await asyncio.wait_for(
+            nova.runtime._router.execute(
+                ToolCall("project.delete", {"name": "never-existed"})),
+            timeout=20)
+        gone_payload = gone.result if isinstance(gone.result, dict) else {}
+        check(gone_payload.get("error") == "not_found",
+              f"a missing project is not-found, not not-a-project "
+              f"({str(gone_payload)[:70]!r})")
+
+
 async def main():
     await test_selection_is_recognised()
     await test_selection_is_not_mutation()
@@ -752,6 +798,7 @@ async def main():
     await test_both_creation_paths_agree()
     await test_the_manager_and_builder_agree_in_every_case()
     await test_the_legacy_policy_is_explicit()
+    await test_the_delete_tool_obeys_the_contract_too()
     await test_selection_never_claims_success_it_did_not_achieve()
     check.finish()
 

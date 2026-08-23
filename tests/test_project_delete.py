@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.permissions import ADMIN, CRITICAL, STANDARD, evaluate, tier_of
-from core.project_manager import ProjectManager
+from core.project_manager import NotAProjectError, ProjectManager
 
 _fail = False
 
@@ -40,6 +40,83 @@ def make_project(pm: ProjectManager, name: str, files=3) -> Path:
     for i in range(files):
         (p / f"file{i}.py").write_text(f"# file {i}\nprint({i})\n", encoding="utf-8")
     return p
+
+
+async def test_delete_obeys_the_project_identity_contract():
+    """Destroying something is the last place a definition may drift.
+
+    Every read surface agrees that a directory without PROJECT.md is not a
+    project: `list_projects` omits it, conversation cannot name it, `select`
+    refuses it, `status` denies it, `last_active` will not return it. Measured
+    on b2a931e, `delete_project()` still accepted it and moved it to trash —
+    the one surface that disagreed was the destructive one.
+    """
+    print("\nidentity: delete refuses what is not a project")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        projects = root / "projects"
+        projects.mkdir()
+        pm = ProjectManager(repo_root=root, projects_dir=projects)
+
+        real = make_project(pm, "keeper", files=2)
+        raw = projects / "orphan-dir"
+        raw.mkdir()
+        (raw / "main.py").write_text("x = 1\n", encoding="utf-8")
+        before = (raw / "main.py").read_bytes()
+
+        check(pm.list_projects() == ["keeper"],
+              f"the raw directory is not a project ({pm.list_projects()})")
+        check(pm.list_unadopted() == ["orphan-dir"],
+              f"…it is unadopted ({pm.list_unadopted()})")
+
+        try:
+            pm.delete_project("orphan-dir")
+            check(False, "delete should refuse a directory that is not a project")
+        except NotAProjectError as e:
+            check("PROJECT.md" in str(e),
+                  f"delete refuses it, and says why ({str(e)[:70]!r})")
+
+        check(raw.is_dir(), "the directory is still there")
+        check((raw / "main.py").read_bytes() == before,
+              "its files are byte-identical, in place")
+        check(pm.list_unadopted() == ["orphan-dir"],
+              "and it is still reported as unadopted")
+        check(not (projects / ".trash").exists()
+              or not any((projects / ".trash").iterdir()),
+              "nothing was moved to trash")
+
+        # …and "not a project" is distinguishable from "not there at all",
+        # because only one of them has a remedy.
+        try:
+            pm.delete_project("no-such-thing")
+            check(False, "a missing directory should still raise")
+        except NotAProjectError:
+            check(False, "a missing directory must not report as 'not a project'")
+        except FileNotFoundError:
+            check(True, "a missing directory is still FileNotFoundError")
+
+        # ADOPT, then delete works normally.
+        res = pm.adopt_project("orphan-dir")
+        check(res["adopted"] is True, f"adoption converts it ({res})")
+        check("orphan-dir" in pm.list_projects(), "now it is a project")
+        info = pm.delete_project("orphan-dir")
+        check(info["project"] == "orphan-dir" and info["recoverable"] is True,
+              f"and delete works ({info})")
+        check(not raw.exists(), "the directory moved to trash")
+        restored = pm.restore_project(info["moved_to_trash"])
+        check(restored["restored"] == "orphan-dir",
+              f"restore brings it back under its own name ({restored})")
+        check((raw / "main.py").read_bytes() == before,
+              "with its original file intact")
+
+        # A real project is unaffected by any of this.
+        check("keeper" in pm.list_projects(), "the real project is untouched")
+        keep = pm.delete_project("keeper")
+        check(keep["project"] == "keeper", "and still deletes normally")
+        pm.restore_project(keep["moved_to_trash"])
+        check(real.is_dir() and "keeper" in pm.list_projects(),
+              "and restores normally")
 
 
 async def main():
@@ -135,6 +212,8 @@ async def main():
             check(False, "deleting a missing project should raise")
         except FileNotFoundError:
             check(True, "missing project reports not-found honestly")
+
+    await test_delete_obeys_the_project_identity_contract()
 
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)

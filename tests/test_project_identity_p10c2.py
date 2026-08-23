@@ -312,10 +312,18 @@ async def test_delete_by_natural_name_clears_the_pointer():
 
     for spoken in ["Balloon Tower Defense", "balloon tower defense",
                    "  Balloon   Tower Defense  "]:
+        # These fixtures build REAL projects. PROJECT.md is the identity
+        # document and delete now takes the same view of a project as
+        # every read surface, so a bare mkdir is a directory, not a
+        # project. What these tests are about is name resolution and
+        # build races, so the fixture has to get past the contract to
+        # reach them.
         with _tmp() as td:
             rt, m, projects = await _runtime(td)
             slug = canonical_project_slug("Balloon Tower Defense")
             (projects / slug).mkdir(parents=True)
+            (projects / slug / "PROJECT.md").write_text(
+                "# " + slug + "\n", encoding="utf-8")
             (projects / slug / "main.py").write_text("print(1)\n", encoding="utf-8")
             await m.add_fact(entity="projects", attribute="last_active",
                              value=slug, confidence=0.95)
@@ -358,6 +366,8 @@ async def test_stale_pointer_is_never_returned():
         rt, m, projects = await _runtime(td)
         slug = "balloon-tower-defense"
         (projects / slug).mkdir(parents=True)
+        (projects / slug / "PROJECT.md").write_text(
+            "# " + slug + "\n", encoding="utf-8")
         (projects / slug / "main.py").write_text("print(1)\n", encoding="utf-8")
         await m.add_fact(entity="projects", attribute="last_active",
                          value=slug, confidence=0.95)
@@ -489,6 +499,8 @@ async def test_active_build_guard_uses_resolved_identity():
             rt, m, projects = await _runtime(td)
             slug = canonical_project_slug("Balloon Tower Defense")
             (projects / slug).mkdir(parents=True)
+            (projects / slug / "PROJECT.md").write_text(
+                "# " + slug + "\n", encoding="utf-8")
             (projects / slug / "main.py").write_text("print(1)\n", encoding="utf-8")
 
             # Mark it actively building, exactly as the builder would.
@@ -529,6 +541,8 @@ async def test_active_build_guard_uses_resolved_identity():
     with _tmp() as td:
         rt, m, projects = await _runtime(td)
         (projects / "other-project").mkdir(parents=True)
+        (projects / "other-project" / "PROJECT.md").write_text(
+            "# other-project\n", encoding="utf-8")
         (projects / "other-project" / "x.py").write_text("x=1\n", encoding="utf-8")
         task = asyncio.create_task(rt._router.execute(
             ToolCall(name="project.delete", args={"name": "Other Project"}),
@@ -963,6 +977,8 @@ async def test_case_variant_delete_respects_the_active_build():
         rt, m, projects = await _runtime(td)
         actual = "My_Old.Project"
         (projects / actual).mkdir(parents=True)
+        (projects / actual / "PROJECT.md").write_text(
+            "# " + actual + "\n", encoding="utf-8")
         (projects / actual / "main.py").write_text("print(1)\n", encoding="utf-8")
         await m.add_fact(entity="projects", attribute="last_active",
                          value=actual, confidence=0.95)

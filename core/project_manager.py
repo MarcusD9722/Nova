@@ -10,10 +10,20 @@ from typing import Any, Iterable
 
 from core.project_names import (
     MAX_COMPONENT_LEN, PROJECT_MARKER, canonical_project_slug,
-    list_project_dirs, list_unadopted_dirs, resolve_existing_identity,
-    safe_live_component, safe_trash_entry,
+    is_project_dir, list_project_dirs, list_unadopted_dirs,
+    resolve_existing_identity, safe_live_component, safe_trash_entry,
 )
 from core.safety import ensure_safe_subdir
+
+
+class NotAProjectError(ValueError):
+    """The directory exists but carries no identity document.
+
+    Distinct from FileNotFoundError, which means the directory is not
+    there at all. A caller has to tell "you don't have that" apart from
+    "that is not a project", because only the second one has a remedy —
+    adopt it.
+    """
 
 
 class ProjectManager:
@@ -200,12 +210,30 @@ class ProjectManager:
         return {"project": proj.name, "adopted": True}
 
     def delete_project(self, name: str) -> dict[str, Any]:
-        """Move a project into .trash/ (recoverable). Never deletes bytes."""
+        """Move a PROJECT into .trash/ (recoverable). Never deletes bytes.
+
+        Takes the same view of "project" as every read surface. It used to
+        accept any directory, which meant a folder the whole rest of the
+        system called unadopted — invisible to `list_projects`, unnameable
+        in conversation, refused by `select`, denied by `status` — could
+        still be deleted AS a project. One contract has to mean one
+        contract, and least of all on the destructive side.
+
+        An unadopted directory is not thereby undeletable: `adopt_project`
+        makes it a project first, deliberately, and then this works
+        normally. The point is that nothing is moved to trash on a
+        definition of "project" no other surface agrees with.
+        """
         proj = self.project_path(name)          # sandboxed by ensure_safe_subdir
         if proj.resolve() == self._projects_dir.resolve():
             raise ValueError("refusing to delete the projects directory itself")
         if not proj.exists() or not proj.is_dir():
             raise FileNotFoundError(f"no such project: {name}")
+        if not is_project_dir(proj):
+            raise NotAProjectError(
+                f"'{proj.name}' is a directory under projects/ but has no "
+                f"{PROJECT_MARKER}, so it is not a project. Adopt it first "
+                "if you want to delete it as one.")
 
         files, size = self._measure(proj)
         trash = self._trash_dir()

@@ -49,6 +49,7 @@ __all__ = [
     "asks_current_project",
     "describes_a_change",
     "cancels_pending_change",
+    "defers_a_change",
     "is_bare_approval",
     "approves_without_naming_a_change",
     "qualified_project_name",
@@ -466,6 +467,55 @@ def approves_without_naming_a_change(text: str) -> bool:
     return bool(_ANAPHORIC_APPROVAL_RE.match((text or "").strip()))
 
 
+#: A prohibition scoped in TIME. This is the structural difference between a
+#: DEFERRAL and a WITHDRAWAL, and it is what decides whether a refused message
+#: becomes a pending proposal.
+#:
+#:   "Make the pipe gap easier, but don't change anything yet."   deferral
+#:   "I'd like a dark mode, but don't change anything yet."       deferral
+#:   "Don't change the physics."                                  withdrawal
+#:   "Never change the scoring."                                  withdrawal
+#:   "Do not update that file."                                   withdrawal
+#:
+#: Both shapes are refused by the mutation gate for the same reason
+#: ("vetoed: prohibition"), so the reason alone could not tell them apart — and
+#: the capture accepted that whole bucket. Measured on b2a931e: "Don't change
+#: the physics." became a pending proposal and a later "Go ahead." EXECUTED it.
+#: A ban became executable work, which is the exact inversion of what the gate
+#: exists to prevent.
+#:
+#: "never" is deliberately absent. It is a prohibition over all time, which is
+#: the opposite of putting something off.
+_DEFERRAL_RE = re.compile(
+    r"\b(?:not\s+yet|yet|for\s+now|right\s+now|just\s+yet|"
+    r"at\s+the\s+moment|for\s+the\s+moment|later\s+on|later|"
+    r"another\s+time|some\s+other\s+time|in\s+a\s+bit|"
+    r"down\s+the\s+line|eventually|at\s+some\s+point)\b",
+    re.IGNORECASE,
+)
+
+#: "Don't change anything." / "Don't make any changes." — a prohibition whose
+#: object is EVERYTHING. Unqualified, that is a withdrawal of whatever was on
+#: the table; qualified by time it is the deferral half of a proposal, which is
+#: why the caller checks `defers_a_change` first.
+_GENERIC_PROHIBITION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|no\s+need\s+to)\s+"
+    r"(?:make\s+any\s+chang\w*|chang\w*\s+anything|do\s+anything|"
+    r"touch\s+anything|modify\s+anything|edit\s+anything|"
+    r"chang\w*\s+any(?:thing)?)\b",
+    re.IGNORECASE,
+)
+
+
+def defers_a_change(text: str) -> bool:
+    """Is this putting a change OFF, rather than forbidding it?
+
+    Time-qualified, a prohibition still wants the change — later. Unqualified,
+    it wants it not to happen. Only the first may become a pending proposal.
+    """
+    return bool(_DEFERRAL_RE.search((text or "").strip()))
+
+
 def cancels_pending_change(text: str) -> bool:
     """Does this message call OFF a change that was proposed but not approved?
 
@@ -473,7 +523,14 @@ def cancels_pending_change(text: str) -> bool:
     vertical opening") also contains a refusal and must NOT read as a
     cancellation — it replaces the proposal rather than withdrawing it.
     """
-    return bool(_CANCEL_RE.search((text or "").strip()))
+    raw = (text or "").strip()
+    if _CANCEL_RE.search(raw):
+        return True
+    # "Don't change anything." with no time qualifier withdraws whatever was
+    # proposed. With one ("…yet") it is the second half of a proposal and must
+    # not cancel it — which is why this is checked here rather than folded into
+    # `_CANCEL_RE`.
+    return bool(_GENERIC_PROHIBITION_RE.search(raw)) and not defers_a_change(raw)
 
 
 def is_bare_approval(text: str) -> bool:
