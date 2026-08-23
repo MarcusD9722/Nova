@@ -150,7 +150,7 @@ async def test_cancellation_invalidates_the_proposal():
         # A bare approval after a cancellation is idle again.
         rec.prompts.clear()
         cid = str(uuid4())
-        await _chat(nova, cid, "I'd like a parallax background, but don't "
+        await _chat(nova, cid, "I'd like you to add a parallax background, but don't "
                                "change anything yet.")
         await _chat(nova, cid, "Never mind.")
         await _chat(nova, cid, "Go ahead.")
@@ -167,10 +167,10 @@ async def test_a_cancellation_is_scoped_too():
         rec = await _wire(nova, "flappy-bird", "calc-tool")
         cid = str(uuid4())
         await _chat(nova, cid, "Open flappy-bird.")
-        await _chat(nova, cid, "I'd like a parallax background, but don't "
+        await _chat(nova, cid, "I'd like you to add a parallax background, but don't "
                                "change anything yet.")
         await _chat(nova, cid, "Switch to calc-tool.")
-        await _chat(nova, cid, "I'd like a percent key, but don't change "
+        await _chat(nova, cid, "I'd like you to add a percent key, but don't change "
                                "anything yet.")
         check(bool(_pending(nova, cid, "flappy-bird")), "A has a plan")
         check(bool(_pending(nova, cid, "calc-tool")), "B has a plan")
@@ -242,7 +242,7 @@ async def test_a_specific_withdrawal_cancels_the_proposal_it_names():
         # A prohibition about something ELSE must not erase the proposal.
         rec.prompts.clear()
         cid = str(uuid4())
-        await _chat(nova, cid, "I'd like a dark mode, but don't change it yet.")
+        await _chat(nova, cid, "I'd like you to add a dark mode, but don't change it yet.")
         for unrelated in ("Don't change the physics.",
                           "Don't remove the menu.",
                           "Don't update the readme."):
@@ -264,7 +264,7 @@ async def test_a_specific_withdrawal_cancels_the_proposal_it_names():
         await _chat(nova, cid, "I'd like you to change the physics, but don't "
                                "change it yet.")
         await _chat(nova, cid, "Switch to calc-tool.")
-        await _chat(nova, cid, "I'd like a percent key, but don't add it yet.")
+        await _chat(nova, cid, "I'd like you to add a percent key, but don't add it yet.")
         await _chat(nova, cid, "Go back to flappy-bird.")
         await _chat(nova, cid, "Actually, don't change the physics.")
         check(not _pending(nova, cid, "flappy-bird"),

@@ -748,7 +748,7 @@ async def journey(nova) -> None:
     j.section = "J"
     check.section("J: discussed / planned / done are not the same word")
 
-    later = await j.say("Later on I'd like a pause menu, but don't build it yet.")
+    later = await j.say("I'd like you to add a pause menu later on, but don't build it yet.")
     still_planned = _pending(nova, j.cid, "flappy-bird")
     j.log(user="plan a pause menu, not now", intent="plan_only",
           project="flappy-bird", reads="project", writes="pending_plan",

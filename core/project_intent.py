@@ -176,7 +176,12 @@ _IMPERATIVE_RE = re.compile(
 _REQUEST_RE = re.compile(
     r"^\s*(?:can|could|would|will)\s+you\s+(?:please\s+)?" + _IMPERATIVE_VERB + r"\b"
     r"|^\s*(?:let'?s|lets)\s+(?:please\s+)?" + _IMPERATIVE_VERB + r"\b"
-    r"|^\s*i\s+(?:want|need|would\s+like|'?d\s+like)\s+you\s+to\s+" + _IMPERATIVE_VERB + r"\b",
+    # "I'd like you to add X". The old alternation required whitespace between
+    # "i" and "'d", so the contracted form - the one people actually type - never
+    # matched and an explicit request read as no instruction at all.
+    r"|^\s*i(?:'?d)?\s+(?:want|need|would\s+like|like)\s+you\s+to\s+" + _IMPERATIVE_VERB + r"\b"
+    # "Help me add a pause button" is a request, not a description.
+    r"|^\s*(?:please\s+)?help\s+me\s+(?:to\s+)?" + _IMPERATIVE_VERB + r"\b",
     re.IGNORECASE,
 )
 
@@ -613,55 +618,53 @@ def defers_a_change(text: str) -> bool:
     return bool(_DEFERRED_PROHIBITION_RE.search((text or "").strip()))
 
 
-#: "I'd like a dark mode" / "I want a pause menu" — a change proposed without
-#: any of the action verbs. The OBJECT is what makes it a proposal: "I'd like a
-#: dark mode" names one, "I was thinking about it" names a pronoun.
-_DESIRE_FRAME_RE = re.compile(
-    r"\b(?:i\s*(?:'?d|\swould)?\s*(?:like|love|want|need)|"
-    r"we\s*(?:'?d|\swould)?\s*(?:like|love|want|need)|"
-    r"(?:it|that)\s+would\s+be\s+(?:nice|good|great|better))"
-    r"\b(?P<object>[^.;!?]*)",
-    re.IGNORECASE,
-)
-
-
 def carries_a_proposal(text: str) -> bool:
     """Does this turn say WHAT to change, or only WHEN NOT to?
 
     A deferral answers "not now". On its own it proposes nothing:
 
         "Don't change it yet."          only timing
-        "Don't build it for now."       only timing
         "Add a parallax background, but don't change anything yet."
                                         a proposal AND its timing
 
-    The capture accepted the whole deferral bucket, so a standalone deferral
-    became the pending proposal — replacing a real one, or creating an
-    executable one out of nothing. Measured on e88104c: with a parallax
-    proposal pending, "Don't build it yet." replaced it and a later "Go ahead."
-    ran the words "Don't build it yet."
+    THE TEST IS THE AUTHORISATION GRAMMAR, applied to what is left after the
+    deferral clause is removed. Two weaker tests were tried first and both
+    admitted things that are not proposals:
 
-    Structural, not a list of phrases: remove the deferral clause and see
-    whether anything describing a change is left.
+      "any content words remain"    "The game looks pretty good, so don't
+                                    change anything yet." — measured on
+                                    da27c9d, it replaced a real proposal
+
+      "a positive action family"    `_ACTION_VERB` is deliberately broad TOPIC
+                                    detection and matches inflections, so "I
+                                    changed the menu yesterday, but don't
+                                    change anything yet." read as a proposal.
+                                    A retrospective is not a proposal.
+
+      "a desire with an object"     "I want pizza, but don't change anything
+                                    yet." — an arbitrary noun after "I want"
+                                    is not a project change.
+
+    Reusing `authorize_project_mutation` fixes all three at once and for the
+    right reason: it is the module's only affirmative-instruction grammar, and
+    it already vetoes retrospectives, denials, deliberation, questions and
+    messages about Nova herself. A proposal is exactly a sentence that WOULD
+    have authorised the change if the user had not deferred it.
+
+    DESIRE-ONLY FORMS FAIL CLOSED. "I'd like a dark mode" is a real proposal to
+    a human and indistinguishable, deterministically, from "I want pizza" — so
+    neither becomes executable pending state. The explicit forms do work:
+    "I'd like you to add a dark mode", "Help me add a dark mode", "Add a dark
+    mode". Making every stray desire a future filesystem mutation is the wrong
+    way to be wrong.
     """
     raw = (text or "").strip()
     if not raw:
         return False
-    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw)
-    # POSITIVE CHANGE INTENT, not merely leftover prose. Asking only whether
-    # content words remain meant "The game looks pretty good, so don't change
-    # anything yet." proposed something — it has "game" and "good" in it — and
-    # it replaced a real parallax proposal that a later approval then failed to
-    # execute. Measured on da27c9d.
-    #
-    # An action verb the module knows is the strong form. The weak one is a
-    # DESIRE naming a concrete object: "I'd like a dark mode" proposes a dark
-    # mode without using one of those verbs, while "I was thinking about it"
-    # names only a pronoun and proposes nothing.
-    if _positive_families(rest):
-        return True
-    m = _DESIRE_FRAME_RE.search(rest)
-    return bool(m and _content_words(m.group("object")))
+    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw).strip()
+    if not rest:
+        return False
+    return bool(authorize_project_mutation(rest, complaint=False).allowed)
 
 
 def withdraws_pending_change(text: str, pending: str) -> bool:

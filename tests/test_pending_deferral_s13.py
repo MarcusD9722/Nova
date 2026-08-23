@@ -137,7 +137,7 @@ async def test_a_deferral_qualifier_must_modify_the_prohibition():
         "Don't build that for now.",
         "Don't implement it until later.",
         "Make the gap larger, but don't change anything yet.",
-        "I'd like a dark mode, but don't change it yet.",
+        "I'd like you to add a dark mode, but don't change it yet.",
     )
 
     for text in not_deferrals:
@@ -174,7 +174,7 @@ async def test_a_deferral_qualifier_must_modify_the_prohibition():
         for text in ("Don't change it yet.", "Don't build that for now."):
             rec.prompts.clear()
             cid = str(uuid4())
-            # A real proposal: "I'd like a parallax background." carries no
+            # A real proposal: "I'd like you to add a parallax background." carries no
             # action verb the vocabulary knows, so it never created one -
             # this block used to pass only because the DEFERRAL was being
             # stored as the proposal, which is the defect under test.
