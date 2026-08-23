@@ -23,6 +23,7 @@ from core.policy.storyteller import StorytellerLLM, is_story_request, story_syst
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.intent import is_question, is_purely_conversational
+from core.project_intent import authorize_project_mutation
 from core.gpu import GPU_SEM
 from core.turn_gate import GATE
 from core.capabilities.navigation import Navigation, extract_directions
@@ -1397,8 +1398,16 @@ class RuntimeManager:
         # the exact gap that spawned the junk "what-other-improvements-…" slug.
         looks_like_question = is_question(t)
 
+        # THE side-effect gate. Everything below that can write to disk asks
+        # this first, and it is deterministic on purpose — see
+        # core/project_intent.py for the three live messages that made Nova
+        # edit a project during ordinary conversation. A keyword like
+        # "improve" is NOT authority; an affirmative instruction is.
+        is_complaint = bool(CONTINUATION_COMPLAINT_RE.search(t))
+        may_mutate = authorize_project_mutation(t, complaint=is_complaint)
+
         # "implement those suggestions" (uses last active project when unnamed)
-        if IMPLEMENT_SUGG_RE.search(t):
+        if IMPLEMENT_SUGG_RE.search(t) and may_mutate:
             slug = pb.known_slug_in_text(t) or await pb.last_active()
             if slug:
                 res = await pb.improve(
@@ -1415,18 +1424,19 @@ class RuntimeManager:
         # intent is detected but the name wasn't repeated — unless the message
         # looks like it's naming a brand new project ("called X"/"named X").
         slug = pb.known_slug_in_text(t)
-        direct_mention = slug is not None
-        is_complaint = bool(CONTINUATION_COMPLAINT_RE.search(t))
-        has_continuation_intent = bool(
-            STATUS_WORDS_RE.search(t) or RESUME_WORDS_RE.search(t) or IMPROVE_WORDS_RE.search(t)
-            or BUILD_ACTION_RE.search(t) or is_complaint
-        )
-        if slug is None and has_continuation_intent and not looks_like_question and not NAME_RE.search(t):
-            slug = await pb.last_active()
+        if slug is None and not looks_like_question and not NAME_RE.search(t):
+            # Falling back to the last-active project is how an unnamed message
+            # acquires a mutation target, so it is gated by the same
+            # authorisation. Reading STATUS is exempt: `status_text()` only
+            # reports, and "where did we leave off" names no project by nature.
+            if STATUS_WORDS_RE.search(t):
+                slug = await pb.last_active()
+            elif may_mutate:
+                slug = await pb.last_active()
         if slug:
             if STATUS_WORDS_RE.search(t):
                 return pb.status_text(slug)
-            if RESUME_WORDS_RE.search(t):
+            if RESUME_WORDS_RE.search(t) and may_mutate:
                 if pb.is_building(slug):
                     return f"I'm already working on {slug} — I'll report when it's done."
                 res = await pb.improve(
@@ -1436,15 +1446,18 @@ class RuntimeManager:
                 if res.get("started"):
                     return f"Resuming {slug} from where we left off. I'll report when finished."
                 return f"I couldn't resume {slug}: {res.get('reason', 'unknown')}."
-            # Any non-question message that names/points at a known project and
-            # carries a work signal (improve/build verb, complaint, or just a
-            # direct mention with an instruction) works on it. Questions about a
-            # project ("is flappybird a good game?", "what could we add?") are
-            # for DISCUSSION — the whole condition is gated behind the question
-            # check so a question can never kick off an autonomous change.
-            if not looks_like_question and (
-                IMPROVE_WORDS_RE.search(t) or BUILD_ACTION_RE.search(t) or is_complaint or direct_mention
-            ):
+            # Work on it only when the message actually INSTRUCTS it.
+            #
+            # This condition used to be "improve-ish keyword OR build verb OR
+            # complaint OR the project was merely mentioned". Two of those were
+            # enough on their own to write to disk: a keyword anywhere in the
+            # sentence, and — worse — a bare mention, so
+            # "flappy-bird is a project I made earlier" was an edit request.
+            # Both now go through the same deterministic authorisation, which
+            # requires an affirmative instruction and vetoes prohibitions,
+            # denials, retrospectives, deliberation, and messages whose subject
+            # is Nova herself rather than a project.
+            if may_mutate:
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
                 res = await pb.improve(slug=slug, instructions=t)
@@ -1637,14 +1650,12 @@ class RuntimeManager:
                 {"role": "user", "content": clean_user},
             ]
             story_budget = int(os.getenv("NOVA_STORY_TOKENS", "1200").strip() or "1200")
-            parts: list[str] = []
-            async with self._llm_sem:
-                async for token in self._llm.chat_stream(
-                    messages, max_tokens=story_budget, temperature=0.7, thinking=True
-                ):
-                    parts.append(token)
-                    yield {"type": "token", "text": token}
-            story_reply = "".join(parts).strip()
+            story_reply = ""
+            async for ev in self._stream_story(messages, budget=story_budget):
+                if ev.get("type") == "story_final":
+                    story_reply = (ev.get("text") or "").strip()
+                    continue          # internal: never forwarded to the client
+                yield ev
             if not story_reply:
                 async with self._llm_sem:
                     retry = await self._llm.chat(messages, max_tokens=story_budget, temperature=0.7, thinking=True)
@@ -2001,30 +2012,71 @@ class RuntimeManager:
         # does not need to re-derive them.
         reply_budget = int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536")
         chat_model = self._models.for_role("chat")
-        full: list[str] = []
-        async with chat_model.semaphore:
-            async for token in chat_model.runtime.chat_stream(
-                messages, max_tokens=reply_budget, temperature=0.4, thinking=False
-            ):
-                full.append(token)
-                yield {"type": "token", "text": token}
+        # Prior replies stay in the prompt for continuity; the guard is on the
+        # OUTPUT. Live, a new personal statement was answered with the previous
+        # capability answer almost verbatim.
+        previous_replies: list[str] = []
+        previous_user_text = ""
+        try:
+            prior_state = await self._state_store.load(conversation_id)
+            previous_replies = list(prior_state.last_assistant_replies or [])[-4:]
+            # The message BEFORE this one. This turn has not been recorded yet
+            # (that happens in _finish), so the last entry is the previous user
+            # turn — which is what decides whether the user has moved on.
+            prior_users = list(prior_state.last_user_messages or [])
+            previous_user_text = prior_users[-1] if prior_users else ""
+        except Exception:
+            previous_replies, previous_user_text = [], ""
+        reply = ""
+        async for ev in self._stream_guarded_reply(
+            chat_model, messages, budget=reply_budget,
+            user_text=clean_user, previous_replies=previous_replies,
+            previous_user_text=previous_user_text,
+        ):
+            if ev.get("type") == "reply_final":
+                reply = (ev.get("text") or "").strip()
+                continue              # internal: never forwarded to the client
+            yield ev
 
-        reply = "".join(full).strip()
         if not reply:
-            # Rare overflow (the model reasoned past the budget without closing
-            # the think block). The non-streaming chat() retries internally; give
-            # it extra room and an explicit terse-answer nudge so it lands.
+            # The stream produced nothing visible. By the time we are here,
+            # `chat_stream` has already escalated through its three attempts and
+            # its LAST one used native reasoning — so repeating `thinking=True`
+            # here is not a retry, it is the same contract a fourth time.
+            #
+            # The direction is taken from this repo's own P2.5 measurement on
+            # the six production cases, quoted above in this method:
+            #
+            #     thinking=True    5/18 empty
+            #     thinking=False   0/18 empty
+            #
+            # `thinking=False` prefills an ALREADY-CLOSED reasoning block
+            # (core/llm_runtime._apply_no_think), and the failure being rescued
+            # from is a block that opened and never closed — one the model never
+            # opens cannot overflow. So the rescue is structurally DIFFERENT
+            # from what just failed, which is the only kind of retry worth
+            # spending a generation on.
             salvage = messages + [{
                 "role": "user",
                 "content": "Reply now in one or two warm, natural sentences. No analysis, no reasoning — just talk.",
             }]
             async with self._llm_sem:
                 retry = await self._llm.chat(
-                    salvage, max_tokens=512, temperature=0.4, thinking=True
+                    salvage, max_tokens=512, temperature=0.4, thinking=False
                 )
             reply = (retry or "").strip()
             if reply:
+                # Counted apart from `empty_exhausted` so "recovered" and
+                # "gave up" stay distinguishable in telemetry.
+                try:
+                    self._llm._usage["empty_salvaged"] = int(
+                        self._llm._usage.get("empty_salvaged", 0)) + 1
+                except Exception:
+                    pass
+                logger.info("chat_stream_salvaged", chars=len(reply))
                 yield {"type": "token", "text": reply}
+            else:
+                logger.warning("chat_stream_salvage_failed")
         if not reply:
             reply = "Sorry — I came up empty on that one."
         await _finish(reply, tool_results)
@@ -2044,6 +2096,351 @@ class RuntimeManager:
             seen.add(key)
             out.append(vv)
         return out
+
+    # ── Authoritative personal dates (structured, no model) ─────────────────
+    async def _stored_person_date(self, subject: str, attribute: str) -> "PersonDate":
+        """What memory actually holds for one subject. Never guesses.
+
+        SCOPED BY SPEAKER. This read used to be two hardcoded stores — `user`
+        for "my birthday" and the global `people` table for everyone else —
+        both of which mean Marcus. A known guest asking "when is my birthday?"
+        was answered with his, and one asking "when is Robin's birthday?" was
+        answered from his social map even when they had a Robin of their own.
+
+        The routing is `scoped_person_entity`, the same helper the remember and
+        recall tools use, so there is one rule rather than four.
+        """
+        from core.personal_dates import PersonDate, parse_stored_date
+        from core.turn_identity import scoped_person_entity, self_person_entity
+
+        async def _scoped_attrs(scope) -> dict[str, str]:
+            """A guest's own record of this person, as an attribute map."""
+            rows = await self._memory.get_facts(entity=scope.entity or "", limit=40)
+            return {r.attribute: str(r.value or "") for r in rows}
+
+        value = ""
+        attrs: dict[str, str] = {}
+        if not subject:
+            # "my birthday" — the speaker's OWN root, never a literal "user".
+            own = self_person_entity()
+            if own is None:
+                return PersonDate(subject=subject, known=False)
+            fact = await self._memory.get_latest_fact(entity=own, attribute=attribute)
+            value = str(getattr(fact, "value", "") or "") if fact else ""
+        else:
+            scope = scoped_person_entity(subject)
+            if scope.refused:
+                # Unverified: no personal record of anybody, theirs or Marcus's.
+                return PersonDate(subject=subject, known=False)
+            if scope.is_global_people:
+                rec = await self._memory.recall_person(subject)
+                attrs = {k: str(v) for k, v in
+                         ((rec or {}).get("attributes") or {}).items()}
+                value = str(attrs.get(attribute) or "")
+                if not value:
+                    # A person may also have been recorded as a plain fact.
+                    fact = await self._memory.get_latest_fact(
+                        entity=subject, attribute=attribute)
+                    value = str(getattr(fact, "value", "") or "") if fact else ""
+            else:
+                # A known guest reads only the people THEY told Nova about.
+                # No fallback to the global table: that fallback IS the leak.
+                attrs = await _scoped_attrs(scope)
+                value = str(attrs.get(attribute) or "")
+            if not value:
+                birth = str(attrs.get("birth_date") or "")
+                if birth and attribute == "birthday":
+                    value = birth
+
+        parsed = parse_stored_date(value) if value else None
+        if not parsed:
+            return PersonDate(subject=subject, known=False)
+        year, month, day = parsed
+        derived = str(attrs.get("birth_date_source") or "") == "derived"
+        return PersonDate(subject=subject, known=True, month=month, day=day,
+                          year=year, derived_year=derived)
+
+    async def _personal_date_reply(self, text: str) -> str | None:
+        """Answer "when is X's birthday" from the authoritative store.
+
+        Returns None when this is not that question, so every other message is
+        untouched. Returns a sentence — including an honest "I don't have it" —
+        when it is, because the failure this fixes was a stored fact being
+        routed through generation and coming back as a generic apology.
+        """
+        from core.personal_dates import format_month_day, parse_date_query
+
+        query = parse_date_query(text)
+        if not query:
+            return None
+
+        # Privacy scoping is unchanged: an unidentified speaker gets no
+        # personal record, exactly as the rest of the runtime treats them.
+        if current_identity().is_unverified:
+            return None
+
+        parts: list[str] = []
+        missing: list[str] = []
+        for subject in query.subjects:
+            found = await self._stored_person_date(subject, query.attribute)
+            who = "Your" if not subject else f"{subject}'s"
+            if not found.known:
+                missing.append("yours" if not subject else subject)
+                continue
+            when = format_month_day(found.month, found.day,
+                                    None if found.derived_year else found.year)
+            parts.append(f"{who} {query.attribute} is {when}")
+
+        if not parts and not missing:
+            return None
+        reply = ""
+        if parts:
+            reply = ", and ".join(parts) + "."
+        if missing:
+            names = " or ".join(missing)
+            note = (f"I don't have {names} on file — tell me and I'll remember it."
+                    if not parts else
+                    f" I don't have {names} on file yet, though.")
+            reply = (reply + note) if parts else note
+        return reply.strip()
+
+    #: "what can you do", "what are you capable of", "what features do you have"
+    _INTROSPECTION_RE = re.compile(
+        r"\b(?:what|which)\s+(?:can|could)\s+you\s+do\b"
+        r"|\bwhat\s+are\s+you\s+(?:capable\s+of|able\s+to\s+do)\b"
+        r"|\bwhat\s+(?:features|capabilities|tools|abilities|skills)\s+"
+        r"(?:do\s+you\s+have|are\s+(?:there|available))\b"
+        r"|\bwhat\s+can\s+you\s+help\s+(?:me\s+)?with\b"
+        r"|\blist\s+your\s+(?:capabilities|features|tools)\b",
+        re.IGNORECASE,
+    )
+
+    def _capability_report(self):
+        """The runtime's own view of what is wired up right now.
+
+        Registration is not operability: `ComputerControl` is constructed with
+        `adapter=None` because no platform adapter ships, so its tools exist
+        and permission may be granted while nothing can actually execute. That
+        is measured here and passed in, rather than inferred from a flag.
+        """
+        from core.capability_report import summarize_capabilities
+
+        probes: dict[str, object] = {}
+        try:
+            # `ComputerControl.available` is a PROPERTY: flag AND adapter. An
+            # earlier version of this called a `can_execute()` that does not
+            # exist, and the except below swallowed the AttributeError — so the
+            # probe was silently absent and the category went back to claiming
+            # availability. The test that drives the real runtime caught it.
+            probes["computer_can_execute"] = bool(self._computer.available)
+        except Exception:  # noqa: BLE001 — a genuine unknown stays unknown
+            pass
+        return summarize_capabilities(self._router.list_tools(), probes)
+
+    def _capability_reply(self, text: str) -> str | None:
+        """Answer an introspection question from the REGISTRY, not the README.
+
+        Live, "What are you capable of?" was answered from whatever the model
+        remembered about itself, because the tool inventory was collected into
+        the grounding context and then never rendered into it. There is one
+        source of truth for this question now, and it is the router.
+        """
+        if not self._INTROSPECTION_RE.search(text or ""):
+            return None
+        return self._capability_report().sentence()
+
+    #: How much of a reply to hold back before letting it stream.
+    #:
+    #: The guard has to decide BEFORE tokens reach the user — retracting text
+    #: already on screen is worse than the bug. A short probe is enough: an
+    #: accidental replay of a previous answer repeats it from the beginning.
+    _REPEAT_PROBE_CHARS = 160
+
+    async def _stream_guarded_reply(self, chat_model, messages, *, budget: int,
+                                    user_text: str, previous_replies: list[str],
+                                    previous_user_text: str = ""):
+        """Stream a reply, refusing to replay a recent one.
+
+        Yields `{"type": "token", ...}` as tokens arrive, then exactly one
+        `{"type": "reply_final", "text": ...}`. The caller consumes that final
+        event and does NOT forward it.
+
+        WHY a final EVENT and not an attribute: `backend/state.py` keeps one
+        process-wide RuntimeManager (`STATE.runtime`), so two concurrent turns
+        share this object. An earlier version parked the answer in
+        `self._last_stream_text` and the second turn to finish overwrote the
+        first turn's reply. Completion data travels with the stream for the same
+        reason `chat_stream_ex` carries finish_reason there.
+
+        WHY it streams: an earlier version collected every token into a list and
+        yielded only after the generation finished, so the user waited a whole
+        generation for the first character. Only the repeat PROBE is held back
+        now; after it clears, token N is yielded before token N+1 exists.
+        """
+        from core.repetition import (
+            is_near_duplicate, materially_different, wants_repeat,
+        )
+
+        # Three conditions, all required:
+        #   - there is something to accidentally replay
+        #   - the user did not ASK for a repeat ("say that again")
+        #   - the user actually moved on. Asking "Explain RAID 5" twice should
+        #     get the same answer twice; that is not a stale reply, and
+        #     rejecting it was the reason `materially_different` exists.
+        guard_on = (
+            bool(previous_replies)
+            and not wants_repeat(user_text)
+            and materially_different(user_text, previous_user_text)
+        )
+
+        async def _generate(msgs):
+            """One generation. Yields token events, then a private outcome."""
+            collected: list[str] = []
+            held: list[str] = []
+            releasing = not guard_on
+            async with chat_model.semaphore:
+                async for token in chat_model.runtime.chat_stream(
+                    msgs, max_tokens=budget, temperature=0.4, thinking=False
+                ):
+                    collected.append(token)
+                    if releasing:
+                        yield {"type": "token", "text": token}
+                        continue
+                    held.append(token)
+                    if sum(len(x) for x in held) >= self._REPEAT_PROBE_CHARS:
+                        probe = "".join(held)
+                        if is_near_duplicate(
+                            probe, [p[:len(probe)] for p in previous_replies]
+                        ):
+                            yield {"type": "_abandoned", "text": "".join(collected)}
+                            return
+                        releasing = True
+                        yield {"type": "token", "text": probe}
+                        held = []
+                # Anything still held means the probe never cleared, so NOTHING
+                # has been emitted yet and abandoning here is still invisible.
+                if held:
+                    tail = "".join(held)
+                    if is_near_duplicate(tail, previous_replies):
+                        yield {"type": "_abandoned", "text": "".join(collected)}
+                        return
+                    yield {"type": "token", "text": tail}
+            yield {"type": "_complete", "text": "".join(collected)}
+
+        async def _run(msgs):
+            """Forward tokens as they arrive; return (text, abandoned)."""
+            text, abandoned = "", False
+            async for ev in _generate(msgs):
+                kind = ev.get("type")
+                if kind == "token":
+                    yield ev
+                elif kind == "_abandoned":
+                    text, abandoned = ev["text"], True
+                elif kind == "_complete":
+                    text = ev["text"]
+            yield {"type": "_outcome", "text": text, "abandoned": abandoned}
+
+        first_text, abandoned = "", False
+        async for ev in _run(messages):
+            if ev.get("type") == "_outcome":
+                first_text, abandoned = ev["text"], ev["abandoned"]
+            else:
+                yield ev
+        if not abandoned:
+            yield {"type": "reply_final", "text": first_text}
+            return
+
+        # Exactly ONE retry, and it is told what it just repeated rather than
+        # asked to "be different" — naming the offending text is what actually
+        # moves the model off it.
+        logger.info("chat_repeat_rejected", chars=len(first_text))
+        BUS.publish("chat.repeat_rejected", {"chars": len(first_text)})
+        retry_msgs = messages + [{
+            "role": "user",
+            "content": (
+                "That reply repeated something you already said earlier in this "
+                "conversation. Do not repeat it. Respond to what was just said:\n"
+                f"{user_text}"),
+        }]
+        second_text, abandoned2 = "", False
+        async for ev in _run(retry_msgs):
+            if ev.get("type") == "_outcome":
+                second_text, abandoned2 = ev["text"], ev["abandoned"]
+            else:
+                yield ev
+        if not abandoned2:
+            yield {"type": "reply_final", "text": second_text}
+            return
+
+        # Still a replay. Say so rather than silently serving stale text.
+        honest = ("Sorry — I started repeating myself there. Could you say that "
+                  "again in a different way?")
+        yield {"type": "token", "text": honest}
+        yield {"type": "reply_final", "text": honest}
+
+    #: How many extra segments a long story may take after running out of
+    #: budget. Bounded so a model that never emits a natural stop cannot loop.
+    _STORY_MAX_CONTINUATIONS = int(os.getenv("NOVA_STORY_MAX_CONTINUATIONS", "3").strip() or "3")
+
+    async def _stream_story(self, messages: list[dict[str, Any]], *, budget: int,
+                            llm=None):
+        """Stream a story, continuing it when the model runs out of budget.
+
+        A requested long story ended mid-sentence live. Story mode used one
+        fixed budget and treated any non-empty stream as success — and the
+        stream discarded `finish_reason`, so "finished" and "hit the token
+        limit" were indistinguishable. They are different endings and only one
+        of them deserves a continuation.
+
+        Yields token events, then exactly one
+        `{"type": "story_final", "text": ...}` carrying the COMPLETE story, so
+        the bible is updated from the whole thing rather than the first segment.
+
+        That final text is an EVENT rather than `self._last_story_text` because
+        `STATE.runtime` is one shared instance: two concurrent stories parked on
+        the same attribute overwrote each other.
+        """
+        model = llm or self._llm
+        whole: list[str] = []
+        convo = list(messages)
+
+        for segment in range(self._STORY_MAX_CONTINUATIONS + 1):
+            piece: list[str] = []
+            reason = "stop"
+            async with self._llm_sem:
+                async for ev in model.chat_stream_ex(
+                    convo, max_tokens=budget, temperature=0.7, thinking=True
+                ):
+                    if ev.get("type") == "token":
+                        piece.append(ev["text"])
+                        yield {"type": "token", "text": ev["text"]}
+                    elif ev.get("type") == "done":
+                        reason = str(ev.get("finish_reason") or "stop")
+
+            text = "".join(piece)
+            whole.append(text)
+            # `length` is the ONLY reason to continue. A natural stop is a
+            # finished story, and continuing it would pad something already
+            # complete. Punctuation is a secondary sanity check, never the
+            # primary signal, precisely because it cannot tell those apart.
+            if reason != "length" or not text.strip():
+                break
+            if segment == self._STORY_MAX_CONTINUATIONS:
+                logger.info("story_continuation_bound_reached",
+                            segments=segment + 1)
+                break
+
+            so_far = "".join(whole)
+            convo = list(messages) + [
+                {"role": "assistant", "content": so_far},
+                {"role": "user", "content": (
+                    "Continue the story from exactly where it stopped. Do not "
+                    "restart it, do not summarise or repeat what you already "
+                    "wrote, and keep the same characters, setting and voice. "
+                    "Bring it to a natural ending.")},
+            ]
+
+        yield {"type": "story_final", "text": "".join(whole).strip()}
 
     async def _direct_live_reply(
         self,
@@ -2086,6 +2483,22 @@ class RuntimeManager:
             return ("I don't recognise your voice, so I can't connect you to any "
                     "personal history. If you tell me what you need, I'm happy to "
                     "help with it right now."), [], "smalltalk"
+
+        # A stored date is a row, not a generation. Answered here so a
+        # question like "When is Leslie's birthday and when is my birthday?"
+        # cannot depend on the model emitting tokens — live, that exact
+        # sentence returned "Sorry — I came up empty on that one" while both
+        # dates sat in SQLite.
+        dated = await self._personal_date_reply(text)
+        if dated is not None:
+            return dated, [], "smalltalk"
+
+        # "What are you capable of?" is a question about this process, and the
+        # process knows the answer exactly. Answered from the tool registry so
+        # it cannot drift from what is actually wired up.
+        caps = self._capability_reply(text)
+        if caps is not None:
+            return caps, [], "smalltalk"
 
         if _looks_like_name_query(text):
             # V3 P5.1d. This read bypassed grounding entirely and answered
@@ -2210,7 +2623,9 @@ class RuntimeManager:
         available_tools: list[str],
         conversation_id: UUID | None = None,
     ) -> str:
-        del user_text
+        # `user_text` used to be discarded here (`del user_text`). It is read
+        # now, but for exactly one thing: deciding whether this turn is ASKING
+        # what Nova can do, so the capability summary is added only then.
         context: dict[str, Any] = {
             "known_user": {},
             "known_family": {},
@@ -2509,6 +2924,15 @@ class RuntimeManager:
         tool_names = sorted({str(t).strip() for t in (available_tools or []) if str(t).strip()})
         if tool_names:
             context["available_tools"] = tool_names
+            # `available_tools` was collected here and then never rendered by
+            # `_grounding_to_natural`, so the response model never saw it and
+            # under-reported Nova to her own user. It is summarised (not dumped
+            # tool by tool) and only when the message is actually asking what
+            # she can do — an ordinary turn should not carry the inventory.
+            if self._INTROSPECTION_RE.search(user_text or ""):
+                # The same runtime-probed report the deterministic answer uses,
+                # so the prompt cannot claim more than the runtime can do.
+                context["capability_summary"] = self._capability_report().prompt_line()
 
         smart_home_tools = [t for t in tool_names if ("smart" in t.lower() or "home" in t.lower())]
         if smart_home_tools:
@@ -2634,6 +3058,10 @@ class RuntimeManager:
                 "proactive context you MAY raise if it fits naturally (don't force it, don't list all of it): "
                 + " | ".join(str(r) for r in exec_recs)
             )
+
+        summary = context.get("capability_summary")
+        if summary:
+            parts.append(str(summary))
 
         caps = context.get("capabilities") or {}
         if caps.get("smart_home_control") == "available":
@@ -2765,6 +3193,51 @@ class RuntimeManager:
         msg = (message or "").strip()
         if not msg:
             return
+
+        # ── Age statements ──────────────────────────────────────────────
+        # "Mateo is three years old and he turns four on September 16th."
+        #
+        # Deterministic rather than model-extracted, because this writes a
+        # DURABLE personal record and a stochastic extractor is the wrong
+        # authority for one. Stored as a normalized person record — the
+        # established shape for people — never as a bare `age`, which would be
+        # wrong within months.
+        #
+        # SCOPED BY SPEAKER, via the same helper the person tools use. This
+        # block honoured `target` for nothing: it called `upsert_person` for
+        # every verified speaker, so a guest saying "Robin is three" rewrote
+        # Marcus's Robin — measured, his age_observation went 10 -> 3 and his
+        # birthday 03-14 -> 12-05. That is corruption of his data, not merely a
+        # leak, which is why the guest branch writes facts under their own root.
+        try:
+            from datetime import date as _date
+
+            from core.personal_dates import parse_age_statements
+            from core.turn_identity import scoped_person_entity
+
+            for said in parse_age_statements(msg, today=_date.today()):
+                said_attrs = said.attributes()
+                scope = scoped_person_entity(said.name)
+                if scope.refused:
+                    continue                      # unreachable here; explicit anyway
+                if scope.is_global_people:
+                    await self._memory.upsert_person(said.name, said_attrs)
+                else:
+                    root = scope.entity or ""
+                    await self._memory.add_fact(
+                        entity=root, attribute="name", value=said.name[:200],
+                        confidence=0.9, source="user",
+                        verification_status="stated")
+                    for attr, val in said_attrs.items():
+                        await self._memory.add_fact(
+                            entity=root, attribute=attr, value=str(val)[:300],
+                            confidence=0.9, source="user",
+                            verification_status="stated")
+                logger.info("age_observation_recorded", person=said.name,
+                            age=said.age, derived=said.birth_year is not None,
+                            scope=scope.store)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("age_capture_failed", error=str(e)[:160])
 
         user_name = _extract_user_name(msg)
         if user_name:

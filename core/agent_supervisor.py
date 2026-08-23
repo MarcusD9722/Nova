@@ -73,13 +73,46 @@ class AgentSupervisor:
     def _iso(self, dt: datetime) -> str:
         return dt.isoformat()
 
-    async def _enqueue_decide(self, *, goal_id: UUID, project_name: str) -> None:
-        await self._memory.enqueue_goal_task(
-            goal_id=goal_id,
-            project_name=project_name,
-            tool_name="__decide__",
-            args={},
-        )
+    async def _generation_is_current(self, goal_id: str, generation: int) -> bool:
+        """Is the goal still in the lifecycle run this decision was made for?
+
+        A cheap pre-check so a stale decision is discarded with a clear reason
+        rather than as a bare refusal. It is NOT the safety boundary: the goal
+        can be cancelled between this SELECT and the write. What actually
+        decides is the fenced `UPDATE ... WHERE generation=? AND status='active'`
+        that opens each `apply_*_decision` transaction — same condition, but
+        inside the statement that mutates, and holding the lock for the rest of
+        the decision.
+        """
+        try:
+            goal = await self._memory.get_goal(goal_id=UUID(goal_id))
+        except Exception:  # noqa: BLE001
+            return True          # unknown -> let the fenced writes decide
+        if goal is None:
+            return False
+        return (int(goal.get("generation") or 0) == int(generation)
+                and str(goal.get("status")) == "active")
+
+    async def _discard_stale_decision(self, *, task_id: str, goal_id: str,
+                                      project_name: str, generation: int) -> None:
+        """Finish a decision that belongs to a lifecycle run that has ended.
+
+        The task is completed as `stale` rather than left running forever, so
+        nothing is stranded and the history says what happened.
+        """
+        logger.info("agent_decision_stale", goal_id=goal_id, generation=generation)
+        try:
+            await self._memory.complete_goal_task(
+                task_id=task_id, status="failed", result={"stale": True},
+                error=(f"decision discarded: it was made during lifecycle run "
+                       f"{generation}, which ended (the goal was cancelled or "
+                       f"resumed while this was being decided)"))
+            await self._memory.add_progress_event(
+                goal_id=UUID(goal_id), project_name=project_name, kind="blocked",
+                message=("A decision from before this goal was cancelled/resumed "
+                         "was discarded rather than applied."))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agent_stale_discard_failed", error=str(e)[:160])
 
     async def _decide_next(self, *, goal_id: str, project_name: str) -> dict[str, Any]:
         """
@@ -168,23 +201,47 @@ Return JSON only.
                 tool_name = str(task["tool_name"])
                 args_json = str(task.get("args_json") or "{}")
                 attempts = int(task.get("attempts") or 0)
+                # The lifecycle run this task belongs to. Everything decided
+                # below is applied ONLY while the goal is still on it: a cancel
+                # (and a resume) bumps the generation, so a decision made
+                # before the user cancelled cannot land on the goal they
+                # resumed afterwards.
+                generation = int(task.get("generation") or 0)
                 try:
                     args = json.loads(args_json) if args_json else {}
                 except Exception:
                     args = {}
 
                 if tool_name == "__decide__":
-                    # Enforce the per-goal step budget before spending an LLM call.
-                    done_steps = await self._memory.list_goal_tasks(goal_id=goal_id, limit=self._cfg.max_steps_per_goal + 4)
-                    executed = sum(1 for t in done_steps if t.get("status") in ("done", "failed"))
+                    # Enforce the per-goal step budget before spending an LLM
+                    # call — counted PER RUN. Counting every finished step the
+                    # goal ever had made the budget permanent: a resume landed
+                    # in a run whose history already exceeded it and paused
+                    # again immediately, so "resume or cancel it" could only
+                    # ever mean cancel. Each run gets its own bounded window;
+                    # the budget is not reset globally and never becomes
+                    # unlimited.
+                    executed = await self._memory.count_finished_goal_steps(
+                        goal_id=UUID(goal_id), generation=generation)
                     if executed >= self._cfg.max_steps_per_goal:
                         msg = (
                             f"Goal paused after {executed} steps without completion. "
                             "Review progress and resume or cancel it."
                         )
-                        await self._memory.update_goal_status(goal_id=UUID(goal_id), status="paused")
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"paused": msg})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="paused", message=msg)
+                        # One fenced transaction, exactly like a decision: this
+                        # ENDS the run the claimed __decide__ belongs to. It was
+                        # an unfenced update_goal_status plus two more commits,
+                        # so a cancel arriving first was overwritten by `paused`
+                        # on a run that had already ended.
+                        paused = await self._memory.apply_step_budget_pause(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            message=msg)
+                        if not paused:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
+                            continue
                         logger.info("agent_goal_step_budget_hit", goal_id=goal_id, steps=executed)
                         continue
 
@@ -194,39 +251,85 @@ Return JSON only.
                         # A malformed decision must not leave the claimed task
                         # stuck forever (silent stalled goal). Fail it explicitly
                         # so the loop moves on and the goal can be retried/paused.
+                        #
+                        # But the failure belongs to the run this task was
+                        # claimed under. The generation check used to happen only
+                        # AFTER a SUCCESSFUL decision, so a planner call that
+                        # started before a cancel and raised after the resume
+                        # published "Could not decide next step" into the
+                        # resumed lifecycle — a stale run reporting an error as
+                        # if it were current work.
                         logger.warning("agent_decide_failed", goal_id=goal_id, error=str(decide_err)[:200])
-                        await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=str(decide_err)[:300])
-                        await self._memory.add_progress_event(
-                            goal_id=UUID(goal_id), project_name=project_name, kind="error",
-                            message=f"Could not decide next step: {str(decide_err)[:160]}",
-                        )
+                        # ONE fenced transaction, not a pre-check followed by
+                        # two unfenced writes. `_generation_is_current` is a
+                        # SELECT and says of itself that the goal can be
+                        # cancelled before the write lands; measured, that gap
+                        # published a run-0 failure into a resumed run 1.
+                        recorded = await self._memory.apply_decision_error(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            error=str(decide_err)[:300],
+                            message=f"Could not decide next step: {str(decide_err)[:160]}")
+                        if not recorded:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
                         continue
+                    # The model call above can take tens of seconds. In that
+                    # window the goal may have been cancelled and resumed, which
+                    # opens a NEW generation — and this decision belongs to the
+                    # old one. This is a cheap pre-check that produces a clear
+                    # reason; the SAFETY boundary is the fenced, single-
+                    # transaction apply below, which re-verifies generation and
+                    # status inside the statement that mutates.
+                    if not await self._generation_is_current(goal_id, generation):
+                        await self._discard_stale_decision(
+                            task_id=task_id, goal_id=goal_id,
+                            project_name=project_name, generation=generation)
+                        continue
+
+                    # Each branch applies its WHOLE decision in one storage
+                    # transaction, fenced to this generation and to the goal
+                    # still being active. `False` means the lifecycle moved on
+                    # and NOTHING was written, so the decision is discarded —
+                    # there is no partial state to reconcile.
                     t = decision.get("type")
                     if t == "tool":
                         name = str(decision.get("name", "")).strip()
                         if not name:
                             raise ValueError("Decision missing tool name")
-                        await self._memory.enqueue_goal_task(goal_id=UUID(goal_id), project_name=project_name, tool_name=name, args=decision.get("args") or {})
-                        # enqueue next decision step
-                        await self._enqueue_decide(goal_id=UUID(goal_id), project_name=project_name)
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"decision": decision})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="plan", message=f"Next: {name}")
+                        applied = await self._memory.apply_tool_decision(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            tool_name=name, args=decision.get("args") or {})
+                        if not applied:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
                         continue
 
                     if t == "question":
                         msg = str(decision.get("message", "")).strip() or "I need your input to proceed."
-                        # create a proposal to get approval/clarification
-                        await self._memory.create_proposal(goal_id=UUID(goal_id), project_name=project_name, suggestion=msg, rationale="Needed to proceed with the active goal.")
-                        await self._memory.update_goal_status(goal_id=UUID(goal_id), status="paused")
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"question": msg})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="question", message=msg)
+                        applied = await self._memory.apply_question_decision(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            message=msg)
+                        if not applied:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
                         continue
 
                     if t == "final":
                         msg = str(decision.get("message", "")).strip() or "Completed."
-                        await self._memory.update_goal_status(goal_id=UUID(goal_id), status="completed")
-                        await self._memory.complete_goal_task(task_id=task_id, status="done", result={"final": msg})
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="complete", message=msg)
+                        applied = await self._memory.apply_final_decision(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            expected_generation=generation, task_id=task_id,
+                            message=msg)
+                        if not applied:
+                            await self._discard_stale_decision(
+                                task_id=task_id, goal_id=goal_id,
+                                project_name=project_name, generation=generation)
                         continue
 
                     raise ValueError(f"Unknown decision type: {t}")
@@ -250,15 +353,70 @@ Return JSON only.
                     result, failure = None, str(e)
 
                 if failure is not None:
+                    # A SECOND retry loop lives here, above the router's. Fixing
+                    # only the router's meant a side-effecting tool still ran
+                    # once, failed, and was requeued to run again later — the same
+                    # invariant broken one layer up. Requeue only what the router
+                    # says is safe to re-invoke.
+                    #
+                    # And only when the failure is TRANSIENT. A tool that
+                    # answers `{"ok": false, "error": "missing_query"}` has
+                    # decided; running the identical refused request again can
+                    # only be refused again. Measured before this check: a
+                    # retry-safe tool returning `missing_query` was invoked 116
+                    # times for one goal, every task carrying attempts=2. The
+                    # structured payload is what distinguishes the two cases —
+                    # no string matching on the error text.
+                    refused = (result is not None
+                               and isinstance(result.result, dict)
+                               and result.result.get("ok") is False)
+                    if refused or not self._router.is_retry_safe(tool_name):
+                        why = ("it reported a refusal, so re-running the same "
+                               "request would only be refused again"
+                               if refused else
+                               f"'{tool_name}' may have side effects, so it is "
+                               f"never re-run automatically")
+                        await self._memory.complete_goal_task(
+                            task_id=task_id, status="failed", result={},
+                            error=f"{failure} (not retried: {why})")
+                        await self._memory.add_progress_event(
+                            goal_id=UUID(goal_id), project_name=project_name,
+                            kind="blocked",
+                            message=f"{tool_name} failed and was NOT retried "
+                                    f"automatically: {failure}")
+                        continue
+
                     attempts += 1
                     if attempts <= self._cfg.max_retries:
                         backoff = timedelta(seconds=min(60, 2 ** attempts))
-                        await self._memory.bump_goal_task_attempt(
+                        # Fenced to the run this task was claimed under. A retry
+                        # is FUTURE work: the tool already ran once and that
+                        # cannot be undone, but scheduling it to run AGAIN after
+                        # the user cancelled is a different thing, and it is what
+                        # resurrected a run-N task into run N+1 after a resume.
+                        requeued = await self._memory.bump_goal_task_attempt(
                             task_id=task_id,
                             attempts=attempts,
                             run_after_iso=self._iso(self._now() + backoff),
                             error=failure,
+                            expected_generation=generation,
                         )
+                        if not requeued:
+                            # Nothing was scheduled, so nothing may announce a
+                            # retry. Finalise the task truthfully instead.
+                            await self._memory.complete_goal_task(
+                                task_id=task_id, status="failed", result={"stale": True},
+                                error=(f"{failure} (not retried: the goal left "
+                                       f"lifecycle run {generation} while this was "
+                                       f"running, so re-running it would execute "
+                                       f"work from before it was cancelled)"))
+                            await self._memory.add_progress_event(
+                                goal_id=UUID(goal_id), project_name=project_name,
+                                kind="blocked",
+                                message=(f"{tool_name} failed and was NOT retried: "
+                                         f"the goal was cancelled or resumed while "
+                                         f"it was running."))
+                            continue
                         await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {failure}")
                     else:
                         await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=failure)

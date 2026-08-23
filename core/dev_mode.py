@@ -131,7 +131,15 @@ class DevMode:
                 )
             base = ext
 
-        target = Path(raw_path).expanduser()
+        # A control character never belongs in a path, and one of them is not
+        # merely invalid: `Path("core/x\x00.py").resolve()` raises a bare
+        # ValueError from the C layer, which is not a DevModeError, so it flew
+        # past every `except DevModeError` and `POST /dev/inspect` answered 500.
+        raw = str(raw_path or "")
+        if any(ord(ch) < 32 for ch in raw):
+            raise DevModeError("Path contains a control character.")
+
+        target = Path(raw).expanduser()
         if not target.is_absolute():
             target = base / target
         target = target.resolve()

@@ -159,6 +159,9 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_ALLOW_SHELL", "bool", "1", "Expose the guarded shell.exec tool."),
         _s("NOVA_ALLOW_NETWORK_TOOLS", "bool", "1", "Expose network plugins to the agent."),
         _s("NOVA_STORY_TOKENS", "int", "1200", "Token budget for storytelling mode."),
+        _s("NOVA_STORY_MAX_CONTINUATIONS", "int", "3",
+           "Extra segments a long story may take after hitting the token budget "
+           "(finish_reason=length). Bounded so a model that never stops cannot loop."),
         # ── Scheduling ──────────────────────────────────────────────────────
         _s("NOVA_REMINDER_POLL_S", "float", "30", "Reminder worker poll interval."),
         _s("NOVA_BRIEFING_TIME", "hhmm", "08:00", "Morning briefing time (empty disables)."),

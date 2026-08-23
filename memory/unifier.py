@@ -2442,11 +2442,20 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="fired")
 
-    async def cancel_reminder(self, *, reminder_id: str) -> None:
+    async def cancel_reminder(self, *, reminder_id: str) -> bool:
+        """True if a real reminder was cancelled.
+
+        It used to return None either way and publish `reminder.cancelled`
+        regardless, so an unknown id produced a cancellation event for a
+        reminder that never existed and `DELETE /reminders/<anything>` answered
+        `{"status": "cancelled"}`.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="cancelled")
-        BUS.publish("reminder.cancelled", {"reminder_id": reminder_id})
+            changed = await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="cancelled")
+        if changed:
+            BUS.publish("reminder.cancelled", {"reminder_id": reminder_id})
+        return changed
 
     # --- Local file / photo recall (indexed documents) ----------------------
 
@@ -3235,10 +3244,39 @@ class MemoryUnifier:
             )
         return gid
 
-    async def update_goal_status(self, *, goal_id: UUID, status: str) -> None:
+    async def update_goal_status(self, *, goal_id: UUID, status: str,
+                                 expected_generation: int | None = None) -> bool:
+        """True if the goal existed and changed status. See the backend method.
+
+        `expected_generation` refuses the change if the goal has moved on to a
+        new lifecycle run since the caller decided to make it.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.update_goal_status(goal_id=goal_id, status=status)
+            return await self._sqlite.update_goal_status(
+                goal_id=goal_id, status=status,
+                expected_generation=expected_generation)
+
+    async def get_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """One goal row, or None. Authoritative for its project_name."""
+        await self.initialize()
+        return await self._sqlite.get_goal(goal_id=goal_id)
+
+    async def cancel_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """Cancel a goal and stop its queued work. See the backend method."""
+        await self.initialize()
+        async with self._write_lock:
+            out = await self._sqlite.cancel_goal(goal_id=goal_id)
+        if out:
+            BUS.publish("goal.cancelled", {"goal_id": str(goal_id),
+                                           "cancelled_tasks": out["cancelled_tasks"]})
+        return out
+
+    async def resume_goal(self, *, goal_id: UUID) -> dict[str, Any] | None:
+        """Activate a goal with at most one runnable continuation."""
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.resume_goal(goal_id=goal_id)
 
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
@@ -3252,19 +3290,97 @@ class MemoryUnifier:
         tool_name: str,
         args: dict[str, Any] | None = None,
         run_after_iso: str | None = None,
-    ) -> UUID:
+        expected_generation: int | None = None,
+    ) -> UUID | None:
+        """Queue a step for a goal. None if the goal accepts no more work.
+
+        A cancelled goal must not acquire new runnable steps: the claim
+        already refuses them, but a later resume would have executed a step
+        planned before the user cancelled. See the backend method.
+
+        `expected_generation` additionally refuses work decided during a
+        lifecycle run the goal has since left — cancel-then-resume opens a new
+        one, and a decision from before the cancel belongs to the old.
+        """
         await self.initialize()
         tid = uuid4()
         async with self._write_lock:
-            await self._sqlite.enqueue_task(
+            queued = await self._sqlite.enqueue_task(
                 task_id=tid,
                 goal_id=goal_id,
                 project_name=project_name,
                 tool_name=tool_name,
                 args=args or {},
                 run_after_iso=run_after_iso,
+                expected_generation=expected_generation,
             )
-        return tid
+        return tid if queued else None
+
+    # ── Atomic decision application (V3 P10 C5) ─────────────────────────────
+    #
+    # One supervisor decision is one act. These apply all of its consequences
+    # in a single storage transaction, fenced to the lifecycle run the decision
+    # was made for, or apply none of them. `False` means the run moved on and
+    # the caller must discard the decision — never that half of it landed.
+
+    async def apply_question_decision(self, *, goal_id: UUID, project_name: str,
+                                      expected_generation: int, task_id: str,
+                                      message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_question_decision(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                proposal_id=uuid4(), event_id=uuid4(), message=message)
+
+    async def apply_final_decision(self, *, goal_id: UUID, project_name: str,
+                                   expected_generation: int, task_id: str,
+                                   message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_final_decision(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                event_id=uuid4(), message=message)
+
+    async def apply_decision_error(self, *, goal_id: UUID, project_name: str,
+                                   expected_generation: int, task_id: str,
+                                   error: str, message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_decision_error(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                error=error, message=message)
+
+    async def count_finished_goal_steps(self, *, goal_id: UUID,
+                                        generation: int) -> int:
+        """Finished steps in ONE run — the window the step budget applies to."""
+        await self.initialize()
+        return await self._sqlite.count_finished_steps(
+            goal_id=goal_id, generation=int(generation))
+
+    async def apply_step_budget_pause(self, *, goal_id: UUID, project_name: str,
+                                      expected_generation: int, task_id: str,
+                                      message: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_step_budget_pause(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                message=message)
+
+    async def apply_tool_decision(self, *, goal_id: UUID, project_name: str,
+                                  expected_generation: int, task_id: str,
+                                  tool_name: str,
+                                  args: dict[str, Any] | None = None) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.apply_tool_decision(
+                goal_id=goal_id, project_name=project_name,
+                expected_generation=int(expected_generation), task_id=task_id,
+                tool_task_id=uuid4(), decide_task_id=uuid4(), event_id=uuid4(),
+                tool_name=tool_name, args=args or {})
 
     async def claim_next_goal_task(self) -> dict[str, Any] | None:
         await self.initialize()
@@ -3275,10 +3391,19 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.complete_task(task_id=task_id, status=status, result=result, error=error)
 
-    async def bump_goal_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
+    async def bump_goal_task_attempt(self, *, task_id: str, attempts: int,
+                                     run_after_iso: str, error: str,
+                                     expected_generation: int | None = None) -> bool:
+        """Requeue a running goal task. False when the lifecycle refuses it.
+
+        A retry schedules FUTURE work, so it is fenced to the run the task was
+        claimed under. See the backend method for the race this closes.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.bump_task_attempt(task_id=task_id, attempts=attempts, run_after_iso=run_after_iso, error=error)
+            return await self._sqlite.bump_task_attempt(
+                task_id=task_id, attempts=attempts, run_after_iso=run_after_iso,
+                error=error, expected_generation=expected_generation)
 
     async def list_goal_tasks(self, *, goal_id: str | None = None, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()

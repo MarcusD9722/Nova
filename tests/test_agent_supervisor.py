@@ -125,13 +125,18 @@ async def test_bad_decisions_do_not_orphan(tmp: Path) -> None:
               f"{label}: the failure is recorded honestly")
 
 
-async def test_failing_tool_is_retried_then_failed(tmp: Path) -> None:
-    """Regression: ToolRouter.execute() NEVER raises — it returns ok=False. The
-    retry/backoff branch was guarded by `except`, so it was dead code and a
-    failing tool was recorded as status 'done'."""
-    check.section("A failing tool is retried, then honestly marked failed")
+async def test_failing_tool_is_not_retried_then_failed(tmp: Path) -> None:
+    """A failing tool is recorded honestly, and an UNSAFE one is not re-run.
+
+    Two regressions in one place. Originally the retry/backoff branch was guarded
+    by `except`, so it was dead code and a failing tool was recorded as 'done'.
+    This test then asserted the opposite extreme — that a failing tool IS retried
+    — which became wrong once retry safety landed: `demo.bad` is not declared
+    retry-safe, so re-running it could repeat a side effect. The honest contract
+    is: run once, record the failure, do not requeue.
+    """
+    check.section("An unsafe failing tool is NOT retried, and is marked failed")
     mem, sup, _ = await build(tmp / "g5", '{"type":"tool","name":"demo.bad","args":{}}')
-    # max_retries=1 so the 2**attempts backoff resolves inside the test window.
     sup._cfg = SupervisorConfig(tick_seconds=0.05, max_retries=1, max_steps_per_goal=6)
     gid = await seed_goal(mem)
     await drain(sup, 10.0)
@@ -141,12 +146,137 @@ async def test_failing_tool_is_retried_then_failed(tmp: Path) -> None:
     check(bool(bad), "the failing tool task exists")
     check(all(t["status"] != "done" for t in bad),
           f"a tool that failed is NEVER recorded as done ({[t['status'] for t in bad]})")
-    check(any(int(t.get("attempts") or 0) > 0 for t in bad),
-          f"the retry counter actually incremented ({[t.get('attempts') for t in bad]})")
-    check(any(t["status"] == "failed" for t in bad),
-          f"once retries are exhausted it is marked failed ({[t['status'] for t in bad]})")
-    check(any("blew up" in (t.get("last_error") or "") for t in bad),
-          "the real tool error is retained on the task")
+    check(all(int(t.get("attempts") or 0) == 0 for t in bad),
+          f"an UNSAFE tool is not requeued ({[t.get('attempts') for t in bad]})")
+    check(any("not retried" in (t.get("last_error") or "") for t in bad),
+          f"and the record says why ({[(t.get('last_error') or '')[:50] for t in bad]})")
+
+
+async def test_retry_safe_tool_is_still_retried(tmp: Path) -> None:
+    """The capability is aimed, not removed: a READ-ONLY tool still retries."""
+    check.section("A declared retry-safe tool is still retried")
+
+    attempts = {"n": 0}
+
+    async def flaky_read(_args):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise RuntimeError("transient blip")
+        return {"result": "eventually fine"}
+
+    mem, sup, _ = await build(tmp / "g5b",
+                              '{"type":"tool","name":"demo.read","args":{}}',
+                              tools={"demo.read": flaky_read})
+    sup._router.set_retry_safe("demo.read", True)
+    sup._cfg = SupervisorConfig(tick_seconds=0.05, max_retries=2, max_steps_per_goal=6)
+    gid = await seed_goal(mem)
+    await drain(sup, 12.0)
+
+    check(attempts["n"] >= 2,
+          f"the read-only tool was retried ({attempts['n']} invocations)")
+    tasks = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+    read = [t for t in tasks if t["tool_name"] == "demo.read"]
+    check(any(t["status"] == "done" for t in read),
+          f"and eventually succeeded ({[t['status'] for t in read]})")
+
+
+async def test_structured_refusal_is_never_retried(tmp: Path) -> None:
+    """A tool that REFUSES is done; only a transient failure earns a retry.
+
+    The router already distinguishes the two — an exception or timeout returns
+    ToolResult(ok=False, result=None), while a tool answering
+    `{"ok": false, "error": "missing_query"}` returns that payload in
+    `result.result`. The supervisor saw neither: it saw `ok is False` plus
+    `is_retry_safe(name) is True` and requeued. Measured before the fix, with a
+    read-only tool that always answers `missing_query`: **116 invocations** for
+    one goal, every task carrying attempts=2. Re-running an identical refused
+    request can only be refused again.
+    """
+    check.section("A structured refusal is final; a transient failure is not")
+
+    for label, payload in (
+        ("missing_query", {"ok": False, "error": "missing_query"}),
+        ("not_found", {"ok": False, "error": "not_found"}),
+        ("scoped_unavailable", {"ok": False, "error": "scoped_unavailable",
+                                "scope": "connected_account"}),
+        ("not_approved", {"ok": False, "status": "not_approved",
+                          "note": "You didn't approve it."}),
+    ):
+        calls = {"n": 0}
+
+        async def refuses(_args, _p=payload):
+            calls["n"] += 1
+            return dict(_p)
+
+        mem, sup, llm = await build(tmp / f"g8-{label}", "",
+                                    tools={"demo.read": refuses})
+        # One tool step, then finish — so "exactly once" means exactly once,
+        # not "once per step the planner happened to invent".
+        step = {"n": 0}
+
+        def decide(_prompt: str) -> str:
+            step["n"] += 1
+            if step["n"] == 1:
+                return '{"type":"tool","name":"demo.read","args":{}}'
+            return '{"type":"final","message":"nothing more to do"}'
+
+        llm.when(lambda _p: True, decide)
+        sup._router.set_retry_safe("demo.read", True)      # a READ tool
+        gid = await seed_goal(mem)
+        await drain(sup, 6.0)
+
+        tasks = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+        reads = [t for t in tasks if t["tool_name"] == "demo.read"]
+        check(calls["n"] == 1,
+              f"{label}: the refusing tool ran EXACTLY once ({calls['n']}x)")
+        check(len(reads) == 1 and all(int(t.get("attempts") or 0) == 0 for t in reads),
+              f"{label}: the task was never requeued "
+              f"({len(reads)} task(s), attempts={[t.get('attempts') for t in reads]})")
+        check(all(t["status"] == "failed" for t in reads),
+              f"{label}: and it is recorded as failed, not done "
+              f"({[t['status'] for t in reads]})")
+        check(any("refus" in (t.get("last_error") or "").lower() for t in reads),
+              f"{label}: the record says it was a refusal "
+              f"({[(t.get('last_error') or '')[:60] for t in reads]})")
+        check(not [t for t in tasks if t["status"] not in ("done", "failed")],
+              f"{label}: nothing is left claimed")
+
+
+async def test_transient_failure_still_recovers(tmp: Path) -> None:
+    """The other half: an EXCEPTION from a read-only tool is still retried.
+
+    This is what stops the refusal fix from becoming "never retry anything".
+    """
+    check.section("A transient exception from a read tool still recovers")
+
+    attempts = {"n": 0}
+
+    async def flaky(_args):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise RuntimeError("transient blip")
+        return {"ok": True, "value": "eventually fine"}
+
+    mem, sup, llm = await build(tmp / "g9", "", tools={"demo.read": flaky})
+    step = {"n": 0}
+
+    def decide(_prompt: str) -> str:
+        step["n"] += 1
+        if step["n"] == 1:
+            return '{"type":"tool","name":"demo.read","args":{}}'
+        return '{"type":"final","message":"done"}'
+
+    llm.when(lambda _p: True, decide)
+    sup._router.set_retry_safe("demo.read", True)
+    gid = await seed_goal(mem)
+    await drain(sup, 12.0)
+
+    check(attempts["n"] >= 2,
+          f"the read tool was retried after the exception ({attempts['n']}x)")
+    tasks = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
+    reads = [t for t in tasks if t["tool_name"] == "demo.read"]
+    check(any(t["status"] == "done" for t in reads),
+          f"and eventually succeeded ({[t['status'] for t in reads]})")
 
 
 async def test_step_budget(tmp: Path) -> None:
@@ -186,7 +316,10 @@ async def main() -> None:
         await test_question_pauses(tmp)
         await test_tool_chain(tmp)
         await test_bad_decisions_do_not_orphan(tmp)
-        await test_failing_tool_is_retried_then_failed(tmp)
+        await test_failing_tool_is_not_retried_then_failed(tmp)
+        await test_retry_safe_tool_is_still_retried(tmp)
+        await test_structured_refusal_is_never_retried(tmp)
+        await test_transient_failure_still_recovers(tmp)
         await test_step_budget(tmp)
         await test_lifecycle(tmp)
     check.finish()
