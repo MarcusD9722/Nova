@@ -1500,7 +1500,14 @@ class RuntimeManager:
         # plan the user actually approved. Only these two refusal shapes count:
         # a retrospective or a message about Nova herself is not a plan.
         in_play = (pb.known_slug_in_text(t) or await pb.last_active()) if conv else None
-        if conv and cancels_pending_change(t):
+        # The pending proposal is passed in because a SPECIFIC withdrawal
+        # ("don't change the physics") can only be tied to the proposal it
+        # refers to by looking at both. Measured on c86bfb1: with the
+        # physics change pending, that sentence cancelled nothing and a
+        # later "Go ahead." executed the change the user had just
+        # withdrawn.
+        if conv and cancels_pending_change(
+                t, self._pending_plan.get(conv, {}).get(in_play or "", "")):
             # CANCEL. Withdrawing a proposal has to invalidate it, and the
             # cancellation must never be stored AS the proposal - measured on
             # 3278f39, "Don't make that change." became the pending plan and a

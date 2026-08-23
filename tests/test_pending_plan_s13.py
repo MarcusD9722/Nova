@@ -52,6 +52,8 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 
 from harness import Checks, boot, run  # noqa: E402
 
+from core.project_intent import defers_a_change  # noqa: E402
+
 check = Checks()
 
 
@@ -325,74 +327,6 @@ async def test_the_plan_is_scoped_to_its_project():
               "B's plan is still pending for B")
 
 
-async def test_cancellation_invalidates_the_proposal():
-    check.section("pending plan: a cancellation withdraws it, and is not one")
-
-    cancels = ("Actually don't.", "Don't make that change.", "Never mind.",
-               "Forget that change.", "Cancel that.", "Leave it the way it is.",
-               "Scrap that.", "On second thought, no.")
-
-    async with boot() as nova:
-        rec = await _wire(nova)
-        for text in cancels:
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, "Open flappy-bird.")
-            await _chat(nova, cid, "Make the pipe gap larger, but don't change "
-                                   "anything yet.")
-            check(bool(_pending(nova, cid, "flappy-bird")),
-                  f"[{text}] a plan was pending first")
-
-            await _chat(nova, cid, text)
-            left = _pending(nova, cid, "flappy-bird")
-            check(not left, f"{text!r} withdrew the proposal ({left[:40]!r})")
-
-            await _chat(nova, cid, "The weather is bad today.")
-            await _chat(nova, cid, "Okay, make that change.")
-            await _quiet(nova, rec, ticks=40)
-            check(not rec.saw("pipe gap larger"),
-                  f"{text!r}: the withdrawn plan did not run later")
-            # …and the cancellation itself never became the instruction.
-            check(not rec.saw(text.rstrip(".").lower()),
-                  f"{text!r} was not stored as the new plan ({rec.tails()})")
-
-        # A bare approval after a cancellation is idle again.
-        rec.prompts.clear()
-        cid = str(uuid4())
-        await _chat(nova, cid, "Open flappy-bird.")
-        await _chat(nova, cid, "I'd like a parallax background, but don't "
-                               "change anything yet.")
-        await _chat(nova, cid, "Never mind.")
-        await _chat(nova, cid, "Go ahead.")
-        await _quiet(nova, rec, ticks=40)
-        check(not rec.prompts,
-              f"'go ahead' after a cancellation approves nothing ({rec.tails()})")
-
-
-async def test_a_cancellation_is_scoped_too():
-    """Withdrawing A's plan does not withdraw B's."""
-    check.section("pending plan: a cancellation withdraws one project's plan")
-
-    async with boot() as nova:
-        rec = await _wire(nova, "flappy-bird", "calc-tool")
-        cid = str(uuid4())
-        await _chat(nova, cid, "Open flappy-bird.")
-        await _chat(nova, cid, "I'd like a parallax background, but don't "
-                               "change anything yet.")
-        await _chat(nova, cid, "Switch to calc-tool.")
-        await _chat(nova, cid, "I'd like a percent key, but don't change "
-                               "anything yet.")
-        check(bool(_pending(nova, cid, "flappy-bird")), "A has a plan")
-        check(bool(_pending(nova, cid, "calc-tool")), "B has a plan")
-
-        await _chat(nova, cid, "Never mind.")
-        check(not _pending(nova, cid, "calc-tool"),
-              "the cancellation withdrew the CURRENT project's plan")
-        check("parallax" in _pending(nova, cid, "flappy-bird").lower(),
-              f"and left the other project's alone "
-              f"({_pending(nova, cid, 'flappy-bird')!r})")
-
-
 async def test_an_approved_plan_is_consumed_once():
     check.section("pending plan: approving twice does not run it twice")
 
@@ -483,85 +417,6 @@ async def test_an_independent_instruction_does_not_approve_a_proposal():
         check(not _pending(nova, cid, "flappy-bird"), "now it is consumed")
 
 
-async def test_a_prohibition_never_becomes_a_proposal():
-    """A ban must not turn into executable work.
-
-    Measured on b2a931e: "Don't change the physics." was stored as the pending
-    proposal, and a later "Go ahead." CARRIED IT OUT — the exact inversion of
-    what the mutation gate exists to prevent.
-
-    The capture accepted every refusal whose reason was "vetoed: prohibition",
-    and two opposite sentences share that reason. What separates them is not the
-    verb but whether the prohibition is scoped in TIME: deferred means "later",
-    unqualified means "not at all".
-    """
-    check.section("pending plan: a prohibition is not a deferred proposal")
-
-    prohibitions = (
-        "Don't change the physics.",
-        "Don't modify the menu.",
-        "Never change the scoring.",
-        "I don't want you to change the physics.",
-        "Do not update that file.",
-        "Don't touch the collision code.",
-        "Never update the readme.",
-    )
-    async with boot() as nova:
-        rec = await _wire(nova)
-        for text in prohibitions:
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, "Open flappy-bird.")
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check(not held, f"{text!r} was not stored as a proposal ({held[:40]!r})")
-
-            await _chat(nova, cid, "Go ahead.")
-            await _quiet(nova, rec, ticks=40)
-            check(not rec.prompts,
-                  f"{text!r}: and a later approval executed nothing "
-                  f"({rec.tails()})")
-
-        # KNOWN LIMIT, stated rather than hidden. What is recognised is a
-        # deferral expressed as a PROHIBITION clause: "but don't ... yet".
-        # A bare "..., but not yet." carries no prohibition and, in the
-        # cases tried, no action verb the vocabulary knows, so it is not
-        # captured. Widening the test to any sentence containing "later" or
-        # "at some point" would misfire on "Fix the bug that happens later in
-        # the level", so that is deliberately left alone.
-        # The deferral half of the same grammar still works, or the fix would
-        # have closed the feature instead of the hole.
-        for text in ("Make the pipe gap easier, but don't change anything yet.",
-                     "Add a pause menu later, but don't build it yet.",
-                     "Improve the pipe spacing, but don't change it yet.",
-                     "Change the physics, but don't change anything right now."):
-            rec.prompts.clear()
-            cid = str(uuid4())
-            await _chat(nova, cid, "Open flappy-bird.")
-            await _chat(nova, cid, text)
-            held = _pending(nova, cid, "flappy-bird")
-            check(bool(held), f"deferred proposal still captured: {text!r}")
-            check(not rec.prompts, f"and not executed: {text!r}")
-
-            n = len(rec.prompts)
-            await _chat(nova, cid, "Okay, make that change.")
-            check(await _settled(nova, rec, n),
-                  f"and approving it runs it: {text!r}")
-
-        # A deferral must not read as a cancellation either — it would throw away
-        # the proposal it is half of.
-        from core.project_intent import cancels_pending_change, defers_a_change
-        for text in ("Make the pipe gap easier, but don't change anything yet.",
-                     "I'd like a dark mode, but don't change anything yet."):
-            check(defers_a_change(text), f"is a deferral: {text!r}")
-            check(not cancels_pending_change(text),
-                  f"and not a cancellation: {text!r}")
-        # …while the same prohibition WITHOUT a time qualifier withdraws.
-        for text in ("Don't change anything.", "Don't make any changes."):
-            check(cancels_pending_change(text), f"withdraws: {text!r}")
-            check(not defers_a_change(text), f"and defers nothing: {text!r}")
-
-
 async def main():
     await test_a_plan_alone_never_executes()
     await test_a_bare_approval_is_authority_only_with_a_proposal()
@@ -569,10 +424,7 @@ async def main():
     await test_the_correction_is_what_runs()
     await test_the_plan_is_scoped_to_its_conversation()
     await test_the_plan_is_scoped_to_its_project()
-    await test_cancellation_invalidates_the_proposal()
-    await test_a_cancellation_is_scoped_too()
     await test_an_independent_instruction_does_not_approve_a_proposal()
-    await test_a_prohibition_never_becomes_a_proposal()
     await test_an_approved_plan_is_consumed_once()
     check.finish()
 

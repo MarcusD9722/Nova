@@ -50,6 +50,7 @@ __all__ = [
     "describes_a_change",
     "cancels_pending_change",
     "defers_a_change",
+    "withdraws_pending_change",
     "is_bare_approval",
     "approves_without_naming_a_change",
     "qualified_project_name",
@@ -467,30 +468,46 @@ def approves_without_naming_a_change(text: str) -> bool:
     return bool(_ANAPHORIC_APPROVAL_RE.match((text or "").strip()))
 
 
-#: A prohibition scoped in TIME. This is the structural difference between a
-#: DEFERRAL and a WITHDRAWAL, and it is what decides whether a refused message
-#: becomes a pending proposal.
+#: A prohibition scoped in TIME, recognised as a CLAUSE rather than by looking
+#: for time words anywhere in the sentence.
 #:
-#:   "Make the pipe gap easier, but don't change anything yet."   deferral
-#:   "I'd like a dark mode, but don't change anything yet."       deferral
-#:   "Don't change the physics."                                  withdrawal
-#:   "Never change the scoring."                                  withdrawal
-#:   "Do not update that file."                                   withdrawal
+#: The clause shape is the whole point. Searching the message for "later" or
+#: "eventually" classified these as deferrals:
 #:
-#: Both shapes are refused by the mutation gate for the same reason
-#: ("vetoed: prohibition"), so the reason alone could not tell them apart — and
-#: the capture accepted that whole bucket. Measured on b2a931e: "Don't change
-#: the physics." became a pending proposal and a later "Go ahead." EXECUTED it.
-#: A ban became executable work, which is the exact inversion of what the gate
-#: exists to prevent.
+#:   "Don't fix the bug that happens later in the level."
+#:   "Don't change the animation that appears later."
+#:   "Don't modify the eventually-called cleanup function."
 #:
-#: "never" is deliberately absent. It is a prohibition over all time, which is
-#: the opposite of putting something off.
-_DEFERRAL_RE = re.compile(
-    r"\b(?:not\s+yet|yet|for\s+now|right\s+now|just\s+yet|"
-    r"at\s+the\s+moment|for\s+the\s+moment|later\s+on|later|"
-    r"another\s+time|some\s+other\s+time|in\s+a\s+bit|"
-    r"down\s+the\s+line|eventually|at\s+some\s+point)\b",
+#: In every one of them the temporal word describes the OBJECT, not the
+#: prohibition, and treating them as deferrals stored a ban as pending work that
+#: a later "Go ahead." would carry out. Measured on c86bfb1.
+#:
+#: So the qualifier has to modify the prohibition itself: it must follow the
+#: negated verb across a SHORT object - at most three words - and sit at a
+#: clause boundary. The short object is what does the discriminating: "Don't
+#: change it yet" qualifies the prohibition, while "Don't change the animation
+#: that appears later" puts a four-word relative clause in between.
+#:
+#: Anchoring to the end of the MESSAGE instead was the first attempt, and it
+#: broke a real deferral: "...but don't change anything yet. First tell me what
+#: you think should change." The journey caught it; the new tests did not.
+#:
+#: Bare "later" is not a qualifier at all — only the bound form "until later" —
+#: because "the later animation" and "happens later" are ordinary object talk.
+#: "never" is not an opener: it is a prohibition over all time, the opposite of
+#: putting something off.
+_DEFER_QUALIFIER = (
+    r"(?:just\s+yet|yet|right\s+now|for\s+now|at\s+the\s+moment|"
+    r"for\s+the\s+moment|for\s+the\s+time\s+being|"
+    r"until\s+later|till\s+later|until\s+then)"
+)
+
+_DEFERRED_PROHIBITION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|no\s+need\s+to)\s+"
+    r"(?:\w+\s+){0,3}?" + _IMPERATIVE_VERB + r"\b"
+    r"(?:\s+[\w'-]+){0,3}?"
+    r"\s+" + _DEFER_QUALIFIER +
+    r"(?=[\s.,;!?]|$)",
     re.IGNORECASE,
 )
 
@@ -506,31 +523,94 @@ _GENERIC_PROHIBITION_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: What a prohibition is ABOUT: the words after the negated verb.
+#:
+#: A withdrawal has to be tied to the proposal it refers to. Cancelling whatever
+#: happens to be pending would mean "Don't change the physics." silently erased
+#: an unrelated dark-mode proposal; cancelling nothing meant a withdrawn change
+#: stayed pending and a later "Go ahead." executed it. Both are wrong, and the
+#: object is what separates them.
+_PROHIBITION_TARGET_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|never|stop|no\s+need\s+to)\s+"
+    r"(?:\w+\s+){0,3}?" + _IMPERATIVE_VERB + r"\b(?P<target>[^.;!?]*)",
+    re.IGNORECASE,
+)
+
+#: Words that carry no identity, so they cannot decide what a withdrawal is
+#: about. A target made only of these is a GENERIC withdrawal ("don't change
+#: it") and refers to whatever is on the table.
+_TARGET_STOPWORDS = frozenset("""
+a an the this that these those it its them they he she his her their our my
+your any anything something everything nothing some all both each either
+to of in on at for with from into onto by about over under and or but so
+is are was were be been being do does did done have has had
+thing things stuff bit part now right just yet please really actually
+""".split())
+
+
+def _content_words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9][a-z0-9'-]*", (text or "").lower())
+            if w not in _TARGET_STOPWORDS and len(w) > 2}
+
 
 def defers_a_change(text: str) -> bool:
     """Is this putting a change OFF, rather than forbidding it?
 
     Time-qualified, a prohibition still wants the change — later. Unqualified,
-    it wants it not to happen. Only the first may become a pending proposal.
+    it wants it not to happen. Only the first may become a pending proposal, and
+    the qualifier has to modify the PROHIBITION rather than merely appear
+    somewhere in the sentence.
     """
-    return bool(_DEFERRAL_RE.search((text or "").strip()))
+    return bool(_DEFERRED_PROHIBITION_RE.search((text or "").strip()))
 
 
-def cancels_pending_change(text: str) -> bool:
+def withdraws_pending_change(text: str, pending: str) -> bool:
+    """Does this prohibition call off the change that is actually pending?
+
+    Tied to the proposal by what the prohibition is ABOUT. A target of only
+    empty words ("don't change it") refers to whatever is on the table; a target
+    naming something ("the physics") withdraws only a proposal that mentions it.
+    """
+    raw = (text or "").strip()
+    if not raw or not (pending or "").strip():
+        return False
+    if defers_a_change(raw):
+        return False
+    m = _PROHIBITION_TARGET_RE.search(raw)
+    if not m:
+        return False
+    target = _content_words(m.group("target"))
+    if not target:
+        return True
+    return bool(target & _content_words(pending))
+
+
+def cancels_pending_change(text: str, pending: str = "") -> bool:
     """Does this message call OFF a change that was proposed but not approved?
 
-    Tight shapes only. A correction ("keep the horizontal spacing, I meant the
-    vertical opening") also contains a refusal and must NOT read as a
-    cancellation — it replaces the proposal rather than withdrawing it.
+    Three shapes, narrowest first:
+
+      1. an explicit withdrawal      "never mind", "cancel that", "actually don't"
+      2. a GENERIC prohibition       "don't change anything" — refers to whatever
+                                     is on the table, so `pending` is not needed
+      3. a SPECIFIC prohibition      "don't change the physics" — withdraws only
+                                     a proposal it actually refers to
+
+    `pending` is what makes (3) possible. Without it the choice was between
+    cancelling whatever happened to be pending — so an unrelated prohibition
+    erased a dark-mode proposal — and cancelling nothing, which left a withdrawn
+    change pending for a later "Go ahead." to execute. Both were wrong.
+
+    A correction ("keep the horizontal spacing, I meant the vertical opening")
+    contains a refusal too and must NOT read as a cancellation: it replaces the
+    proposal rather than withdrawing it.
     """
     raw = (text or "").strip()
     if _CANCEL_RE.search(raw):
         return True
-    # "Don't change anything." with no time qualifier withdraws whatever was
-    # proposed. With one ("…yet") it is the second half of a proposal and must
-    # not cancel it — which is why this is checked here rather than folded into
-    # `_CANCEL_RE`.
-    return bool(_GENERIC_PROHIBITION_RE.search(raw)) and not defers_a_change(raw)
+    if _GENERIC_PROHIBITION_RE.search(raw) and not defers_a_change(raw):
+        return True
+    return withdraws_pending_change(raw, pending)
 
 
 def is_bare_approval(text: str) -> bool:
