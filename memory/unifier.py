@@ -3496,6 +3496,14 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.add_progress_event(event_id=uuid4(), goal_id=goal_id, project_name=project_name, kind=kind, message=message)
 
+    async def list_progress_events(self, *, goal_id: str | None = None,
+                                   project_name: str | None = None,
+                                   limit: int = 50) -> list[dict[str, Any]]:
+        """Progress, read without consuming it. See the backend for why."""
+        await self.initialize()
+        return await self._sqlite.list_progress_events(
+            goal_id=goal_id, project_name=project_name, limit=limit)
+
     async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:
         await self.initialize()
         return await self._sqlite.fetch_unacked_progress(project_name=project_name, limit=limit)

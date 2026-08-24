@@ -2522,6 +2522,48 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
+    async def list_progress_events(self, *, goal_id: str | None = None,
+                                   project_name: str | None = None,
+                                   limit: int = 50) -> list[dict[str, Any]]:
+        """Read progress without consuming it.
+
+        `fetch_unacked_progress` ACKNOWLEDGES what it returns, which makes it a
+        destructive read: the first caller takes the events and every later one
+        sees nothing. That is correct for a once-only delivery, and wrong for
+        anything that polls -- so it could never have served a panel, and it
+        never did. Nothing in production called it at all.
+
+        Meanwhile `add_progress_event` is written from seven places in
+        `AgentSupervisor`: retries, errors, blocked work, a tool completing, and
+        the note saying a completion arrived after its run had ended. All of it
+        was recorded and unreachable — the channel that answers "what should
+        Nova say next" was write-only.
+
+        This read leaves `acknowledged` alone, so it can be polled, and returns
+        it, so a caller can still tell what has been delivered once.
+        """
+        await self.initialize()
+        q = ("SELECT event_id, goal_id, project_name, kind, message, "
+             "created_at, acknowledged FROM progress_events")
+        where, params = [], []
+        if goal_id:
+            where.append("goal_id=?")
+            params.append(str(goal_id))
+        if project_name:
+            where.append("project_name=?")
+            params.append(project_name)
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        q += " ORDER BY created_at ASC LIMIT ?"
+        params.append(int(limit))
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        return [dict(event_id=r[0], goal_id=r[1], project_name=r[2], kind=r[3],
+                     message=r[4], created_at=r[5],
+                     acknowledged=bool(int(r[6] or 0)))
+                for r in rows]
+
     async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:

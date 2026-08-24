@@ -87,6 +87,56 @@ async def main() -> None:
         r = await http.get("/tasks?limit=9999")
         check(r.status_code == 422, "an over-large task limit is rejected")
 
+        check.section("Reading a goal's progress without consuming it")
+        # AgentSupervisor records progress from seven places and, until now,
+        # nothing in production could read any of it back. The only reader that
+        # existed acknowledges what it returns, so polling it would consume the
+        # history it was showing.
+        from uuid import UUID as _UUID
+        gid = await nova.memory.create_goal(
+            project_name="flappy-bird", title="add a pause menu",
+            objective="pause menu", success_criteria="it pauses")
+        await nova.memory.add_progress_event(
+            goal_id=_UUID(str(gid)), project_name="flappy-bird", kind="tool",
+            message="code.write completed")
+        await nova.memory.add_progress_event(
+            goal_id=_UUID(str(gid)), project_name="flappy-bird", kind="blocked",
+            message="demo.slow finished after lifecycle run 0 ended, so it was "
+                    "not counted as work done.")
+
+        r = await http.get(f"/goals/{gid}/progress")
+        check(r.status_code == 200, f"GET /goals/id/progress -> {r.status_code}")
+        first = r.json().get("events", [])
+        check(len(first) == 2,
+              f"both progress events are readable ({len(first)})")
+        check(any("not counted as work done" in str(e.get("message")) for e in first),
+              f"including the superseded note ({[e.get('kind') for e in first]})")
+
+        # The point of the endpoint: it is a read, not a delivery.
+        again = (await http.get(f"/goals/{gid}/progress")).json().get("events", [])
+        check(len(again) == len(first),
+              f"reading it twice returns the same history ({len(again)})")
+        check([e.get("event_id") for e in again] == [e.get("event_id") for e in first],
+              "the same events, in the same order")
+
+        # Progress belongs to ONE goal. The claim is global and two goals can
+        # run at once, so this is not automatic.
+        other = await nova.memory.create_goal(
+            project_name="quickcalc", title="add a percent key",
+            objective="percent", success_criteria="works")
+        await nova.memory.add_progress_event(
+            goal_id=_UUID(str(other)), project_name="quickcalc", kind="tool",
+            message="a different goal entirely")
+        mine = (await http.get(f"/goals/{gid}/progress")).json().get("events", [])
+        check(len(mine) == 2,
+              f"the other goal's progress does not leak in ({len(mine)})")
+        check(all(str(e.get("goal_id")) == str(gid) for e in mine),
+              "every event returned belongs to the goal asked for")
+
+        r = await http.get("/goals/not-a-uuid/progress")
+        check(r.status_code == 422,
+              f"a malformed goal id is the client's error ({r.status_code})")
+
         check.section("Answering a task that is waiting on a person")
         # A background task that asked a question used to be recorded `done`,
         # so there was nothing to answer and no endpoint to answer it with.
