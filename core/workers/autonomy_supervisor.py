@@ -84,7 +84,21 @@ class AutonomySupervisorWorker:
                 result_payload: dict[str, object] = {"action": plan.action, "reason": plan.reason}
 
                 if plan.action == "idle":
-                    await self._memory.mark_task_done(task_id=task_id, result={"status": "idle", **result_payload})
+                    # "Nothing to do" and "I could not read the plan" are
+                    # both `idle` — the planner falls back to it on an
+                    # unparseable or invalid response, labelling the reason.
+                    # Recording the second one as `done` tells the user
+                    # their task finished when no plan was ever produced,
+                    # and the label lives in result_json, which
+                    # list_autonomy_tasks does not return.
+                    degraded = str(plan.reason or "").startswith("planner_")
+                    if degraded:
+                        await self._memory.mark_task_failed(
+                            task_id=task_id,
+                            error=f"planner produced no usable plan ({plan.reason})",
+                            result={"status": "planner_failed", **result_payload})
+                    else:
+                        await self._memory.mark_task_done(task_id=task_id, result={"status": "idle", **result_payload})
                     continue
 
                 if plan.action == "enqueue_task":
@@ -137,8 +151,16 @@ class AutonomySupervisorWorker:
 
                     if blocked is not None:
                         remaining = [tc.tool for tc in plan.tool_calls][len(tool_results):]
-                        await self._memory.mark_task_done(
+                        # FAILED, not done. Every terminal path here used to call
+                        # mark_task_done, which writes status='done', clears
+                        # last_error and publishes task.completed. The honest
+                        # outcome survived only inside result_json — and
+                        # list_autonomy_tasks does not even return that column,
+                        # so "what failed?" had nothing to read and
+                        # list_tasks(status='failed') was always empty.
+                        await self._memory.mark_task_failed(
                             task_id=task_id,
+                            error=str(blocked["error"] or "tool reported failure"),
                             result={"status": "tools_blocked", "tools": tool_results,
                                     "failed_tool": blocked["tool"],
                                     "error": blocked["error"],
@@ -148,18 +170,29 @@ class AutonomySupervisorWorker:
                     await self._memory.mark_task_done(task_id=task_id, result={"status": "tools_done", "tools": tool_results, **result_payload})
                     continue
 
-                await self._memory.mark_task_done(task_id=task_id, result={"status": "unknown_action", **result_payload})
+                # An action this loop does not implement means nothing ran. That
+                # is an unknown outcome, and recording it as success is exactly
+                # the "unknown becomes success" failure.
+                await self._memory.mark_task_failed(
+                    task_id=task_id,
+                    error=f"planner returned an action this worker cannot run: {plan.action!r}",
+                    result={"status": "unknown_action", **result_payload})
 
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
                 log_worker_error(logger, "autonomy_loop_error", e, task_id=claimed_id or "-")
                 # Release the claim honestly so the task shows as failed rather
-                # than sitting in 'running' for the rest of the session.
+                # than sitting in 'running' for the rest of the session. It has
+                # to be mark_task_FAILED: the previous call wrote 'done' with an
+                # empty last_error and announced task.completed, so a crash was
+                # indistinguishable from success on every surface that reads the
+                # row.
                 if claimed_id:
                     try:
-                        await self._memory.mark_task_done(
+                        await self._memory.mark_task_failed(
                             task_id=claimed_id,
+                            error=str(e)[:300],
                             result={"status": "failed", "error": str(e)[:300]},
                         )
                     except Exception as e2:  # noqa: BLE001
