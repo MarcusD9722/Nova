@@ -729,6 +729,64 @@ class SQLiteMemoryBackend:
             await db.commit()
             return int(cur.rowcount or 0) == 1
 
+    async def block_autonomy_task(self, *, task_id: str, question: str,
+                                  result: dict[str, Any] | None = None) -> bool:
+        """Park a task that is waiting on a person. Returns whether it landed.
+
+        `blocked` is a durable state, not a terminal one. It exists because the
+        four statuses this table had could not express "waiting for the user":
+
+            queued    it will run on its own. It will not; it needs an answer.
+            running   a worker holds it. None does.
+            done      finished. It is not, and pretending so is what made
+                      "what is pending?" answer nothing.
+            failed    it went wrong. Nothing went wrong.
+
+        The autonomy worker asked its question and then called mark_task_done,
+        so a task waiting on a human was filed with the completed work and the
+        question was invisible to every caller that reads a task.
+
+        A blocked row is deliberately NOT claimable (`claim` reads 'queued'
+        only) and deliberately survives a restart: `cancel_pending_background_work`
+        touches queued and running, and an unanswered question is still an
+        unanswered question after a reboot.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        payload = dict(result or {})
+        payload["question"] = question
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE autonomy_tasks SET status='blocked', result_json=?, "
+                "last_error=?, updated_at=? WHERE task_id=? AND status='running'",
+                (json.dumps(payload, ensure_ascii=False), question, now, task_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def answer_autonomy_task(self, *, task_id: str, answer: str) -> bool:
+        """Give a blocked task its answer and let it run again.
+
+        Without this, `blocked` would be a nicer-looking dead end than `done`:
+        a state with no exit is not an improvement on a state that lies. The
+        answer is appended to `details` so the next plan actually sees it, and
+        the row goes back to 'queued' where the claim can pick it up.
+
+        Guarded on `status='blocked'` so an answer cannot restart something
+        that is running, finished, or cancelled.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE autonomy_tasks SET status='queued', run_after=?, "
+                "last_error='', "
+                "details = details || ? , updated_at=? "
+                "WHERE task_id=? AND status='blocked'",
+                (now, f"\n\nYou asked, and the answer is: {answer}", now,
+                 task_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
     async def bump_autonomy_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
         await self.initialize()
         now = self._now_iso()

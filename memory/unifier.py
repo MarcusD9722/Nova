@@ -3219,6 +3219,33 @@ class MemoryUnifier:
             BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
         return applied
 
+    async def mark_task_blocked(self, *, task_id: str, question: str,
+                                result: dict[str, Any] | None = None) -> bool:
+        """Park a task on a question for the user. True if it landed.
+
+        Announced as `task.updated`, never `task.completed`: nothing completed.
+        """
+        await self.initialize()
+        async with self._write_lock:
+            applied = await self._sqlite.block_autonomy_task(
+                task_id=task_id, question=question, result=result)
+        if applied:
+            BUS.publish("task.updated", {"task_id": str(task_id),
+                                         "status": "blocked",
+                                         "question": clip(question, 160)})
+        return applied
+
+    async def answer_task_question(self, *, task_id: str, answer: str) -> bool:
+        """Answer a blocked task so it can run again. True if it was waiting."""
+        await self.initialize()
+        async with self._write_lock:
+            applied = await self._sqlite.answer_autonomy_task(
+                task_id=task_id, answer=answer)
+        if applied:
+            BUS.publish("task.updated", {"task_id": str(task_id),
+                                         "status": "queued"})
+        return applied
+
     async def bump_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
         await self.initialize()
         async with self._write_lock:

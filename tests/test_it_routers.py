@@ -87,6 +87,41 @@ async def main() -> None:
         r = await http.get("/tasks?limit=9999")
         check(r.status_code == 422, "an over-large task limit is rejected")
 
+        check.section("Answering a task that is waiting on a person")
+        # A background task that asked a question used to be recorded `done`,
+        # so there was nothing to answer and no endpoint to answer it with.
+        tid = str(await nova.memory.enqueue_task(
+            title="add a pause menu", details="step one",
+            project_name="flappy-bird", initiated_by_user=True))
+        claimed = await nova.memory.claim_next_task()
+        check(claimed is not None and str(claimed.get("task_id")) == tid,
+              f"the task was claimed ({str((claimed or {}).get('task_id'))[:8]})")
+        parked = await nova.memory.mark_task_blocked(
+            task_id=tid, question="Should the pause menu darken the screen?")
+        check(parked is True, f"and parked as waiting ({parked})")
+
+        r = await http.get("/tasks?status=blocked")
+        listed = [t for t in r.json().get("tasks", [])
+                  if str(t.get("task_id")) == tid]
+        check(r.status_code == 200 and len(listed) == 1,
+              f"GET /tasks?status=blocked lists it ({r.status_code}, {len(listed)})")
+
+        r = await http.post(f"/tasks/{tid}/answer", json={"answer": "yes, darken it"})
+        check(r.status_code == 200, f"POST /tasks/id/answer -> {r.status_code}")
+        row = [t for t in (await http.get("/tasks?limit=50")).json().get("tasks", [])
+               if str(t.get("task_id")) == tid]
+        check(bool(row) and str(row[0].get("status")) == "queued",
+              f"the task is runnable again ({(row or [{}])[0].get('status')!r})")
+        check(bool(row) and "yes, darken it" in str(row[0].get("details") or ""),
+              "and the answer is where the next plan will read it")
+
+        r = await http.post(f"/tasks/{tid}/answer", json={"answer": "again"})
+        check(r.status_code == 409,
+              f"answering something that is not waiting is refused ({r.status_code})")
+        r = await http.post(f"/tasks/{tid}/answer", json={"answer": "   "})
+        check(r.status_code in (409, 422),
+              f"an empty answer does not release it ({r.status_code})")
+
         check.section("Reminders CRUD (real scheduling)")
         r = await http.post("/reminders", json={"title": "Call the dentist", "when": "in 30 minutes"})
         check(r.status_code == 200, f"POST /reminders -> {r.status_code}")

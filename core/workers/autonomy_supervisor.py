@@ -169,8 +169,22 @@ class AutonomySupervisorWorker:
                     # a self-feeding loop (observed: thousands of chained tasks
                     # hammering the GPU at boot).
                     if not initiated_by_user:
+                        # NOT the same case as `ask_user`, despite the shared
+                        # word. Nothing is waiting on a person here and nothing
+                        # will unblock it: the plan was to create more work, a
+                        # planner-created task may not do that, and the refusal
+                        # is final. Re-running it would produce the same plan
+                        # and the same refusal.
+                        #
+                        # It is also not `done`. The task's own work was never
+                        # performed -- the only thing it proposed was refused.
                         logger.info("autonomy_subtask_fanout_blocked", task=title[:80])
-                        await self._memory.mark_task_done(task_id=task_id, result={"status": "fanout_blocked", **result_payload})
+                        await self._memory.mark_task_failed(
+                            task_id=task_id,
+                            error=("this task planned to create more tasks, which "
+                                   "only work you asked for directly is allowed to "
+                                   "do; nothing was run"),
+                            result={"status": "fanout_blocked", **result_payload})
                         continue
                     for nt in (plan.new_tasks or [])[:3]:
                         try:
@@ -187,11 +201,21 @@ class AutonomySupervisorWorker:
                     continue
 
                 if plan.action == "ask_user":
-                    # Store as progress event; chat can surface on demand.
+                    # Waiting on a person is not finishing. This called
+                    # mark_task_done, so a task that had asked a question and
+                    # was going nowhere until someone answered was filed with
+                    # the completed work: "what is pending?" did not include
+                    # it, and the question itself lived only in a fact nothing
+                    # linked back to the task.
                     msg = (plan.message_to_user or "").strip()
                     if msg:
                         await self._memory.add_fact(entity=f"project:{project_name}", attribute="autonomy_note", value=msg, confidence=0.6)
-                    await self._memory.mark_task_done(task_id=task_id, result={"status": "needs_user", "message": msg, **result_payload})
+                    blocked_ok = await self._memory.mark_task_blocked(
+                        task_id=task_id,
+                        question=msg or "this needs a decision from you before it can go on",
+                        result={"status": "needs_user", "message": msg, **result_payload})
+                    if not blocked_ok:
+                        logger.info("autonomy_block_not_applied", task_id=task_id)
                     continue
 
                 if plan.action == "tool":

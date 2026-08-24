@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { ListTodo, RefreshCw, CircleDot, CheckCircle2, XCircle, Loader2 } from "lucide-react";
+import { ListTodo, RefreshCw, CircleDot, CheckCircle2, XCircle, Loader2, HelpCircle, Ban } from "lucide-react";
 
 function apiUrl(path) {
   try {
@@ -10,11 +10,17 @@ function apiUrl(path) {
   }
 }
 
+// Every status the backend can write has to be here. The fallback below is
+// `queued`, so a status this map does not know is shown as "Queued" -- which
+// says the task will run on its own. `cancelled` was already being mislabelled
+// that way, and `blocked` (waiting for an answer) would have been too.
 const STATUS_META = {
   queued: { icon: CircleDot, cls: "text-nova-gold/70 border-nova-gold/25 bg-black/25", label: "Queued" },
   running: { icon: Loader2, cls: "text-nova-purple border-nova-purple/40 bg-nova-purple/10", label: "Running" },
+  blocked: { icon: HelpCircle, cls: "text-amber-300 border-amber-400/30 bg-amber-500/10", label: "Waiting for you" },
   done: { icon: CheckCircle2, cls: "text-emerald-300 border-emerald-400/25 bg-emerald-500/10", label: "Done" },
   failed: { icon: XCircle, cls: "text-red-300 border-red-400/25 bg-red-500/10", label: "Failed" },
+  cancelled: { icon: Ban, cls: "text-nova-gold/40 border-nova-gold/15 bg-black/25", label: "Cancelled" },
 };
 
 function StatusChip({ status }) {
@@ -25,6 +31,39 @@ function StatusChip({ status }) {
       <Icon size={10} className={status === "running" ? "animate-spin" : ""} />
       {meta.label}
     </span>
+  );
+}
+
+function AnswerBox({ question, onSubmit }) {
+  const [text, setText] = useState("");
+  return (
+    <div className="mt-1 rounded-lg border border-amber-400/25 bg-amber-500/10 px-2 py-2 space-y-2">
+      <div className="text-[11px] text-amber-100 break-words">{question}</div>
+      <div className="flex items-center gap-2">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              onSubmit(text);
+              setText("");
+            }
+          }}
+          placeholder="Answer, and Nova picks it back up"
+          className="flex-1 min-w-0 rounded-lg bg-black/30 border border-amber-400/20 px-2 py-1 text-[11px] text-nova-gold placeholder:text-nova-gold/30"
+        />
+        <button
+          type="button"
+          onClick={() => {
+            onSubmit(text);
+            setText("");
+          }}
+          className="rounded-lg px-2 py-1 border border-amber-400/30 bg-amber-500/10 text-[11px] text-amber-100 hover:bg-amber-500/20"
+        >
+          Send
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -62,12 +101,35 @@ export default function TasksSheet({ liveEvents = [] }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskEventCount]);
 
+  // A task waiting on an answer is NOT history: it is the one thing here that
+  // needs the user. It gets its own group at the top rather than being filed
+  // with the finished work, which is exactly what the backend used to do to it.
   const grouped = useMemo(() => {
     const list = tasks || [];
+    const waiting = list.filter((t) => t.status === "blocked");
     const active = list.filter((t) => t.status === "queued" || t.status === "running");
-    const finished = list.filter((t) => t.status !== "queued" && t.status !== "running");
-    return { active, finished };
+    const finished = list.filter(
+      (t) => t.status !== "queued" && t.status !== "running" && t.status !== "blocked"
+    );
+    return { waiting, active, finished };
   }, [tasks]);
+
+  const answer = async (taskId, text) => {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) return;
+    setError("");
+    try {
+      const res = await fetch(apiUrl(`/tasks/${encodeURIComponent(taskId)}/answer`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer: trimmed }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await load();
+    } catch (err) {
+      setError(String(err?.message || err));
+    }
+  };
 
   const renderTask = (t) => (
     <div key={t.task_id} className="rounded-xl border border-nova-gold/10 bg-black/25 px-3 py-2">
@@ -82,9 +144,13 @@ export default function TasksSheet({ liveEvents = [] }) {
         <span>{t.updated_at ? new Date(t.updated_at).toLocaleString() : ""}</span>
       </div>
       {t.last_error ? (
-        <div className="mt-1 rounded-lg border border-red-400/20 bg-red-500/10 px-2 py-1 text-[11px] text-red-200 break-words">
-          {t.last_error}
-        </div>
+        t.status === "blocked" ? (
+          <AnswerBox question={t.last_error} onSubmit={(text) => answer(t.task_id, text)} />
+        ) : (
+          <div className="mt-1 rounded-lg border border-red-400/20 bg-red-500/10 px-2 py-1 text-[11px] text-red-200 break-words">
+            {t.last_error}
+          </div>
+        )
       ) : null}
     </div>
   );
@@ -111,6 +177,15 @@ export default function TasksSheet({ liveEvents = [] }) {
       )}
 
       <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1">
+        {grouped.waiting.length ? (
+          <div className="space-y-2">
+            <div className="text-[10px] uppercase tracking-[0.24em] text-amber-300/70">
+              Waiting for you ({grouped.waiting.length})
+            </div>
+            {grouped.waiting.map(renderTask)}
+          </div>
+        ) : null}
+
         <div className="space-y-2">
           <div className="text-[10px] uppercase tracking-[0.24em] text-nova-gold/50">Active ({grouped.active.length})</div>
           {grouped.active.length ? (
