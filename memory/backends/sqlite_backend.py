@@ -2102,7 +2102,10 @@ class SQLiteMemoryBackend:
 
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
-        q = "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at FROM goals"
+        # `generation` is selected because a goal list that cannot say which
+        # lifecycle run a goal is on cannot answer "which revision is that?".
+        # Appended last so the positional mapping below does not shift.
+        q = "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at, generation FROM goals"
         params: list[Any] = []
         if project_name:
             q += " WHERE project_name=?"
@@ -2125,6 +2128,7 @@ class SQLiteMemoryBackend:
                     priority=r[6],
                     created_at=r[7],
                     updated_at=r[8],
+                    generation=int(r[9] or 0),
                 )
             )
         return out
