@@ -93,6 +93,23 @@ class AgentSupervisor:
         return (int(goal.get("generation") or 0) == int(generation)
                 and str(goal.get("status")) == "active")
 
+    async def _note_superseded(self, *, goal_id: str, project_name: str,
+                               what: str, generation: int) -> None:
+        """Say that something finished too late to count, rather than nothing.
+
+        A superseded completion is not progress and must never be announced as
+        progress -- but it is not silence either: the work did run, and the user
+        asked for it to stop, so the honest line is that it finished after the
+        run ended and was not counted.
+        """
+        try:
+            await self._memory.add_progress_event(
+                goal_id=UUID(goal_id), project_name=project_name, kind="blocked",
+                message=(f"{what} finished after lifecycle run {generation} "
+                         f"ended, so it was not counted as work done."))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agent_superseded_note_failed", error=str(e)[:160])
+
     async def _discard_stale_decision(self, *, task_id: str, goal_id: str,
                                       project_name: str, generation: int) -> None:
         """Finish a decision that belongs to a lifecycle run that has ended.
@@ -104,6 +121,7 @@ class AgentSupervisor:
         try:
             await self._memory.complete_goal_task(
                 task_id=task_id, status="failed", result={"stale": True},
+                expected_generation=generation,
                 error=(f"decision discarded: it was made during lifecycle run "
                        f"{generation}, which ended (the goal was cancelled or "
                        f"resumed while this was being decided)"))
@@ -183,6 +201,10 @@ Return JSON only.
         await self._memory.initialize()
         while not self._stop.is_set():
             claimed_id: str | None = None
+            # The run the claim belongs to, captured with the claim itself:
+            # the outer handler has to finish the task and cannot do that
+            # honestly without saying which run it is finishing.
+            claimed_generation: int | None = None
             try:
                 task = await self._memory.claim_next_goal_task()
                 if not task:
@@ -196,6 +218,7 @@ Return JSON only.
                 # which logged and slept but never released the claim — the
                 # goal stalled forever with nothing reporting it.
                 claimed_id = task_id
+                claimed_generation = int(task.get("generation") or 0)
                 goal_id = str(task["goal_id"])
                 project_name = str(task["project_name"])
                 tool_name = str(task["tool_name"])
@@ -376,14 +399,20 @@ Return JSON only.
                                if refused else
                                f"'{tool_name}' may have side effects, so it is "
                                f"never re-run automatically")
-                        await self._memory.complete_goal_task(
+                        outcome = await self._memory.complete_goal_task(
                             task_id=task_id, status="failed", result={},
+                            expected_generation=generation,
                             error=f"{failure} (not retried: {why})")
-                        await self._memory.add_progress_event(
-                            goal_id=UUID(goal_id), project_name=project_name,
-                            kind="blocked",
-                            message=f"{tool_name} failed and was NOT retried "
-                                    f"automatically: {failure}")
+                        if outcome == "applied":
+                            await self._memory.add_progress_event(
+                                goal_id=UUID(goal_id), project_name=project_name,
+                                kind="blocked",
+                                message=f"{tool_name} failed and was NOT retried "
+                                        f"automatically: {failure}")
+                        elif outcome == "superseded":
+                            await self._note_superseded(
+                                goal_id=goal_id, project_name=project_name,
+                                what=tool_name, generation=generation)
                         continue
 
                     attempts += 1
@@ -406,6 +435,7 @@ Return JSON only.
                             # retry. Finalise the task truthfully instead.
                             await self._memory.complete_goal_task(
                                 task_id=task_id, status="failed", result={"stale": True},
+                                expected_generation=generation,
                                 error=(f"{failure} (not retried: the goal left "
                                        f"lifecycle run {generation} while this was "
                                        f"running, so re-running it would execute "
@@ -419,13 +449,31 @@ Return JSON only.
                             continue
                         await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {failure}")
                     else:
-                        await self._memory.complete_goal_task(task_id=task_id, status="failed", result={}, error=failure)
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="error", message=f"{tool_name} failed: {failure}")
+                        outcome = await self._memory.complete_goal_task(
+                            task_id=task_id, status="failed", result={},
+                            error=failure, expected_generation=generation)
+                        if outcome == "applied":
+                            await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="error", message=f"{tool_name} failed: {failure}")
+                        elif outcome == "superseded":
+                            await self._note_superseded(
+                                goal_id=goal_id, project_name=project_name,
+                                what=tool_name, generation=generation)
                     continue
 
-                # Mark tool task done
-                await self._memory.complete_goal_task(task_id=task_id, status="done", result={"ok": True, "data": result.result}, error="")
-                await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="tool", message=f"{tool_name} completed")
+                # Mark the tool task done -- only if this worker still owns the
+                # run it is reporting on. A tool that succeeded after the user
+                # cancelled did really run, but the goal it ran for is over, so
+                # it is neither completed work nor progress to announce.
+                outcome = await self._memory.complete_goal_task(
+                    task_id=task_id, status="done",
+                    result={"ok": True, "data": result.result}, error="",
+                    expected_generation=generation)
+                if outcome == "applied":
+                    await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="tool", message=f"{tool_name} completed")
+                elif outcome == "superseded":
+                    await self._note_superseded(
+                        goal_id=goal_id, project_name=project_name,
+                        what=tool_name, generation=generation)
             except Exception as e:
                 # Schema drift during upgrades can cause sqlite OperationalError spam; back off harder.
                 msg = str(e)
@@ -433,10 +481,12 @@ Return JSON only.
                 # structlog's traceback renderer raised UnicodeEncodeError from
                 # inside this very handler and killed the supervisor outright.
                 log_worker_error(logger, "agent_supervisor_loop_error", e, task_id=claimed_id or "-")
-                if claimed_id:
+                if claimed_id and claimed_generation is not None:
                     try:
                         await self._memory.complete_goal_task(
-                            task_id=claimed_id, status="failed", result={}, error=msg[:300])
+                            task_id=claimed_id, status="failed", result={},
+                            error=msg[:300],
+                            expected_generation=claimed_generation)
                     except Exception as e2:  # noqa: BLE001
                         log_worker_error(logger, "agent_task_release_failed", e2, task_id=claimed_id)
                 if "no such column" in msg and "sqlite" in msg.lower():

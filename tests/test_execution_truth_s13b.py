@@ -98,24 +98,43 @@ async def _drain(mem, worker, task_id: str, *, ticks: int = 200) -> dict:
 
 
 class BusSpy:
-    """Task lifecycle events, captured with the task id they carry.
+    """Task lifecycle events, attributed by the task id they carry.
 
-    Attributed by the task_id ON the event, never by arrival order — a shared
-    bus cannot be sliced.
+    The bus is global and every worker in the process publishes onto it, so the
+    ONLY sound way to say which operation produced an event is the task_id on
+    the event itself. Position in the queue is not evidence: two workers
+    interleave, a slow consumer has its oldest event dropped to make room, and
+    `BUS.recent()` is one shared list. Anything that sliced it would be
+    measuring arrival order and calling it causation.
     """
 
     def __init__(self) -> None:
-        self.events: list[tuple[str, dict]] = []
-        self._subs = []
+        self._q = None
 
-    def start(self) -> None:
-        for name in ("task.completed", "task.updated", "task.failed"):
-            q = BUS.subscribe(name) if hasattr(BUS, "subscribe") else None
-            self._subs.append((name, q))
+    def __enter__(self) -> "BusSpy":
+        self._q = BUS.subscribe()
+        return self
 
-    def for_task(self, task_id: str) -> list[tuple[str, dict]]:
-        return [(n, d) for (n, d) in self.events
-                if str(d.get("task_id")) == str(task_id)]
+    def __exit__(self, *exc) -> None:
+        if self._q is not None:
+            BUS.unsubscribe(self._q)
+        self._q = None
+
+    def drain(self) -> list:
+        """Everything published since subscribing, oldest first."""
+        out = []
+        if self._q is None:
+            return out
+        while True:
+            try:
+                out.append(self._q.get_nowait())
+            except asyncio.QueueEmpty:
+                return out
+
+    def for_task(self, task_id: str) -> list:
+        """Only the events that name this task. Never 'the last N events'."""
+        return [e for e in self.drain()
+                if str((e.data or {}).get("task_id")) == str(task_id)]
 
 
 async def test_a_failed_tool_is_not_recorded_as_done():
@@ -291,6 +310,131 @@ async def test_an_exception_in_the_loop_is_a_failed_task():
               f"and carries the real error ({row.get('last_error')!r})")
 
 
+async def test_a_failed_task_publishes_no_completion_event():
+    """The bus must not announce a failure as a completion.
+
+    `mark_task_done` publishes `task.completed`, and it used to be the only
+    terminal call the worker made — so anything listening (the UI, the voice
+    layer, the episodic promoter) was told a crashed task had completed. The
+    row and the announcement have to agree, or Nova's next sentence is wrong
+    even when the database is right.
+    """
+    check.section("event truth: a failed task is not announced as completed")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        async def failing(_args):
+            return {"ok": False, "error": "the api returned 503"}
+
+        mem, worker = await _build(Path(td) / "ev1", plan_reply=TOOL_PLAN,
+                                   tool=failing)
+        task_id = str(await mem.enqueue_task(
+            title="write the file", details="step one",
+            project_name="flappy-bird", initiated_by_user=True))
+
+        with BusSpy() as spy:
+            await _drain(mem, worker, task_id)
+            mine = spy.for_task(task_id)
+
+        row = await _row(mem, task_id)
+        kinds = [e.type for e in mine]
+        check(str(row.get("status")) == "failed",
+              f"the row says failed ({row.get('status')!r})")
+        check("task.completed" not in kinds,
+              f"and NO task.completed names this task ({kinds})")
+        check("task.updated" in kinds,
+              f"the failure was announced instead ({kinds})")
+
+        # The announcement must agree with the row, field by field.
+        upd = [e for e in mine if e.type == "task.updated"]
+        last = upd[-1].data if upd else {}
+        check(str(last.get("status")) == str(row.get("status")),
+              f"event status matches the row "
+              f"({last.get('status')!r} vs {row.get('status')!r})")
+        check(str(last.get("task_id")) == str(task_id),
+              f"event task_id matches the task ({str(last.get('task_id'))[:8]})")
+        check("503" in str(last.get("error") or ""),
+              f"and the event carries the real error ({last.get('error')!r})")
+        check(str(last.get("error") or "")[:60] in str(row.get("last_error") or ""),
+              f"which is the row's error too ({row.get('last_error')!r})")
+
+
+async def test_a_successful_task_still_publishes_a_completion_event():
+    """COUNTER-TEST. Silence is not truth either."""
+    check.section("event truth: a real success is still announced")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        async def working(_args):
+            return {"ok": True, "data": {"wrote": "game.js"}}
+
+        mem, worker = await _build(Path(td) / "ev2", plan_reply=TOOL_PLAN,
+                                   tool=working)
+        task_id = str(await mem.enqueue_task(
+            title="write the file", details="step one",
+            project_name="flappy-bird", initiated_by_user=True))
+
+        with BusSpy() as spy:
+            await _drain(mem, worker, task_id)
+            mine = spy.for_task(task_id)
+
+        row = await _row(mem, task_id)
+        kinds = [e.type for e in mine]
+        check(str(row.get("status")) == "done",
+              f"the row says done ({row.get('status')!r})")
+        check("task.completed" in kinds,
+              f"and task.completed names this task ({kinds})")
+        done = [e for e in mine if e.type == "task.completed"]
+        data = done[-1].data if done else {}
+        check(str(data.get("status")) == "done",
+              f"with a matching status ({data.get('status')!r})")
+
+
+async def test_two_tasks_do_not_borrow_each_others_events():
+    """Attribution, proved rather than assumed.
+
+    If events were read by position this test would pass by accident, so it
+    runs a failing task and a succeeding one through the SAME worker and the
+    SAME bus, then checks each task's verdict against its own id.
+    """
+    check.section("event truth: concurrent tasks keep their own verdicts")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        calls = {"n": 0}
+
+        async def alternating(_args):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": False, "error": "first one broke"}
+            return {"ok": True, "data": {}}
+
+        mem, worker = await _build(Path(td) / "ev3", plan_reply=TOOL_PLAN,
+                                   tool=alternating)
+        bad = str(await mem.enqueue_task(
+            title="first step", details="one",
+            project_name="flappy-bird", initiated_by_user=True))
+        good = str(await mem.enqueue_task(
+            title="second step", details="two",
+            project_name="flappy-bird", initiated_by_user=True))
+
+        with BusSpy() as spy:
+            await _drain(mem, worker, bad)
+            await _drain(mem, worker, good)
+            events = spy.drain()
+
+        def kinds_for(tid):
+            return [e.type for e in events
+                    if str((e.data or {}).get("task_id")) == str(tid)]
+
+        bad_row, good_row = await _row(mem, bad), await _row(mem, good)
+        check(str(bad_row.get("status")) == "failed"
+              and str(good_row.get("status")) == "done",
+              f"the rows disagree as they should "
+              f"({bad_row.get('status')!r} / {good_row.get('status')!r})")
+        check("task.completed" not in kinds_for(bad),
+              f"the failed task has no completion event ({kinds_for(bad)})")
+        check("task.completed" in kinds_for(good),
+              f"the successful one does ({kinds_for(good)})")
+
+
 async def main():
     await test_a_failed_tool_is_not_recorded_as_done()
     await test_a_crashed_task_is_not_recorded_as_done()
@@ -298,6 +442,9 @@ async def main():
     await test_genuine_success_is_still_done()
     await test_a_degraded_planner_is_not_a_finished_task()
     await test_an_exception_in_the_loop_is_a_failed_task()
+    await test_a_failed_task_publishes_no_completion_event()
+    await test_a_successful_task_still_publishes_a_completion_event()
+    await test_two_tasks_do_not_borrow_each_others_events()
     check.finish()
 
 

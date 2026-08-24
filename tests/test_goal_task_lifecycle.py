@@ -285,7 +285,8 @@ async def test_only_a_task_of_the_current_run_is_claimable():
         check(claimed is not None and int(claimed["generation"]) == 7,
               f"and the generation comes from the TASK row ({(claimed or {}).get('generation')})")
 
-        await m.complete_goal_task(task_id=b, status="done", result={})
+        await m.complete_goal_task(task_id=b, status="done", result={},
+                                   expected_generation=7)
         again = await m.claim_next_goal_task()
         check(again is None,
               f"the stale run-6 task stays unclaimable ({(again or {}).get('tool_name')})")

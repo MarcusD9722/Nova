@@ -3386,10 +3386,22 @@ class MemoryUnifier:
         await self.initialize()
         return await self._sqlite.claim_next_task()
 
-    async def complete_goal_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
+    async def complete_goal_task(self, *, task_id: str, status: str,
+                                 result: dict[str, Any] | None = None,
+                                 error: str = "",
+                                 expected_generation: int) -> str:
+        """Finish a goal task. Returns "applied", "superseded" or "ignored".
+
+        `expected_generation` is the run the caller claimed the task under —
+        required, so that no caller can write a terminal status without
+        saying which run it is finishing. See
+        `SQLiteBackend.complete_task` for what each outcome means.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.complete_task(task_id=task_id, status=status, result=result, error=error)
+            return await self._sqlite.complete_task(
+                task_id=task_id, status=status, result=result, error=error,
+                expected_generation=expected_generation)
 
     async def bump_goal_task_attempt(self, *, task_id: str, attempts: int,
                                      run_after_iso: str, error: str,

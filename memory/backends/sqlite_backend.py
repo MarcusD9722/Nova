@@ -2178,21 +2178,110 @@ class SQLiteMemoryBackend:
                 # still runnable.
         return None
 
-    async def complete_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
+    #: Does this caller still own the run it is reporting on? The task must be
+    #: the one it claimed, on the same run, and that run must still be the
+    #: goal's current one. `paused` counts as owned: a pause does not bump the
+    #: generation and does not invalidate work already in flight, so a tool that
+    #: finished during a pause finished honestly and resume must not redo it.
+    _OWNS_RUN = (
+        "generation=? AND EXISTS (SELECT 1 FROM goals g "
+        "                         WHERE g.goal_id = tasks.goal_id "
+        "                         AND g.generation=? "
+        "                         AND g.status IN ('active','paused'))"
+    )
+
+    async def complete_task(self, *, task_id: str, status: str,
+                            result: dict[str, Any] | None = None,
+                            error: str = "",
+                            expected_generation: int) -> str:
+        """Write a terminal outcome, if this caller still owns the run.
+
+        Returns "applied", "superseded" or "ignored".
+
+        This was `UPDATE tasks SET status=? ... WHERE task_id=?` with no guard
+        at all, while the claim and the retry beside it were both fenced. So a
+        worker holding a task from run N could write a terminal status at any
+        later moment. Measured on ed81c94:
+
+            claim (run 0) -> cancel (goal cancelled, run 1) -> worker returns ok
+              -> tasks.status = 'done'.  A cancelled goal had completed work.
+            claim -> cancel -> resume (run 1) -> the run-0 worker returns ok
+              -> 'done' on the CURRENT run's behalf.
+            complete failed('disk full') -> a duplicate callback says done
+              -> 'done', last_error ''. A recorded failure became a success.
+            cancel marks a queued task 'cancelled' -> a late completion arrives
+              -> 'done'. The cancellation was erased.
+
+        `expected_generation` is required rather than optional. An opt-in fence
+        is the same defect with more steps: whoever forgets it is unfenced
+        again, silently. There is no way to finish a goal task without saying
+        which run is being finished.
+
+        Three outcomes, decided in one statement each:
+
+        applied     the caller owns the run; the status it reports is written.
+        superseded  the row is still running but the run ended underneath it.
+                    The work may genuinely have succeeded, so the truth is
+                    kept in `result_json` and `last_error` - but the STATUS is
+                    NOT the one reported, because "what completed?" must not
+                    count work belonging to a run the user stopped.
+
+                    It resolves to `failed`, which is what this codebase
+                    already means by "ran during a run that ended": it is the
+                    status `_discard_stale_decision` chose for exactly this
+                    case, and the generation step counter already reads
+                    `status IN ('done','failed')`. Neither label is precise -
+                    the work did not fail, and `cancelled` means "never ran"
+                    for every queued row a cancel touches. That missing state
+                    is recorded in the Stage 13B state-model note rather than
+                    invented here: a sixth task status is a schema and UI
+                    change, and it should be decided once, together with the
+                    `ask_user` missing-state work.
+        ignored     the row is not running: already done, failed or cancelled.
+                    The first terminal write wins and repeats change nothing.
+
+        The outer `WHERE ... AND status='running'` is what makes it idempotent;
+        the CASE is what keeps a superseded row from being stranded in
+        `running` forever.
+        """
         await self.initialize()
         now = self._now_iso()
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "UPDATE tasks SET status=?, result_json=?, last_error=?, updated_at=? WHERE task_id=?",
-                (
-                    status,
-                    json.dumps(result or {}, ensure_ascii=False),
-                    (error or ""),
-                    now,
-                    task_id,
-                ),
-            )
-            await db.commit()
+        gen = int(expected_generation)
+        payload = json.dumps(result or {}, ensure_ascii=False)
+        stale_note = (error or "").strip() or (
+            f"this finished after lifecycle run {gen} ended (the goal was "
+            f"cancelled, or resumed onto a later run), so its outcome "
+            f"({status}) was recorded but not counted as work done")
+        stale_payload = json.dumps(
+            {"superseded": True, "generation": gen, "reported_status": status,
+             "reported_result": result or {}, "reported_error": error or ""},
+            ensure_ascii=False)
+
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            # IMMEDIATE takes the write lock up front, so the ownership read and
+            # the write it decides cannot straddle another writer's commit.
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "SELECT status, (" + self._OWNS_RUN + ") FROM tasks "
+                    "WHERE task_id=?", (gen, gen, task_id))
+                row = await cur.fetchone()
+                if row is None or str(row[0]) != "running":
+                    await db.execute("COMMIT")
+                    return "ignored"
+                owns = bool(row[1])
+                await db.execute(
+                    "UPDATE tasks SET status=?, result_json=?, last_error=?, "
+                    "updated_at=? WHERE task_id=? AND status='running'",
+                    (status if owns else "failed",
+                     payload if owns else stale_payload,
+                     (error or "") if owns else stale_note,
+                     now, task_id))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return "applied" if owns else "superseded"
 
     async def bump_task_attempt(self, *, task_id: str, attempts: int,
                                 run_after_iso: str, error: str,
@@ -2245,7 +2334,9 @@ class SQLiteMemoryBackend:
 
     async def list_tasks(self, *, goal_id: str | None = None, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
-        q = "SELECT task_id, goal_id, project_name, tool_name, status, attempts, run_after, last_error, result_json, created_at, updated_at FROM tasks"
+        # `generation` is selected because a task list that cannot say which
+        # run a row belongs to cannot answer "which revision was that?".
+        q = "SELECT task_id, goal_id, project_name, tool_name, status, attempts, run_after, last_error, result_json, generation, created_at, updated_at FROM tasks"
         params: list[Any] = []
         where = []
         if goal_id:
@@ -2265,7 +2356,8 @@ class SQLiteMemoryBackend:
         for r in rows:
             out.append(dict(
                 task_id=r[0], goal_id=r[1], project_name=r[2], tool_name=r[3], status=r[4],
-                attempts=r[5], run_after=r[6], last_error=r[7], result_json=r[8], created_at=r[9], updated_at=r[10]
+                attempts=r[5], run_after=r[6], last_error=r[7], result_json=r[8],
+                generation=r[9], created_at=r[10], updated_at=r[11]
             ))
         return out
 
