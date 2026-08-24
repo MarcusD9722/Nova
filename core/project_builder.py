@@ -20,7 +20,8 @@ import asyncio
 import os
 import re
 from core.project_names import (
-    WIN_RESERVED, canonical_project_slug, safe_live_component,
+    WIN_RESERVED, canonical_project_slug, is_project_dir,
+    list_project_dirs, safe_live_component,
 )
 from datetime import datetime
 from pathlib import Path
@@ -278,6 +279,15 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+class ProjectStateError(RuntimeError):
+    """The project exists, but its current-project pointer could not be stored.
+
+    Deliberately distinct from `select()` returning None, which means "no such
+    project". The caller has to tell "you don't have that" apart from "I could
+    not record that", because only one of them is the user's mistake.
+    """
+
+
 class ProjectBuilder:
     def __init__(self, *, projects_dir: Path, llm: Any, llm_semaphore: asyncio.Semaphore, memory: Any,
                  models: Any | None = None) -> None:
@@ -405,12 +415,8 @@ class ProjectBuilder:
         return path
 
     def list_projects(self) -> list[str]:
-        if not self._projects_dir.exists():
-            return []
-        return sorted(
-            p.name for p in self._projects_dir.iterdir()
-            if p.is_dir() and not p.name.startswith("_") and (p / "PROJECT.md").exists()
-        )
+        """Projects, by the ONE definition in `core.project_names`."""
+        return list_project_dirs(self._projects_dir)
 
     def known_slug_in_text(self, text: str) -> str | None:
         lowered = (text or "").lower()
@@ -538,11 +544,42 @@ class ProjectBuilder:
         except Exception:
             pass
 
-    async def _set_last_active(self, slug: str) -> None:
+    async def _set_last_active(self, slug: str) -> bool:
+        """Store the current-project pointer. False if it did not get stored.
+
+        Build and improve treat this as best-effort — the edit itself is the
+        point and a lost pointer is a nuisance. `select()` cannot: its ENTIRE
+        job is moving the pointer, so a swallowed failure there turns into Nova
+        announcing a switch that never happened.
+        """
         try:
             await self._memory.add_fact(entity="projects", attribute="last_active", value=slug, confidence=0.95)
-        except Exception:
-            pass
+            return True
+        except Exception:  # noqa: BLE001
+            logger.warning("last_active_write_failed", slug=slug)
+            return False
+
+    async def select(self, slug: str) -> str | None:
+        """Make an EXISTING project current. Changes nothing inside it.
+
+        The pointer was only ever written as a side effect of build/improve, so
+        a conversation that merely moved between projects left it empty and
+        "what are we working on?" had no authoritative answer. Selecting is its
+        own act now.
+
+        Returns the slug it settled on, or None if no such project exists —
+        selection must never invent one.
+        """
+        slug = safe_live_component(slug)
+        if slug not in self.list_projects():
+            return None
+        # READ BACK, do not merely check that the write did not raise. A store
+        # that accepts a write and does not persist it is indistinguishable
+        # from success at the call site, and the failure being closed here is
+        # Nova announcing "we're on X now" when the pointer never moved.
+        if not await self._set_last_active(slug) or await self.last_active() != slug:
+            raise ProjectStateError(slug)
+        return slug
 
     async def last_active(self) -> str | None:
         """The current project, or None — never one that no longer exists.
@@ -563,8 +600,13 @@ class ProjectBuilder:
         slug = (fact.value or "").strip() if fact else ""
         if not slug:
             return None
+        # `is_dir()` was not enough. A directory with no identity document is
+        # not a project anywhere else — select refuses it, status reports "I
+        # don't have a project called that", conversation cannot name it — and
+        # returning it here made it the CURRENT project regardless. Measured
+        # with a seeded `projects/orphan-dir/`.
         try:
-            if self._project_path(slug).is_dir():
+            if is_project_dir(self._project_path(slug)):
                 return slug
         except Exception:  # noqa: BLE001
             return None

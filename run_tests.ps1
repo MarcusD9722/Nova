@@ -8,16 +8,35 @@ $repo = $PSScriptRoot
 $python = Join-Path $repo "venv\Scripts\python.exe"
 if (-not (Test-Path $python)) { Write-Host "venv python not found: $python" -ForegroundColor Red; exit 1 }
 
+# Child stdout is decoded with the console code page, which on this machine is
+# cp1252. A suite that prints an em dash or a curly quote then dies with
+# UnicodeEncodeError inside its own print() and is reported as a FAILURE, with
+# no failing assertion anywhere - test_artifacts_recall_jv2.py has been failing
+# the gate this way for reasons that have nothing to do with the code under
+# test. UTF-8 on both sides of the pipe.
+$env:PYTHONIOENCODING = "utf-8"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONPATH = $repo
 $suites = Get-ChildItem (Join-Path $repo "tests") -Filter "test_*.py" | Sort-Object Name
 if ($Filter) { $suites = $suites | Where-Object { $_.Name -match $Filter } }
 
 $failed = @()
 $passed = 0
+# A passing suite gets its usual three lines. A FAILING one gets enough to
+# name the assertion that failed: keeping only the tail made every flake
+# un-diagnosable, and "it passed when I ran it again" is not a diagnosis.
 foreach ($suite in $suites) {
     Write-Host ("-- " + $suite.Name) -ForegroundColor Cyan
-    & $python $suite.FullName 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host ("   " + $_) }
-    if ($LASTEXITCODE -eq 0) { $passed++ } else { $failed += $suite.Name }
+    $out = & $python $suite.FullName 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $passed++
+        $out | Select-Object -Last 3 | ForEach-Object { Write-Host ("   " + $_) }
+    } else {
+        $failed += $suite.Name
+        $hits = $out | Select-String -SimpleMatch "FAIL", "Error", "Traceback"
+        if ($hits) { $hits | ForEach-Object { Write-Host ("   " + $_.Line) -ForegroundColor Red } }
+        $out | Select-Object -Last 25 | ForEach-Object { Write-Host ("   " + $_) }
+    }
 }
 
 Write-Host ""

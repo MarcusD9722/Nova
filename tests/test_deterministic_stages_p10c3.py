@@ -2223,7 +2223,12 @@ async def test_long_legacy_trash_lifecycle():
         ids = []
         for _ in range(3):
             ids.append(pm.delete_project(name)["moved_to_trash"])
+            # Recreated as a PROJECT, not a bare directory: delete now takes
+            # the same view of a project as every read surface, and what this
+            # loop is about is same-second trash-id collisions.
             (projects / name).mkdir(exist_ok=True)
+            (projects / name / "PROJECT.md").write_text(
+                "# long legacy\n", encoding="utf-8")
         check(len(set(ids)) == 3,
               f"three same-second long deletes stay distinct ({len(set(ids))})")
         for e in ids:

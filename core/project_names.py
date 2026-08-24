@@ -168,3 +168,75 @@ def safe_trash_entry(entry: str) -> str:
     if not e:
         raise ValueError("Trash entry is empty after sanitization")
     return e
+
+
+# ── WHAT MAKES A DIRECTORY A PROJECT ────────────────────────────────────────
+#
+# There were four read-side answers to this question and they disagreed:
+#
+#   ProjectManager.list_projects()   any non-dot directory
+#   ProjectBuilder.list_projects()   directories containing PROJECT.md
+#   ProjectBuilder.last_active()     any directory that still exists
+#   ProjectBuilder.select()          whatever list_projects() said
+#
+# Seeded with `projects/orphan-dir/` and no PROJECT.md, that produced a
+# directory the manager called a project, conversation could not name, status
+# reported as "I don't have a project called orphan-dir yet", select refused —
+# and `last_active()` happily returned as the CURRENT project. One object,
+# four answers.
+#
+# One predicate now, and everything reads through it.
+#
+# LEGACY POLICY, decided rather than left implicit. A directory without the
+# marker is not a project on ANY surface — it is not silently a project here and
+# not-a-project there. It is instead reported by a differently named API,
+# `list_unadopted_dirs()`, and `ProjectManager.adopt_project()` turns one into a
+# real project by WRITING the marker. Adoption is additive: nothing is renamed,
+# moved or deleted, and it only ever happens on deliberate access
+# (`ensure_workspace`) or an explicit call — never as a side effect of listing,
+# because a read that writes is how "don't silently migrate Marcus's projects"
+# gets violated by accident.
+
+#: The document that MAKES a directory a project.
+PROJECT_MARKER = "PROJECT.md"
+
+
+def is_project_dir(path: Path) -> bool:
+    """THE definition. A project is a directory carrying the identity document."""
+    try:
+        name = path.name
+        if name.startswith(".") or name.startswith("_"):
+            return False
+        return path.is_dir() and (path / PROJECT_MARKER).is_file()
+    except OSError:
+        return False
+
+
+def list_project_dirs(projects_dir: Path) -> list[str]:
+    """Every project name under `projects_dir`, by the one definition."""
+    try:
+        if not projects_dir.exists():
+            return []
+        return sorted(p.name for p in projects_dir.iterdir() if is_project_dir(p))
+    except OSError:
+        return []
+
+
+def list_unadopted_dirs(projects_dir: Path) -> list[str]:
+    """Directories that are NOT projects, named honestly as such.
+
+    Existing folders that predate the marker live here. They are visible and
+    adoptable, which is the point: the alternative to reporting them under their
+    own name is either pretending they are projects on one surface, or hiding
+    them entirely.
+    """
+    try:
+        if not projects_dir.exists():
+            return []
+        return sorted(
+            p.name for p in projects_dir.iterdir()
+            if p.is_dir() and not p.name.startswith((".", "_"))
+            and not is_project_dir(p)
+        )
+    except OSError:
+        return []

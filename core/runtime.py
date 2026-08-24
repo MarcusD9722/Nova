@@ -23,12 +23,25 @@ from core.policy.storyteller import StorytellerLLM, is_story_request, story_syst
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.intent import is_question, is_purely_conversational
-from core.project_intent import authorize_project_mutation
+from core.project_names import is_project_dir
+from core.project_intent import (
+    describes_a_change,
+    asks_current_project,
+    approves_without_naming_a_change,
+    authorize_project_mutation,
+    cancels_pending_change,
+    carries_a_proposal,
+    defers_a_change,
+    is_bare_approval,
+    is_project_selection,
+    qualified_project_name,
+)
 from core.gpu import GPU_SEM
 from core.turn_gate import GATE
 from core.capabilities.navigation import Navigation, extract_directions
 from core.project_builder import (
     ProjectBuilder,
+    ProjectStateError,
     BUILD_ACTION_RE,
     CONTINUATION_COMPLAINT_RE,
     IMPLEMENT_SUGG_RE,
@@ -476,6 +489,20 @@ class RuntimeManager:
         # artifacts are the concrete things turns produced. Both are hot, bounded
         # and in-memory — SQLite remains the authoritative store.
         self._working = WorkingContextStore()
+        # conversation -> project -> the most recent change DESCRIBED but not
+        # authorised. Consumed by the approval turn; see _project_prepass.
+        #
+        # PROJECT-SCOPED, not just conversation-scoped. Keyed only by
+        # conversation, the plan was popped and executed against whatever
+        # project happened to be current at approval time, so
+        #
+        #   open flappy-bird / "make the vertical opening larger, but don't
+        #   change anything yet" / switch to calc-tool / "okay, make that change"
+        #
+        # fed the Flappy Bird plan to improve(calc-tool). Measured on 3278f39.
+        # A plan belongs to the project it was described for, and nothing else
+        # can consume it.
+        self._pending_plan: dict[str, dict[str, str]] = {}
         # Episodic memory (V3 P4.1). The WARM tier of the same hot/warm/cold
         # structure: the artifact store below stays hot and unchanged, and what
         # it produces is promoted here. Same SQLite file as facts — deliberately
@@ -948,6 +975,20 @@ class RuntimeManager:
             if resolved in self._project_builder.active_projects():
                 return {"ok": False, "error": "build_in_progress",
                         "note": f"'{name}' is still being built — stop it before deleting."}
+            # The identity contract, checked BEFORE the approval prompt.
+            # ProjectManager enforces it too — that is the authoritative
+            # boundary — but asking a human to approve deleting a "project"
+            # that is about to be refused as not-a-project is its own small
+            # dishonesty.
+            if not is_project_dir(_projects.project_path(name)):
+                if (_projects.project_path(name)).is_dir():
+                    return {"ok": False, "error": "not_a_project",
+                            "project": resolved,
+                            "note": (f"'{resolved}' is a directory under projects/ "
+                                     "but has no PROJECT.md, so it is not a "
+                                     "project. Adopt it first if you want to "
+                                     "delete it as one.")}
+                return {"ok": False, "error": "not_found", "project": name}
             blocked = await _gate("project.delete", {"project": name, "recoverable": True})
             if blocked:
                 return blocked
@@ -1381,12 +1422,37 @@ class RuntimeManager:
         reply = (done_full or "".join(full)).strip()
         return ChatTurnResult(conversation_id=conversation_id, assistant_text=reply, tool_calls=tool_calls)
 
-    async def _project_prepass(self, text: str) -> str | None:
+    #: Conversations whose pending proposals are kept. Bounded because the
+    #: store is keyed by conversation id and a long-lived process sees an
+    #: unbounded number of them; oldest-inserted is dropped first.
+    _PENDING_PLAN_CONVERSATIONS = 256
+
+    def _bound_pending_plans(self) -> None:
+        while len(self._pending_plan) > self._PENDING_PLAN_CONVERSATIONS:
+            self._pending_plan.pop(next(iter(self._pending_plan)), None)
+
+    def _no_such_project(self, wanted: str) -> str:
+        """One honest answer for "you named a project I do not have".
+
+        Both the selection path and the mutation fall-back need it, and they
+        must not drift apart: the whole point is that a named project Nova
+        cannot find is never silently replaced by the one already open.
+        """
+        known = self._project_builder.list_projects()
+        if known:
+            return (f"I don't have a project called {wanted}. "
+                    f"I've got: {', '.join(known)}.")
+        return ("I don't have any projects yet — tell me what to build and "
+                "I'll start one.")
+
+    async def _project_prepass(self, text: str,
+                               conversation_id: Any = None) -> str | None:
         """Detect project build/status/resume/improve intents and act on them."""
         t = (text or "").strip()
         if not t:
             return None
         pb = self._project_builder
+        conv = str(conversation_id or "")
 
         # Plain questions ("what improvements could we make to X?", "is X a
         # good game?", "what should we add next?") are asking Nova to DISCUSS,
@@ -1418,6 +1484,132 @@ class RuntimeManager:
                     return f"On it. I'm implementing the suggested improvements for {slug} now — I'll report when finished."
                 return f"I couldn't start improvements on {slug}: {res.get('reason', 'unknown')}."
 
+        # "What project are we working on?" — a READ of the current pointer,
+        # answered from authoritative state rather than from whatever the model
+        # remembers of the conversation.
+        if asks_current_project(t):
+            current = await pb.last_active()
+            if current:
+                return f"We're on {current} right now. {pb.status_text(current)}"
+            return ("We're not on a particular project at the moment — name one "
+                    "and I'll pick it up.")
+
+        # A PLAN, not an instruction. The message describes a change to the
+        # project in play but does not authorise it — "…but don't change
+        # anything yet", or a correction like "I meant the vertical opening".
+        # Remembering it is what lets a later "make that change" execute the
+        # plan the user actually approved. Only these two refusal shapes count:
+        # a retrospective or a message about Nova herself is not a plan.
+        in_play = (pb.known_slug_in_text(t) or await pb.last_active()) if conv else None
+        # The pending proposal is passed in because a SPECIFIC withdrawal
+        # ("don't change the physics") can only be tied to the proposal it
+        # refers to by looking at both. Measured on c86bfb1: with the
+        # physics change pending, that sentence cancelled nothing and a
+        # later "Go ahead." executed the change the user had just
+        # withdrawn.
+        if conv and cancels_pending_change(
+                t, self._pending_plan.get(conv, {}).get(in_play or "", "")):
+            # CANCEL. Withdrawing a proposal has to invalidate it, and the
+            # cancellation must never be stored AS the proposal - measured on
+            # 3278f39, "Don't make that change." became the pending plan and a
+            # later approval executed those words as an instruction. Both halves
+            # are fixed by handling this BEFORE the capture and not falling
+            # through to it.
+            plans = self._pending_plan.get(conv)
+            if plans:
+                if in_play:
+                    plans.pop(in_play, None)
+                else:
+                    plans.clear()
+        elif conv and describes_a_change(t) and not may_mutate.allowed:
+            # WHICH refusals are proposals. "No affirmative instruction"
+            # is a plain description of a change and always is one.
+            # "Vetoed: prohibition" covers two opposite sentences that
+            # the gate refuses for the same reason:
+            #
+            #   "Make the pipe gap easier, but don't change anything yet."
+            #   "Don't change the physics."
+            #
+            # Accepting that whole bucket meant a BAN became executable
+            # work — measured on b2a931e, "Don't change the physics."
+            # was stored and a later "Go ahead." carried it out. What
+            # separates them is not the verb but whether the prohibition
+            # is scoped in time: deferred means "later", unqualified
+            # means "not at all".
+            reason = may_mutate.reason
+            # A deferral says WHEN NOT to act; it does not say what to
+            # build. Storing one on its own replaced a real proposal, or
+            # created an executable one out of nothing - measured on
+            # e88104c, "Don't build it yet." replaced a pending parallax
+            # background and a later "Go ahead." ran those words.
+            is_proposal = (reason == "no affirmative instruction"
+                           or (reason == "vetoed: prohibition"
+                               and defers_a_change(t)
+                               and carries_a_proposal(t)))
+            if is_proposal and in_play:
+                self._pending_plan.setdefault(conv, {})[in_play] = t
+                self._bound_pending_plans()
+
+        # SELECTION: "let's work on X", "switch to X", "go back to X", "open X".
+        # Making a project current writes nothing inside it, so this is not
+        # gated by `authorize_project_mutation` — and it must be checked before
+        # the mutation branch, or "let's work on the calculator" would start an
+        # autonomous edit off a sentence that names no action.
+        named = pb.known_slug_in_text(t)
+        if named and is_project_selection(t):
+            # A failed pointer write must not be reported as a switch. select()
+            # raises rather than returning None for that case precisely so the
+            # two are distinguishable here: None means "no such project", and
+            # this means "the project is real and I could not record it".
+            try:
+                chosen = await pb.select(named)
+            except ProjectStateError:
+                still = await pb.last_active()
+                where = f"still on {still}" if still else "not on a project"
+                return (f"I couldn't switch to {named} — recording it failed, so "
+                        f"we're {where}. Nothing in either project changed. "
+                        "Want me to try again?")
+            if chosen:
+                return f"Okay — we're on {chosen} now. {pb.status_text(chosen)}"
+        if not named and is_project_selection(t):
+            # "Switch to the calculator project." when there is no calculator.
+            # Answering it here rather than letting it fall through to ordinary
+            # chat is what makes an unresolved selection VISIBLE — silently
+            # replying "sure." to a request to change projects is how a
+            # conversation ends up believing it moved and Nova believing it
+            # did not.
+            wanted = qualified_project_name(t)
+            if wanted:
+                return self._no_such_project(wanted)
+
+        # CONTEXT-AWARE APPROVAL. "Go ahead." names no action, so the
+        # context-free gate refuses it and still does - that regex is
+        # deliberately untouched, because an idle "go ahead" in conversation is
+        # the same string. What makes this one an instruction is a real pending
+        # proposal FOR THE CURRENT PROJECT, which only the turn path knows.
+        #
+        # Everything here is scoped: the proposal must belong to this
+        # conversation AND to the project we are actually on. With no such
+        # proposal this falls through and mutates nothing, which is exactly the
+        # pairing the earlier comments said was required before the gap could
+        # be closed.
+        if conv and is_bare_approval(t):
+            current = await pb.last_active()
+            plan = self._pending_plan.get(conv, {}).get(current or "", "")
+            if current and plan:
+                if pb.is_building(current):
+                    return (f"I'm still working on {current} - I'll report the "
+                            "moment it's done.")
+                self._pending_plan[conv].pop(current, None)
+                res = await pb.improve(
+                    slug=current,
+                    instructions=f"{plan}\n\n(Approved by: {t})")
+                if res.get("started"):
+                    return (f"Got it - working on those improvements to "
+                            f"{current} now. I'll report when it's finished.")
+                return (f"I couldn't start on {current}: "
+                        f"{res.get('reason', 'unknown')}.")
+
         # Mentions of a known project + status/resume/improve intent. In natural
         # conversation the project name is usually only stated once, so fall
         # back to the last-active project when a continuation/feature-request
@@ -1432,6 +1624,16 @@ class RuntimeManager:
             if STATUS_WORDS_RE.search(t):
                 slug = await pb.last_active()
             elif may_mutate:
+                # …but only when the message did not NAME a different project.
+                # Measured with flappy-bird open: "Let's work on the calculator
+                # project." resolved no slug, borrowed the last-active one, and
+                # started an autonomous improve OF FLAPPY-BIRD. The user named
+                # one project and a different one was edited. A message that
+                # names a project Nova does not have gets an honest answer
+                # instead of a substituted target.
+                wanted = qualified_project_name(t)
+                if wanted and pb.known_slug_in_text(wanted) is None:
+                    return self._no_such_project(wanted)
                 slug = await pb.last_active()
         if slug:
             if STATUS_WORDS_RE.search(t):
@@ -1460,7 +1662,45 @@ class RuntimeManager:
             if may_mutate:
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
-                res = await pb.improve(slug=slug, instructions=t)
+                # THE APPROVAL TURN. "Okay, make that change." names no change;
+                # the change was described one or two turns earlier and then
+                # corrected. Without carrying that forward, the approval reached
+                # the builder with its own text as the instruction and the plan
+                # the user actually approved was simply lost.
+                #
+                # `_pending_plan` holds the most recent project change that was
+                # DESCRIBED but not authorised, per conversation. A correction
+                # overwrites it, so what executes is the corrected plan and the
+                # superseded one never runs.
+                # ONLY AN APPROVAL CONSUMES A PROPOSAL.
+                #
+                # This used to pop the proposal for ANY authorised mutation
+                # on the same project, so an independent instruction became
+                # implicit approval of something the user had explicitly
+                # deferred. Measured on b2a931e:
+                #
+                #   "I'd like a dark mode, but don't change anything yet."
+                #   "Add a pause button."
+                #     -> improve() ran with BOTH, and the unapproved dark
+                #        mode was consumed as though it had been agreed
+                #
+                # An approval refers to something already on the table
+                # ("make THAT change"); a concrete instruction carries its
+                # own object and speaks only for itself. A proposal that
+                # was not approved stays pending — the user asked for it and
+                # never withdrew it, so it is still theirs to approve later.
+                approving = approves_without_naming_a_change(t)
+                pending = (self._pending_plan.get(conv, {}).pop(slug, "")
+                           if conv and approving else "")
+                if approving and not pending:
+                    # An approval whose object is a pronoun, with nothing to
+                    # resolve it against. Handing the builder the sentence
+                    # "Okay, make that change." as its instruction is an edit
+                    # that cannot know what to do, so say so instead.
+                    return (f"I don't have a change pending for {slug} — what "
+                            "would you like me to change?")
+                instructions = (f"{pending}\n\n(Approved by: {t})" if pending else t)
+                res = await pb.improve(slug=slug, instructions=instructions)
                 if res.get("started"):
                     reopen = "taking another pass at" if is_complaint else "working on those improvements to"
                     return f"Got it — {reopen} {slug} now. I'll report when it's finished."
@@ -1581,7 +1821,7 @@ class RuntimeManager:
                 logger.warning("memory_ingest_enqueue_failed", error=str(e)[:200])
 
         # ── Deterministic pre-passes (instant, no LLM) ──────────────────────
-        project_reply = await self._project_prepass(clean_user)
+        project_reply = await self._project_prepass(clean_user, conversation_id)
         if project_reply is not None:
             yield {"type": "token", "text": project_reply}
             await _finish(project_reply, [], mode="task")

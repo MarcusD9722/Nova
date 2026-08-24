@@ -9,10 +9,21 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core.project_names import (
-    MAX_COMPONENT_LEN, canonical_project_slug, resolve_existing_identity,
-    safe_live_component, safe_trash_entry,
+    MAX_COMPONENT_LEN, PROJECT_MARKER, canonical_project_slug,
+    is_project_dir, list_project_dirs, list_unadopted_dirs,
+    resolve_existing_identity, safe_live_component, safe_trash_entry,
 )
 from core.safety import ensure_safe_subdir
+
+
+class NotAProjectError(ValueError):
+    """The directory exists but carries no identity document.
+
+    Distinct from FileNotFoundError, which means the directory is not
+    there at all. A caller has to tell "you don't have that" apart from
+    "that is not a project", because only the second one has a remedy —
+    adopt it.
+    """
 
 
 class ProjectManager:
@@ -157,21 +168,72 @@ class ProjectManager:
         return files, size
 
     def list_projects(self) -> list[str]:
-        """Project names, excluding the trash folder and other dot-dirs."""
-        if not self._projects_dir.exists():
-            return []
-        return sorted(
-            p.name for p in self._projects_dir.iterdir()
-            if p.is_dir() and not p.name.startswith(".")
-        )
+        """Projects, by the ONE definition in `core.project_names`.
+
+        This used to accept any non-dot directory while ProjectBuilder required
+        PROJECT.md, so the two disagreed about whether a given folder existed at
+        all. It has no production callers, which is why aligning it costs
+        nothing — but the disagreement was real and reachable through the
+        builder, and `last_active()` resolved it in the most permissive
+        direction.
+        """
+        return list_project_dirs(self._projects_dir)
+
+    def list_unadopted(self) -> list[str]:
+        """Directories under projects/ that are NOT projects.
+
+        Folders predating the identity document live here. Reported under their
+        own name rather than counted as projects on one surface and denied on
+        another.
+        """
+        return list_unadopted_dirs(self._projects_dir)
+
+    def adopt_project(self, name: str) -> dict[str, Any]:
+        """Give an existing directory the identity document. Additive only.
+
+        Nothing is renamed, moved or deleted — the directory keeps its exact
+        name, which is the constraint that rules out "canonicalise it on the way
+        in". Idempotent: adopting a real project leaves its PROJECT.md alone.
+
+        Deliberately NOT called from any listing. A read that writes is how
+        "don't silently migrate Marcus's projects" gets violated by accident.
+        """
+        proj = self.project_path(name)
+        if not proj.is_dir():
+            raise FileNotFoundError(f"no such directory: {name}")
+        marker = proj / PROJECT_MARKER
+        if marker.exists():
+            return {"project": proj.name, "adopted": False,
+                    "note": "already had an identity document"}
+        marker.write_text(
+            self._MINIMAL_PROJECT_MD.format(slug=proj.name), encoding="utf-8")
+        return {"project": proj.name, "adopted": True}
 
     def delete_project(self, name: str) -> dict[str, Any]:
-        """Move a project into .trash/ (recoverable). Never deletes bytes."""
+        """Move a PROJECT into .trash/ (recoverable). Never deletes bytes.
+
+        Takes the same view of "project" as every read surface. It used to
+        accept any directory, which meant a folder the whole rest of the
+        system called unadopted — invisible to `list_projects`, unnameable
+        in conversation, refused by `select`, denied by `status` — could
+        still be deleted AS a project. One contract has to mean one
+        contract, and least of all on the destructive side.
+
+        An unadopted directory is not thereby undeletable: `adopt_project`
+        makes it a project first, deliberately, and then this works
+        normally. The point is that nothing is moved to trash on a
+        definition of "project" no other surface agrees with.
+        """
         proj = self.project_path(name)          # sandboxed by ensure_safe_subdir
         if proj.resolve() == self._projects_dir.resolve():
             raise ValueError("refusing to delete the projects directory itself")
         if not proj.exists() or not proj.is_dir():
             raise FileNotFoundError(f"no such project: {name}")
+        if not is_project_dir(proj):
+            raise NotAProjectError(
+                f"'{proj.name}' is a directory under projects/ but has no "
+                f"{PROJECT_MARKER}, so it is not a project. Adopt it first "
+                "if you want to delete it as one.")
 
         files, size = self._measure(proj)
         trash = self._trash_dir()
@@ -276,6 +338,31 @@ class ProjectManager:
             purged.append({"entry": t.name, "files": files, "bytes": size})
         return {"purged": purged, "permanent": True}
 
+    #: The document that MAKES a directory a project.
+    #:
+    #: There were two disagreeing definitions of "project": ProjectManager
+    #: treated any workspace directory as one, while
+    #: `ProjectBuilder.list_projects()` counts only directories containing
+    #: PROJECT.md. So `project.scaffold("calc-tool")` produced something that
+    #: existed on the tool surface and did not exist to conversation — it could
+    #: never be named, statused, selected or resumed in chat.
+    #:
+    #: One contract, and this is it: PROJECT.md is the project's identity
+    #: document, every creation path writes one, and ProjectBuilder's view is
+    #: the authoritative universe. The sections match what `status_text` parses,
+    #: so a scaffolded project reports honestly instead of "unknown" — it is a
+    #: real minimal project, not a placeholder that merely satisfies a check.
+    _MINIMAL_PROJECT_MD = (
+        "# {slug}\n\n"
+        "## Brief\n{slug}\n\n"
+        "## Status\nscaffolded\n\n"
+        "## Summary\nAn empty project created by Nova. Nothing has been built yet.\n\n"
+        "## Files\n(none yet)\n\n"
+        "## How to run\n(pending)\n\n"
+        "## Progress log\n- scaffolded\n\n"
+        "## Next steps / suggestions\n(none yet)\n"
+    )
+
     def ensure_workspace(self, name: str) -> Path:
         proj = self.project_path(name)
         proj.mkdir(parents=True, exist_ok=True)
@@ -285,6 +372,12 @@ class ProjectManager:
         chat = proj / "chat_history.jsonl"
         if not chat.exists():
             chat.write_text("", encoding="utf-8")
+        # Never overwrite: a real PROJECT.md carries the build history.
+        marker = proj / "PROJECT.md"
+        if not marker.exists():
+            marker.write_text(
+                self._MINIMAL_PROJECT_MD.format(slug=self._sanitize(name)),
+                encoding="utf-8")
         return proj
 
     def scaffold_project(self, name: str) -> Path:

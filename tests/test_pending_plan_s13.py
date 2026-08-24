@@ -1,0 +1,722 @@
+"""The plan that gets approved is the plan that runs — and only that one.
+
+THE GAP THIS CLOSES. "Okay, make that change." names no change. The change was
+described one or two turns earlier and then corrected, so an approval turn that
+carried only its own text reached the builder with nothing to build — and the
+plan the user actually approved was simply lost.
+
+WHAT IS STORED, AND HOW IT IS KEYED
+
+    conversation -> project -> the most recent change DESCRIBED but not approved
+
+Both levels are load-bearing and both were found missing by review:
+
+  conversation  one conversation's unapproved plan is not another's to run.
+
+  project       keyed only by conversation, the plan was popped and executed
+                against whatever project happened to be current at approval
+                time, so "open flappy-bird / describe a change / switch to
+                calc-tool / okay, make that change" fed the Flappy Bird plan to
+                improve(calc-tool). A plan belongs to the project it was
+                described for.
+
+WHAT IT SUPPLIES. The plan supplies WHAT to do. Whether to do anything is
+decided by the approving message, and the context-free mutation gate is
+unchanged — `authorize_project_mutation("Go ahead.")` still refuses, because an
+idle "go ahead" in conversation is the same string. The approval path pairs that
+shape with a real proposal for the project actually in play. With no such
+proposal, the identical words mutate nothing. Both directions are asserted.
+
+CANCELLING. A proposal can also be withdrawn, which used to be impossible and
+failed in both directions at once: "Actually don't." left the plan pending for a
+later approval to run, and "Don't make that change." was stored AS the plan, so
+approving it later executed those words as an instruction.
+
+Run:  venv\\Scripts\\python.exe tests\\test_pending_plan_s13.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from uuid import uuid4
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tests"))
+
+os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
+
+from harness import Checks, boot, run  # noqa: E402
+
+from core.project_intent import defers_a_change  # noqa: E402
+
+check = Checks()
+
+
+class Recorder:
+    """Every instruction that reached the edit orchestration."""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def plan(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return json.dumps({"changes": [], "summary": "nothing to do"})
+
+    def saw(self, needle: str) -> bool:
+        return any(needle.lower() in p.lower() for p in self.prompts)
+
+    def tails(self, n: int = 140) -> list[str]:
+        return [p[-n:].replace("\n", " ") for p in self.prompts]
+
+
+async def _wire(nova, *projects: str) -> Recorder:
+    rec = Recorder()
+    nova.llm.when("You are Nova improving an existing project", rec.plan,
+                  label="improve-plan")
+    nova.llm.when(lambda _p: True, lambda _p: "right.", label="flat")
+    from core.tool_router import ToolCall
+    for name in (projects or ("flappy-bird",)):
+        res = await nova.runtime._router.execute(
+            ToolCall("project.scaffold", {"name": name}))
+        assert res.ok, res.error
+    return rec
+
+
+async def _chat(nova, cid: str, text: str) -> str:
+    r = await nova.http.post("/chat", json={"message": text,
+                                            "conversation_id": cid})
+    assert r.status_code == 200, f"/chat {r.status_code}: {r.text[:200]}"
+    return str(r.json().get("assistant") or "")
+
+
+async def _quiet(nova, rec: Recorder, *, ticks: int = 30) -> None:
+    """Give any edit that WAS started time to reach the orchestration."""
+    for _ in range(ticks):
+        if rec.prompts:
+            return
+        await asyncio.sleep(0.05)
+
+
+async def _settled(nova, rec: Recorder, before: int, *, ticks: int = 200) -> bool:
+    for _ in range(ticks):
+        if len(rec.prompts) > before:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+def _pending(nova, cid: str, slug: str) -> str:
+    return nova.runtime._pending_plan.get(cid, {}).get(slug, "")
+
+
+async def test_a_plan_alone_never_executes():
+    check.section("pending plan: describing a change does not start it")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        await _chat(nova, cid, "Help me make the pipe spacing easier, but "
+                               "don't change anything yet.")
+        check(bool(_pending(nova, cid, "flappy-bird")), "the plan was remembered")
+        for filler in ("What's the difference between RAM and VRAM?",
+                       "My coffee machine died this morning.",
+                       "I might switch to tea.",
+                       "Do you ever get bored?"):
+            await _chat(nova, cid, filler)
+        await _quiet(nova, rec)
+        check(not rec.prompts,
+              f"and four unrelated turns did not fire it ({len(rec.prompts)})")
+        check(bool(_pending(nova, cid, "flappy-bird")),
+              "it is still pending, not quietly dropped")
+
+
+async def test_a_bare_approval_is_authority_only_with_a_proposal():
+    """Both directions of the context-aware approval, in one conversation.
+
+    The pairing is the safety property. A bare approval that could authorise on
+    its own would turn an idle "go ahead" into an edit; a bare approval that can
+    NEVER authorise leaves the user unable to say yes to a proposal Nova just
+    made. Neither half is safe alone, so neither is asserted alone.
+    """
+    check.section("pending plan: 'go ahead' needs a proposal to be authority")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+
+        # IDLE: nothing proposed. The same words must do nothing at all.
+        for text in ("Go ahead.", "Do that.", "Yes, do it.", "Go for it.",
+                     "Okay, go ahead.", "Sure, do it."):
+            await _chat(nova, cid, text)
+        await _quiet(nova, rec)
+        check(not rec.prompts,
+              f"idle approval starts nothing ({len(rec.prompts)} improve calls)")
+
+        # …and the context-free gate is untouched, which is what keeps the
+        # decision in the turn path where the context actually lives.
+        from core.project_intent import authorize_project_mutation
+        for text in ("Go ahead.", "Do that.", "Yes, do it."):
+            check(not authorize_project_mutation(text, complaint=False).allowed,
+                  f"the message-level gate still refuses {text!r}")
+
+        # CONTEXTUAL: with a proposal for the CURRENT project, it approves.
+        await _chat(nova, cid, "I'd like you to make the pipe gap bigger, but don't change "
+                               "anything yet.")
+        check(bool(_pending(nova, cid, "flappy-bird")), "plan pending")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Go ahead.")
+        check(await _settled(nova, rec, n), "a contextual 'go ahead' executes")
+        check(rec.saw("pipe gap bigger"),
+              f"and it carries the proposal ({rec.tails()})")
+        check(not _pending(nova, cid, "flappy-bird"),
+              "and consumes it")
+
+        # …and immediately afterwards the same words are idle again.
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Go ahead.")
+        await asyncio.sleep(0.6)
+        check(len(rec.prompts) == n,
+              "the same words do nothing once the proposal is spent")
+
+
+async def test_an_approval_that_names_nothing_refuses_when_nothing_is_pending():
+    """"Okay, make that change." with no proposal must not invent one.
+
+    This one passes the mutation gate — it has an action verb — so scoping the
+    plan away from it was not enough on its own: the approval still ran, with
+    its own sentence handed to the builder as the instruction. An edit that
+    cannot know what to do should say so.
+    """
+    check.section("pending plan: an approval with no proposal says so")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        reply = await _chat(nova, cid, "Okay, make that change.")
+        await _quiet(nova, rec)
+        check(not rec.prompts,
+              f"no edit was started ({len(rec.prompts)} improve calls)")
+        check("flappy-bird" in reply.lower(),
+              f"and Nova says which project she has nothing for ({reply[:70]!r})")
+
+        # A message that NAMES the change is unaffected — the refusal is about
+        # the pronoun, not about editing.
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Make the pipe gap 20% larger.")
+        check(await _settled(nova, rec, n),
+              "a concrete instruction still executes with nothing pending")
+
+
+async def test_the_correction_is_what_runs():
+    check.section("pending plan: a correction replaces, it does not queue")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        await _chat(nova, cid, "Make the horizontal pipe spacing wider, but "
+                               "don't change anything yet.")
+        await _chat(nova, cid, "Actually, keep the horizontal spacing. I meant "
+                               "make the vertical opening larger.")
+        pending = _pending(nova, cid, "flappy-bird")
+        check("vertical opening" in pending.lower(),
+              f"the correction is what is pending ({pending[:60]!r})")
+        check("wider" not in pending.lower(),
+              "and the superseded plan is gone, not appended")
+
+        await _chat(nova, cid, "Okay, make that change.")
+        await _quiet(nova, rec, ticks=200)
+        check(bool(rec.prompts), "the approval executed")
+        check(rec.saw("vertical opening"),
+              "the corrected requirement reached the edit")
+        check(not rec.saw("spacing wider"),
+              f"and the stale one did not ({rec.tails()})")
+
+
+async def test_the_plan_is_scoped_to_its_conversation():
+    """One conversation's unapproved plan is not another's to execute."""
+    check.section("pending plan: it does not leak across conversations")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        a, b = str(uuid4()), str(uuid4())
+        await _chat(nova, a, "Open flappy-bird.")
+        await _chat(nova, a, "I want you to add a rainbow trail behind the bird, but "
+                             "don't change anything yet.")
+        check("rainbow trail" in _pending(nova, a, "flappy-bird").lower(),
+              "conversation A has a pending plan")
+        check(not _pending(nova, b, "flappy-bird"), "conversation B has none")
+
+        await _chat(nova, b, "Okay, make that change.")
+        await _quiet(nova, rec, ticks=60)
+        check(not rec.saw("rainbow trail"),
+              f"B's approval did not execute A's plan ({rec.tails()})")
+        check("rainbow trail" in _pending(nova, a, "flappy-bird").lower(),
+              "and A's plan is still A's, unconsumed")
+
+        # A bare approval in B must not reach across either.
+        await _chat(nova, b, "Go ahead.")
+        await _quiet(nova, rec, ticks=60)
+        check(not rec.saw("rainbow trail"),
+              f"nor does a bare approval in B ({rec.tails()})")
+
+
+async def test_the_plan_is_scoped_to_its_project():
+    """The defect this level of keying exists for.
+
+    Measured on 3278f39: describe a change for flappy-bird, switch to calc-tool,
+    approve — and the Flappy Bird plan was handed to improve(calc-tool).
+    """
+    check.section("pending plan: A's plan can never execute on B")
+
+    async with boot() as nova:
+        rec = await _wire(nova, "flappy-bird", "calc-tool")
+        pb = nova.runtime._project_builder
+        cid = str(uuid4())
+
+        await _chat(nova, cid, "Open flappy-bird.")
+        await _chat(nova, cid, "I want you to add a rainbow trail behind the bird, but "
+                               "don't change anything yet.")
+        check("rainbow trail" in _pending(nova, cid, "flappy-bird").lower(),
+              "the plan is filed under flappy-bird")
+
+        await _chat(nova, cid, "Switch to calc-tool.")
+        check(await pb.last_active() == "calc-tool", "we are on B")
+        check("rainbow trail" in _pending(nova, cid, "flappy-bird").lower(),
+              "switching did not re-target the plan")
+        check(not _pending(nova, cid, "calc-tool"),
+              f"and B has no plan of its own "
+              f"({_pending(nova, cid, 'calc-tool')!r})")
+
+        await _chat(nova, cid, "Okay, make that change.")
+        await _quiet(nova, rec, ticks=60)
+        check(not rec.saw("rainbow trail"),
+              f"an approval on B cannot consume A's plan ({rec.tails()})")
+        await _chat(nova, cid, "Go ahead.")
+        await _quiet(nova, rec, ticks=60)
+        check(not rec.saw("rainbow trail"),
+              f"nor can a bare approval on B ({rec.tails()})")
+
+        # A new plan for B does not disturb A's.
+        await _chat(nova, cid, "I'd like you to add a percent key here, but don't "
+                               "change anything yet.")
+        check("percent key" in _pending(nova, cid, "calc-tool").lower(),
+              f"B has its own plan now ({_pending(nova, cid, 'calc-tool')!r})")
+        check("rainbow trail" in _pending(nova, cid, "flappy-bird").lower(),
+              "and A's is untouched")
+
+        # Back on A, A's plan is still valid and is the one that runs.
+        await _chat(nova, cid, "Go back to flappy-bird.")
+        check(await pb.last_active() == "flappy-bird", "we are back on A")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Okay, make that change.")
+        check(await _settled(nova, rec, n), "A's plan executes on A")
+        check("rainbow trail" in rec.prompts[-1].lower(),
+              f"and it is A's plan, not B's ({rec.tails()})")
+        check("percent key" not in rec.prompts[-1].lower(),
+              "B's plan did not come along")
+        check("percent key" in _pending(nova, cid, "calc-tool").lower(),
+              "B's plan is still pending for B")
+
+
+async def test_an_approved_plan_is_consumed_once():
+    check.section("pending plan: approving twice does not run it twice")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        await _chat(nova, cid, "I'd like you to add a parallax background, but don't "
+                               "change anything yet.")
+        await _chat(nova, cid, "Okay, make that change.")
+        await _quiet(nova, rec, ticks=200)
+        check(rec.saw("parallax background"), "the plan ran once")
+        check(not _pending(nova, cid, "flappy-bird"), "and was consumed")
+
+        first = len(rec.prompts)
+        await _chat(nova, cid, "Okay, make that change.")
+        await asyncio.sleep(0.6)
+        later = rec.prompts[first:]
+        check(not any("parallax background" in p.lower() for p in later),
+              f"a second approval does not replay it ({len(later)} later calls)")
+
+
+async def test_an_independent_instruction_does_not_approve_a_proposal():
+    """Doing one thing is not agreeing to another.
+
+    Measured on b2a931e: the proposal was popped for ANY authorised mutation on
+    the same project, so
+
+        "I'd like you to add a dark mode, but don't change anything yet."
+        "Add a pause button."
+
+    ran improve() with BOTH, and the dark mode the user had explicitly deferred
+    was consumed as though it had been approved. An approval refers to something
+    already on the table ("make THAT change"); a concrete instruction carries its
+    own object and speaks only for itself.
+
+    The unapproved proposal is left PENDING rather than discarded — the user
+    asked for it and never withdrew it, so it stays theirs to approve later.
+    """
+    check.section("pending plan: an unrelated instruction approves nothing")
+
+    async with boot() as nova:
+        rec = await _wire(nova, "flappy-bird", "calc-tool")
+        cid = str(uuid4())
+        await _chat(nova, cid, "Open flappy-bird.")
+        await _chat(nova, cid, "I'd like you to add a dark mode, but don't change anything yet.")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              "the proposal is pending")
+
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Add a pause button.")
+        check(await _settled(nova, rec, n), "the instruction itself ran")
+        last = rec.prompts[-1].lower()
+        check("pause button" in last, "and it carried its own instruction")
+        check("dark mode" not in last,
+              f"the deferred proposal did NOT ride along ({rec.tails()})")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              f"and is still pending, not silently spent "
+              f"({_pending(nova, cid, 'flappy-bird')!r})")
+
+        # Every concrete shape, not just one.
+        for text in ("Fix collision.", "Update the README."):
+            n = len(rec.prompts)
+            await _chat(nova, cid, text)
+            check(await _settled(nova, rec, n), f"{text!r} ran")
+            check("dark mode" not in rec.prompts[-1].lower(),
+                  f"{text!r} did not approve the proposal")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              "the proposal survived all of them")
+
+        # A concrete instruction while ANOTHER project holds a proposal.
+        await _chat(nova, cid, "Switch to calc-tool.")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Add a percent key.")
+        check(await _settled(nova, rec, n), "the instruction ran on B")
+        check("dark mode" not in rec.prompts[-1].lower(),
+              f"and A's proposal did not cross over ({rec.tails()})")
+        check("dark mode" in _pending(nova, cid, "flappy-bird").lower(),
+              "A's proposal is intact")
+
+        # …and an actual approval still consumes it.
+        await _chat(nova, cid, "Go back to flappy-bird.")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Okay, make that change.")
+        check(await _settled(nova, rec, n), "the approval ran")
+        check("dark mode" in rec.prompts[-1].lower(),
+              f"and THAT is what executes the proposal ({rec.tails()})")
+        check(not _pending(nova, cid, "flappy-bird"), "now it is consumed")
+
+
+async def test_conversation_plus_a_deferral_proposes_nothing():
+    """Ordinary talk ending in "not yet" is not a proposal.
+
+    `carries_a_proposal` asked only whether CONTENT survived stripping the
+    deferral clause, which any sentence does. Measured on da27c9d:
+
+        "Add a parallax background, but don't change anything yet."
+        "The game looks pretty good, so don't change anything yet."
+          -> the second REPLACED the first, and "Go ahead." executed the
+             conversational sentence instead of the parallax proposal
+
+    The property is intentional, not vocabulary: what survives the stripping
+    has to pass the module's own affirmative-instruction grammar. Two weaker
+    tests were tried first and both admitted non-proposals — "any content
+    remains", then "a positive action family", which is broad TOPIC detection
+    and so accepted the retrospective "I changed the menu yesterday".
+
+    Desire-only forms FAIL CLOSED: "I'd like a dark mode" is a proposal to a
+    human and is not deterministically separable from "I want pizza", so
+    neither becomes executable pending state. The explicit forms do work —
+    "I'd like you to add a dark mode", "Help me add a dark mode", "Add a dark
+    mode" — and making every stray desire a future filesystem mutation is the
+    wrong way to be wrong.
+    """
+    check.section("pending plan: conversation + 'not yet' is not a proposal")
+
+    from core.project_intent import carries_a_proposal
+
+    for text in ("Don't change it yet.",
+                 "I was thinking about it, but don't change it yet.",
+                 "The game looks good, so don't change anything yet.",
+                 "We can talk about it, but don't change anything yet.",
+                 "I'm not sure, so don't change anything yet.",
+                 "It's been a long week, but don't change anything yet.",
+                 # RETROSPECTIVE. `_ACTION_VERB` is deliberately broad TOPIC
+                 # detection and matches inflections, so these read as
+                 # proposals while the capture trusted it. Reporting a change
+                 # you already made is not proposing one.
+                 "I changed the menu yesterday, but don't change anything yet.",
+                 "I fixed the collision bug earlier, but don't change anything yet.",
+                 "We updated the menu yesterday, but don't change anything yet.",
+                 # UNRELATED DESIRE. An arbitrary noun after "I want" is not a
+                 # project change, and desire-only forms FAIL CLOSED.
+                 "I want pizza, but don't change anything yet.",
+                 "I need coffee, but don't change anything yet.",
+                 "I'd like a dark mode, but don't change it yet."):
+        check(not carries_a_proposal(text), f"proposes nothing: {text!r}")
+
+    for text in ("Add a parallax background, but don't change anything yet.",
+                 "Make the pipe gap larger, but don't change it yet.",
+                 "Improve the menu, but don't update it right now.",
+                 # The EXPLICIT forms of the desire that fails closed above.
+                 "I'd like you to add a dark mode, but don't change it yet.",
+                 "I want you to add a dark mode, but don't change it yet.",
+                 "Help me add a dark mode, but don't change it yet."):
+        check(carries_a_proposal(text), f"proposes a change: {text!r}")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        # Nothing pending: conversation + deferral creates nothing.
+        for text in ("The game looks pretty good, so don't change anything yet.",
+                     "I was thinking about it, but don't change anything yet."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{text[:40]!r} created no proposal ({held[:40]!r})")
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{text[:40]!r}: and a later approval ran nothing "
+                  f"({rec.tails()})")
+
+        # A real proposal pending: conversation + deferral must not replace it.
+        rec.prompts.clear()
+        cid = str(uuid4())
+        await _chat(nova, cid, "Add a parallax background, but don't change "
+                               "anything yet.")
+        await _chat(nova, cid, "The game looks pretty good, so don't change "
+                               "anything yet.")
+        held = _pending(nova, cid, "flappy-bird")
+        check("parallax background" in held.lower(),
+              f"the parallax proposal is still the pending one ({held[:50]!r})")
+        check("looks pretty good" not in held.lower(),
+              f"the conversational sentence did not replace it ({held[:50]!r})")
+        n = len(rec.prompts)
+        await _chat(nova, cid, "Go ahead.")
+        check(await _settled(nova, rec, n), "the approval executed")
+        ran = rec.prompts[-1].lower()
+        check("parallax background" in ran,
+              f"PARALLAX is what reached improve() ({rec.tails()})")
+        check("looks pretty good" not in ran,
+              f"and the chatter did not ({rec.tails()})")
+
+
+async def test_a_prohibition_never_becomes_a_proposal():
+    """A ban must not turn into executable work.
+
+    Measured on b2a931e: "Don't change the physics." was stored as the pending
+    proposal, and a later "Go ahead." CARRIED IT OUT — the exact inversion of
+    what the mutation gate exists to prevent.
+
+    The capture accepted every refusal whose reason was "vetoed: prohibition",
+    and two opposite sentences share that reason. What separates them is not the
+    verb but whether the prohibition is scoped in TIME: deferred means "later",
+    unqualified means "not at all".
+    """
+    check.section("pending plan: a prohibition is not a deferred proposal")
+
+    prohibitions = (
+        "Don't change the physics.",
+        "Don't modify the menu.",
+        "Never change the scoring.",
+        "I don't want you to change the physics.",
+        "Do not update that file.",
+        "Don't touch the collision code.",
+        "Never update the readme.",
+    )
+    async with boot() as nova:
+        rec = await _wire(nova)
+        # Selected ONCE for the whole boot. `last_active` is durable, so
+        # re-selecting per sub-case is redundant setup rather than
+        # coverage - and this suite has to stay under the harness
+        # watchdog.
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+        for text in prohibitions:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{text!r} was not stored as a proposal ({held[:40]!r})")
+
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{text!r}: and a later approval executed nothing "
+                  f"({rec.tails()})")
+
+        # KNOWN LIMIT, stated rather than hidden. What is recognised is a
+        # deferral expressed as a PROHIBITION clause: "but don't ... yet".
+        # A bare "..., but not yet." carries no prohibition and, in the
+        # cases tried, no action verb the vocabulary knows, so it is not
+        # captured. Widening the test to any sentence containing "later" or
+        # "at some point" would misfire on "Fix the bug that happens later in
+        # the level", so that is deliberately left alone.
+        # The deferral half of the same grammar still works, or the fix would
+        # have closed the feature instead of the hole.
+        for text in ("Make the pipe gap easier, but don't change anything yet.",
+                     "Add a pause menu later, but don't build it yet.",
+                     "Improve the pipe spacing, but don't change it yet.",
+                     "Change the physics, but don't change anything right now."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(bool(held), f"deferred proposal still captured: {text!r}")
+            check(not rec.prompts, f"and not executed: {text!r}")
+
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Okay, make that change.")
+            check(await _settled(nova, rec, n),
+                  f"and approving it runs it: {text!r}")
+
+        # A deferral must not read as a cancellation either — it would throw away
+        # the proposal it is half of.
+        from core.project_intent import cancels_pending_change, defers_a_change
+        for text in ("Make the pipe gap easier, but don't change anything yet.",
+                     "I'd like you to add a dark mode, but don't change anything yet."):
+            check(defers_a_change(text), f"is a deferral: {text!r}")
+            check(not cancels_pending_change(text),
+                  f"and not a cancellation: {text!r}")
+        # …while the same prohibition WITHOUT a time qualifier withdraws.
+        for text in ("Don't change anything.", "Don't make any changes."):
+            check(cancels_pending_change(text), f"withdraws: {text!r}")
+            check(not defers_a_change(text), f"and defers nothing: {text!r}")
+
+
+async def test_a_retrospective_or_stray_desire_is_not_a_proposal():
+    """Two things the broad topic detector called proposals.
+
+    `_ACTION_VERB` is deliberately stem-plus-anything, for TOPIC detection —
+    "changed", "fixed", "updated" all match. Using it as evidence of proposal
+    INTENT meant a report of work already done became executable pending state.
+    Measured on 47d511e:
+
+        "I changed the menu yesterday, but don't change anything yet."
+          -> stored as the pending proposal
+        "Go ahead."
+          -> improve() ran with those words
+
+    And a desire naming any concrete noun was accepted, so "I want pizza, but
+    don't change anything yet." proposed something to a project.
+
+    What survives stripping the deferral now has to pass the module's own
+    affirmative-instruction grammar, which already vetoes retrospectives. Every
+    assertion below reads the payload, not bool(pending).
+    """
+    check.section("pending plan: a retrospective or a stray desire proposes nothing")
+
+    not_proposals = (
+        "I changed the menu yesterday, but don't change anything yet.",
+        "I fixed the collision bug earlier, but don't change anything yet.",
+        "We updated the menu yesterday, but don't change anything yet.",
+        "I want pizza, but don't change anything yet.",
+        "I need coffee, but don't change anything yet.",
+    )
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        # Nothing pending: none of them creates executable state.
+        for text in not_proposals:
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(not held, f"{text[:44]!r} created no proposal ({held[:40]!r})")
+            await _chat(nova, cid, "Go ahead.")
+            await _quiet(nova, rec, ticks=40)
+            check(not rec.prompts,
+                  f"{text[:44]!r}: and a later approval ran nothing "
+                  f"({rec.tails()})")
+
+        # A real proposal pending: none of them replaces it, and the approval
+        # still executes the real one.
+        for text in ("I changed the menu yesterday, but don't change anything yet.",
+                     "I want pizza, but don't change anything yet."):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, "Add a parallax background, but don't "
+                                   "change anything yet.")
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check("parallax background" in held.lower(),
+                  f"{text[:34]!r} left the proposal intact ({held[:44]!r})")
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Go ahead.")
+            check(await _settled(nova, rec, n), "the approval executed")
+            ran = rec.prompts[-1].lower()
+            check("parallax background" in ran,
+                  f"PARALLAX reached improve() ({rec.tails()})")
+            check("pizza" not in ran and "yesterday" not in ran,
+                  f"and {text[:30]!r} did not ({rec.tails()})")
+
+
+async def test_the_explicit_request_forms_still_propose():
+    """Failing closed on bare desire must not close the door on asking.
+
+    "I'd like a dark mode" is not deterministically separable from "I want
+    pizza", so it fails closed. The forms that NAME the action still work, and
+    this is what stops that decision from quietly removing the capability.
+    """
+    check.section("pending plan: the explicit request forms still propose")
+
+    async with boot() as nova:
+        rec = await _wire(nova)
+        await _chat(nova, str(uuid4()), "Open flappy-bird.")
+
+        for text, token in (
+            ("I'd like you to add a dark mode, but don't change it yet.",
+             "dark mode"),
+            ("I want you to add a pause button, but don't change it yet.",
+             "pause button"),
+            ("Help me add a parallax background, but don't change it yet.",
+             "parallax background"),
+            ("Add a restart button, but don't change anything yet.",
+             "restart button"),
+        ):
+            rec.prompts.clear()
+            cid = str(uuid4())
+            await _chat(nova, cid, text)
+            held = _pending(nova, cid, "flappy-bird")
+            check(token in held.lower(),
+                  f"{text[:40]!r} is a proposal ({held[:44]!r})")
+            check(not rec.prompts, f"and nothing ran yet ({rec.tails()})")
+            n = len(rec.prompts)
+            await _chat(nova, cid, "Go ahead.")
+            check(await _settled(nova, rec, n), f"{text[:40]!r} is approvable")
+            check(token in rec.prompts[-1].lower(),
+                  f"and {token!r} reached improve() ({rec.tails()})")
+
+
+async def main():
+    await test_a_plan_alone_never_executes()
+    await test_a_bare_approval_is_authority_only_with_a_proposal()
+    await test_an_approval_that_names_nothing_refuses_when_nothing_is_pending()
+    await test_the_correction_is_what_runs()
+    await test_the_plan_is_scoped_to_its_conversation()
+    await test_the_plan_is_scoped_to_its_project()
+    await test_an_independent_instruction_does_not_approve_a_proposal()
+    await test_conversation_plus_a_deferral_proposes_nothing()
+    await test_a_retrospective_or_stray_desire_is_not_a_proposal()
+    await test_the_explicit_request_forms_still_propose()
+    await test_a_prohibition_never_becomes_a_proposal()
+    await test_an_approved_plan_is_consumed_once()
+    check.finish()
+
+
+if __name__ == "__main__":
+    run(main)

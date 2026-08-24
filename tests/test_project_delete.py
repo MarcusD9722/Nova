@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.permissions import ADMIN, CRITICAL, STANDARD, evaluate, tier_of
-from core.project_manager import ProjectManager
+from core.project_manager import NotAProjectError, ProjectManager
 
 _fail = False
 
@@ -27,11 +27,96 @@ def check(cond, label):
 
 
 def make_project(pm: ProjectManager, name: str, files=3) -> Path:
-    p = pm.project_path(name)
-    p.mkdir(parents=True, exist_ok=True)
+    """A REAL project, i.e. one carrying the identity document.
+
+    This used to `mkdir` and stop, which made a directory rather than a
+    project. That was invisible while ProjectManager counted any directory
+    as a project; now that there is one definition and PROJECT.md is it,
+    the fixture has to build the thing it claims to build. Going through
+    `ensure_workspace` — the production creation path — also keeps it
+    honest about what a project actually looks like on disk.
+    """
+    p = pm.ensure_workspace(name)
     for i in range(files):
         (p / f"file{i}.py").write_text(f"# file {i}\nprint({i})\n", encoding="utf-8")
     return p
+
+
+async def test_delete_obeys_the_project_identity_contract():
+    """Destroying something is the last place a definition may drift.
+
+    Every read surface agrees that a directory without PROJECT.md is not a
+    project: `list_projects` omits it, conversation cannot name it, `select`
+    refuses it, `status` denies it, `last_active` will not return it. Measured
+    on b2a931e, `delete_project()` still accepted it and moved it to trash —
+    the one surface that disagreed was the destructive one.
+    """
+    print("\nidentity: delete refuses what is not a project")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        root = Path(td)
+        projects = root / "projects"
+        projects.mkdir()
+        pm = ProjectManager(repo_root=root, projects_dir=projects)
+
+        real = make_project(pm, "keeper", files=2)
+        raw = projects / "orphan-dir"
+        raw.mkdir()
+        (raw / "main.py").write_text("x = 1\n", encoding="utf-8")
+        before = (raw / "main.py").read_bytes()
+
+        check(pm.list_projects() == ["keeper"],
+              f"the raw directory is not a project ({pm.list_projects()})")
+        check(pm.list_unadopted() == ["orphan-dir"],
+              f"…it is unadopted ({pm.list_unadopted()})")
+
+        try:
+            pm.delete_project("orphan-dir")
+            check(False, "delete should refuse a directory that is not a project")
+        except NotAProjectError as e:
+            check("PROJECT.md" in str(e),
+                  f"delete refuses it, and says why ({str(e)[:70]!r})")
+
+        check(raw.is_dir(), "the directory is still there")
+        check((raw / "main.py").read_bytes() == before,
+              "its files are byte-identical, in place")
+        check(pm.list_unadopted() == ["orphan-dir"],
+              "and it is still reported as unadopted")
+        check(not (projects / ".trash").exists()
+              or not any((projects / ".trash").iterdir()),
+              "nothing was moved to trash")
+
+        # …and "not a project" is distinguishable from "not there at all",
+        # because only one of them has a remedy.
+        try:
+            pm.delete_project("no-such-thing")
+            check(False, "a missing directory should still raise")
+        except NotAProjectError:
+            check(False, "a missing directory must not report as 'not a project'")
+        except FileNotFoundError:
+            check(True, "a missing directory is still FileNotFoundError")
+
+        # ADOPT, then delete works normally.
+        res = pm.adopt_project("orphan-dir")
+        check(res["adopted"] is True, f"adoption converts it ({res})")
+        check("orphan-dir" in pm.list_projects(), "now it is a project")
+        info = pm.delete_project("orphan-dir")
+        check(info["project"] == "orphan-dir" and info["recoverable"] is True,
+              f"and delete works ({info})")
+        check(not raw.exists(), "the directory moved to trash")
+        restored = pm.restore_project(info["moved_to_trash"])
+        check(restored["restored"] == "orphan-dir",
+              f"restore brings it back under its own name ({restored})")
+        check((raw / "main.py").read_bytes() == before,
+              "with its original file intact")
+
+        # A real project is unaffected by any of this.
+        check("keeper" in pm.list_projects(), "the real project is untouched")
+        keep = pm.delete_project("keeper")
+        check(keep["project"] == "keeper", "and still deletes normally")
+        pm.restore_project(keep["moved_to_trash"])
+        check(real.is_dir() and "keeper" in pm.list_projects(),
+              "and restores normally")
 
 
 async def main():
@@ -52,13 +137,21 @@ async def main():
         projects.mkdir()
         pm = ProjectManager(repo_root=root, projects_dir=projects)
 
-        make_project(pm, "doomed", files=3)
+        doomed = make_project(pm, "doomed", files=3)
         make_project(pm, "keeper", files=2)
+        # Counted, not assumed. A real project carries its identity
+        # document and chat log as well as the fixture's source files, and
+        # the claim worth testing is that delete/purge REPORT what they
+        # actually moved — not that a project happens to hold three files.
+        doomed_files = sum(1 for f in doomed.rglob("*") if f.is_file())
+        check(doomed_files > 3,
+              f"a real project is more than its source files ({doomed_files})")
         check(pm.list_projects() == ["doomed", "keeper"], "both projects listed")
 
         # ── delete MOVES to trash; bytes survive ──
         res = pm.delete_project("doomed")
-        check(res["files"] == 3 and res["recoverable"] is True, f"delete reports what it moved ({res['files']} files)")
+        check(res["files"] == doomed_files and res["recoverable"] is True,
+              f"delete reports what it moved ({res['files']} of {doomed_files})")
         check(not (projects / "doomed").exists(), "project folder gone from projects/")
         check(pm.list_projects() == ["keeper"], "deleted project no longer listed")
         trashed = projects / ".trash" / res["moved_to_trash"]
@@ -88,7 +181,9 @@ async def main():
 
         # ── purge is the ONLY thing that destroys data ──
         purged = pm.purge_trash(entry)
-        check(purged["permanent"] is True and purged["purged"][0]["files"] == 3, "purge reports what it erased")
+        check(purged["permanent"] is True
+              and purged["purged"][0]["files"] == doomed_files,
+              f"purge reports what it erased ({purged['purged'][0]['files']})")
         check(not (projects / ".trash" / entry).exists(), "purged entry is gone for good")
         check((projects / "doomed").is_dir(), "the live project was untouched by the purge")
 
@@ -117,6 +212,8 @@ async def main():
             check(False, "deleting a missing project should raise")
         except FileNotFoundError:
             check(True, "missing project reports not-found honestly")
+
+    await test_delete_obeys_the_project_identity_contract()
 
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)
