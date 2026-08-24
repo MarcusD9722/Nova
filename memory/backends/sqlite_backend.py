@@ -698,12 +698,26 @@ class SQLiteMemoryBackend:
         status: str,
         result: dict[str, Any] | None = None,
         error: str = "",
-    ) -> None:
+    ) -> bool:
+        """Write the terminal outcome. The FIRST one wins; later ones no-op.
+
+        Returns whether this call is the one that landed.
+
+        Unguarded, this was `UPDATE ... WHERE task_id=?`, so any later caller
+        could overwrite a finished task. That is not hypothetical here: the
+        interruption handler added in this same commit runs from
+        `except CancelledError`, which can fire immediately AFTER a successful
+        `mark_task_done` has already committed — and would have replaced a
+        genuine `done` with `failed: interrupted`. A terminal state is a fact
+        about something that already happened, so the first one to be written
+        is the one that is true.
+        """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "UPDATE autonomy_tasks SET status=?, result_json=?, last_error=?, updated_at=? WHERE task_id=?",
+            cur = await db.execute(
+                "UPDATE autonomy_tasks SET status=?, result_json=?, last_error=?, "
+                "updated_at=? WHERE task_id=? AND status='running'",
                 (
                     status,
                     json.dumps(result or {}, ensure_ascii=False),
@@ -713,6 +727,7 @@ class SQLiteMemoryBackend:
                 ),
             )
             await db.commit()
+            return int(cur.rowcount or 0) == 1
 
     async def bump_autonomy_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
         await self.initialize()
@@ -726,9 +741,13 @@ class SQLiteMemoryBackend:
 
     async def list_autonomy_tasks(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
+        # `result_json` is selected because without it nothing that reads a
+        # task can see the outcome the worker recorded. That is what made
+        # S13B-1 invisible: the honest result was written, and no reader could
+        # reach it.
         query = (
             "SELECT task_id, conversation_id, project_name, title, details, priority, status, attempts, "
-            "last_error, initiated_by_user, created_at, updated_at FROM autonomy_tasks"
+            "last_error, initiated_by_user, result_json, created_at, updated_at FROM autonomy_tasks"
         )
         params: list[Any] = []
         if status:
@@ -753,33 +772,65 @@ class SQLiteMemoryBackend:
                 "attempts": r[7],
                 "last_error": r[8],
                 "initiated_by_user": bool(int(r[9] or 0)),
-                "created_at": r[10],
-                "updated_at": r[11],
+                "result_json": r[10],
+                "created_at": r[11],
+                "updated_at": r[12],
             }
             for r in rows
         ]
 
+    #: A task that never left the queue provably did nothing, so saying it was
+    #: cancelled is simply true.
+    _STARTUP_CANCEL = (
+        "UPDATE {table} SET status='cancelled', last_error=?, updated_at=? "
+        "WHERE status='queued'")
+
+    #: A task that was RUNNING when the process died is a different fact. It had
+    #: been claimed, it may have invoked a tool, and nothing survived to say
+    #: which. Recording it as `cancelled` asserts that it never happened, and
+    #: that assertion is not one this process is in a position to make.
+    _STARTUP_INTERRUPTED = (
+        "UPDATE {table} SET status='failed', last_error=?, updated_at=? "
+        "WHERE status='running'")
+
     async def cancel_pending_background_work(self) -> dict[str, int]:
-        """Cancel queued/running background work from older sessions.
+        """Clear background work left over from an older session.
 
         This prevents stale autonomous jobs from auto-resuming on process restart
         and repeatedly invoking the model before a user asks for new work.
+
+        Queued and running rows are NOT the same thing and are no longer written
+        the same way. Both used to become `cancelled` / "cancelled_on_startup",
+        so a task that had been interrupted halfway through a tool call was
+        recorded exactly like one that never started — a definite claim that the
+        work never happened, made about something the process could not know.
         """
         await self.initialize()
         now = self._now_iso()
+        interrupted_note = (
+            "interrupted by a restart while it was running. Whether its tool "
+            "completed is unknown: it was claimed and may have acted before "
+            "the process stopped.")
         async with aiosqlite.connect(self._db_path) as db:
-            cur1 = await db.execute(
-                "UPDATE autonomy_tasks SET status='cancelled', last_error=?, updated_at=? WHERE status IN ('queued','running')",
-                ("cancelled_on_startup", now),
-            )
-            cur2 = await db.execute(
-                "UPDATE tasks SET status='cancelled', last_error=?, updated_at=? WHERE status IN ('queued','running')",
-                ("cancelled_on_startup", now),
-            )
+            totals: dict[str, int] = {}
+            interrupted = 0
+            for key, table in (("autonomy_tasks", "autonomy_tasks"),
+                               ("goal_tasks", "tasks")):
+                cur_q = await db.execute(
+                    self._STARTUP_CANCEL.format(table=table),
+                    ("cancelled_on_startup", now))
+                cur_r = await db.execute(
+                    self._STARTUP_INTERRUPTED.format(table=table),
+                    (interrupted_note, now))
+                n_q, n_r = int(cur_q.rowcount or 0), int(cur_r.rowcount or 0)
+                totals[key] = n_q + n_r
+                interrupted += n_r
             await db.commit()
-            autonomy_n = int(cur1.rowcount or 0)
-            goal_n = int(cur2.rowcount or 0)
-        return {"autonomy_tasks": autonomy_n, "goal_tasks": goal_n}
+        # `interrupted` is additive: existing callers read the two totals and
+        # keep working, and anything that wants to say "N were mid-flight" now
+        # can.
+        totals["interrupted"] = interrupted
+        return totals
 
     @staticmethod
     def _now_iso() -> str:

@@ -3195,17 +3195,29 @@ class MemoryUnifier:
         items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
         return items[:limit]
 
-    async def mark_task_done(self, *, task_id: str, result: dict[str, Any] | None = None) -> None:
-        await self.initialize()
-        async with self._write_lock:
-            await self._sqlite.complete_autonomy_task(task_id=task_id, status="done", result=result or {}, error="")
-        BUS.publish("task.completed", {"task_id": str(task_id), "status": "done"})
+    async def mark_task_done(self, *, task_id: str, result: dict[str, Any] | None = None) -> bool:
+        """Record success. Returns whether this call is the one that landed.
 
-    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None) -> None:
+        The announcement is conditional on the write. `complete_autonomy_task`
+        is first-write-wins, so a second caller changes nothing -- and a bus
+        event for a write that did not happen is the same lie as a row that
+        disagrees with it, one layer out.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error)
-        BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
+            applied = await self._sqlite.complete_autonomy_task(task_id=task_id, status="done", result=result or {}, error="")
+        if applied:
+            BUS.publish("task.completed", {"task_id": str(task_id), "status": "done"})
+        return applied
+
+    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None) -> bool:
+        """Record failure. Returns whether this call is the one that landed."""
+        await self.initialize()
+        async with self._write_lock:
+            applied = await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error)
+        if applied:
+            BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
+        return applied
 
     async def bump_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
         await self.initialize()
