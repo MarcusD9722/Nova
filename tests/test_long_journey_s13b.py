@@ -49,6 +49,8 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 from harness import Checks, ScriptedLLM, run  # noqa: E402
 
 from core.policy.autonomy_planner import AutonomyPlannerLLM  # noqa: E402
+from core.agent_supervisor import (AgentSupervisor,  # noqa: E402
+                                   SupervisorConfig)
 from core.tool_router import ToolRouter  # noqa: E402
 from core.workers.autonomy_supervisor import (  # noqa: E402
     AutonomySupervisorWorker)
@@ -608,10 +610,143 @@ async def journey_three_background_work():
         check(j.n >= 20, f"the journey ran {j.n} checked transitions")
 
 
+# -- journey 4: the real supervisor, deciding its own way through a goal -----
+
+
+async def journey_four_supervisor_decides():
+    """The decision loop end to end, then cancelled while it is thinking.
+
+    Journeys 1 and 2 drive the lifecycle directly, which is the only way to
+    force an exact interleaving. This one hands the wheel to `AgentSupervisor`
+    and lets it decide, schedule, execute and finish on its own -- so the
+    fenced `apply_*_decision` transactions, the claim, the completion fence and
+    the progress record are all exercised together, by the code that really
+    runs them.
+
+    The model is scripted, so the sequence is fixed; nothing else is faked.
+    """
+    check.section("journey 4: the supervisor decides, acts, and is cancelled")
+    j = Journey()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        mem = MemoryUnifier(Path(td) / "nova", enable_chroma=False)
+        await mem.initialize()
+
+        ran: list[str] = []
+        gate_open = asyncio.Event()
+        gate_open.set()
+
+        async def demo_ok(_a):
+            ran.append("demo.ok")
+            await gate_open.wait()
+            return {"ok": True, "wrote": "game.js"}
+
+        llm = ScriptedLLM()
+        decisions = {"n": 0}
+
+        def decide(_prompt: str) -> str:
+            decisions["n"] += 1
+            if decisions["n"] == 1:
+                return '{"type":"tool","name":"demo.ok","args":{}}'
+            return '{"type":"final","message":"the pause menu is in"}'
+
+        llm.when(lambda _t: True, decide, label="decide")
+        sup = AgentSupervisor(
+            memory=mem, llm=llm, router=ToolRouter({"demo.ok": demo_ok}, {}),
+            tool_descriptions={"demo.ok": "writes a file"},
+            cfg=SupervisorConfig(tick_seconds=0.05, max_retries=1,
+                                 max_steps_per_goal=6))
+
+        goal_id = await mem.create_goal(project_name=GAME,
+                                        title="add a pause menu",
+                                        objective="pause menu",
+                                        success_criteria="it pauses")
+        await mem.enqueue_goal_task(goal_id=goal_id, project_name=GAME,
+                                    tool_name="__decide__", args={})
+
+        sup.start()
+        try:
+            for _ in range(400):
+                await asyncio.sleep(0.05)
+                row = await mem.get_goal(goal_id=goal_id)
+                if str((row or {}).get("status")) != "active":
+                    break
+        finally:
+            await sup.stop()
+
+        goal = await mem.get_goal(goal_id=goal_id)
+        t = await truths(mem, GAME)
+        check(ran == ["demo.ok"],
+              j.step(f"the supervisor chose and ran the tool once ({ran})"))
+        check(str(goal.get("status")) == "completed",
+              j.step(f"and drove the goal to completion ({goal.get('status')!r})"))
+        check(len(t.succeeded) >= 2 and not t.failed,
+              j.step(f"every step it took is recorded as done ({t.summary()})"))
+        check(not t.pending,
+              j.step(f"with nothing left pending ({t.summary()})"))
+
+        # The progress record is readable, and says what happened in order.
+        events = await mem.list_progress_events(goal_id=str(goal_id), limit=50)
+        kinds = [str(e.get("kind")) for e in events]
+        check(bool(events), j.step(f"the run left a readable record ({kinds})"))
+        check(any("demo.ok" in str(e.get("message") or "") for e in events),
+              j.step("naming the tool it ran"))
+        check(all(str(e.get("goal_id")) == str(goal_id) for e in events),
+              j.step("all of it belonging to this goal"))
+
+        # -- a second goal, cancelled while its tool is in flight ----------
+        gate_open.clear()
+        decisions["n"] = 0
+        goal2 = await mem.create_goal(project_name=GAME, title="add sound",
+                                      objective="sound", success_criteria="it beeps")
+        await mem.enqueue_goal_task(goal_id=goal2, project_name=GAME,
+                                    tool_name="__decide__", args={})
+        sup.start()
+        try:
+            for _ in range(400):
+                await asyncio.sleep(0.05)
+                if len(ran) >= 2:
+                    break
+            check(len(ran) == 2, j.step(f"its tool is mid-flight ({ran})"))
+            await mem.cancel_goal(goal_id=goal2)
+            gate_open.set()
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                rows = await mem.list_goal_tasks(goal_id=str(goal2), limit=20)
+                if all(str(r.get("status")) not in ("queued", "running")
+                       for r in rows):
+                    break
+        finally:
+            await sup.stop()
+
+        goal2row = await mem.get_goal(goal_id=goal2)
+        rows = await mem.list_goal_tasks(goal_id=str(goal2), limit=20)
+        done = [r for r in rows if str(r.get("status")) == "done"]
+        check(str(goal2row.get("status")) == "cancelled",
+              j.step(f"the cancelled goal stays cancelled "
+                     f"({goal2row.get('status')!r})"))
+        check(not any(str(r.get("tool_name")) == "demo.ok" for r in done),
+              j.step(f"and the tool that finished after the cancel is NOT "
+                     f"counted as done ({[(r.get('tool_name'), r.get('status')) for r in rows]})"))
+        check(all(str(r.get("status")) not in ("queued", "running")
+                  for r in rows),
+              j.step("nothing is left runnable or stranded"))
+
+        after = await mem.list_progress_events(goal_id=str(goal2), limit=50)
+        msgs = [str(e.get("message") or "") for e in after]
+        check(not any("completed" in m and "demo.ok" in m for m in msgs),
+              j.step(f"nothing announces the cancelled run as progress ({msgs})"))
+        check(any("not counted as work done" in m for m in msgs),
+              j.step("it says the work landed too late instead"))
+
+        check(j.n >= 13, f"the journey ran {j.n} checked transitions")
+
+
 async def main():
     await journey_one_long_build()
     await journey_two_retries_and_revisions()
     await journey_three_background_work()
+    await journey_four_supervisor_decides()
     check.finish()
 
 
