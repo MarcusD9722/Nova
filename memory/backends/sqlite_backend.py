@@ -883,11 +883,40 @@ class SQLiteMemoryBackend:
                 n_q, n_r = int(cur_q.rowcount or 0), int(cur_r.rowcount or 0)
                 totals[key] = n_q + n_r
                 interrupted += n_r
+            # A goal whose work was just cancelled is not still going. It
+            # was left `active` with every task cancelled, nothing claimable,
+            # and no record of why -- so it would never progress, nothing would
+            # ever say so, and "what are you working on?" still answered with
+            # it. Measured on 6805224: goal active, tasks {'cancelled': 2},
+            # claim -> None, progress events [].
+            #
+            # `paused` is the honest word and the useful one: resume already
+            # opens exactly one new bounded run with a fresh `__decide__`, so
+            # this leaves the goal somewhere a person can actually pick it up
+            # from, instead of somewhere nothing can.
+            cur = await db.execute(
+                "SELECT goal_id, project_name FROM goals WHERE status='active'")
+            stranded = list(await cur.fetchall())
+            if stranded:
+                await db.execute(
+                    "UPDATE goals SET status='paused', updated_at=? "
+                    "WHERE status='active'", (now,))
+                for gid, proj in stranded:
+                    await db.execute(
+                        "INSERT INTO progress_events(event_id, goal_id, "
+                        "project_name, kind, message, created_at, acknowledged) "
+                        "VALUES(?, ?, ?, ?, ?, ?, 0)",
+                        (str(uuid4()), str(gid), str(proj), "blocked",
+                         "Paused when Nova restarted: the work already queued "
+                         "was stopped so nothing would run unasked. Resume it "
+                         "to carry on.", now))
             await db.commit()
-        # `interrupted` is additive: existing callers read the two totals and
-        # keep working, and anything that wants to say "N were mid-flight" now
+        # `interrupted` and `paused_goals` are additive: existing callers read
+        # the two totals and keep working, and anything that wants to say "N
+        # were mid-flight" or "N goals are waiting to be picked back up" now
         # can.
         totals["interrupted"] = interrupted
+        totals["paused_goals"] = len(stranded)
         return totals
 
     @staticmethod

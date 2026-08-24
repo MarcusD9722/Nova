@@ -742,11 +742,123 @@ async def journey_four_supervisor_decides():
         check(j.n >= 13, f"the journey ran {j.n} checked transitions")
 
 
+# -- journey 5: what a restart leaves behind, and whether it can be resumed --
+
+
+async def journey_five_restart_integrity():
+    """A restart must leave a goal somewhere a person can pick it up from.
+
+    Boot recovery cancels queued and running background work so nothing runs
+    unasked. That is right for the WORK. It said nothing about the GOAL, which
+    was left `active` with every task cancelled: nothing claimable, nothing
+    scheduled, and no record of why. It would never progress, nothing would
+    ever mention it, and "what are you working on?" still answered with it.
+
+    A state nothing can leave is not a checkpoint. This journey ends by
+    actually resuming, because `paused` is only an honest answer if resume
+    genuinely works from it.
+    """
+    check.section("journey 5: a restart leaves a goal somewhere resumable")
+    j = Journey()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        store = Path(td) / "nova"
+        mem = MemoryUnifier(store, enable_chroma=False)
+        await mem.initialize()
+
+        # The second project FIRST, and finished, so that recovery can be
+        # shown not to reach past what it should. Order matters: the claim is
+        # global and takes the oldest runnable row, so seeding this second
+        # would have handed `_claim_and_finish` the other project's step.
+        done_goal, _ = await _seed(mem, CALC, "add a percent key", ["code.write"])
+        finished_id, _o = await _claim_and_finish(mem, status="done")
+        c = await truths(mem, CALC)
+        check(finished_id in c.succeeded,
+              j.step(f"the other project has finished its step ({c.summary()})"))
+
+        goal_id = await mem.create_goal(project_name=GAME,
+                                        title="add a pause menu",
+                                        objective="pause menu",
+                                        success_criteria="it pauses")
+        await mem.enqueue_goal_task(goal_id=goal_id, project_name=GAME,
+                                    tool_name="__decide__", args={})
+        await mem.enqueue_goal_task(goal_id=goal_id, project_name=GAME,
+                                    tool_name="code.write", args={})
+        g = await truths(mem, GAME)
+        check(len(g.may_resume) == 2,
+              j.step(f"and this one has queued work ({g.summary()})"))
+
+        # -- the process stops and comes back -----------------------------
+        del mem
+        mem2 = MemoryUnifier(store, enable_chroma=False)
+        await mem2.initialize()
+        recovered = await mem2.cancel_pending_background_work()
+
+        goal = await mem2.get_goal(goal_id=goal_id) or {}
+        g = await truths(mem2, GAME)
+        check(str(goal.get("status")) != "active",
+              j.step(f"the goal is not left claiming to be running "
+                     f"({goal.get('status')!r})"))
+        check(str(goal.get("status")) == "paused",
+              j.step(f"it is paused ({goal.get('status')!r})"))
+        check(not g.may_resume,
+              j.step(f"with nothing runnable ({g.summary()})"))
+        check(await mem2.claim_next_goal_task() is None,
+              j.step("and nothing claims for it"))
+        # BOTH goals were active -- finishing a step does not close a goal --
+        # so both are paused. That is the point: every goal a restart leaves
+        # without a worker gets said out loud, not just the busy one.
+        check(int(recovered.get("paused_goals") or 0) == 2,
+              j.step(f"boot recovery says what it did ({recovered})"))
+
+        # It is not silent about it either.
+        events = await mem2.list_progress_events(goal_id=str(goal_id), limit=20)
+        msgs = [str(e.get("message") or "") for e in events]
+        check(any("restart" in m for m in msgs),
+              j.step(f"and the goal's own record says why ({msgs})"))
+        check(any("Resume" in m for m in msgs),
+              j.step("and what to do about it"))
+
+        # The finished work of the other project is untouched by any of this.
+        c = await truths(mem2, CALC)
+        check(finished_id in c.succeeded,
+              j.step(f"work that had already finished is not disturbed "
+                     f"({c.summary()})"))
+        done_row = await mem2.get_goal(goal_id=done_goal) or {}
+        check(str(done_row.get("status")) == "paused",
+              j.step(f"its goal is paused too, not cancelled "
+                     f"({done_row.get('status')!r})"))
+
+        # -- and it can genuinely be picked back up ------------------------
+        rev_before = int(goal.get("generation") or 0)
+        await mem2.resume_goal(goal_id=goal_id)
+        goal = await mem2.get_goal(goal_id=goal_id) or {}
+        g = await truths(mem2, GAME)
+        check(str(goal.get("status")) == "active",
+              j.step(f"resuming makes it active again ({goal.get('status')!r})"))
+        check(int(goal.get("generation") or 0) > rev_before,
+              j.step(f"on a new run ({rev_before} -> {goal.get('generation')})"))
+        check(bool(g.may_resume),
+              j.step(f"with work it can actually do ({g.summary()})"))
+
+        nxt = await mem2.claim_next_goal_task()
+        check(nxt is not None and str(nxt.get("goal_id")) == str(goal_id),
+              j.step(f"which the queue hands out ({(nxt or {}).get('tool_name')!r})"))
+        check(nxt is not None
+              and int(nxt.get("generation")) == int(goal.get("generation") or 0),
+              j.step(f"on the current run ({(nxt or {}).get('generation')})"))
+        check(nxt is not None and str(nxt.get("tool_name")) == "__decide__",
+              j.step("and it is a fresh decision, not the cancelled step"))
+
+        check(j.n >= 16, f"the journey ran {j.n} checked transitions")
+
+
 async def main():
     await journey_one_long_build()
     await journey_two_retries_and_revisions()
     await journey_three_background_work()
     await journey_four_supervisor_decides()
+    await journey_five_restart_integrity()
     check.finish()
 
 
