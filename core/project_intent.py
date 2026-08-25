@@ -55,6 +55,7 @@ __all__ = [
     "is_bare_approval",
     "approves_without_naming_a_change",
     "qualified_project_name",
+    "requests_project_removal",
 ]
 
 
@@ -605,6 +606,80 @@ thing things stuff bit part now right just yet please really actually
 def _content_words(text: str) -> set:
     return {w for w in re.findall(r"[a-z0-9][a-z0-9'-]*", (text or "").lower())
             if w not in _TARGET_STOPWORDS and len(w) > 2}
+
+
+#: Verbs that ask for a thing to STOP EXISTING, as opposed to being changed.
+#: "retire" and "archive" are here because a user reaches for them meaning the
+#: same thing; Nova has no such capability and must not quietly invent one by
+#: treating the sentence as an edit instead.
+_REMOVAL_VERB_RE = re.compile(
+    r"\b(delete|deleting|remove|removing|erase|erasing|trash|purge|purging|"
+    r"retire|retiring|archive|archiving|get\s+rid\s+of|throw\s+(?:it\s+)?away)\b",
+    re.I)
+
+#: How far after the verb its object may sit: "delete the with-you project",
+#: "remove the project called with-you". Long enough for an article, an
+#: adjective and a noun; short enough that a project named later in a different
+#: clause is not mistaken for this verb's object.
+_REMOVAL_OBJECT_WINDOW = 44
+
+#: After one of these, whatever follows is where the removal happens, not what
+#: is being removed.
+_CONTAINER_PREP_RE = re.compile(
+    r"\b(from|in|inside|within|on|out\s+of|off\s+of)\b", re.I)
+
+
+def requests_project_removal(text: str, *, slug: str = "") -> bool:
+    """Is this asking for the PROJECT to stop existing?
+
+    The distinction that matters, and the one Nova got wrong:
+
+        "delete with-you"                 the project itself
+        "remove the pause button from it" a feature inside the project
+
+    Both are removals, and both were authorised as "a project mutation" —
+    after which the caller ran `improve()` on whichever one it was. Measured on
+    55c485b: "Please delete with-you, I mean it." started an autonomous CODE
+    EDIT of with-you and answered "working on those improvements to with-you
+    now". The delete never happened, the permission gate was never reached, and
+    Nova reported work it was not doing.
+
+    Deciding by ADJACENCY rather than by mere presence of a removal word is
+    what separates the two: the object of the removal verb has to BE the
+    project — its slug, or the word "project" itself. A feature name sitting
+    there means the removal is inside the project, which is ordinary edit work.
+
+    Returns False when it cannot tell. That leaves the existing edit path in
+    charge, which is the conservative direction: a missed classification here
+    costs an edit that a person can undo, while a wrong one aims a
+    permission-gated delete at a project nobody asked to lose.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    targets = {"project", "projects"}
+    for part in re.split(r"[-_\s]+", (slug or "").lower()):
+        if len(part) > 2:
+            targets.add(part)
+    if (slug or "").strip():
+        targets.add((slug or "").strip().lower())
+
+    for m in _REMOVAL_VERB_RE.finditer(raw):
+        window = raw[m.end():m.end() + _REMOVAL_OBJECT_WINDOW].lower()
+        # Stop at a preposition that puts the project back in the position of
+        # a CONTAINER rather than the thing being removed. Without this,
+        # "remove the pause button FROM with-you" reads as removing with-you,
+        # because the slug is still inside the window.
+        cut = _CONTAINER_PREP_RE.search(window)
+        if cut:
+            window = window[:cut.start()]
+        # The slug may be written with spaces where the directory has hyphens.
+        flattened = re.sub(r"[-_\s]+", " ", window)
+        for t in targets:
+            spaced = re.sub(r"[-_\s]+", " ", t)
+            if spaced and re.search(rf"\b{re.escape(spaced)}\b", flattened):
+                return True
+    return False
 
 
 def defers_a_change(text: str) -> bool:
