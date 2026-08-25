@@ -209,6 +209,46 @@ inflated:
 
 ---
 
+## Full gates
+
+Three consecutive runs of `run_tests.ps1` on the final head:
+
+| run | result | failing suites |
+|---|---|---|
+| 1 | **PASSED: 140/140** | 0 |
+| 2 | **PASSED: 140/140** | 0 |
+| 3 | **PASSED: 140/140** | 0 |
+
+420 suite runs seen (140 x 3), 139 with an explicit verdict in all three, zero
+non-pass verdicts. One opt-in skip (`test_cloud_live.py`, needs
+`NOVA_CLOUD_LIVE=1` and real tokens) and one suite reporting success in its own
+wording rather than the harness format (`test_memory_hardening.py`, prints
+"ALL OFFLINE CHECKS PASSED").
+
+Output was captured from the console rather than through `Out-File`:
+`run_tests.ps1` writes with `Write-Host`, which bypasses the pipeline, and an
+earlier attempt at capturing these logs produced three 0-byte files. "Zero
+failing suites" read off those would have been vacuous.
+
+THE FIRST ATTEMPT AT THESE THREE GATES REPORTED 138/140 - the same two suites
+in all three runs, which is the opposite of a flake and precisely why three
+runs are required. Both were real signals about this stage's own changes:
+
+`test_permission_handshake_p10` R25 pinned the ABSENCE of an approval surface
+and was written to fail the day one landed, so that whoever added it had to
+test the lifecycle rather than assume it. One landed here. Inverted rather than
+deleted: a consumer must now exist, and it points at the suite that exercises
+timeout, denial, approval, a late click reporting applied=false, and a fresh
+user turn.
+
+`test_orchestrator_p2` asserted a failing tool is attempted twice. The turn
+fence makes a NON-retry-safe tool dead after one failure, which is what the
+router's contract has always said. Both rules are now covered rather than one
+relaxed: a retry-safe flaky tool still gets two strikes, a side-effecting one
+gets a single attempt.
+
+---
+
 ## Build and checks
 
 - `npm run build` — passes
