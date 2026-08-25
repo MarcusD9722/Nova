@@ -177,6 +177,8 @@ async def test_an_interruption_before_any_tool_ran_says_so():
               f"and is not recorded as done ({row.get('status')!r})")
         check("nothing was executed" in _note(row),
               f"the record says nothing was executed ({_note(row)!r})")
+        check(str(row.get("outcome")) == "never_started",
+              f"and the outcome says so too ({row.get('outcome')!r})")
 
 
 async def test_an_interruption_mid_tool_is_recorded_as_unknown():
@@ -227,6 +229,13 @@ async def test_an_interruption_mid_tool_is_recorded_as_unknown():
               f"the record says the outcome is unknown ({note!r})")
         check("work.step" in note,
               f"and names what was in flight ({note!r})")
+        # The OUTCOME the worker chose, not just its prose. Asserting the
+        # sentence alone let a mutant swap `unknown` for `never_started` and
+        # for `succeeded` without a single test noticing.
+        check(str(row.get("outcome")) == "unknown",
+              f"the recorded outcome is unknown ({row.get('outcome')!r})")
+        check(str(row.get("outcome")) not in ("succeeded", "never_started"),
+              "neither claimed nor denied")
 
 
 async def test_an_interruption_after_the_tool_keeps_what_is_known():
@@ -249,6 +258,8 @@ async def test_an_interruption_after_the_tool_keeps_what_is_known():
               f"the record says the call completed ({note!r})")
         check("cannot tell whether it completed" not in note,
               f"and does NOT call a known outcome unknown ({note!r})")
+        check(str(row.get("outcome")) == "succeeded",
+              f"the call's real verdict is kept ({row.get('outcome')!r})")
 
 
 async def test_a_restart_does_not_call_an_interrupted_task_a_non_event():
