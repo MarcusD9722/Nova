@@ -171,6 +171,12 @@ async def truths(mem, project: str) -> Truth:
                  await mem.list_goals(limit=100), project)
 
 
+async def _row_of(mem, task_id: str) -> dict:
+    for t in await mem.list_goal_tasks(limit=200):
+        if str(t.get("task_id")) == str(task_id):
+            return t
+    return {}
+
 class Journey:
     """Numbered steps, so a failure names the transition that produced it."""
 
@@ -853,12 +859,320 @@ async def journey_five_restart_integrity():
         check(j.n >= 16, f"the journey ran {j.n} checked transitions")
 
 
+# -- journey 8: an ambiguous side effect, and a run that ends under it -------
+
+
+async def journey_eight_ambiguous_side_effects():
+    """The hardest thing to record honestly: work whose fate is not knowable.
+
+    Two shapes, deliberately side by side, because the whole point is that they
+    must not come out the same:
+
+      KNOWN   the tool finished and said what happened; the run ended before
+              the answer was written down. History keeps the outcome; the
+              current run is untouched.
+      UNKNOWN the process died with the tool in flight. Nothing anywhere can
+              say whether the side effect landed, and saying either "it did" or
+              "it did not" is a claim Nova cannot support.
+
+    The stage's first two defects were these two collapsing into "done" and
+    into "cancelled" respectively.
+    """
+    check.section("journey 8: a known outcome and an unknowable one")
+    j = Journey()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        store = Path(td) / "nova"
+        mem = MemoryUnifier(store, enable_chroma=False)
+        await mem.initialize()
+
+        # 01  a goal, and a step that reaches the side-effect boundary.
+        goal_a, _ = await _seed(mem, GAME, "upload the build", ["deploy.push"])
+        claimed = await mem.claim_next_goal_task()
+        tid_known = str(claimed["task_id"])
+        gen_known = int(claimed["generation"])
+        t = await truths(mem, GAME)
+        check(t.status_of(tid_known) == "running",
+              j.step(f"the step is in flight ({t.status_of(tid_known)})"))
+        check(tid_known not in t.succeeded and tid_known not in t.failed,
+              j.step("and nothing is claimed about it yet"))
+
+        # 02  the run ends underneath it.
+        await mem.cancel_goal(goal_id=goal_a)
+        t = await truths(mem, GAME)
+        check(t.revision_of(str(goal_a)) == gen_known + 1,
+              j.step(f"the revision moves on ({t.revision_of(str(goal_a))})"))
+
+        # 03  the tool returns, and it KNOWS it succeeded.
+        verdict = await mem.complete_goal_task(
+            task_id=tid_known, status="done", result={"ok": True}, error="",
+            expected_generation=gen_known)
+        row = await _row_of(mem, tid_known)
+        check(verdict == "superseded",
+              j.step(f"the completion is superseded ({verdict})"))
+        check(str(row.get("status")) == "superseded",
+              j.step(f"the step is not counted as done ({row.get('status')})"))
+        check(str(row.get("outcome")) == "succeeded",
+              j.step(f"but the tool's success is preserved ({row.get('outcome')})"))
+        check(str(row.get("outcome")) != "never_started",
+              j.step("nothing claims it never ran"))
+
+        # 04  the current run is untouched by any of it.
+        goal_row = await mem.get_goal(goal_id=goal_a) or {}
+        check(str(goal_row.get("status")) == "cancelled",
+              j.step(f"the goal is still cancelled ({goal_row.get('status')})"))
+        live = [x for x in await mem.list_goal_tasks(goal_id=str(goal_a), limit=20)
+                if int(x.get("generation")) == int(goal_row.get("generation"))]
+        check(all(str(x.get("status")) != "done" for x in live),
+              j.step(f"and nothing on the new revision was completed ({len(live)})"))
+
+        # 05-06  now the UNKNOWN shape, on the autonomy side.
+        unknown_id = str(await mem.enqueue_task(
+            title="upload the build", details="d", project_name=GAME,
+            initiated_by_user=True))
+        await mem.claim_next_task()
+        await mem.mark_task_failed(
+            task_id=unknown_id, outcome="unknown",
+            error="interrupted while 'deploy.push' was running. Nova cannot "
+                  "tell whether it completed.",
+            result={"status": "interrupted_tool_unknown"})
+        arow = await _auto_row(mem, unknown_id)
+        check(str(arow.get("outcome")) == "unknown",
+              j.step(f"the unknowable one is unknown ({arow.get('outcome')})"))
+        check(str(arow.get("outcome")) not in ("succeeded", "never_started"),
+              j.step("neither claimed nor denied"))
+
+        # 07  the two shapes are distinguishable, which is the entire point.
+        check(str(row.get("outcome")) != str(arow.get("outcome")),
+              j.step(f"known and unknown read differently "
+                     f"({row.get('outcome')} vs {arow.get('outcome')})"))
+
+        # 08-10  a restart, and both survive as themselves.
+        del mem
+        mem2 = MemoryUnifier(store, enable_chroma=False)
+        await mem2.initialize()
+        recovered = await mem2.cancel_pending_background_work()
+        row2 = await _row_of(mem2, tid_known)
+        arow2 = await _auto_row(mem2, unknown_id)
+        check((str(row2.get("status")), str(row2.get("outcome")))
+              == ("superseded", "succeeded"),
+              j.step(f"the known one reloads intact "
+                     f"({row2.get('status')}/{row2.get('outcome')})"))
+        check(str(arow2.get("outcome")) == "unknown",
+              j.step(f"the unknown one is still unknown ({arow2.get('outcome')})"))
+        check(int(recovered.get("interrupted") or 0) == 0,
+              j.step(f"and the restart invents no new in-flight work ({recovered})"))
+
+        # 11-13  the goal can be picked back up, on a fresh revision.
+        before = int((await mem2.get_goal(goal_id=goal_a) or {}).get("generation"))
+        await mem2.resume_goal(goal_id=goal_a)
+        after = await mem2.get_goal(goal_id=goal_a) or {}
+        check(str(after.get("status")) == "active",
+              j.step(f"resuming reactivates it ({after.get('status')})"))
+        check(int(after.get("generation")) >= before,
+              j.step(f"on a revision no older than before "
+                     f"({before} -> {after.get('generation')})"))
+        nxt = await mem2.claim_next_goal_task()
+        check(nxt is not None and str(nxt.get("task_id")) != tid_known,
+              j.step(f"and the superseded step is NOT what resumes "
+                     f"({(nxt or {}).get('tool_name')})"))
+
+        # 14  finish the fresh run properly.
+        if nxt:
+            v = await mem2.complete_goal_task(
+                task_id=str(nxt["task_id"]), status="done",
+                result={"ok": True}, error="",
+                expected_generation=int(nxt["generation"]))
+            check(v == "applied",
+                  j.step(f"the fresh step completes normally ({v})"))
+        final = await _row_of(mem2, tid_known)
+        check(str(final.get("status")) == "superseded",
+              j.step(f"without disturbing the superseded one "
+                     f"({final.get('status')})"))
+
+        check(j.n >= 18, f"the journey ran {j.n} checked transitions")
+
+
+# -- journey 9: two projects, duplicate delivery, drift and a restart --------
+
+
+async def journey_nine_interleaved_with_duplicates():
+    """The long one. Two projects interleaved, every duplicate-delivery shape,
+    an artifact changing underneath, a restart in the middle, and a final
+    check that the project which was never touched is byte-for-byte untouched.
+
+    Nothing here is new machinery; it is the combination that is the test.
+    """
+    check.section("journey 9: A and B interleaved, with duplicates and drift")
+    j = Journey()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        store = Path(td) / "nova"
+        mem = MemoryUnifier(store, enable_chroma=False)
+        await mem.initialize()
+
+        # 01-03  project A starts and takes a step.
+        goal_a, _ = await _seed(mem, GAME, "add a pause menu",
+                                ["code.write", "code.test"])
+        c1 = await mem.claim_next_goal_task()
+        a_first = str(c1["task_id"])
+        v = await mem.complete_goal_task(
+            task_id=a_first, status="done", result={"ok": True}, error="",
+            expected_generation=int(c1["generation"]))
+        ta = await truths(mem, GAME)
+        check(v == "applied", j.step(f"A's first step lands ({v})"))
+        check(a_first in ta.succeeded, j.step(f"and counts ({ta.summary()})"))
+
+        # 04-05  switch to B and do work there.
+        goal_b, _ = await _seed(mem, CALC, "add a percent key", ["code.write"])
+        c2 = await mem.claim_next_goal_task()
+        check(str(c2.get("project_name")) == GAME,
+              j.step(f"the queue is still on A's older work "
+                     f"({c2.get('project_name')})"))
+        b_gen = int(c2["generation"])
+        await mem.bump_goal_task_attempt(
+            task_id=str(c2["task_id"]), attempts=1,
+            run_after_iso="2000-01-01T00:00:00+00:00",
+            error="network blipped", expected_generation=b_gen)
+        ta = await truths(mem, GAME)
+        check(str(c2["task_id"]) in ta.may_resume,
+              j.step(f"A's retried step may resume ({ta.summary()})"))
+
+        # 06-08  duplicate retry, which must change nothing.
+        again = await mem.bump_goal_task_attempt(
+            task_id=str(c2["task_id"]), attempts=2,
+            run_after_iso="2000-01-01T00:00:00+00:00",
+            error="network blipped", expected_generation=b_gen)
+        check(again is False,
+              j.step(f"a duplicate retry is refused ({again})"))
+        ta2 = await truths(mem, GAME)
+        check(ta2.status_of(str(c2["task_id"])) == "queued",
+              j.step(f"and the step is where it was "
+                     f"({ta2.status_of(str(c2['task_id']))})"))
+        tb = await truths(mem, CALC)
+        check(not tb.failed and not tb.cancelled,
+              j.step(f"B is untouched by any of it ({tb.summary()})"))
+
+        # 09-11  pause A, work B to completion.
+        await mem.update_goal_status(goal_id=goal_a, status="paused")
+        cb = await mem.claim_next_goal_task()
+        check(cb is not None and str(cb.get("project_name")) == CALC,
+              j.step(f"with A paused the queue moves to B "
+                     f"({(cb or {}).get('project_name')})"))
+        vb = await mem.complete_goal_task(
+            task_id=str(cb["task_id"]), status="done", result={"ok": True},
+            error="", expected_generation=int(cb["generation"]))
+        tb = await truths(mem, CALC)
+        check(vb == "applied" and str(cb["task_id"]) in tb.succeeded,
+              j.step(f"B's step completes ({tb.summary()})"))
+
+        # 12-14  duplicate and contradictory completion on B.
+        dup = await mem.complete_goal_task(
+            task_id=str(cb["task_id"]), status="done", result={"ok": True},
+            error="", expected_generation=int(cb["generation"]))
+        contra = await mem.complete_goal_task(
+            task_id=str(cb["task_id"]), status="failed", result={},
+            error="actually it broke", expected_generation=int(cb["generation"]))
+        tb = await truths(mem, CALC)
+        check(dup == "ignored" and contra == "ignored",
+              j.step(f"repeats are ignored ({dup}, {contra})"))
+        check(str(cb["task_id"]) in tb.succeeded,
+              j.step(f"the first answer stands ({tb.summary()})"))
+        check(str(cb["task_id"]) not in tb.failed,
+              j.step("and it is not also recorded as a failure"))
+
+        # 15-17  a restart in the middle of all of it.
+        del mem
+        mem = MemoryUnifier(store, enable_chroma=False)
+        await mem.initialize()
+        recovered = await mem.cancel_pending_background_work()
+        ta, tb = await truths(mem, GAME), await truths(mem, CALC)
+        check(a_first in ta.succeeded,
+              j.step(f"A's finished work survives ({ta.summary()})"))
+        check(str(cb["task_id"]) in tb.succeeded,
+              j.step(f"B's finished work survives ({tb.summary()})"))
+        check(not ta.may_resume and not tb.may_resume,
+              j.step(f"and nothing restarts itself ({recovered})"))
+
+        # 18-20  A is resumed deliberately and finishes.
+        await mem.resume_goal(goal_id=goal_a)
+        ga = await mem.get_goal(goal_id=goal_a) or {}
+        check(str(ga.get("status")) == "active",
+              j.step(f"A is picked back up ({ga.get('status')})"))
+        nxt = await mem.claim_next_goal_task()
+        check(nxt is not None and str(nxt.get("project_name")) == GAME,
+              j.step(f"its own work is claimable ({(nxt or {}).get('tool_name')})"))
+        if nxt:
+            v = await mem.complete_goal_task(
+                task_id=str(nxt["task_id"]), status="done",
+                result={"ok": True}, error="",
+                expected_generation=int(nxt["generation"]))
+            check(v == "applied", j.step(f"and completes ({v})"))
+
+        # 21-24  a late worker from before the restart tries to report.
+        stale = await mem.complete_goal_task(
+            task_id=str(c2["task_id"]), status="done", result={"ok": True},
+            error="", expected_generation=b_gen)
+        ta = await truths(mem, GAME)
+        check(stale == "ignored",
+              j.step(f"a worker from before the restart cannot report ({stale})"))
+        check(str(c2["task_id"]) not in ta.succeeded,
+              j.step(f"and its step is not counted ({ta.summary()})"))
+        check(str(c2["task_id"]) in ta.never_resume,
+              j.step("it is in the never-again set"))
+        tb = await truths(mem, CALC)
+        check(len(tb.succeeded) == 1 and not tb.failed,
+              j.step(f"B is STILL exactly as it was ({tb.summary()})"))
+
+        # 25-27  cancel A twice, and prove the second changes nothing.
+        gen_before = (await mem.get_goal(goal_id=goal_a) or {}).get("generation")
+        await mem.cancel_goal(goal_id=goal_a)
+        once = (await mem.get_goal(goal_id=goal_a) or {}).get("generation")
+        await mem.cancel_goal(goal_id=goal_a)
+        twice = (await mem.get_goal(goal_id=goal_a) or {}).get("generation")
+        check(int(once) == int(gen_before) + 1,
+              j.step(f"cancelling advances the revision once ({gen_before} -> {once})"))
+        check(int(twice) == int(once),
+              j.step(f"and cancelling again does not ({twice})"))
+        ta = await truths(mem, GAME)
+        check(not ta.may_resume,
+              j.step(f"nothing on A may resume ({ta.summary()})"))
+
+        # 28-30  final: B never moved, and the two projects never mixed.
+        tb = await truths(mem, CALC)
+        gb = await mem.get_goal(goal_id=goal_b) or {}
+        check(str(gb.get("status")) in ("active", "paused"),
+              j.step(f"B's goal was never cancelled by A's cancel "
+                     f"({gb.get('status')})"))
+        check(tb.succeeded.isdisjoint(ta.succeeded),
+              j.step("the two projects share no work"))
+        all_rows = await mem.list_goal_tasks(limit=200)
+        check(all(str(r.get("project_name")) in (GAME, CALC) for r in all_rows),
+              j.step(f"and nothing was attributed anywhere else "
+                     f"({sorted({str(r.get('project_name')) for r in all_rows})})"))
+
+        # B's revision must never have moved. A's whole lifecycle - retries,
+        # a pause, a restart, a resume, two cancels - happened alongside it,
+        # and none of that is B's business.
+        check(int(gb.get("generation")) == 0,
+              j.step(f"B is still on its first revision "
+                     f"({gb.get('generation')}) after all of A's churn"))
+        ta_final = await truths(mem, GAME)
+        check(ta_final.never_resume >= (ta_final.succeeded | ta_final.cancelled),
+              j.step(f"everything terminal on A is in the never-again set "
+                     f"({len(ta_final.never_resume)} of {len(ta_final.tasks)})"))
+
+        check(j.n >= 28, f"the journey ran {j.n} checked transitions")
+
+
 async def main():
     await journey_one_long_build()
     await journey_two_retries_and_revisions()
     await journey_three_background_work()
     await journey_four_supervisor_decides()
     await journey_five_restart_integrity()
+    await journey_eight_ambiguous_side_effects()
+    await journey_nine_interleaved_with_duplicates()
     check.finish()
 
 
