@@ -96,9 +96,15 @@ async def _async_checks():
     async def boom(args):
         raise RuntimeError("kaboom")
 
-    tools = {"weather.current": weather, "web.fetch": fetch, "flaky.tool": boom}
-    descs = {"weather.current": "live weather", "web.fetch": "fetch a url", "flaky.tool": "breaks"}
+    tools = {"weather.current": weather, "web.fetch": fetch, "flaky.tool": boom,
+             "flaky.readonly": boom}
+    descs = {"weather.current": "live weather", "web.fetch": "fetch a url",
+             "flaky.tool": "breaks", "flaky.readonly": "breaks, but changes nothing"}
     router = ToolRouter(tools, descs)
+    # Declared retry-safe: it changes nothing, so re-running it after a
+    # failure is safe and the two-strike guard still applies to it.
+    router.register("flaky.readonly", boom, "breaks, but changes nothing",
+                    retry_safe=True)
 
     def executor_with(replies):
         return ToolLoopExecutor(models=ModelRouter.single(_ScriptedLLM(replies), asyncio.Semaphore(1)), tool_router=router)
@@ -128,11 +134,24 @@ async def _async_checks():
     ]).run(agent=agent, user_text="chain", grounding="{}")
     check([r["tool"] for r in res] == ["weather.current", "web.fetch"], "tools chain in order (lenient parse works)")
 
-    # a tool that keeps failing stops after 2 failures (guard), never budget-spins
+    # A failing tool never budget-spins, but HOW soon it stops depends on
+    # whether re-running it is safe at all.
+    #
+    # Retry-safe: it changes nothing, so a second attempt is free. Two strikes.
+    calls.clear()
+    ex = executor_with(['{"action": "tool", "tool": "flaky.readonly", "args": {}}'] * 6)
+    res = await ex.run(agent=agent, user_text="fail", grounding="{}")
+    check(sum(1 for r in res if not r["ok"]) == 2,
+          f"a retry-SAFE failing tool stops after 2 attempts (got {len(res)})")
+
+    # Not retry-safe: the router refuses to re-run it after a failure, and the
+    # loop above it used to do so anyway. One attempt. Measured on 55c485b as
+    # the cause of ONE delete request producing TWO approval prompts.
     calls.clear()
     ex = executor_with(['{"action": "tool", "tool": "flaky.tool", "args": {}}'] * 6)
     res = await ex.run(agent=agent, user_text="fail", grounding="{}")
-    check(sum(1 for r in res if not r["ok"]) == 2, f"failing tool stops after 2 attempts (got {len(res)})")
+    check(sum(1 for r in res if not r["ok"]) == 1,
+          f"a side-effecting failing tool is not re-run at all (got {len(res)})")
 
     # step budget caps a model that never says respond
     calls.clear()
