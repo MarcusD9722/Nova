@@ -107,8 +107,12 @@ async def _blocked_apply(kind: str, at: str = "complete"):
         gid = await _goal(m)
         tid = await m.enqueue_goal_task(goal_id=gid, project_name="alpha",
                                         tool_name="__decide__", args={})
-        rows = await m.list_goal_tasks(goal_id=str(gid), limit=10)
-        task_id = rows[0]["task_id"]
+        # CLAIM it, the way the supervisor does. A decision belongs to a
+        # `__decide__` that is actually running: applying one for a task
+        # nobody claimed is refused now, and refusing it is the point of
+        # the idempotency fence.
+        claimed = await m.claim_next_goal_task()
+        task_id = str(claimed["task_id"])
 
         inside = asyncio.Event()
         release = asyncio.Event()

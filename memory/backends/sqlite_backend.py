@@ -1817,12 +1817,31 @@ class SQLiteMemoryBackend:
     )
 
     async def _complete_decision_task(self, db, *, task_id: str,
-                                      result: dict[str, Any], now: str) -> None:
-        await db.execute(
+                                      result: dict[str, Any], now: str) -> bool:
+        """Finish the `__decide__` that produced this decision. False if it
+        was not the running one.
+
+        This is what makes the whole apply_* family idempotent, and it was
+        missing. The gate above each of them is `status='active' AND
+        generation=?` on the GOAL, which for a tool decision is an
+        `active -> active` touch: it passes just as happily the second time.
+        The inserted ids are fresh per call, so nothing collided either.
+        Measured on 5729e36: calling `apply_tool_decision` twice for the SAME
+        claimed decide task turned 3 tasks into 5 - a duplicate tool AND a
+        duplicate continuation, both runnable.
+
+        That it cannot happen through the supervisor is true and not enough:
+        it rested on an argument about the exclusive claim rather than on the
+        statement, and `MemoryUnifier.apply_tool_decision` is a public method.
+        A decision applies only while the task that decided it is still the
+        running one - the same rule the completion fence already enforces.
+        """
+        cur = await db.execute(
             "UPDATE tasks SET status='done', outcome='succeeded', "
             "result_json=?, last_error='', updated_at=? "
-            "WHERE task_id=?",
+            "WHERE task_id=? AND status='running'",
             (json.dumps(result or {}, ensure_ascii=False), now, task_id))
+        return int(cur.rowcount or 0) == 1
 
     async def _add_event(self, db, *, event_id: UUID, goal_id: UUID,
                          project_name: str, kind: str, message: str,
@@ -1858,8 +1877,11 @@ class SQLiteMemoryBackend:
                 "VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL)",
                 (str(proposal_id), str(goal_id), project_name, message,
                  "Needed to proceed with the active goal.", now))
-            await self._complete_decision_task(
-                db, task_id=task_id, result={"question": message}, now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id, result={"question": message},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="question",
                                   message=message, now=now)
@@ -1885,8 +1907,11 @@ class SQLiteMemoryBackend:
             if int(cur.rowcount or 0) != 1:
                 await db.rollback()
                 return False
-            await self._complete_decision_task(
-                db, task_id=task_id, result={"final": message}, now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id, result={"final": message},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="complete",
                                   message=message, now=now)
@@ -1973,8 +1998,11 @@ class SQLiteMemoryBackend:
             if int(cur.rowcount or 0) != 1:
                 await db.rollback()
                 return False
-            await self._complete_decision_task(
-                db, task_id=task_id, result={"paused": message}, now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id, result={"paused": message},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
                                   project_name=project_name, kind="paused",
                                   message=message, now=now)
@@ -2020,11 +2048,13 @@ class SQLiteMemoryBackend:
             await db.execute(insert, (
                 str(decide_task_id), str(goal_id), project_name, "__decide__",
                 "{}", now, now, now, int(expected_generation)))
-            await self._complete_decision_task(
-                db, task_id=task_id,
-                result={"decision": {"type": "tool", "name": tool_name,
-                                     "args": args or {}}, "scheduled": True},
-                now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id,
+                    result={"decision": {"type": "tool", "name": tool_name,
+                                         "args": args or {}}, "scheduled": True},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="plan",
                                   message=f"Next: {tool_name}", now=now)
