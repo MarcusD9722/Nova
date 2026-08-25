@@ -3501,6 +3501,70 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.add_progress_event(event_id=uuid4(), goal_id=goal_id, project_name=project_name, kind=kind, message=message)
 
+    async def describe_work_state(self, *, project_name: str | None = None,
+                                  limit: int = 12) -> str:
+        """What is true about Nova's work right now, from the durable record.
+
+        Built for the answer prompt, and built from rows rather than from the
+        conversation, because the conversation is exactly the wrong authority
+        for it: after a restart the transcript starts empty while the work is
+        still there, and a model asked "what failed?" with no state in front of
+        it will answer from whatever it remembers saying.
+
+        Both axes are reported. `status` alone cannot distinguish a step that
+        never ran from one whose tool succeeded after the run was cancelled,
+        and those are different answers to "did that happen?".
+
+        Empty string when there is nothing to say, so an ordinary turn carries
+        no extra tokens.
+        """
+        await self.initialize()
+        try:
+            goals = await self.list_goals(project_name=project_name, limit=limit)
+            tasks = await self.list_goal_tasks(limit=100)
+            auto = await self.list_tasks(limit=50)
+        except Exception:  # noqa: BLE001
+            return ""
+
+        if project_name:
+            tasks = [t for t in tasks
+                     if str(t.get("project_name")) == project_name]
+            auto = [a for a in auto
+                    if str(a.get("project_name")) == project_name]
+        if not goals and not tasks and not auto:
+            return ""
+
+        lines: list[str] = []
+        for g in goals[:limit]:
+            gid = str(g.get("goal_id"))
+            mine = [t for t in tasks if str(t.get("goal_id")) == gid]
+            lines.append(
+                f"- goal '{g.get('title')}' ({g.get('project_name')}): "
+                f"{g.get('status')}, revision {g.get('generation')}")
+            for t in mine[:limit]:
+                bit = f"    - {t.get('tool_name')}: {t.get('status')}"
+                outcome = str(t.get("outcome") or "")
+                if outcome and outcome != "pending":
+                    bit += f" (work {outcome})"
+                err = str(t.get("last_error") or "").strip()
+                if err:
+                    bit += f" - {err[:160]}"
+                lines.append(bit)
+
+        waiting = [a for a in auto if str(a.get("status")) == "blocked"]
+        for a in waiting[:limit]:
+            lines.append(f"- waiting on you: {a.get('title')} - "
+                         f"{str(a.get('last_error') or '')[:160]}")
+        other = [a for a in auto if str(a.get("status")) in ("queued", "running")]
+        for a in other[:limit]:
+            lines.append(f"- background task '{a.get('title')}': {a.get('status')}")
+
+        if not lines:
+            return ""
+        return ("\nThe work you are actually tracking (from the record, not "
+                "from this conversation - trust it over anything you remember "
+                "saying):\n" + "\n".join(lines) + "\n")
+
     async def list_progress_events(self, *, goal_id: str | None = None,
                                    project_name: str | None = None,
                                    limit: int = 50) -> list[dict[str, Any]]:

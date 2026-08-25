@@ -22,7 +22,8 @@ from core.policy.summarizer import SummarizerLLM
 from core.policy.storyteller import StorytellerLLM, is_story_request, story_system_prompt
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
-from core.intent import is_question, is_purely_conversational
+from core.intent import (asks_about_work, is_question,
+                         is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
     describes_a_change,
@@ -2142,6 +2143,17 @@ class RuntimeManager:
         # budget work exists to avoid. It earns its place only when the user
         # actually pointed at it, or when it is recent enough to still be "on
         # screen" in any meaningful sense.
+        # Status questions are answered from the record, never from the
+        # transcript. Measured on 4e0e458: asking "What failed?" with a failed
+        # step and its error sitting in the database produced an answer prompt
+        # containing none of it - not the step, not the error, not the goal.
+        work_context = ""
+        try:
+            if asks_about_work(clean_user):
+                work_context = await self._memory.describe_work_state()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("work_state_summary_failed", error=str(e)[:160])
+
         artifact_context = ""
         current_set = self._artifacts.latest_result_set(str(conversation_id))
         if current_set is not None and (referenced is not None
@@ -2226,6 +2238,9 @@ class RuntimeManager:
             # the moment it reads like the other two blocks she will quote it as
             # today's.
             + episodic_context
+            # Before live tool output and after history: this IS current state,
+            # and it outranks anything remembered.
+            + work_context
             + tools_context
             # Say "a reasoning block", never the literal tag. Measured on this
             # model (tests/bench_empty_generations.py, 30 samples per variant):
