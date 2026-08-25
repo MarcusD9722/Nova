@@ -306,7 +306,7 @@ async def _stale_race(decision: str, *, blind_precheck: bool = False):
             for _ in range(120):
                 await asyncio.sleep(0.05)
                 rows = await m.list_goal_tasks(goal_id=str(gid), limit=50)
-                if any(t["status"] == "failed" for t in rows):
+                if any(t["status"] in ("failed", "superseded") for t in rows):
                     break
         finally:
             await gated.sup.stop()
@@ -326,7 +326,7 @@ async def test_a_stale_question_leaves_no_proposal_and_no_event():
         check("question" not in end["kinds"],
               f"no stale question event {tag} ({end['kinds']})")
         stale = [t for t in end["tasks"]
-                 if t["status"] == "failed" and "discarded" in (t["last_error"] or "")]
+                 if t["status"] == "superseded" and "discarded" in (t["last_error"] or "")]
         check(len(stale) == 1,
               f"the old decision is recorded as discarded, not done {tag} ({len(stale)})")
         check(end["status"] == "active",

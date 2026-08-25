@@ -181,9 +181,9 @@ async def test_a_cancelled_run_cannot_be_completed_by_its_stale_worker():
         check(str(row.get("status")) != "done",
               f"the cancelled run's task is NOT recorded as done "
               f"({_describe(row, goal)})")
-        check(str(row.get("status")) == "failed",
-              f"it is finalised as a step that did not land "
-              f"({_describe(row, goal)})")
+        check(str(row.get("status")) == "superseded",
+              f"it is finalised as superseded, which is neither done nor a "
+              f"failure of the work ({_describe(row, goal)})")
         check(str(row.get("status")) != "running",
               f"and not stranded in running ({_describe(row, goal)})")
         check(str(goal.get("status")) == "cancelled",
@@ -464,8 +464,8 @@ async def test_a_tool_that_finished_after_a_cancel_is_not_announced():
         goal = await _goal_row(m, goal_id)
         check(ran["n"] == 1,
               f"the tool really executed once ({ran['n']})")
-        check(str(row.get("status")) == "failed",
-              f"its task is not done ({_describe(row, goal)})")
+        check(str(row.get("status")) == "superseded",
+              f"its task is superseded, not done ({_describe(row, goal)})")
 
         # Attributed by goal_id, not by taking the last few events.
         events = await m.fetch_unacked_progress(project_name=project, limit=50)

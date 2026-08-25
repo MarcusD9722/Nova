@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { ListTodo, RefreshCw, CircleDot, CheckCircle2, XCircle, Loader2, HelpCircle, Ban } from "lucide-react";
+import { ListTodo, RefreshCw, CircleDot, CheckCircle2, XCircle, Loader2, HelpCircle, Ban, History, CircleHelp } from "lucide-react";
 
 function apiUrl(path) {
   try {
@@ -21,7 +21,35 @@ const STATUS_META = {
   done: { icon: CheckCircle2, cls: "text-emerald-300 border-emerald-400/25 bg-emerald-500/10", label: "Done" },
   failed: { icon: XCircle, cls: "text-red-300 border-red-400/25 bg-red-500/10", label: "Failed" },
   cancelled: { icon: Ban, cls: "text-nova-gold/40 border-nova-gold/15 bg-black/25", label: "Cancelled" },
+  superseded: { icon: History, cls: "text-sky-300/80 border-sky-400/25 bg-sky-500/10", label: "Superseded" },
 };
+
+// What happened to the WORK, which is a different question from where the row
+// is in its life. A superseded step may have succeeded; an interrupted one may
+// have done anything at all. Showing only the status hid both.
+const OUTCOME_META = {
+  succeeded: { cls: "text-emerald-300/80 border-emerald-400/20", label: "work succeeded" },
+  failed: { cls: "text-red-300/80 border-red-400/20", label: "work failed" },
+  unknown: { cls: "text-amber-300/90 border-amber-400/30", label: "outcome unknown" },
+  never_started: { cls: "text-nova-gold/45 border-nova-gold/15", label: "never ran" },
+};
+
+function OutcomeChip({ status, outcome }) {
+  const meta = OUTCOME_META[outcome];
+  // Only worth showing when it says something the status does not: a plain
+  // done/succeeded or failed/failed pairing is noise.
+  const redundant =
+    (status === "done" && outcome === "succeeded") ||
+    (status === "failed" && outcome === "failed") ||
+    (status === "cancelled" && outcome === "never_started");
+  if (!meta || redundant) return null;
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] ${meta.cls}`}>
+      <CircleHelp size={10} />
+      {meta.label}
+    </span>
+  );
+}
 
 function StatusChip({ status }) {
   const meta = STATUS_META[status] || STATUS_META.queued;
@@ -135,7 +163,10 @@ export default function TasksSheet({ liveEvents = [] }) {
     <div key={t.task_id} className="rounded-xl border border-nova-gold/10 bg-black/25 px-3 py-2">
       <div className="flex items-center justify-between gap-2">
         <div className="text-sm text-nova-gold/90 font-medium break-words">{t.title || "(untitled task)"}</div>
-        <StatusChip status={t.status} />
+        <div className="flex items-center gap-1.5 shrink-0">
+          <OutcomeChip status={t.status} outcome={t.outcome} />
+          <StatusChip status={t.status} />
+        </div>
       </div>
       {t.details ? <div className="mt-1 text-xs text-nova-gold/60 break-words">{t.details}</div> : null}
       <div className="mt-1 flex items-center gap-3 text-[10px] text-nova-gold/40">

@@ -3210,11 +3210,16 @@ class MemoryUnifier:
             BUS.publish("task.completed", {"task_id": str(task_id), "status": "done"})
         return applied
 
-    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None) -> bool:
-        """Record failure. Returns whether this call is the one that landed."""
+    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None,
+                               outcome: str = "") -> bool:
+        """Record failure. Returns whether this call is the one that landed.
+
+        `outcome` lets a caller say the work's fate is UNKNOWN rather than
+        failed - an interrupted tool did not fail, it stopped being observable.
+        """
         await self.initialize()
         async with self._write_lock:
-            applied = await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error)
+            applied = await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error, outcome=outcome)
         if applied:
             BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
         return applied

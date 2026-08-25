@@ -134,7 +134,7 @@ async def _run_race(decision: str, *, blind_precheck: bool = False):
             for _ in range(80):
                 await asyncio.sleep(0.05)
                 rows = await mem.list_goal_tasks(goal_id=str(gid), limit=50)
-                if any(t["status"] == "failed" for t in rows):
+                if any(t["status"] in ("failed", "superseded") for t in rows):
                     break
         finally:
             await gated.sup.stop()
@@ -211,7 +211,8 @@ async def test_a_stale_tool_decision_never_runs():
           f"exactly one fresh continuation existed after resume "
           f"({len(out['fresh_decides'])})")
     stale = [t for t in out["tasks"]
-             if t["tool_name"] == "__decide__" and t["status"] == "failed"]
+             if t["tool_name"] == "__decide__"
+             and t["status"] in ("failed", "superseded")]
     check(bool(stale), f"the old decide is finished, not left running "
                        f"({[(t['tool_name'], t['status']) for t in out['tasks']]})")
     check(any("discarded" in (t.get("last_error") or "") for t in stale),
@@ -231,7 +232,8 @@ async def test_a_stale_question_does_not_pause_the_resumed_goal():
     check(final["status"] == "active",
           f"it is still the run the user resumed ({final['status']})")
     stale = [t for t in out["tasks"]
-             if t["tool_name"] == "__decide__" and t["status"] == "failed"]
+             if t["tool_name"] == "__decide__"
+             and t["status"] in ("failed", "superseded")]
     check(bool(stale), "the stale decision is finished as discarded")
 
 
@@ -246,7 +248,8 @@ async def test_a_stale_final_does_not_complete_the_resumed_goal():
     check(final["status"] == "active",
           f"the resumed run is intact ({final['status']})")
     stale = [t for t in out["tasks"]
-             if t["tool_name"] == "__decide__" and t["status"] == "failed"]
+             if t["tool_name"] == "__decide__"
+             and t["status"] in ("failed", "superseded")]
     check(bool(stale), "the stale decision is finished as discarded")
 
 

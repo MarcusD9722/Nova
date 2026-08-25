@@ -12,6 +12,31 @@ import aiosqlite
 from memory.episodic_schema import EPISODIC_DDL, EPISODIC_MIGRATION
 
 
+# ── Execution outcome, which is NOT the same axis as lifecycle status ────────
+#
+# `status` says where a task is in its life: queued, running, blocked, done,
+# failed, cancelled, superseded. `outcome` says what happened to the WORK. They
+# are independent, and collapsing them is what made these three
+# indistinguishable:
+#
+#   a step that was cancelled before it ever ran
+#   a step whose tool succeeded, after the user cancelled the run
+#   a step whose tool was interrupted mid-call and may or may not have acted
+#
+# All three were `cancelled` or `failed`, and every reader that asked "did this
+# happen?" got the same answer for all of them. Two of those answers were false.
+OUTCOME_NEVER_STARTED = "never_started"   # provably nothing ran
+OUTCOME_SUCCEEDED = "succeeded"           # the work completed, and we know it
+OUTCOME_FAILED = "failed"                 # the work ran and did not succeed
+OUTCOME_UNKNOWN = "unknown"               # it may have acted; nothing can say
+OUTCOME_PENDING = "pending"               # not finished: queued, running, blocked
+
+#: A superseded row keeps its real outcome. `status='superseded'` is what stops
+#: it counting as completed work; `outcome` is what stops it being a lie about
+#: whether the tool ran.
+STATUS_SUPERSEDED = "superseded"
+
+
 class SQLiteMemoryBackend:
     #: How many candidate rows a claimer will try before giving up for this tick.
     #: A claim can legitimately lose the race to another worker; it should then
@@ -270,7 +295,10 @@ class SQLiteMemoryBackend:
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         -- The goal generation this task was created under.
-                        generation INTEGER NOT NULL DEFAULT 0
+                        generation INTEGER NOT NULL DEFAULT 0,
+                        -- What happened to the WORK, as opposed to
+                        -- where the row is in its lifecycle.
+                        outcome TEXT NOT NULL DEFAULT 'pending'
                     );
                     '''
                 )
@@ -280,6 +308,7 @@ class SQLiteMemoryBackend:
                     '''
                     CREATE TABLE IF NOT EXISTS autonomy_tasks (
                         task_id TEXT PRIMARY KEY,
+                        outcome TEXT NOT NULL DEFAULT 'pending',
                         conversation_id TEXT,
                         project_name TEXT NOT NULL,
                         title TEXT NOT NULL,
@@ -366,6 +395,23 @@ class SQLiteMemoryBackend:
                         await db.execute("ALTER TABLE tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00';")
                     if "updated_at" not in cols:
                         await db.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00';")
+                    # Execution outcome, separate from lifecycle status. Old
+                    # rows get 'pending' and are corrected below from what their
+                    # status already implies, so a database written before this
+                    # column existed still answers honestly.
+                    if "outcome" not in cols:
+                        await db.execute("ALTER TABLE tasks ADD COLUMN outcome TEXT NOT NULL DEFAULT 'pending';")
+                        await db.execute("UPDATE tasks SET outcome='succeeded' WHERE status='done';")
+                        await db.execute("UPDATE tasks SET outcome='failed' WHERE status='failed';")
+                        await db.execute("UPDATE tasks SET outcome='never_started' WHERE status='cancelled';")
+
+                if "autonomy_tasks" in existing_tables:
+                    cols = await _table_columns("autonomy_tasks")
+                    if "outcome" not in cols:
+                        await db.execute("ALTER TABLE autonomy_tasks ADD COLUMN outcome TEXT NOT NULL DEFAULT 'pending';")
+                        await db.execute("UPDATE autonomy_tasks SET outcome='succeeded' WHERE status='done';")
+                        await db.execute("UPDATE autonomy_tasks SET outcome='failed' WHERE status='failed';")
+                        await db.execute("UPDATE autonomy_tasks SET outcome='never_started' WHERE status='cancelled';")
 
                 if "goals" in existing_tables:
                     cols = await _table_columns("goals")
@@ -698,8 +744,14 @@ class SQLiteMemoryBackend:
         status: str,
         result: dict[str, Any] | None = None,
         error: str = "",
+        outcome: str = "",
     ) -> bool:
         """Write the terminal outcome. The FIRST one wins; later ones no-op.
+
+        `outcome` is the EXECUTION truth and defaults to what `status` implies.
+        The one caller that must override it is an interruption: a task whose
+        tool was in flight is `failed` as a lifecycle matter and `unknown` as a
+        matter of fact, and those are different sentences to anyone reading it.
 
         Returns whether this call is the one that landed.
 
@@ -716,10 +768,12 @@ class SQLiteMemoryBackend:
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE autonomy_tasks SET status=?, result_json=?, last_error=?, "
-                "updated_at=? WHERE task_id=? AND status='running'",
+                "UPDATE autonomy_tasks SET status=?, outcome=?, result_json=?, "
+                "last_error=?, updated_at=? WHERE task_id=? AND status='running'",
                 (
                     status,
+                    (OUTCOME_SUCCEEDED if status == "done" else outcome
+                     or OUTCOME_FAILED),
                     json.dumps(result or {}, ensure_ascii=False),
                     (error or ""),
                     now,
@@ -757,8 +811,9 @@ class SQLiteMemoryBackend:
         payload["question"] = question
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE autonomy_tasks SET status='blocked', result_json=?, "
-                "last_error=?, updated_at=? WHERE task_id=? AND status='running'",
+                "UPDATE autonomy_tasks SET status='blocked', outcome='pending', "
+                "result_json=?, last_error=?, updated_at=? "
+                "WHERE task_id=? AND status='running'",
                 (json.dumps(payload, ensure_ascii=False), question, now, task_id))
             await db.commit()
             return int(cur.rowcount or 0) == 1
@@ -778,8 +833,8 @@ class SQLiteMemoryBackend:
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE autonomy_tasks SET status='queued', run_after=?, "
-                "last_error='', "
+                "UPDATE autonomy_tasks SET status='queued', outcome='pending', "
+                "run_after=?, last_error='', "
                 "details = details || ? , updated_at=? "
                 "WHERE task_id=? AND status='blocked'",
                 (now, f"\n\nYou asked, and the answer is: {answer}", now,
@@ -805,7 +860,7 @@ class SQLiteMemoryBackend:
         # reach it.
         query = (
             "SELECT task_id, conversation_id, project_name, title, details, priority, status, attempts, "
-            "last_error, initiated_by_user, result_json, created_at, updated_at FROM autonomy_tasks"
+            "last_error, initiated_by_user, result_json, outcome, created_at, updated_at FROM autonomy_tasks"
         )
         params: list[Any] = []
         if status:
@@ -831,8 +886,9 @@ class SQLiteMemoryBackend:
                 "last_error": r[8],
                 "initiated_by_user": bool(int(r[9] or 0)),
                 "result_json": r[10],
-                "created_at": r[11],
-                "updated_at": r[12],
+                "outcome": r[11],
+                "created_at": r[12],
+                "updated_at": r[13],
             }
             for r in rows
         ]
@@ -840,16 +896,16 @@ class SQLiteMemoryBackend:
     #: A task that never left the queue provably did nothing, so saying it was
     #: cancelled is simply true.
     _STARTUP_CANCEL = (
-        "UPDATE {table} SET status='cancelled', last_error=?, updated_at=? "
-        "WHERE status='queued'")
+        "UPDATE {table} SET status='cancelled', outcome='never_started', "
+        "last_error=?, updated_at=? WHERE status='queued'")
 
     #: A task that was RUNNING when the process died is a different fact. It had
     #: been claimed, it may have invoked a tool, and nothing survived to say
     #: which. Recording it as `cancelled` asserts that it never happened, and
     #: that assertion is not one this process is in a position to make.
     _STARTUP_INTERRUPTED = (
-        "UPDATE {table} SET status='failed', last_error=?, updated_at=? "
-        "WHERE status='running'")
+        "UPDATE {table} SET status='failed', outcome='unknown', "
+        "last_error=?, updated_at=? WHERE status='running'")
 
     async def cancel_pending_background_work(self) -> dict[str, int]:
         """Clear background work left over from an older session.
@@ -1763,7 +1819,8 @@ class SQLiteMemoryBackend:
     async def _complete_decision_task(self, db, *, task_id: str,
                                       result: dict[str, Any], now: str) -> None:
         await db.execute(
-            "UPDATE tasks SET status='done', result_json=?, last_error='', updated_at=? "
+            "UPDATE tasks SET status='done', outcome='succeeded', "
+            "result_json=?, last_error='', updated_at=? "
             "WHERE task_id=?",
             (json.dumps(result or {}, ensure_ascii=False), now, task_id))
 
@@ -1864,8 +1921,8 @@ class SQLiteMemoryBackend:
                 await db.rollback()
                 return False
             await db.execute(
-                "UPDATE tasks SET status='failed', result_json='{}', "
-                "last_error=?, updated_at=? WHERE task_id=?",
+                "UPDATE tasks SET status='failed', outcome='failed', "
+                "result_json='{}', last_error=?, updated_at=? WHERE task_id=?",
                 (error, now, task_id))
             await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
                                   project_name=project_name, kind="error",
@@ -2024,7 +2081,8 @@ class SQLiteMemoryBackend:
                 (now, str(goal_id)),
             )
             stopped = await db.execute(
-                "UPDATE tasks SET status='cancelled', last_error='goal cancelled', updated_at=? "
+                "UPDATE tasks SET status='cancelled', outcome='never_started', "
+                "last_error='goal cancelled', updated_at=? "
                 "WHERE goal_id=? AND status='queued'",
                 (now, str(goal_id)),
             )
@@ -2412,10 +2470,18 @@ class SQLiteMemoryBackend:
                     await db.execute("COMMIT")
                     return "ignored"
                 owns = bool(row[1])
+                # Two axes, written together. `status` says the row is
+                # over and how it counts; `outcome` says what actually
+                # happened to the work, which is not the same question and
+                # used to have no answer at all for a superseded row.
+                outcome = (OUTCOME_SUCCEEDED if status == "done"
+                           else OUTCOME_FAILED)
                 await db.execute(
-                    "UPDATE tasks SET status=?, result_json=?, last_error=?, "
-                    "updated_at=? WHERE task_id=? AND status='running'",
-                    (status if owns else "failed",
+                    "UPDATE tasks SET status=?, outcome=?, result_json=?, "
+                    "last_error=?, updated_at=? "
+                    "WHERE task_id=? AND status='running'",
+                    (status if owns else STATUS_SUPERSEDED,
+                     outcome,
                      payload if owns else stale_payload,
                      (error or "") if owns else stale_note,
                      now, task_id))
@@ -2457,8 +2523,8 @@ class SQLiteMemoryBackend:
         async with aiosqlite.connect(self._db_path) as db:
             if expected_generation is not None:
                 cur = await db.execute(
-                    "UPDATE tasks SET status='queued', attempts=?, run_after=?, "
-                    "last_error=?, updated_at=? "
+                    "UPDATE tasks SET status='queued', outcome='pending', "
+                    "attempts=?, run_after=?, last_error=?, updated_at=? "
                     "WHERE task_id=? AND status='running' AND generation=? "
                     "AND EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id "
                     "            AND g.status='active' AND g.generation=?)",
@@ -2478,7 +2544,7 @@ class SQLiteMemoryBackend:
         await self.initialize()
         # `generation` is selected because a task list that cannot say which
         # run a row belongs to cannot answer "which revision was that?".
-        q = "SELECT task_id, goal_id, project_name, tool_name, status, attempts, run_after, last_error, result_json, generation, created_at, updated_at FROM tasks"
+        q = "SELECT task_id, goal_id, project_name, tool_name, status, attempts, run_after, last_error, result_json, generation, outcome, created_at, updated_at FROM tasks"
         params: list[Any] = []
         where = []
         if goal_id:
@@ -2499,7 +2565,7 @@ class SQLiteMemoryBackend:
             out.append(dict(
                 task_id=r[0], goal_id=r[1], project_name=r[2], tool_name=r[3], status=r[4],
                 attempts=r[5], run_after=r[6], last_error=r[7], result_json=r[8],
-                generation=r[9], created_at=r[10], updated_at=r[11]
+                generation=r[9], outcome=r[10], created_at=r[11], updated_at=r[12]
             ))
         return out
 

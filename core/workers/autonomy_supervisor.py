@@ -80,21 +80,26 @@ class AutonomySupervisorWorker:
         """
         if not task_id:
             return
+        # The three cases differ in what can be PROVED, so they differ in the
+        # outcome recorded, not only in the prose.
+        fate = "never_started"
         if in_flight:
             note = (f"interrupted while '{in_flight}' was running. Nova cannot "
                     f"tell whether it completed, so this is recorded as unknown "
                     f"rather than as done or as never having run.")
             status = "interrupted_tool_unknown"
+            fate = "unknown"
         elif done_calls:
             note = (f"interrupted after {len(done_calls)} tool call(s) had "
                     f"completed, before the outcome was recorded.")
             status = "interrupted_after_tools"
+            fate = "succeeded" if all(c.get("ok") for c in done_calls) else "failed"
         else:
             note = "interrupted before any tool ran; nothing was executed."
             status = "interrupted_before_tools"
         try:
             await asyncio.shield(self._memory.mark_task_failed(
-                task_id=task_id, error=note,
+                task_id=task_id, error=note, outcome=fate,
                 result={"status": status, "in_flight_tool": in_flight,
                         "completed_calls": done_calls}))
         except Exception as e:  # noqa: BLE001
