@@ -1774,9 +1774,23 @@ class SQLiteMemoryBackend:
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             if expected_generation is None:
+                # From `cancelled` the only way out is back to `active` -
+                # resuming, which is the user's own decision and which the
+                # operator route and `resume_goal` both express. A cancelled
+                # goal may not be relabelled into any OTHER state on the way
+                # past.
+                #
+                # Found by the generated sequences (seed 0): cancel, then
+                # pause, and the goal read back `paused`. That is a false
+                # status - it says "waiting to continue" about work the user
+                # stopped - and it takes the goal out of any answer to "what
+                # was cancelled?". Resuming it afterwards then bumped the
+                # revision a second time, for a run that never existed.
                 cur = await db.execute(
-                    "UPDATE goals SET status=?, updated_at=? WHERE goal_id=?",
-                    (status, now, str(goal_id)))
+                    "UPDATE goals SET status=?, updated_at=? "
+                    "WHERE goal_id=? AND (status != 'cancelled' "
+                    "                     OR ? IN ('cancelled', 'active'))",
+                    (status, now, str(goal_id), status))
             else:
                 cur = await db.execute(
                     self._DECISION_GATE,
@@ -2100,6 +2114,21 @@ class SQLiteMemoryBackend:
             if not row:
                 return None
             project_name, previous = str(row[0]), str(row[1])
+            if previous == "cancelled":
+                # Cancelling twice is not cancelling harder. The second call
+                # used to bump the generation again, so a double-click left the
+                # goal claiming to be on a run that never existed - and "which
+                # revision is this?" is one of the things the stage exists to
+                # keep true. Found by the generated sequences (seeds 19, 46, 47).
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE goal_id=? AND status='running'",
+                    (str(goal_id),))
+                running = int((await cur.fetchone())[0] or 0)
+                return {
+                    "goal_id": str(goal_id), "project_name": project_name,
+                    "previous_status": previous, "status": "cancelled",
+                    "cancelled_tasks": 0, "already_running": running,
+                }
             # The generation bump is what makes an in-flight decision stale.
             # Without it, "cancel then immediately resume" left the goal active
             # again by the time a pre-cancel model call returned, and that old
