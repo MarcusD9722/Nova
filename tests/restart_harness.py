@@ -15,11 +15,18 @@ handle on anything the child made except the files it left behind.
 
 TWO WAYS TO END A PROCESS, and they are different facts:
 
-    run_step(...)            a clean shutdown - the app's own stop path runs
-    run_step(..., kill=True) SIGKILL-equivalent: the child is terminated while
-                             it holds whatever it holds. Nothing drains, no
-                             shutdown hook fires, no final commit is coaxed out
-                             of it. That is what a crash is.
+    run_step(...)                    a clean shutdown - the app's own stop path
+                                     runs and everything drains.
+    run_step(..., expect_crash=True) the scenario calls CRASH() at an exact
+                                     point. `os._exit` skips every finally
+                                     block, atexit hook and buffer flush, so
+                                     nothing drains and whatever reached the
+                                     database before that line is all that
+                                     survives.
+    crash_step(..., at=3.0)          killed by the parent after N seconds. Only
+                                     for boundaries a scenario cannot name;
+                                     prefer CRASH(), which is placed rather
+                                     than timed.
 
 USAGE
 
@@ -88,6 +95,17 @@ sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "tests"))
 _OUT = []
 def emit(d):
     _OUT.append(dict(d))
+def CRASH():
+    """Die exactly here, the way a killed process dies.
+
+    `os._exit` skips every finally block, atexit hook, buffer flush and
+    shutdown path. Nothing drains. Whatever reached the database before this
+    call is all that survives - which is the whole point of a crash window, and
+    is far more precise than killing the child after N seconds and hoping it
+    was in the right place.
+    """
+    sys.stdout.flush()
+    os._exit(9)
 from memory.unifier import MemoryUnifier
 
 async def _main():
@@ -106,6 +124,10 @@ sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "tests"))
 _OUT = []
 def emit(d):
     _OUT.append(dict(d))
+def CRASH():
+    """Die exactly here. See the note in the memory-only preamble."""
+    sys.stdout.flush()
+    os._exit(9)
 from harness import boot
 
 async def _main():
@@ -123,6 +145,7 @@ class StepFailed(RuntimeError):
 
 def run_step(root: Path, body: str, *, full: bool = False,
              kill_after: float | None = None,
+             expect_crash: bool = False,
              timeout: float = 240.0) -> list[dict]:
     """Run one scenario in a fresh interpreter. Returns what it emitted.
 
@@ -159,6 +182,13 @@ def run_step(root: Path, body: str, *, full: bool = False,
     except subprocess.TimeoutExpired:
         proc.kill()
         raise StepFailed(f"child timed out after {timeout}s")
+    if expect_crash:
+        # A placed CRASH() is a non-zero exit BY DESIGN. Exiting cleanly means
+        # the boundary was never reached, which would make the whole window
+        # vacuous - so that is the failure, not the crash.
+        if proc.returncode == 0:
+            raise StepFailed("scenario was expected to CRASH and exited cleanly")
+        return []
     if proc.returncode != 0:
         raise StepFailed(f"child exited {proc.returncode}\n{err[-2500:]}")
     for line in (out or "").splitlines():
@@ -171,6 +201,18 @@ def run_step(root: Path, body: str, *, full: bool = False,
 def crash_step(root: Path, body: str, *, at: float, full: bool = False) -> None:
     """Start a scenario and kill it mid-flight. Emits nothing by definition."""
     run_step(root, body, full=full, kill_after=at)
+
+
+def scenario(*parts: str) -> str:
+    """Join scenario fragments that were written at different indentations.
+
+    Each piece is dedented on its own before joining. Concatenating a
+    flush-left constant with a block indented for readability inside a test
+    leaves `textwrap.dedent` no common prefix to remove, and the child dies on
+    an IndentationError that says nothing about the property under test.
+    """
+    cleaned = [textwrap.dedent(part).strip("\n") for part in parts]
+    return "\n".join(cleaned) + "\n"
 
 
 def one(rows: list[dict], key: str, default=None):
