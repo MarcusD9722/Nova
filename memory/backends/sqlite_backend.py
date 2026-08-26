@@ -351,7 +351,16 @@ class SQLiteMemoryBackend:
                         kind TEXT NOT NULL,
                         message TEXT NOT NULL,
                         created_at TEXT NOT NULL,
-                        acknowledged INTEGER NOT NULL
+                        acknowledged INTEGER NOT NULL,
+                        -- WHICH lifecycle run produced this. Goals and tasks
+                        -- are generation-fenced and progress was not, so a
+                        -- reader had no way to tell a retry from run 6 from
+                        -- activity on run 7. NULL means "written before this
+                        -- column existed" and is never guessed at.
+                        generation INTEGER,
+                        -- The task and attempt that produced it, where one did.
+                        task_id TEXT,
+                        attempt INTEGER
                     );
                     '''
                 )
@@ -412,6 +421,19 @@ class SQLiteMemoryBackend:
                         await db.execute("UPDATE autonomy_tasks SET outcome='succeeded' WHERE status='done';")
                         await db.execute("UPDATE autonomy_tasks SET outcome='failed' WHERE status='failed';")
                         await db.execute("UPDATE autonomy_tasks SET outcome='never_started' WHERE status='cancelled';")
+
+                if "progress_events" in existing_tables:
+                    cols = await _table_columns("progress_events")
+                    # Deliberately left NULL rather than back-filled from the
+                    # goal's CURRENT generation: that would relabel history as
+                    # whatever run the goal happens to be on now, which is the
+                    # exact confusion this column exists to end.
+                    if "generation" not in cols:
+                        await db.execute("ALTER TABLE progress_events ADD COLUMN generation INTEGER;")
+                    if "task_id" not in cols:
+                        await db.execute("ALTER TABLE progress_events ADD COLUMN task_id TEXT;")
+                    if "attempt" not in cols:
+                        await db.execute("ALTER TABLE progress_events ADD COLUMN attempt INTEGER;")
 
                 if "goals" in existing_tables:
                     cols = await _table_columns("goals")
@@ -951,21 +973,25 @@ class SQLiteMemoryBackend:
             # this leaves the goal somewhere a person can actually pick it up
             # from, instead of somewhere nothing can.
             cur = await db.execute(
-                "SELECT goal_id, project_name FROM goals WHERE status='active'")
+                "SELECT goal_id, project_name, generation FROM goals "
+                "WHERE status='active'")
             stranded = list(await cur.fetchall())
             if stranded:
                 await db.execute(
                     "UPDATE goals SET status='paused', updated_at=? "
                     "WHERE status='active'", (now,))
-                for gid, proj in stranded:
+                for gid, proj, gen in stranded:
+                    # Stamped with the run it interrupted. This event is about
+                    # a specific lifecycle run ending, and it was the last
+                    # progress writer with no provenance at all.
                     await db.execute(
                         "INSERT INTO progress_events(event_id, goal_id, "
-                        "project_name, kind, message, created_at, acknowledged) "
-                        "VALUES(?, ?, ?, ?, ?, ?, 0)",
+                        "project_name, kind, message, created_at, acknowledged, "
+                        "generation) VALUES(?, ?, ?, ?, ?, ?, 0, ?)",
                         (str(uuid4()), str(gid), str(proj), "blocked",
                          "Paused when Nova restarted: the work already queued "
                          "was stopped so nothing would run unasked. Resume it "
-                         "to carry on.", now))
+                         "to carry on.", now, int(gen or 0)))
             await db.commit()
         # `interrupted` and `paused_goals` are additive: existing callers read
         # the two totals and keep working, and anything that wants to say "N
@@ -1859,11 +1885,23 @@ class SQLiteMemoryBackend:
 
     async def _add_event(self, db, *, event_id: UUID, goal_id: UUID,
                          project_name: str, kind: str, message: str,
-                         now: str) -> None:
+                         now: str, generation: int | None = None,
+                         task_id: str | None = None,
+                         attempt: int | None = None) -> None:
+        """Record progress, stamped with the run that PRODUCED it.
+
+        Not the run the goal is on when someone reads it later: that would
+        relabel a retry from run 6 as activity on run 7 the moment the goal
+        resumed, which is precisely the attribution this column exists to fix.
+        """
         await db.execute(
             "INSERT INTO progress_events(event_id, goal_id, project_name, kind, "
-            "message, created_at, acknowledged) VALUES(?, ?, ?, ?, ?, ?, 0)",
-            (str(event_id), str(goal_id), project_name, kind, message, now))
+            "message, created_at, acknowledged, generation, task_id, attempt) "
+            "VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (str(event_id), str(goal_id), project_name, kind, message, now,
+             None if generation is None else int(generation),
+             None if task_id is None else str(task_id),
+             None if attempt is None else int(attempt)))
 
     async def apply_question_decision(
         self, *, goal_id: UUID, project_name: str, expected_generation: int,
@@ -1898,7 +1936,9 @@ class SQLiteMemoryBackend:
                 return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="question",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1928,7 +1968,9 @@ class SQLiteMemoryBackend:
                 return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="complete",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1965,7 +2007,9 @@ class SQLiteMemoryBackend:
                 (error, now, task_id))
             await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
                                   project_name=project_name, kind="error",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -2019,7 +2063,9 @@ class SQLiteMemoryBackend:
                 return False
             await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
                                   project_name=project_name, kind="paused",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -2071,7 +2117,9 @@ class SQLiteMemoryBackend:
                 return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="plan",
-                                  message=f"Next: {tool_name}", now=now)
+                                  message=f"Next: {tool_name}", now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -2666,18 +2714,29 @@ class SQLiteMemoryBackend:
             await db.execute("UPDATE proposals SET status=?, decided_at=? WHERE proposal_id=?", (status, now, proposal_id))
             await db.commit()
 
-    async def add_progress_event(self, *, event_id: UUID, goal_id: UUID, project_name: str, kind: str, message: str) -> None:
+    async def add_progress_event(self, *, event_id: UUID, goal_id: UUID, project_name: str,
+                                 kind: str, message: str,
+                                 generation: int | None = None,
+                                 task_id: str | None = None,
+                                 attempt: int | None = None) -> None:
+        """Record progress, stamped with the run that PRODUCED it."""
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO progress_events(event_id, goal_id, project_name, kind, message, created_at, acknowledged) VALUES(?, ?, ?, ?, ?, ?, 0)",
-                (str(event_id), str(goal_id), project_name, kind, message, now),
+                "INSERT INTO progress_events(event_id, goal_id, project_name, kind, "
+                "message, created_at, acknowledged, generation, task_id, attempt) "
+                "VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (str(event_id), str(goal_id), project_name, kind, message, now,
+                 None if generation is None else int(generation),
+                 None if task_id is None else str(task_id),
+                 None if attempt is None else int(attempt)),
             )
             await db.commit()
 
     async def list_progress_events(self, *, goal_id: str | None = None,
                                    project_name: str | None = None,
+                                   generation: int | None = None,
                                    limit: int = 50) -> list[dict[str, Any]]:
         """Read progress without consuming it.
 
@@ -2698,11 +2757,24 @@ class SQLiteMemoryBackend:
         """
         await self.initialize()
         q = ("SELECT event_id, goal_id, project_name, kind, message, "
-             "created_at, acknowledged FROM progress_events")
+             "created_at, acknowledged, generation, task_id, attempt "
+             "FROM progress_events")
         where, params = [], []
         if goal_id:
             where.append("goal_id=?")
             params.append(str(goal_id))
+        if generation is not None:
+            # A run selector, not a filter on "current": history is still
+            # readable, it just has to be asked for.
+            #
+            # Events whose run is UNKNOWN come along, carrying generation=None.
+            # They were written before the column existed, and hiding them from
+            # the default view would make an older database look empty - which
+            # is its own dishonesty. They are included and labelled, never
+            # relabelled: an unknown revision is reported as unknown, not as
+            # this one.
+            where.append("(generation=? OR generation IS NULL)")
+            params.append(int(generation))
         if project_name:
             where.append("project_name=?")
             params.append(project_name)
@@ -2715,7 +2787,13 @@ class SQLiteMemoryBackend:
             rows = await cur.fetchall()
         return [dict(event_id=r[0], goal_id=r[1], project_name=r[2], kind=r[3],
                      message=r[4], created_at=r[5],
-                     acknowledged=bool(int(r[6] or 0)))
+                     acknowledged=bool(int(r[6] or 0)),
+                     # None means unknown, and stays None. A reader that needs
+                     # to say "this is from before we recorded runs" can; one
+                     # that guessed would be inventing a revision.
+                     generation=(None if r[7] is None else int(r[7])),
+                     task_id=r[8],
+                     attempt=(None if r[9] is None else int(r[9])))
                 for r in rows]
 
     async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:

@@ -3496,10 +3496,22 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.set_proposal_status(proposal_id=proposal_id, status=status)
 
-    async def add_progress_event(self, *, goal_id: UUID, project_name: str, kind: str, message: str) -> None:
+    async def add_progress_event(self, *, goal_id: UUID, project_name: str, kind: str, message: str,
+                                 generation: int | None = None,
+                                 task_id: str | None = None,
+                                 attempt: int | None = None) -> None:
+        """Record progress. `generation` is the run that PRODUCED this.
+
+        Left None only when the producer genuinely cannot say which run it was
+        acting for. It is never filled in from the goal's current generation:
+        the goal moves on, and history must not move with it.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.add_progress_event(event_id=uuid4(), goal_id=goal_id, project_name=project_name, kind=kind, message=message)
+            await self._sqlite.add_progress_event(
+                event_id=uuid4(), goal_id=goal_id, project_name=project_name,
+                kind=kind, message=message, generation=generation,
+                task_id=task_id, attempt=attempt)
 
     async def describe_work_state(self, *, project_name: str | None = None,
                                   limit: int = 12) -> str:
@@ -3567,11 +3579,17 @@ class MemoryUnifier:
 
     async def list_progress_events(self, *, goal_id: str | None = None,
                                    project_name: str | None = None,
+                                   generation: int | None = None,
                                    limit: int = 50) -> list[dict[str, Any]]:
-        """Progress, read without consuming it. See the backend for why."""
+        """Progress, read without consuming it. See the backend for why.
+
+        `generation` selects ONE lifecycle run. Without it the whole history
+        comes back, each event carrying the run that produced it.
+        """
         await self.initialize()
         return await self._sqlite.list_progress_events(
-            goal_id=goal_id, project_name=project_name, limit=limit)
+            goal_id=goal_id, project_name=project_name,
+            generation=generation, limit=limit)
 
     async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:
         await self.initialize()

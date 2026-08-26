@@ -28,7 +28,10 @@ from core.project_names import is_project_dir
 from core.project_intent import (
     describes_a_change,
     asks_current_project,
-    requests_project_removal,
+    classify_removal,
+    REMOVAL_AMBIGUOUS,
+    REMOVAL_UNSUPPORTED,
+    REMOVAL_WHOLE_PROJECT,
     approves_without_naming_a_change,
     authorize_project_mutation,
     cancels_pending_change,
@@ -1645,6 +1648,18 @@ class RuntimeManager:
                     return self._no_such_project(wanted)
                 slug = await pb.last_active()
         if slug:
+            # Decided BEFORE authorisation, because this is a refusal rather
+            # than a mutation. "Retire flappy-bird." is not an affirmative
+            # instruction by the mutation grammar, so gating it behind
+            # `may_mutate` meant it never reached the explanation and fell
+            # through to the model to answer however it liked.
+            if classify_removal(t, slug=slug) == REMOVAL_UNSUPPORTED:
+                logger.info("project_removal_unsupported", slug=slug)
+                return (f"I don't have a way to retire or archive a project — "
+                        f"there's no such state for me to move '{slug}' into. I "
+                        f"can delete it (it goes to the trash and can be "
+                        f"restored), or leave it exactly where it is. Which "
+                        f"would you like?")
             if STATUS_WORDS_RE.search(t):
                 return pb.status_text(slug)
             if RESUME_WORDS_RE.search(t) and may_mutate:
@@ -1680,9 +1695,25 @@ class RuntimeManager:
                 # `project.delete` lives behind its admin-tier approval. The
                 # authoritative operation is the only thing allowed to remove a
                 # project; this pre-pass may not do it conversationally.
-                if requests_project_removal(t, slug=slug):
+                removal = classify_removal(t, slug=slug)
+                if removal == REMOVAL_WHOLE_PROJECT:
+                    # The authoritative operation is the only thing allowed to
+                    # remove a project, and it lives behind an admin-tier
+                    # approval in the tool loop.
                     logger.info("project_removal_deferred_to_tool", slug=slug)
                     return None
+                if removal == REMOVAL_AMBIGUOUS:
+                    # "Delete it from my projects." A removal command whose
+                    # object cannot be identified. Falling through to the edit
+                    # path here is what made D4's sibling: the instruction was
+                    # handed to ProjectBuilder.improve as an EDIT and Nova
+                    # answered "working on those improvements". An uncertain
+                    # destructive intent performs no side effect at all.
+                    logger.info("project_removal_ambiguous", slug=slug)
+                    return (f"I want to be sure before I touch anything — do you "
+                            f"mean delete the whole '{slug}' project, or remove "
+                            f"something inside it? Tell me which and I'll do it.")
+
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
                 # THE APPROVAL TURN. "Okay, make that change." names no change;

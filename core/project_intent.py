@@ -56,6 +56,12 @@ __all__ = [
     "approves_without_naming_a_change",
     "qualified_project_name",
     "requests_project_removal",
+    "classify_removal",
+    "REMOVAL_NONE",
+    "REMOVAL_WHOLE_PROJECT",
+    "REMOVAL_INSIDE_PROJECT",
+    "REMOVAL_AMBIGUOUS",
+    "REMOVAL_UNSUPPORTED",
 ]
 
 
@@ -608,78 +614,159 @@ def _content_words(text: str) -> set:
             if w not in _TARGET_STOPWORDS and len(w) > 2}
 
 
-#: Verbs that ask for a thing to STOP EXISTING, as opposed to being changed.
-#: "retire" and "archive" are here because a user reaches for them meaning the
-#: same thing; Nova has no such capability and must not quietly invent one by
-#: treating the sentence as an edit instead.
+#: What a removal instruction is actually asking for. A boolean could not say:
+#: "delete it from my projects" and "remove the bird from flappy-bird" are both
+#: removals, and neither is a whole-project delete, but they need OPPOSITE
+#: handling - one must not act at all, the other is ordinary edit work.
+REMOVAL_NONE = "not_removal"
+REMOVAL_WHOLE_PROJECT = "whole_project"
+REMOVAL_INSIDE_PROJECT = "inside_project"
+REMOVAL_AMBIGUOUS = "ambiguous"
+REMOVAL_UNSUPPORTED = "unsupported_lifecycle"
+
+#: Verbs that ask for a thing to stop existing.
 _REMOVAL_VERB_RE = re.compile(
     r"\b(delete|deleting|remove|removing|erase|erasing|trash|purge|purging|"
-    r"retire|retiring|archive|archiving|get\s+rid\s+of|throw\s+(?:it\s+)?away)\b",
-    re.I)
+    r"get\s+rid\s+of|throw\s+(?:it\s+)?away)\b", re.I)
 
-#: How far after the verb its object may sit: "delete the with-you project",
-#: "remove the project called with-you". Long enough for an article, an
-#: adjective and a noun; short enough that a project named later in a different
-#: clause is not mistaken for this verb's object.
-_REMOVAL_OBJECT_WINDOW = 44
+#: Verbs for a lifecycle Nova does not have. A user reaching for "retire" or
+#: "archive" means something real, and it is NOT delete: there is no retired
+#: state to move a project into, no way back from one, and nothing that would
+#: list it afterwards. Mapping them onto `project.delete` would answer a
+#: question nobody asked with an irreversible action - and the live session
+#: that started this whole thread opened with "retire with-you".
+_UNSUPPORTED_LIFECYCLE_RE = re.compile(
+    r"\b(retire|retiring|retired|archive|archiving|archived|"
+    r"shelve|shelving|mothball)\b", re.I)
 
-#: After one of these, whatever follows is where the removal happens, not what
+#: After one of these, whatever follows is WHERE the removal happens, not what
 #: is being removed.
 _CONTAINER_PREP_RE = re.compile(
-    r"\b(from|in|inside|within|on|out\s+of|off\s+of)\b", re.I)
+    r"\b(from|in|inside|within|out\s+of|off\s+of)\b", re.I)
+
+#: Words that cannot name anything on their own, so an object made only of
+#: these identifies nothing.
+_EMPTY_OBJECT = frozenset("""
+a an the this that these those my our your its his her their
+it them one ones thing things please just now then
+""".split())
+
+#: Generic words for the project as a whole. As the HEAD of the object they
+#: mean the project itself ("delete the project"); as a modifier they describe
+#: something inside it ("delete the project banner").
+_PROJECT_NOUNS = frozenset({"project", "projects"})
+
+#: Where the removal's own clause ends.
+_CLAUSE_END_RE = re.compile(r"[,;:.!?]|\b(and|but|so|then|because)\b", re.I)
+
+_REMOVAL_OBJECT_WINDOW = 60
 
 
-def requests_project_removal(text: str, *, slug: str = "") -> bool:
-    """Is this asking for the PROJECT to stop existing?
+def _normalise(text: str) -> str:
+    return re.sub(r"[-_\s]+", " ", (text or "").strip().lower())
 
-    The distinction that matters, and the one Nova got wrong:
 
-        "delete with-you"                 the project itself
-        "remove the pause button from it" a feature inside the project
+def _object_of(text: str, match) -> str:
+    """The noun phrase the removal verb is acting on.
 
-    Both are removals, and both were authorised as "a project mutation" —
-    after which the caller ran `improve()` on whichever one it was. Measured on
-    55c485b: "Please delete with-you, I mean it." started an autonomous CODE
-    EDIT of with-you and answered "working on those improvements to with-you
-    now". The delete never happened, the permission gate was never reached, and
-    Nova reported work it was not doing.
+    Ends at a container preposition, because after "from"/"in" the project is
+    the place the removal happens rather than the thing being removed. That one
+    rule is what separates "remove the pause button FROM flappy-bird" from
+    "remove flappy-bird".
+    """
+    window = text[match.end():match.end() + _REMOVAL_OBJECT_WINDOW]
+    # The object also ends where the CLAUSE does. "delete with-you, I mean it"
+    # names with-you; without this the object ran on into the next clause and
+    # its head became "mean".
+    clause = _CLAUSE_END_RE.search(window)
+    if clause:
+        window = window[:clause.start()]
+    cut = _CONTAINER_PREP_RE.search(window)
+    if cut:
+        window = window[:cut.start()]
+    return window.strip(" .,;:!?'\"")
 
-    Deciding by ADJACENCY rather than by mere presence of a removal word is
-    what separates the two: the object of the removal verb has to BE the
-    project — its slug, or the word "project" itself. A feature name sitting
-    there means the removal is inside the project, which is ordinary edit work.
 
-    Returns False when it cannot tell. That leaves the existing edit path in
-    charge, which is the conservative direction: a missed classification here
-    costs an edit that a person can undo, while a wrong one aims a
-    permission-gated delete at a project nobody asked to lose.
+def _head_and_tokens(obj: str) -> tuple[str, list[str]]:
+    """The object's head noun and its content tokens.
+
+    English puts the head of a noun phrase last: "the project banner" is a
+    banner, "the flappy-bird project" is a project. Reading the head rather
+    than scanning for a keyword anywhere is what stops a generic word appearing
+    as a MODIFIER from claiming the whole project.
+    """
+    tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9'-]*", (obj or "").lower())
+              if t not in _EMPTY_OBJECT]
+    return (tokens[-1] if tokens else ""), tokens
+
+
+def classify_removal(text: str, *, slug: str = "") -> str:
+    """What kind of removal this is, if any.
+
+    Returns one of REMOVAL_NONE / WHOLE_PROJECT / INSIDE_PROJECT / AMBIGUOUS /
+    UNSUPPORTED.
+
+    The rule that matters most is the one that is NOT here: a component of a
+    hyphenated slug never identifies the whole project. "bird" is not
+    flappy-bird and "tower" is not tower-defense, and treating them as the
+    project pointed a permission-gated delete at something the user was asking
+    to edit. Only the full identity counts, hyphens and spaces normalised, so
+    "flappy bird" is still flappy-bird while "bird" is not.
     """
     raw = (text or "").strip()
     if not raw:
-        return False
-    targets = {"project", "projects"}
-    for part in re.split(r"[-_\s]+", (slug or "").lower()):
-        if len(part) > 2:
-            targets.add(part)
-    if (slug or "").strip():
-        targets.add((slug or "").strip().lower())
+        return REMOVAL_NONE
 
-    for m in _REMOVAL_VERB_RE.finditer(raw):
-        window = raw[m.end():m.end() + _REMOVAL_OBJECT_WINDOW].lower()
-        # Stop at a preposition that puts the project back in the position of
-        # a CONTAINER rather than the thing being removed. Without this,
-        # "remove the pause button FROM with-you" reads as removing with-you,
-        # because the slug is still inside the window.
-        cut = _CONTAINER_PREP_RE.search(window)
-        if cut:
-            window = window[:cut.start()]
-        # The slug may be written with spaces where the directory has hyphens.
-        flattened = re.sub(r"[-_\s]+", " ", window)
-        for t in targets:
-            spaced = re.sub(r"[-_\s]+", " ", t)
-            if spaced and re.search(rf"\b{re.escape(spaced)}\b", flattened):
-                return True
-    return False
+    # An unsupported lifecycle verb is decided before anything else: whatever
+    # its object is, Nova cannot do the thing being asked for.
+    if _UNSUPPORTED_LIFECYCLE_RE.search(raw):
+        return REMOVAL_UNSUPPORTED
+
+    matches = list(_REMOVAL_VERB_RE.finditer(raw))
+    if not matches:
+        return REMOVAL_NONE
+
+    identity = _normalise(slug)
+    verdicts = []
+    for m in matches:
+        obj = _object_of(raw, m)
+        head, tokens = _head_and_tokens(obj)
+        flat = _normalise(obj)
+
+        if not tokens:
+            # "delete it", "remove that" - a removal with nothing to name.
+            verdicts.append(REMOVAL_AMBIGUOUS)
+            continue
+        if identity and (flat == identity or head == identity
+                         or flat.endswith(" " + identity)
+                         or head == identity.replace(" ", "-")):
+            verdicts.append(REMOVAL_WHOLE_PROJECT)
+            continue
+        if head in _PROJECT_NOUNS:
+            # "delete the project", "trash this project" - the head IS the
+            # project. A modifier ("the project banner") is not.
+            verdicts.append(REMOVAL_WHOLE_PROJECT)
+            continue
+        verdicts.append(REMOVAL_INSIDE_PROJECT)
+
+    # A sentence that asks for two different things is not a licence to pick
+    # the destructive reading.
+    if REMOVAL_AMBIGUOUS in verdicts:
+        return REMOVAL_AMBIGUOUS
+    if REMOVAL_WHOLE_PROJECT in verdicts and REMOVAL_INSIDE_PROJECT in verdicts:
+        return REMOVAL_AMBIGUOUS
+    return verdicts[0]
+
+
+def requests_project_removal(text: str, *, slug: str = "") -> bool:
+    """True only for an unambiguous whole-project removal.
+
+    Kept as the narrow question callers usually want. Anything that needs to
+    tell an ambiguous removal from a feature removal must use
+    `classify_removal`, because a boolean cannot carry that difference - which
+    is exactly how an ambiguous delete ended up starting an edit.
+    """
+    return classify_removal(text, slug=slug) == REMOVAL_WHOLE_PROJECT
 
 
 def defers_a_change(text: str) -> bool:

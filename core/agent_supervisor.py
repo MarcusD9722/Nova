@@ -104,7 +104,7 @@ class AgentSupervisor:
         """
         try:
             await self._memory.add_progress_event(
-                goal_id=UUID(goal_id), project_name=project_name, kind="blocked",
+                goal_id=UUID(goal_id), project_name=project_name, generation=generation, kind="blocked",
                 message=(f"{what} finished after lifecycle run {generation} "
                          f"ended, so it was not counted as work done."))
         except Exception as e:  # noqa: BLE001
@@ -126,7 +126,7 @@ class AgentSupervisor:
                        f"{generation}, which ended (the goal was cancelled or "
                        f"resumed while this was being decided)"))
             await self._memory.add_progress_event(
-                goal_id=UUID(goal_id), project_name=project_name, kind="blocked",
+                goal_id=UUID(goal_id), project_name=project_name, generation=generation, kind="blocked",
                 message=("A decision from before this goal was cancelled/resumed "
                          "was discarded rather than applied."))
         except Exception as e:  # noqa: BLE001
@@ -406,6 +406,7 @@ Return JSON only.
                         if outcome == "applied":
                             await self._memory.add_progress_event(
                                 goal_id=UUID(goal_id), project_name=project_name,
+                                generation=generation, task_id=task_id,
                                 kind="blocked",
                                 message=f"{tool_name} failed and was NOT retried "
                                         f"automatically: {failure}")
@@ -442,18 +443,19 @@ Return JSON only.
                                        f"work from before it was cancelled)"))
                             await self._memory.add_progress_event(
                                 goal_id=UUID(goal_id), project_name=project_name,
+                                generation=generation, task_id=task_id,
                                 kind="blocked",
                                 message=(f"{tool_name} failed and was NOT retried: "
                                          f"the goal was cancelled or resumed while "
                                          f"it was running."))
                             continue
-                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {failure}")
+                        await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, generation=generation, kind="retry", message=f"{tool_name} failed, retrying ({attempts}/{self._cfg.max_retries}): {failure}")
                     else:
                         outcome = await self._memory.complete_goal_task(
                             task_id=task_id, status="failed", result={},
                             error=failure, expected_generation=generation)
                         if outcome == "applied":
-                            await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="error", message=f"{tool_name} failed: {failure}")
+                            await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, generation=generation, kind="error", message=f"{tool_name} failed: {failure}")
                         elif outcome == "superseded":
                             await self._note_superseded(
                                 goal_id=goal_id, project_name=project_name,
@@ -469,7 +471,7 @@ Return JSON only.
                     result={"ok": True, "data": result.result}, error="",
                     expected_generation=generation)
                 if outcome == "applied":
-                    await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, kind="tool", message=f"{tool_name} completed")
+                    await self._memory.add_progress_event(goal_id=UUID(goal_id), project_name=project_name, generation=generation, kind="tool", message=f"{tool_name} completed")
                 elif outcome == "superseded":
                     await self._note_superseded(
                         goal_id=goal_id, project_name=project_name,
