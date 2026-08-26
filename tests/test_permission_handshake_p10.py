@@ -909,11 +909,19 @@ def case_runtime() -> None:
                   str(projects).startswith(str(root)) and "Desktop" not in str(projects),
                   str(projects))
 
-            # R24/R25 record a LIMIT, not an achievement. The backend emits
-            # `permission.expired`; no frontend consumes it. Claiming "the UI
-            # withdraws the button" would be unfounded, so the absence is pinned
-            # here instead — if an approval UI ever lands, this check fails and
-            # whoever adds it has to test the lifecycle properly (Stage-10 case 8).
+            # R24/R25. R25 USED to pin the absence of an approval surface: the
+            # backend emitted `permission.expired` and no frontend consumed it,
+            # so claiming "the UI withdraws the button" would have been
+            # unfounded. It was written to FAIL the day a UI landed, so that
+            # whoever added one had to test the lifecycle rather than assume it.
+            #
+            # It landed (Stage 13B closure). Marcus asked Nova to delete a
+            # project, no approval surface existed, the request timed out after
+            # 120 seconds and Nova then said it had deleted it. So R25 is
+            # inverted rather than deleted: a consumer must now EXIST, and the
+            # lifecycle it drives is tested end to end - timeout, denial,
+            # approval, a late click that reports applied=false, and a fresh
+            # user turn - in tests/test_permission_delete_s13b.py.
             fe = REPO / "frontend" / "src"
             consumers = []
             if fe.exists():
@@ -924,10 +932,18 @@ def case_runtime() -> None:
             check("R24 the broker emits permission.expired on abandonment",
                   "permission.expired" in
                   (REPO / "core" / "permissions.py").read_text(encoding="utf-8"))
-            check("R25 NO frontend approval lifecycle exists yet — not claimed as tested",
-                  consumers == [],
-                  f"consumers found: {consumers} — if this fails, the frontend "
-                  f"approval surface now exists and MUST be tested rather than assumed")
+            lifecycle_suite = REPO / "tests" / "test_permission_delete_s13b.py"
+            suite_text = (lifecycle_suite.read_text(encoding="utf-8")
+                          if lifecycle_suite.exists() else "")
+            check("R25 a frontend approval surface exists",
+                  consumers != [],
+                  f"consumers found: {consumers}")
+            check("R25b and its lifecycle is tested, not assumed",
+                  lifecycle_suite.exists()
+                  and "/permissions/resolve" in suite_text
+                  and "applied" in suite_text
+                  and "timeout" in suite_text,
+                  f"{lifecycle_suite.name} exists={lifecycle_suite.exists()}")
 
     asyncio.run(run())
 

@@ -70,6 +70,31 @@ async def tasks_list(status_filter: str | None = Query(None, alias="status"), li
     return {"tasks": items}
 
 
+class TaskAnswer(BaseModel):
+    answer: str = Field(..., min_length=1, max_length=4000,
+                        description="The user's answer to the task's question.")
+
+
+@router.post("/tasks/{task_id}/answer")
+async def task_answer(task_id: str, body: TaskAnswer) -> dict:
+    """Answer a task that is waiting on a person, so it can run again.
+
+    A background task that asked a question used to be recorded as `done`, so
+    there was nothing to answer and no endpoint to answer it with. `blocked` is
+    the state; this is the way out of it. Refused (409) if the task is not
+    actually waiting -- an answer must not restart something that is running,
+    finished, or cancelled.
+    """
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    ok = await STATE.memory.answer_task_question(
+        task_id=task_id, answer=body.answer.strip())
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="That task is not waiting for an answer.")
+    return {"ok": True, "task_id": task_id, "status": "queued"}
+
+
 @router.get("/memory/recent")
 async def memory_recent(limit: int = Query(50, ge=1, le=200)) -> dict:
     """Recent long-term memory records for the Memory panel."""

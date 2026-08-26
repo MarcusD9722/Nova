@@ -234,11 +234,29 @@ async def test_unverified_answer_does_not_fabricate_history():
 
 
 async def _reply(nova, ident, text, cid):
-    """The assistant text, plus how many model calls it took."""
+    """The assistant text, plus how many times the turn ASKED THE MODEL.
+
+    Counts CHAT prompts, not every entry on the scripted model.
+    `nova.llm.prompts` is global and the background memory-ingest worker
+    shares it, so draining an EARLIER turn lands an extractor call inside
+    this measurement window and gets attributed to this turn.
+
+    That is what made this suite flake about 1 run in 10. Instrumented, the
+    counted prompt was always the EXTRACTOR, never a chat prompt, and the
+    identity at the guard was always correct — in_turn=True,
+    unverified=True, memory_entity=None, branch taken. The privacy property
+    held every time; the measurement was wrong.
+
+    The property under test is "this path does not ask the model to answer",
+    so a chat prompt is exactly the thing to count. Whether the extractor
+    runs at all for an unverified speaker is a different question, and the
+    scoping assertions elsewhere in this file are what answer it.
+    """
     nova.llm.reset_calls()
     out = await nova.brain.chat(text, conversation_id=cid, identity=ident)
     txt = getattr(out, "assistant_text", None) or getattr(out, "reply", None) or str(out)
-    return txt, len(nova.llm.prompts)
+    chat_prompts = [q for q in nova.llm.prompts if "You are Nova" in q]
+    return txt, len(chat_prompts)
 
 
 async def test_unverified_self_history_response_is_deterministic():

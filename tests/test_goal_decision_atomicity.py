@@ -107,8 +107,12 @@ async def _blocked_apply(kind: str, at: str = "complete"):
         gid = await _goal(m)
         tid = await m.enqueue_goal_task(goal_id=gid, project_name="alpha",
                                         tool_name="__decide__", args={})
-        rows = await m.list_goal_tasks(goal_id=str(gid), limit=10)
-        task_id = rows[0]["task_id"]
+        # CLAIM it, the way the supervisor does. A decision belongs to a
+        # `__decide__` that is actually running: applying one for a task
+        # nobody claimed is refused now, and refusing it is the point of
+        # the idempotency fence.
+        claimed = await m.claim_next_goal_task()
+        task_id = str(claimed["task_id"])
 
         inside = asyncio.Event()
         release = asyncio.Event()
@@ -306,7 +310,7 @@ async def _stale_race(decision: str, *, blind_precheck: bool = False):
             for _ in range(120):
                 await asyncio.sleep(0.05)
                 rows = await m.list_goal_tasks(goal_id=str(gid), limit=50)
-                if any(t["status"] == "failed" for t in rows):
+                if any(t["status"] in ("failed", "superseded") for t in rows):
                     break
         finally:
             await gated.sup.stop()
@@ -326,7 +330,7 @@ async def test_a_stale_question_leaves_no_proposal_and_no_event():
         check("question" not in end["kinds"],
               f"no stale question event {tag} ({end['kinds']})")
         stale = [t for t in end["tasks"]
-                 if t["status"] == "failed" and "discarded" in (t["last_error"] or "")]
+                 if t["status"] == "superseded" and "discarded" in (t["last_error"] or "")]
         check(len(stale) == 1,
               f"the old decision is recorded as discarded, not done {tag} ({len(stale)})")
         check(end["status"] == "active",

@@ -3195,17 +3195,61 @@ class MemoryUnifier:
         items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
         return items[:limit]
 
-    async def mark_task_done(self, *, task_id: str, result: dict[str, Any] | None = None) -> None:
-        await self.initialize()
-        async with self._write_lock:
-            await self._sqlite.complete_autonomy_task(task_id=task_id, status="done", result=result or {}, error="")
-        BUS.publish("task.completed", {"task_id": str(task_id), "status": "done"})
+    async def mark_task_done(self, *, task_id: str, result: dict[str, Any] | None = None) -> bool:
+        """Record success. Returns whether this call is the one that landed.
 
-    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None) -> None:
+        The announcement is conditional on the write. `complete_autonomy_task`
+        is first-write-wins, so a second caller changes nothing -- and a bus
+        event for a write that did not happen is the same lie as a row that
+        disagrees with it, one layer out.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error)
-        BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
+            applied = await self._sqlite.complete_autonomy_task(task_id=task_id, status="done", result=result or {}, error="")
+        if applied:
+            BUS.publish("task.completed", {"task_id": str(task_id), "status": "done"})
+        return applied
+
+    async def mark_task_failed(self, *, task_id: str, error: str, result: dict[str, Any] | None = None,
+                               outcome: str = "") -> bool:
+        """Record failure. Returns whether this call is the one that landed.
+
+        `outcome` lets a caller say the work's fate is UNKNOWN rather than
+        failed - an interrupted tool did not fail, it stopped being observable.
+        """
+        await self.initialize()
+        async with self._write_lock:
+            applied = await self._sqlite.complete_autonomy_task(task_id=task_id, status="failed", result=result or {}, error=error, outcome=outcome)
+        if applied:
+            BUS.publish("task.updated", {"task_id": str(task_id), "status": "failed", "error": clip(error, 160)})
+        return applied
+
+    async def mark_task_blocked(self, *, task_id: str, question: str,
+                                result: dict[str, Any] | None = None) -> bool:
+        """Park a task on a question for the user. True if it landed.
+
+        Announced as `task.updated`, never `task.completed`: nothing completed.
+        """
+        await self.initialize()
+        async with self._write_lock:
+            applied = await self._sqlite.block_autonomy_task(
+                task_id=task_id, question=question, result=result)
+        if applied:
+            BUS.publish("task.updated", {"task_id": str(task_id),
+                                         "status": "blocked",
+                                         "question": clip(question, 160)})
+        return applied
+
+    async def answer_task_question(self, *, task_id: str, answer: str) -> bool:
+        """Answer a blocked task so it can run again. True if it was waiting."""
+        await self.initialize()
+        async with self._write_lock:
+            applied = await self._sqlite.answer_autonomy_task(
+                task_id=task_id, answer=answer)
+        if applied:
+            BUS.publish("task.updated", {"task_id": str(task_id),
+                                         "status": "queued"})
+        return applied
 
     async def bump_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
         await self.initialize()
@@ -3386,10 +3430,22 @@ class MemoryUnifier:
         await self.initialize()
         return await self._sqlite.claim_next_task()
 
-    async def complete_goal_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
+    async def complete_goal_task(self, *, task_id: str, status: str,
+                                 result: dict[str, Any] | None = None,
+                                 error: str = "",
+                                 expected_generation: int) -> str:
+        """Finish a goal task. Returns "applied", "superseded" or "ignored".
+
+        `expected_generation` is the run the caller claimed the task under —
+        required, so that no caller can write a terminal status without
+        saying which run it is finishing. See
+        `SQLiteBackend.complete_task` for what each outcome means.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.complete_task(task_id=task_id, status=status, result=result, error=error)
+            return await self._sqlite.complete_task(
+                task_id=task_id, status=status, result=result, error=error,
+                expected_generation=expected_generation)
 
     async def bump_goal_task_attempt(self, *, task_id: str, attempts: int,
                                      run_after_iso: str, error: str,
@@ -3440,10 +3496,100 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.set_proposal_status(proposal_id=proposal_id, status=status)
 
-    async def add_progress_event(self, *, goal_id: UUID, project_name: str, kind: str, message: str) -> None:
+    async def add_progress_event(self, *, goal_id: UUID, project_name: str, kind: str, message: str,
+                                 generation: int | None = None,
+                                 task_id: str | None = None,
+                                 attempt: int | None = None) -> None:
+        """Record progress. `generation` is the run that PRODUCED this.
+
+        Left None only when the producer genuinely cannot say which run it was
+        acting for. It is never filled in from the goal's current generation:
+        the goal moves on, and history must not move with it.
+        """
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.add_progress_event(event_id=uuid4(), goal_id=goal_id, project_name=project_name, kind=kind, message=message)
+            await self._sqlite.add_progress_event(
+                event_id=uuid4(), goal_id=goal_id, project_name=project_name,
+                kind=kind, message=message, generation=generation,
+                task_id=task_id, attempt=attempt)
+
+    async def describe_work_state(self, *, project_name: str | None = None,
+                                  limit: int = 12) -> str:
+        """What is true about Nova's work right now, from the durable record.
+
+        Built for the answer prompt, and built from rows rather than from the
+        conversation, because the conversation is exactly the wrong authority
+        for it: after a restart the transcript starts empty while the work is
+        still there, and a model asked "what failed?" with no state in front of
+        it will answer from whatever it remembers saying.
+
+        Both axes are reported. `status` alone cannot distinguish a step that
+        never ran from one whose tool succeeded after the run was cancelled,
+        and those are different answers to "did that happen?".
+
+        Empty string when there is nothing to say, so an ordinary turn carries
+        no extra tokens.
+        """
+        await self.initialize()
+        try:
+            goals = await self.list_goals(project_name=project_name, limit=limit)
+            tasks = await self.list_goal_tasks(limit=100)
+            auto = await self.list_tasks(limit=50)
+        except Exception:  # noqa: BLE001
+            return ""
+
+        if project_name:
+            tasks = [t for t in tasks
+                     if str(t.get("project_name")) == project_name]
+            auto = [a for a in auto
+                    if str(a.get("project_name")) == project_name]
+        if not goals and not tasks and not auto:
+            return ""
+
+        lines: list[str] = []
+        for g in goals[:limit]:
+            gid = str(g.get("goal_id"))
+            mine = [t for t in tasks if str(t.get("goal_id")) == gid]
+            lines.append(
+                f"- goal '{g.get('title')}' ({g.get('project_name')}): "
+                f"{g.get('status')}, revision {g.get('generation')}")
+            for t in mine[:limit]:
+                bit = f"    - {t.get('tool_name')}: {t.get('status')}"
+                outcome = str(t.get("outcome") or "")
+                if outcome and outcome != "pending":
+                    bit += f" (work {outcome})"
+                err = str(t.get("last_error") or "").strip()
+                if err:
+                    bit += f" - {err[:160]}"
+                lines.append(bit)
+
+        waiting = [a for a in auto if str(a.get("status")) == "blocked"]
+        for a in waiting[:limit]:
+            lines.append(f"- waiting on you: {a.get('title')} - "
+                         f"{str(a.get('last_error') or '')[:160]}")
+        other = [a for a in auto if str(a.get("status")) in ("queued", "running")]
+        for a in other[:limit]:
+            lines.append(f"- background task '{a.get('title')}': {a.get('status')}")
+
+        if not lines:
+            return ""
+        return ("\nThe work you are actually tracking (from the record, not "
+                "from this conversation - trust it over anything you remember "
+                "saying):\n" + "\n".join(lines) + "\n")
+
+    async def list_progress_events(self, *, goal_id: str | None = None,
+                                   project_name: str | None = None,
+                                   generation: int | None = None,
+                                   limit: int = 50) -> list[dict[str, Any]]:
+        """Progress, read without consuming it. See the backend for why.
+
+        `generation` selects ONE lifecycle run. Without it the whole history
+        comes back, each event carrying the run that produced it.
+        """
+        await self.initialize()
+        return await self._sqlite.list_progress_events(
+            goal_id=goal_id, project_name=project_name,
+            generation=generation, limit=limit)
 
     async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:
         await self.initialize()

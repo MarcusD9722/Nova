@@ -285,7 +285,8 @@ async def test_only_a_task_of_the_current_run_is_claimable():
         check(claimed is not None and int(claimed["generation"]) == 7,
               f"and the generation comes from the TASK row ({(claimed or {}).get('generation')})")
 
-        await m.complete_goal_task(task_id=b, status="done", result={})
+        await m.complete_goal_task(task_id=b, status="done", result={},
+                                   expected_generation=7)
         again = await m.claim_next_goal_task()
         check(again is None,
               f"the stale run-6 task stays unclaimable ({(again or {}).get('tool_name')})")
@@ -621,7 +622,7 @@ async def test_a_cancel_beats_a_step_budget_pause():
     check("paused" not in kinds,
           f"and no 'paused after N steps' event became authoritative ({kinds})")
     decide = [t for t in rows if t["tool_name"] == "__decide__"][0]
-    check(decide["status"] == "failed" and "discarded" in decide["last_error"],
+    check(decide["status"] == "superseded" and "discarded" in decide["last_error"],
           f"the claimed task is finalised as stale ({decide['status']})")
 
 
@@ -765,7 +766,7 @@ async def _decide_failure_race(*, stale: bool):
             for _ in range(200):
                 await asyncio.sleep(0.05)
                 rows = await _rows(m, gid)
-                if any(t["status"] == "failed" for t in rows):
+                if any(t["status"] in ("failed", "superseded") for t in rows):
                     break
         finally:
             release.set()
@@ -783,7 +784,7 @@ async def test_a_stale_planner_error_does_not_reach_the_resumed_run():
           f"the resumed goal is still active ({goal['status']})")
     check("error" not in kinds,
           f"no ordinary 'Could not decide next step' error is published ({kinds})")
-    failed = [t for t in rows if t["status"] == "failed"]
+    failed = [t for t in rows if t["status"] in ("failed", "superseded")]
     check(failed and "discarded" in failed[0]["last_error"],
           f"the old task is terminal AND marked stale "
           f"({(failed[0]['last_error'][:60] if failed else None)!r})")
@@ -841,7 +842,8 @@ async def test_a_planner_failure_cannot_be_overtaken_between_check_and_write():
             for _ in range(200):
                 await asyncio.sleep(0.05)
                 await log.drain()
-                if any(t["status"] == "failed" for t in await _rows(m, gid)):
+                if any(t["status"] in ("failed", "superseded")
+                       for t in await _rows(m, gid)):
                     break
             for _ in range(20):
                 await asyncio.sleep(0.05)
@@ -858,7 +860,7 @@ async def test_a_planner_failure_cannot_be_overtaken_between_check_and_write():
         check("error" not in kinds,
               f"no ordinary planner-error event from the superseded run ({kinds})")
         stale = [t for t in rows if t["generation"] == 0]
-        check(stale and stale[0]["status"] == "failed"
+        check(stale and stale[0]["status"] == "superseded"
               and "discarded" in stale[0]["last_error"],
               f"the run-0 task is terminal and marked stale "
               f"({(stale[0]['last_error'][:50] if stale else None)!r})")
@@ -968,7 +970,7 @@ async def test_a_current_planner_error_is_still_recorded():
     goal, rows, kinds = await _decide_failure_race(stale=False)
 
     check("error" in kinds, f"the error event is published ({kinds})")
-    failed = [t for t in rows if t["status"] == "failed"]
+    failed = [t for t in rows if t["status"] in ("failed", "superseded")]
     check(failed and "old planner failed" in failed[0]["last_error"],
           f"with the real reason "
           f"({(failed[0]['last_error'][:50] if failed else None)!r})")

@@ -136,6 +136,34 @@ _SOCIAL_OVERRIDE_RE = re.compile(
 _MAX_CONVERSATIONAL_WORDS = 12
 
 
+#: Questions whose only honest source is the durable record, not the
+#: conversation. "What failed?" after a restart has no answer in a transcript
+#: that begins after the restart, and answering it from what Nova happens to
+#: remember saying is how a confident wrong answer gets produced.
+_WORK_STATUS_RE = re.compile(
+    r"\b("
+    r"what happened|what went wrong|what failed|what broke|"
+    r"what(?:'s| is| was)?\s+(?:still\s+)?(?:pending|outstanding|left|remaining)|"
+    r"what(?:'s| is| was)?\s+(?:been\s+)?(?:cancelled|canceled)|"
+    r"what can (?:be )?resume|what(?:'s| is)? resumable|can (?:we|you) resume|"
+    r"what should happen next|what(?:'s| is) next|where (?:are|were) we|"
+    r"what(?:'s| is| are) (?:you|nova) working on|"
+    r"what(?:'s| is) the status|how(?:'s| is) it going with|"
+    r"did (?:it|that) (?:work|finish|succeed|run)"
+    r")\b", re.IGNORECASE)
+
+
+def asks_about_work(text: str) -> bool:
+    """Is this a question about the state of Nova's own work?
+
+    Deliberately a closed list of question shapes rather than a keyword sniff:
+    it decides only whether to ATTACH authoritative state to the answer, and
+    attaching it to an unrelated turn is prompt bloat, while missing one leaves
+    the model answering from memory.
+    """
+    return bool(_WORK_STATUS_RE.search(text or ""))
+
+
 def is_purely_conversational(text: str) -> bool:
     """True only when NO registered tool could plausibly help.
 

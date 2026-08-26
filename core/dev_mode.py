@@ -22,6 +22,7 @@ Safety model (do not weaken without user sign-off):
 """
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -65,6 +66,11 @@ def dev_mode_enabled() -> bool:
     return os.getenv("NOVA_DEV_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _content_sha(text: str) -> str:
+    """Digest of a file's exact bytes, for "is this still the same file?"."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 @dataclass
 class ChangeProposal:
     id: str
@@ -85,6 +91,19 @@ class ChangeProposal:
     # Registered external-project name when the target lives outside Nova's
     # own repo/projects roots ("" = her own code). See register_external_root.
     project: str = ""
+    # Digest of the file as it stood when the diff was computed.
+    #
+    # A proposal is a statement about a SPECIFIC version of a file: "change
+    # this line, in this text". Applying it writes `new_content` wholesale, so
+    # if the file moved on in between, the diff Marcus approved no longer
+    # describes what happens and whatever changed in the meantime is silently
+    # overwritten. Measured on 4d7a316: proposed against version A, file edited
+    # to version B with an extra line, applied -> the file became A's content
+    # and the extra line was gone, reported as `applied` with no warning.
+    #
+    # "" means a proposal written before this field existed. Those keep the old
+    # behaviour rather than being refused on a check that cannot be made.
+    base_sha: str = ""
 
 
 @dataclass
@@ -355,6 +374,7 @@ class DevMode:
             if not path.is_file():
                 raise DevModeError(f"Not a file: {path}")
             old_content = path.read_text(encoding="utf-8", errors="replace")
+        base_sha = _content_sha(old_content)
 
         rel = self._display_path(path)
         diff = "".join(
@@ -369,6 +389,7 @@ class DevMode:
             raise DevModeError("Proposed content is identical to the current file.")
 
         proposal = ChangeProposal(
+            base_sha=base_sha,
             id=uuid4().hex,
             path=str(path),
             reason=(reason or "").strip(),
@@ -423,6 +444,32 @@ class DevMode:
         self._save_proposal(proposal)
         BUS.publish("dev.proposal_rejected", {"proposal_id": proposal_id})
 
+    @staticmethod
+    def _drift_check(proposal: "ChangeProposal", path: Path) -> None:
+        """Refuse to apply a diff to a file that is no longer what it described.
+
+        The allowed answers to drift are re-inspect, invalidate, replan or ask.
+        Silently writing is not one of them, and it is what happened: the
+        proposal carries `new_content` in full, so applying it after the file
+        changed replaces the newer version wholesale.
+
+        Skipped for proposals written before `base_sha` existed - refusing
+        those would be a guess, not a check.
+        """
+        if not proposal.base_sha:
+            return
+        current = ""
+        if path.exists() and path.is_file():
+            current = path.read_text(encoding="utf-8", errors="replace")
+        if _content_sha(current) == proposal.base_sha:
+            return
+        proposal.status = "stale"
+        raise DevModeError(
+            f"Refusing to apply: {path.name} has changed since this diff was "
+            f"computed, so the change you approved no longer describes what "
+            f"would happen and the newer edits would be overwritten. Re-read "
+            f"the file and propose again against what is there now.")
+
     def apply_proposal(self, proposal_id: str, *, confirm: bool = False) -> dict[str, object]:
         """Apply a previously proposed change. Requires explicit confirm=True.
 
@@ -443,6 +490,10 @@ class DevMode:
 
         # Re-validate the path at apply time (defense in depth).
         path = self._resolve_safe(proposal.path)
+
+        # And re-validate the FILE: a path that is still legal may hold
+        # something entirely different from what the diff was computed against.
+        self._drift_check(proposal, path)
 
         # 1) Pre-apply syntax check for Python — never write code that won't compile.
         if path.suffix == ".py":

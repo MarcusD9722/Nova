@@ -148,6 +148,43 @@ async def goals_tasks(goal_id: str, limit: int = Query(50)) -> dict:
     return {"goal_id": goal_id, "tasks": await STATE.memory.list_goal_tasks(goal_id=str(gid), limit=int(limit))}
 
 
+@router.get("/goals/{goal_id}/progress")
+async def goals_progress(goal_id: str, limit: int = Query(50),
+                         generation: int | None = Query(None),
+                         history: bool = Query(False)) -> dict:
+    """What happened on this goal, in order.
+
+    `AgentSupervisor` records progress from seven places -- retries, errors,
+    blocked work, a tool completing, and the note that a completion arrived
+    after its run had ended -- and until now nothing could read any of it back.
+    The only reader that existed, `fetch_unacked_progress`, acknowledges what it
+    returns, so polling it would consume the history it was showing.
+    """
+    if STATE.memory is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    gid = _goal_uuid(goal_id)
+    goal = await STATE.memory.get_goal(goal_id=gid)
+    if goal is None:
+        raise HTTPException(status_code=404, detail=f"No such goal: {goal_id}")
+    current = int(goal.get("generation") or 0)
+
+    # Default is the CURRENT run. Goals are generation-fenced and progress was
+    # not, so a plain read mixed a retry from run 6 with activity on run 7 and
+    # nothing distinguished them. History is still one query away - it just has
+    # to be asked for, rather than arriving disguised as what is happening now.
+    selected = None if history else (generation if generation is not None
+                                     else current)
+    events = await STATE.memory.list_progress_events(
+        goal_id=str(gid), generation=selected, limit=int(limit))
+    return {"goal_id": goal_id,
+            "current_generation": current,
+            "generation": selected,
+            "history": bool(history),
+            # `generation: null` on an event means it was written before the
+            # column existed. It is reported as unknown, never as current.
+            "events": events}
+
+
 @router.post("/goals/{goal_id}/cancel")
 async def goals_cancel(goal_id: str) -> dict:
     """Cancel a goal and stop the work it had queued.

@@ -714,7 +714,9 @@ async def test_seeded_sequence_fuzzing():
                                     f"{row['status']} goal")
                             await m.complete_goal_task(
                                 task_id=str(claimed_task["task_id"]),
-                                status="done", result={})
+                                status="done", result={},
+                                expected_generation=int(
+                                    claimed_task.get("generation") or 0))
                     elif action in ("work", "work_fail"):
                         t = await m.claim_next_task()
                         if t:

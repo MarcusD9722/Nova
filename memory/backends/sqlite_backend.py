@@ -12,6 +12,31 @@ import aiosqlite
 from memory.episodic_schema import EPISODIC_DDL, EPISODIC_MIGRATION
 
 
+# ── Execution outcome, which is NOT the same axis as lifecycle status ────────
+#
+# `status` says where a task is in its life: queued, running, blocked, done,
+# failed, cancelled, superseded. `outcome` says what happened to the WORK. They
+# are independent, and collapsing them is what made these three
+# indistinguishable:
+#
+#   a step that was cancelled before it ever ran
+#   a step whose tool succeeded, after the user cancelled the run
+#   a step whose tool was interrupted mid-call and may or may not have acted
+#
+# All three were `cancelled` or `failed`, and every reader that asked "did this
+# happen?" got the same answer for all of them. Two of those answers were false.
+OUTCOME_NEVER_STARTED = "never_started"   # provably nothing ran
+OUTCOME_SUCCEEDED = "succeeded"           # the work completed, and we know it
+OUTCOME_FAILED = "failed"                 # the work ran and did not succeed
+OUTCOME_UNKNOWN = "unknown"               # it may have acted; nothing can say
+OUTCOME_PENDING = "pending"               # not finished: queued, running, blocked
+
+#: A superseded row keeps its real outcome. `status='superseded'` is what stops
+#: it counting as completed work; `outcome` is what stops it being a lie about
+#: whether the tool ran.
+STATUS_SUPERSEDED = "superseded"
+
+
 class SQLiteMemoryBackend:
     #: How many candidate rows a claimer will try before giving up for this tick.
     #: A claim can legitimately lose the race to another worker; it should then
@@ -270,7 +295,10 @@ class SQLiteMemoryBackend:
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         -- The goal generation this task was created under.
-                        generation INTEGER NOT NULL DEFAULT 0
+                        generation INTEGER NOT NULL DEFAULT 0,
+                        -- What happened to the WORK, as opposed to
+                        -- where the row is in its lifecycle.
+                        outcome TEXT NOT NULL DEFAULT 'pending'
                     );
                     '''
                 )
@@ -280,6 +308,7 @@ class SQLiteMemoryBackend:
                     '''
                     CREATE TABLE IF NOT EXISTS autonomy_tasks (
                         task_id TEXT PRIMARY KEY,
+                        outcome TEXT NOT NULL DEFAULT 'pending',
                         conversation_id TEXT,
                         project_name TEXT NOT NULL,
                         title TEXT NOT NULL,
@@ -322,7 +351,16 @@ class SQLiteMemoryBackend:
                         kind TEXT NOT NULL,
                         message TEXT NOT NULL,
                         created_at TEXT NOT NULL,
-                        acknowledged INTEGER NOT NULL
+                        acknowledged INTEGER NOT NULL,
+                        -- WHICH lifecycle run produced this. Goals and tasks
+                        -- are generation-fenced and progress was not, so a
+                        -- reader had no way to tell a retry from run 6 from
+                        -- activity on run 7. NULL means "written before this
+                        -- column existed" and is never guessed at.
+                        generation INTEGER,
+                        -- The task and attempt that produced it, where one did.
+                        task_id TEXT,
+                        attempt INTEGER
                     );
                     '''
                 )
@@ -366,6 +404,36 @@ class SQLiteMemoryBackend:
                         await db.execute("ALTER TABLE tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00';")
                     if "updated_at" not in cols:
                         await db.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00';")
+                    # Execution outcome, separate from lifecycle status. Old
+                    # rows get 'pending' and are corrected below from what their
+                    # status already implies, so a database written before this
+                    # column existed still answers honestly.
+                    if "outcome" not in cols:
+                        await db.execute("ALTER TABLE tasks ADD COLUMN outcome TEXT NOT NULL DEFAULT 'pending';")
+                        await db.execute("UPDATE tasks SET outcome='succeeded' WHERE status='done';")
+                        await db.execute("UPDATE tasks SET outcome='failed' WHERE status='failed';")
+                        await db.execute("UPDATE tasks SET outcome='never_started' WHERE status='cancelled';")
+
+                if "autonomy_tasks" in existing_tables:
+                    cols = await _table_columns("autonomy_tasks")
+                    if "outcome" not in cols:
+                        await db.execute("ALTER TABLE autonomy_tasks ADD COLUMN outcome TEXT NOT NULL DEFAULT 'pending';")
+                        await db.execute("UPDATE autonomy_tasks SET outcome='succeeded' WHERE status='done';")
+                        await db.execute("UPDATE autonomy_tasks SET outcome='failed' WHERE status='failed';")
+                        await db.execute("UPDATE autonomy_tasks SET outcome='never_started' WHERE status='cancelled';")
+
+                if "progress_events" in existing_tables:
+                    cols = await _table_columns("progress_events")
+                    # Deliberately left NULL rather than back-filled from the
+                    # goal's CURRENT generation: that would relabel history as
+                    # whatever run the goal happens to be on now, which is the
+                    # exact confusion this column exists to end.
+                    if "generation" not in cols:
+                        await db.execute("ALTER TABLE progress_events ADD COLUMN generation INTEGER;")
+                    if "task_id" not in cols:
+                        await db.execute("ALTER TABLE progress_events ADD COLUMN task_id TEXT;")
+                    if "attempt" not in cols:
+                        await db.execute("ALTER TABLE progress_events ADD COLUMN attempt INTEGER;")
 
                 if "goals" in existing_tables:
                     cols = await _table_columns("goals")
@@ -698,14 +766,36 @@ class SQLiteMemoryBackend:
         status: str,
         result: dict[str, Any] | None = None,
         error: str = "",
-    ) -> None:
+        outcome: str = "",
+    ) -> bool:
+        """Write the terminal outcome. The FIRST one wins; later ones no-op.
+
+        `outcome` is the EXECUTION truth and defaults to what `status` implies.
+        The one caller that must override it is an interruption: a task whose
+        tool was in flight is `failed` as a lifecycle matter and `unknown` as a
+        matter of fact, and those are different sentences to anyone reading it.
+
+        Returns whether this call is the one that landed.
+
+        Unguarded, this was `UPDATE ... WHERE task_id=?`, so any later caller
+        could overwrite a finished task. That is not hypothetical here: the
+        interruption handler added in this same commit runs from
+        `except CancelledError`, which can fire immediately AFTER a successful
+        `mark_task_done` has already committed — and would have replaced a
+        genuine `done` with `failed: interrupted`. A terminal state is a fact
+        about something that already happened, so the first one to be written
+        is the one that is true.
+        """
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "UPDATE autonomy_tasks SET status=?, result_json=?, last_error=?, updated_at=? WHERE task_id=?",
+            cur = await db.execute(
+                "UPDATE autonomy_tasks SET status=?, outcome=?, result_json=?, "
+                "last_error=?, updated_at=? WHERE task_id=? AND status='running'",
                 (
                     status,
+                    (OUTCOME_SUCCEEDED if status == "done" else outcome
+                     or OUTCOME_FAILED),
                     json.dumps(result or {}, ensure_ascii=False),
                     (error or ""),
                     now,
@@ -713,6 +803,66 @@ class SQLiteMemoryBackend:
                 ),
             )
             await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def block_autonomy_task(self, *, task_id: str, question: str,
+                                  result: dict[str, Any] | None = None) -> bool:
+        """Park a task that is waiting on a person. Returns whether it landed.
+
+        `blocked` is a durable state, not a terminal one. It exists because the
+        four statuses this table had could not express "waiting for the user":
+
+            queued    it will run on its own. It will not; it needs an answer.
+            running   a worker holds it. None does.
+            done      finished. It is not, and pretending so is what made
+                      "what is pending?" answer nothing.
+            failed    it went wrong. Nothing went wrong.
+
+        The autonomy worker asked its question and then called mark_task_done,
+        so a task waiting on a human was filed with the completed work and the
+        question was invisible to every caller that reads a task.
+
+        A blocked row is deliberately NOT claimable (`claim` reads 'queued'
+        only) and deliberately survives a restart: `cancel_pending_background_work`
+        touches queued and running, and an unanswered question is still an
+        unanswered question after a reboot.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        payload = dict(result or {})
+        payload["question"] = question
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE autonomy_tasks SET status='blocked', outcome='pending', "
+                "result_json=?, last_error=?, updated_at=? "
+                "WHERE task_id=? AND status='running'",
+                (json.dumps(payload, ensure_ascii=False), question, now, task_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def answer_autonomy_task(self, *, task_id: str, answer: str) -> bool:
+        """Give a blocked task its answer and let it run again.
+
+        Without this, `blocked` would be a nicer-looking dead end than `done`:
+        a state with no exit is not an improvement on a state that lies. The
+        answer is appended to `details` so the next plan actually sees it, and
+        the row goes back to 'queued' where the claim can pick it up.
+
+        Guarded on `status='blocked'` so an answer cannot restart something
+        that is running, finished, or cancelled.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE autonomy_tasks SET status='queued', outcome='pending', "
+                "run_after=?, last_error='', "
+                "details = details || ? , updated_at=? "
+                "WHERE task_id=? AND status='blocked'",
+                (now, f"\n\nYou asked, and the answer is: {answer}", now,
+                 task_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
 
     async def bump_autonomy_task_attempt(self, *, task_id: str, attempts: int, run_after_iso: str, error: str) -> None:
         await self.initialize()
@@ -726,9 +876,13 @@ class SQLiteMemoryBackend:
 
     async def list_autonomy_tasks(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
+        # `result_json` is selected because without it nothing that reads a
+        # task can see the outcome the worker recorded. That is what made
+        # S13B-1 invisible: the honest result was written, and no reader could
+        # reach it.
         query = (
             "SELECT task_id, conversation_id, project_name, title, details, priority, status, attempts, "
-            "last_error, initiated_by_user, created_at, updated_at FROM autonomy_tasks"
+            "last_error, initiated_by_user, result_json, outcome, created_at, updated_at FROM autonomy_tasks"
         )
         params: list[Any] = []
         if status:
@@ -753,33 +907,99 @@ class SQLiteMemoryBackend:
                 "attempts": r[7],
                 "last_error": r[8],
                 "initiated_by_user": bool(int(r[9] or 0)),
-                "created_at": r[10],
-                "updated_at": r[11],
+                "result_json": r[10],
+                "outcome": r[11],
+                "created_at": r[12],
+                "updated_at": r[13],
             }
             for r in rows
         ]
 
+    #: A task that never left the queue provably did nothing, so saying it was
+    #: cancelled is simply true.
+    _STARTUP_CANCEL = (
+        "UPDATE {table} SET status='cancelled', outcome='never_started', "
+        "last_error=?, updated_at=? WHERE status='queued'")
+
+    #: A task that was RUNNING when the process died is a different fact. It had
+    #: been claimed, it may have invoked a tool, and nothing survived to say
+    #: which. Recording it as `cancelled` asserts that it never happened, and
+    #: that assertion is not one this process is in a position to make.
+    _STARTUP_INTERRUPTED = (
+        "UPDATE {table} SET status='failed', outcome='unknown', "
+        "last_error=?, updated_at=? WHERE status='running'")
+
     async def cancel_pending_background_work(self) -> dict[str, int]:
-        """Cancel queued/running background work from older sessions.
+        """Clear background work left over from an older session.
 
         This prevents stale autonomous jobs from auto-resuming on process restart
         and repeatedly invoking the model before a user asks for new work.
+
+        Queued and running rows are NOT the same thing and are no longer written
+        the same way. Both used to become `cancelled` / "cancelled_on_startup",
+        so a task that had been interrupted halfway through a tool call was
+        recorded exactly like one that never started — a definite claim that the
+        work never happened, made about something the process could not know.
         """
         await self.initialize()
         now = self._now_iso()
+        interrupted_note = (
+            "interrupted by a restart while it was running. Whether its tool "
+            "completed is unknown: it was claimed and may have acted before "
+            "the process stopped.")
         async with aiosqlite.connect(self._db_path) as db:
-            cur1 = await db.execute(
-                "UPDATE autonomy_tasks SET status='cancelled', last_error=?, updated_at=? WHERE status IN ('queued','running')",
-                ("cancelled_on_startup", now),
-            )
-            cur2 = await db.execute(
-                "UPDATE tasks SET status='cancelled', last_error=?, updated_at=? WHERE status IN ('queued','running')",
-                ("cancelled_on_startup", now),
-            )
+            totals: dict[str, int] = {}
+            interrupted = 0
+            for key, table in (("autonomy_tasks", "autonomy_tasks"),
+                               ("goal_tasks", "tasks")):
+                cur_q = await db.execute(
+                    self._STARTUP_CANCEL.format(table=table),
+                    ("cancelled_on_startup", now))
+                cur_r = await db.execute(
+                    self._STARTUP_INTERRUPTED.format(table=table),
+                    (interrupted_note, now))
+                n_q, n_r = int(cur_q.rowcount or 0), int(cur_r.rowcount or 0)
+                totals[key] = n_q + n_r
+                interrupted += n_r
+            # A goal whose work was just cancelled is not still going. It
+            # was left `active` with every task cancelled, nothing claimable,
+            # and no record of why -- so it would never progress, nothing would
+            # ever say so, and "what are you working on?" still answered with
+            # it. Measured on 6805224: goal active, tasks {'cancelled': 2},
+            # claim -> None, progress events [].
+            #
+            # `paused` is the honest word and the useful one: resume already
+            # opens exactly one new bounded run with a fresh `__decide__`, so
+            # this leaves the goal somewhere a person can actually pick it up
+            # from, instead of somewhere nothing can.
+            cur = await db.execute(
+                "SELECT goal_id, project_name, generation FROM goals "
+                "WHERE status='active'")
+            stranded = list(await cur.fetchall())
+            if stranded:
+                await db.execute(
+                    "UPDATE goals SET status='paused', updated_at=? "
+                    "WHERE status='active'", (now,))
+                for gid, proj, gen in stranded:
+                    # Stamped with the run it interrupted. This event is about
+                    # a specific lifecycle run ending, and it was the last
+                    # progress writer with no provenance at all.
+                    await db.execute(
+                        "INSERT INTO progress_events(event_id, goal_id, "
+                        "project_name, kind, message, created_at, acknowledged, "
+                        "generation) VALUES(?, ?, ?, ?, ?, ?, 0, ?)",
+                        (str(uuid4()), str(gid), str(proj), "blocked",
+                         "Paused when Nova restarted: the work already queued "
+                         "was stopped so nothing would run unasked. Resume it "
+                         "to carry on.", now, int(gen or 0)))
             await db.commit()
-            autonomy_n = int(cur1.rowcount or 0)
-            goal_n = int(cur2.rowcount or 0)
-        return {"autonomy_tasks": autonomy_n, "goal_tasks": goal_n}
+        # `interrupted` and `paused_goals` are additive: existing callers read
+        # the two totals and keep working, and anything that wants to say "N
+        # were mid-flight" or "N goals are waiting to be picked back up" now
+        # can.
+        totals["interrupted"] = interrupted
+        totals["paused_goals"] = len(stranded)
+        return totals
 
     @staticmethod
     def _now_iso() -> str:
@@ -1580,9 +1800,23 @@ class SQLiteMemoryBackend:
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             if expected_generation is None:
+                # From `cancelled` the only way out is back to `active` -
+                # resuming, which is the user's own decision and which the
+                # operator route and `resume_goal` both express. A cancelled
+                # goal may not be relabelled into any OTHER state on the way
+                # past.
+                #
+                # Found by the generated sequences (seed 0): cancel, then
+                # pause, and the goal read back `paused`. That is a false
+                # status - it says "waiting to continue" about work the user
+                # stopped - and it takes the goal out of any answer to "what
+                # was cancelled?". Resuming it afterwards then bumped the
+                # revision a second time, for a run that never existed.
                 cur = await db.execute(
-                    "UPDATE goals SET status=?, updated_at=? WHERE goal_id=?",
-                    (status, now, str(goal_id)))
+                    "UPDATE goals SET status=?, updated_at=? "
+                    "WHERE goal_id=? AND (status != 'cancelled' "
+                    "                     OR ? IN ('cancelled', 'active'))",
+                    (status, now, str(goal_id), status))
             else:
                 cur = await db.execute(
                     self._DECISION_GATE,
@@ -1623,19 +1857,51 @@ class SQLiteMemoryBackend:
     )
 
     async def _complete_decision_task(self, db, *, task_id: str,
-                                      result: dict[str, Any], now: str) -> None:
-        await db.execute(
-            "UPDATE tasks SET status='done', result_json=?, last_error='', updated_at=? "
-            "WHERE task_id=?",
+                                      result: dict[str, Any], now: str) -> bool:
+        """Finish the `__decide__` that produced this decision. False if it
+        was not the running one.
+
+        This is what makes the whole apply_* family idempotent, and it was
+        missing. The gate above each of them is `status='active' AND
+        generation=?` on the GOAL, which for a tool decision is an
+        `active -> active` touch: it passes just as happily the second time.
+        The inserted ids are fresh per call, so nothing collided either.
+        Measured on 5729e36: calling `apply_tool_decision` twice for the SAME
+        claimed decide task turned 3 tasks into 5 - a duplicate tool AND a
+        duplicate continuation, both runnable.
+
+        That it cannot happen through the supervisor is true and not enough:
+        it rested on an argument about the exclusive claim rather than on the
+        statement, and `MemoryUnifier.apply_tool_decision` is a public method.
+        A decision applies only while the task that decided it is still the
+        running one - the same rule the completion fence already enforces.
+        """
+        cur = await db.execute(
+            "UPDATE tasks SET status='done', outcome='succeeded', "
+            "result_json=?, last_error='', updated_at=? "
+            "WHERE task_id=? AND status='running'",
             (json.dumps(result or {}, ensure_ascii=False), now, task_id))
+        return int(cur.rowcount or 0) == 1
 
     async def _add_event(self, db, *, event_id: UUID, goal_id: UUID,
                          project_name: str, kind: str, message: str,
-                         now: str) -> None:
+                         now: str, generation: int | None = None,
+                         task_id: str | None = None,
+                         attempt: int | None = None) -> None:
+        """Record progress, stamped with the run that PRODUCED it.
+
+        Not the run the goal is on when someone reads it later: that would
+        relabel a retry from run 6 as activity on run 7 the moment the goal
+        resumed, which is precisely the attribution this column exists to fix.
+        """
         await db.execute(
             "INSERT INTO progress_events(event_id, goal_id, project_name, kind, "
-            "message, created_at, acknowledged) VALUES(?, ?, ?, ?, ?, ?, 0)",
-            (str(event_id), str(goal_id), project_name, kind, message, now))
+            "message, created_at, acknowledged, generation, task_id, attempt) "
+            "VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (str(event_id), str(goal_id), project_name, kind, message, now,
+             None if generation is None else int(generation),
+             None if task_id is None else str(task_id),
+             None if attempt is None else int(attempt)))
 
     async def apply_question_decision(
         self, *, goal_id: UUID, project_name: str, expected_generation: int,
@@ -1663,11 +1929,16 @@ class SQLiteMemoryBackend:
                 "VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL)",
                 (str(proposal_id), str(goal_id), project_name, message,
                  "Needed to proceed with the active goal.", now))
-            await self._complete_decision_task(
-                db, task_id=task_id, result={"question": message}, now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id, result={"question": message},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="question",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1690,11 +1961,16 @@ class SQLiteMemoryBackend:
             if int(cur.rowcount or 0) != 1:
                 await db.rollback()
                 return False
-            await self._complete_decision_task(
-                db, task_id=task_id, result={"final": message}, now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id, result={"final": message},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="complete",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1726,12 +2002,14 @@ class SQLiteMemoryBackend:
                 await db.rollback()
                 return False
             await db.execute(
-                "UPDATE tasks SET status='failed', result_json='{}', "
-                "last_error=?, updated_at=? WHERE task_id=?",
+                "UPDATE tasks SET status='failed', outcome='failed', "
+                "result_json='{}', last_error=?, updated_at=? WHERE task_id=?",
                 (error, now, task_id))
             await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
                                   project_name=project_name, kind="error",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1778,11 +2056,16 @@ class SQLiteMemoryBackend:
             if int(cur.rowcount or 0) != 1:
                 await db.rollback()
                 return False
-            await self._complete_decision_task(
-                db, task_id=task_id, result={"paused": message}, now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id, result={"paused": message},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=uuid4(), goal_id=goal_id,
                                   project_name=project_name, kind="paused",
-                                  message=message, now=now)
+                                  message=message, now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1825,14 +2108,18 @@ class SQLiteMemoryBackend:
             await db.execute(insert, (
                 str(decide_task_id), str(goal_id), project_name, "__decide__",
                 "{}", now, now, now, int(expected_generation)))
-            await self._complete_decision_task(
-                db, task_id=task_id,
-                result={"decision": {"type": "tool", "name": tool_name,
-                                     "args": args or {}}, "scheduled": True},
-                now=now)
+            if not await self._complete_decision_task(
+                    db, task_id=task_id,
+                    result={"decision": {"type": "tool", "name": tool_name,
+                                         "args": args or {}}, "scheduled": True},
+                    now=now):
+                await db.rollback()
+                return False
             await self._add_event(db, event_id=event_id, goal_id=goal_id,
                                   project_name=project_name, kind="plan",
-                                  message=f"Next: {tool_name}", now=now)
+                                  message=f"Next: {tool_name}", now=now,
+                                  generation=int(expected_generation),
+                                  task_id=task_id)
             await db.commit()
             return True
 
@@ -1875,6 +2162,21 @@ class SQLiteMemoryBackend:
             if not row:
                 return None
             project_name, previous = str(row[0]), str(row[1])
+            if previous == "cancelled":
+                # Cancelling twice is not cancelling harder. The second call
+                # used to bump the generation again, so a double-click left the
+                # goal claiming to be on a run that never existed - and "which
+                # revision is this?" is one of the things the stage exists to
+                # keep true. Found by the generated sequences (seeds 19, 46, 47).
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE goal_id=? AND status='running'",
+                    (str(goal_id),))
+                running = int((await cur.fetchone())[0] or 0)
+                return {
+                    "goal_id": str(goal_id), "project_name": project_name,
+                    "previous_status": previous, "status": "cancelled",
+                    "cancelled_tasks": 0, "already_running": running,
+                }
             # The generation bump is what makes an in-flight decision stale.
             # Without it, "cancel then immediately resume" left the goal active
             # again by the time a pre-cancel model call returned, and that old
@@ -1886,7 +2188,8 @@ class SQLiteMemoryBackend:
                 (now, str(goal_id)),
             )
             stopped = await db.execute(
-                "UPDATE tasks SET status='cancelled', last_error='goal cancelled', updated_at=? "
+                "UPDATE tasks SET status='cancelled', outcome='never_started', "
+                "last_error='goal cancelled', updated_at=? "
                 "WHERE goal_id=? AND status='queued'",
                 (now, str(goal_id)),
             )
@@ -1993,7 +2296,10 @@ class SQLiteMemoryBackend:
 
     async def list_goals(self, *, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
-        q = "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at FROM goals"
+        # `generation` is selected because a goal list that cannot say which
+        # lifecycle run a goal is on cannot answer "which revision is that?".
+        # Appended last so the positional mapping below does not shift.
+        q = "SELECT goal_id, project_name, title, objective, success_criteria, status, priority, created_at, updated_at, generation FROM goals"
         params: list[Any] = []
         if project_name:
             q += " WHERE project_name=?"
@@ -2016,6 +2322,7 @@ class SQLiteMemoryBackend:
                     priority=r[6],
                     created_at=r[7],
                     updated_at=r[8],
+                    generation=int(r[9] or 0),
                 )
             )
         return out
@@ -2178,21 +2485,118 @@ class SQLiteMemoryBackend:
                 # still runnable.
         return None
 
-    async def complete_task(self, *, task_id: str, status: str, result: dict[str, Any] | None = None, error: str = "") -> None:
+    #: Does this caller still own the run it is reporting on? The task must be
+    #: the one it claimed, on the same run, and that run must still be the
+    #: goal's current one. `paused` counts as owned: a pause does not bump the
+    #: generation and does not invalidate work already in flight, so a tool that
+    #: finished during a pause finished honestly and resume must not redo it.
+    _OWNS_RUN = (
+        "generation=? AND EXISTS (SELECT 1 FROM goals g "
+        "                         WHERE g.goal_id = tasks.goal_id "
+        "                         AND g.generation=? "
+        "                         AND g.status IN ('active','paused'))"
+    )
+
+    async def complete_task(self, *, task_id: str, status: str,
+                            result: dict[str, Any] | None = None,
+                            error: str = "",
+                            expected_generation: int) -> str:
+        """Write a terminal outcome, if this caller still owns the run.
+
+        Returns "applied", "superseded" or "ignored".
+
+        This was `UPDATE tasks SET status=? ... WHERE task_id=?` with no guard
+        at all, while the claim and the retry beside it were both fenced. So a
+        worker holding a task from run N could write a terminal status at any
+        later moment. Measured on ed81c94:
+
+            claim (run 0) -> cancel (goal cancelled, run 1) -> worker returns ok
+              -> tasks.status = 'done'.  A cancelled goal had completed work.
+            claim -> cancel -> resume (run 1) -> the run-0 worker returns ok
+              -> 'done' on the CURRENT run's behalf.
+            complete failed('disk full') -> a duplicate callback says done
+              -> 'done', last_error ''. A recorded failure became a success.
+            cancel marks a queued task 'cancelled' -> a late completion arrives
+              -> 'done'. The cancellation was erased.
+
+        `expected_generation` is required rather than optional. An opt-in fence
+        is the same defect with more steps: whoever forgets it is unfenced
+        again, silently. There is no way to finish a goal task without saying
+        which run is being finished.
+
+        Three outcomes, decided in one statement each:
+
+        applied     the caller owns the run; the status it reports is written.
+        superseded  the row is still running but the run ended underneath it.
+                    The work may genuinely have succeeded, so the truth is
+                    kept in `result_json` and `last_error` - but the STATUS is
+                    NOT the one reported, because "what completed?" must not
+                    count work belonging to a run the user stopped.
+
+                    It resolves to `failed`, which is what this codebase
+                    already means by "ran during a run that ended": it is the
+                    status `_discard_stale_decision` chose for exactly this
+                    case, and the generation step counter already reads
+                    `status IN ('done','failed')`. Neither label is precise -
+                    the work did not fail, and `cancelled` means "never ran"
+                    for every queued row a cancel touches. That missing state
+                    is recorded in the Stage 13B state-model note rather than
+                    invented here: a sixth task status is a schema and UI
+                    change, and it should be decided once, together with the
+                    `ask_user` missing-state work.
+        ignored     the row is not running: already done, failed or cancelled.
+                    The first terminal write wins and repeats change nothing.
+
+        The outer `WHERE ... AND status='running'` is what makes it idempotent;
+        the CASE is what keeps a superseded row from being stranded in
+        `running` forever.
+        """
         await self.initialize()
         now = self._now_iso()
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "UPDATE tasks SET status=?, result_json=?, last_error=?, updated_at=? WHERE task_id=?",
-                (
-                    status,
-                    json.dumps(result or {}, ensure_ascii=False),
-                    (error or ""),
-                    now,
-                    task_id,
-                ),
-            )
-            await db.commit()
+        gen = int(expected_generation)
+        payload = json.dumps(result or {}, ensure_ascii=False)
+        stale_note = (error or "").strip() or (
+            f"this finished after lifecycle run {gen} ended (the goal was "
+            f"cancelled, or resumed onto a later run), so its outcome "
+            f"({status}) was recorded but not counted as work done")
+        stale_payload = json.dumps(
+            {"superseded": True, "generation": gen, "reported_status": status,
+             "reported_result": result or {}, "reported_error": error or ""},
+            ensure_ascii=False)
+
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            # IMMEDIATE takes the write lock up front, so the ownership read and
+            # the write it decides cannot straddle another writer's commit.
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "SELECT status, (" + self._OWNS_RUN + ") FROM tasks "
+                    "WHERE task_id=?", (gen, gen, task_id))
+                row = await cur.fetchone()
+                if row is None or str(row[0]) != "running":
+                    await db.execute("COMMIT")
+                    return "ignored"
+                owns = bool(row[1])
+                # Two axes, written together. `status` says the row is
+                # over and how it counts; `outcome` says what actually
+                # happened to the work, which is not the same question and
+                # used to have no answer at all for a superseded row.
+                outcome = (OUTCOME_SUCCEEDED if status == "done"
+                           else OUTCOME_FAILED)
+                await db.execute(
+                    "UPDATE tasks SET status=?, outcome=?, result_json=?, "
+                    "last_error=?, updated_at=? "
+                    "WHERE task_id=? AND status='running'",
+                    (status if owns else STATUS_SUPERSEDED,
+                     outcome,
+                     payload if owns else stale_payload,
+                     (error or "") if owns else stale_note,
+                     now, task_id))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return "applied" if owns else "superseded"
 
     async def bump_task_attempt(self, *, task_id: str, attempts: int,
                                 run_after_iso: str, error: str,
@@ -2226,8 +2630,8 @@ class SQLiteMemoryBackend:
         async with aiosqlite.connect(self._db_path) as db:
             if expected_generation is not None:
                 cur = await db.execute(
-                    "UPDATE tasks SET status='queued', attempts=?, run_after=?, "
-                    "last_error=?, updated_at=? "
+                    "UPDATE tasks SET status='queued', outcome='pending', "
+                    "attempts=?, run_after=?, last_error=?, updated_at=? "
                     "WHERE task_id=? AND status='running' AND generation=? "
                     "AND EXISTS (SELECT 1 FROM goals g WHERE g.goal_id = tasks.goal_id "
                     "            AND g.status='active' AND g.generation=?)",
@@ -2245,7 +2649,9 @@ class SQLiteMemoryBackend:
 
     async def list_tasks(self, *, goal_id: str | None = None, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         await self.initialize()
-        q = "SELECT task_id, goal_id, project_name, tool_name, status, attempts, run_after, last_error, result_json, created_at, updated_at FROM tasks"
+        # `generation` is selected because a task list that cannot say which
+        # run a row belongs to cannot answer "which revision was that?".
+        q = "SELECT task_id, goal_id, project_name, tool_name, status, attempts, run_after, last_error, result_json, generation, outcome, created_at, updated_at FROM tasks"
         params: list[Any] = []
         where = []
         if goal_id:
@@ -2265,7 +2671,8 @@ class SQLiteMemoryBackend:
         for r in rows:
             out.append(dict(
                 task_id=r[0], goal_id=r[1], project_name=r[2], tool_name=r[3], status=r[4],
-                attempts=r[5], run_after=r[6], last_error=r[7], result_json=r[8], created_at=r[9], updated_at=r[10]
+                attempts=r[5], run_after=r[6], last_error=r[7], result_json=r[8],
+                generation=r[9], outcome=r[10], created_at=r[11], updated_at=r[12]
             ))
         return out
 
@@ -2307,15 +2714,87 @@ class SQLiteMemoryBackend:
             await db.execute("UPDATE proposals SET status=?, decided_at=? WHERE proposal_id=?", (status, now, proposal_id))
             await db.commit()
 
-    async def add_progress_event(self, *, event_id: UUID, goal_id: UUID, project_name: str, kind: str, message: str) -> None:
+    async def add_progress_event(self, *, event_id: UUID, goal_id: UUID, project_name: str,
+                                 kind: str, message: str,
+                                 generation: int | None = None,
+                                 task_id: str | None = None,
+                                 attempt: int | None = None) -> None:
+        """Record progress, stamped with the run that PRODUCED it."""
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO progress_events(event_id, goal_id, project_name, kind, message, created_at, acknowledged) VALUES(?, ?, ?, ?, ?, ?, 0)",
-                (str(event_id), str(goal_id), project_name, kind, message, now),
+                "INSERT INTO progress_events(event_id, goal_id, project_name, kind, "
+                "message, created_at, acknowledged, generation, task_id, attempt) "
+                "VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (str(event_id), str(goal_id), project_name, kind, message, now,
+                 None if generation is None else int(generation),
+                 None if task_id is None else str(task_id),
+                 None if attempt is None else int(attempt)),
             )
             await db.commit()
+
+    async def list_progress_events(self, *, goal_id: str | None = None,
+                                   project_name: str | None = None,
+                                   generation: int | None = None,
+                                   limit: int = 50) -> list[dict[str, Any]]:
+        """Read progress without consuming it.
+
+        `fetch_unacked_progress` ACKNOWLEDGES what it returns, which makes it a
+        destructive read: the first caller takes the events and every later one
+        sees nothing. That is correct for a once-only delivery, and wrong for
+        anything that polls -- so it could never have served a panel, and it
+        never did. Nothing in production called it at all.
+
+        Meanwhile `add_progress_event` is written from seven places in
+        `AgentSupervisor`: retries, errors, blocked work, a tool completing, and
+        the note saying a completion arrived after its run had ended. All of it
+        was recorded and unreachable — the channel that answers "what should
+        Nova say next" was write-only.
+
+        This read leaves `acknowledged` alone, so it can be polled, and returns
+        it, so a caller can still tell what has been delivered once.
+        """
+        await self.initialize()
+        q = ("SELECT event_id, goal_id, project_name, kind, message, "
+             "created_at, acknowledged, generation, task_id, attempt "
+             "FROM progress_events")
+        where, params = [], []
+        if goal_id:
+            where.append("goal_id=?")
+            params.append(str(goal_id))
+        if generation is not None:
+            # A run selector, not a filter on "current": history is still
+            # readable, it just has to be asked for.
+            #
+            # Events whose run is UNKNOWN come along, carrying generation=None.
+            # They were written before the column existed, and hiding them from
+            # the default view would make an older database look empty - which
+            # is its own dishonesty. They are included and labelled, never
+            # relabelled: an unknown revision is reported as unknown, not as
+            # this one.
+            where.append("(generation=? OR generation IS NULL)")
+            params.append(int(generation))
+        if project_name:
+            where.append("project_name=?")
+            params.append(project_name)
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        q += " ORDER BY created_at ASC LIMIT ?"
+        params.append(int(limit))
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        return [dict(event_id=r[0], goal_id=r[1], project_name=r[2], kind=r[3],
+                     message=r[4], created_at=r[5],
+                     acknowledged=bool(int(r[6] or 0)),
+                     # None means unknown, and stays None. A reader that needs
+                     # to say "this is from before we recorded runs" can; one
+                     # that guessed would be inventing a revision.
+                     generation=(None if r[7] is None else int(r[7])),
+                     task_id=r[8],
+                     attempt=(None if r[9] is None else int(r[9])))
+                for r in rows]
 
     async def fetch_unacked_progress(self, *, project_name: str, limit: int = 10) -> list[dict[str, Any]]:
         await self.initialize()

@@ -149,14 +149,25 @@ async def test_memory_ingest(tmp: Path) -> None:
                             assistant_reply="sounds fun", follow_up_question=None, mode="chat")
     worker.start()
     await sq.put(SummarizeHintEvent(conversation_id=conv, timestamp=_now(), reason="test"))
+    # Wait for BOTH, because both are asserted. `_summarize_one` writes the
+    # rolling summary and the dated digest as two separate awaits with no
+    # completion signal between them, so waiting only for the summary let
+    # the digest read land in the gap. Measured: the digest was absent at
+    # the read and present 10ms later, with the correct day string — an
+    # ordering race, not a missing write.
+    #
+    # `day` is recomputed each pass rather than once at the end: the worker
+    # stamps the digest when it writes, so a run straddling UTC midnight
+    # would otherwise look for an attribute that was never written.
+    summary = digest = None
     for _ in range(40):
-        if await mem.get_latest_fact(entity=f"conversation:{conv}", attribute="summary"):
+        day = _now().strftime("%Y-%m-%d")
+        summary = await mem.get_latest_fact(entity=f"conversation:{conv}", attribute="summary")
+        digest = await mem.get_latest_fact(entity=f"conversation:{conv}:digest", attribute=day)
+        if summary is not None and digest is not None:
             break
         await asyncio.sleep(0.25)
-    summary = await mem.get_latest_fact(entity=f"conversation:{conv}", attribute="summary")
     check(summary is not None and "fort" in summary.value, f"a rolling summary is written ({summary})")
-    day = _now().strftime("%Y-%m-%d")
-    digest = await mem.get_latest_fact(entity=f"conversation:{conv}:digest", attribute=day)
     check(digest is not None and day in digest.value,
           "a DATED digest is also written so history is not overwritten")
     await worker.stop()

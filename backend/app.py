@@ -1246,6 +1246,18 @@ async def _startup() -> None:
                     "Cleared stale background tasks "
                     f"(autonomy={int(cancelled.get('autonomy_tasks', 0))}, goals={int(cancelled.get('goal_tasks', 0))})"
                 )
+            # Said out loud, because a goal that was paused by a restart is
+            # waiting on a person now, and nothing else would mention it.
+            if int(cancelled.get("paused_goals", 0)):
+                _bullet(
+                    f"Paused {int(cancelled.get('paused_goals', 0))} goal(s) whose "
+                    "queued work was stopped by the restart - resume to carry on"
+                )
+            if int(cancelled.get("interrupted", 0)):
+                _bullet(
+                    f"{int(cancelled.get('interrupted', 0))} task(s) were "
+                    "interrupted mid-flight; whether their tools completed is unknown"
+                )
         except Exception:
             pass
 

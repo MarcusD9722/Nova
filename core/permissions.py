@@ -272,6 +272,16 @@ class PermissionBroker:
                             "the caller was cancelled while waiting; nothing was executed")
             raise
 
+    def settled_as(self, request_id: str) -> str:
+        """How a request ended: approved / rejected / timeout / cancelled / ...
+
+        The caller needs this to say what happened. "Not approved" covers a
+        refusal and a silence, and those are different sentences to a person:
+        one is an answer they gave, the other is one they never saw. The broker
+        already records the difference; without this it simply had no way out.
+        """
+        return str(self._settled.get(str(request_id)) or "")
+
     def pending(self) -> list[dict[str, Any]]:
         return [{"request_id": rid} for rid in self._pending]
 

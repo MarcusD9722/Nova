@@ -161,6 +161,9 @@ class ToolLoopExecutor:
         for this run; the loop stops after agent.step_budget rounds."""
         tool_results: list[dict[str, Any]] = []
         failure_counts: dict[str, int] = {}
+        # Tools this turn may no longer call, and why. A refusal is not a
+        # transient failure to be worked around: it is an answer.
+        fenced: dict[str, str] = {}
         for _ in range(agent.step_budget):
             try:
                 decision = await self.decide(
@@ -177,6 +180,22 @@ class ToolLoopExecutor:
             if failure_counts.get(decision["tool"], 0) >= 2:
                 break
 
+            # A tool the turn has already been refused is dead NOW, not after a
+            # second attempt. Measured on 55c485b: one "delete the project
+            # with-you" produced TWO `permission.requested` (7debd9d5796f, then
+            # 78bc4e077809) and two timeouts, because the guard above allows a
+            # second attempt and the model re-emits the same call once it sees
+            # the refusal in its observations.
+            #
+            # Asking a human again, unprompted, is not a retry — it is nagging
+            # for consent that was already withheld, and the second prompt is
+            # the one most likely to be approved by accident. A fresh USER turn
+            # builds a fresh executor, so this fences the turn, not the session.
+            if decision["tool"] in fenced:
+                logger.info("tool_fenced_for_turn", tool=decision["tool"],
+                            reason=fenced[decision["tool"]])
+                break
+
             call = ToolCall(name=decision["tool"], args=decision["args"])
             # No timeout here on purpose. The router holds the authoritative
             # budget per tool; a number typed at this generic call site cannot
@@ -190,4 +209,35 @@ class ToolLoopExecutor:
                                  "result": res.result, "error": res.error})
             if not res.ok:
                 failure_counts[call.name] = failure_counts.get(call.name, 0) + 1
+                why = self._fence_reason(call.name, res)
+                if why:
+                    fenced[call.name] = why
         return tool_results
+
+    def _fence_reason(self, name: str, res: Any) -> str:
+        """Why this tool may not be called again this turn, or "" if it may.
+
+        Two separate reasons, and they are not the same rule:
+
+        NOT APPROVED. The human said no, or said nothing until the window
+        closed, or the request was withdrawn. Re-asking is not a retry; the
+        answer was already given. `status` comes from the tool's own structured
+        payload, which the router preserves on failure precisely so callers can
+        tell what kind of failure it was.
+
+        NOT RETRY-SAFE. The router already owns this contract: false unless
+        declared, because a retry is only safe for a tool that changes nothing,
+        and a timeout says the call did not finish — never that it did not
+        happen. `execute(retries=0)` here means the ROUTER will not re-run it;
+        without this, the loop re-ran it anyway, one layer up, which is the
+        same defect wearing a different hat.
+
+        Anything retry-safe keeps the ordinary two-strike behaviour above.
+        """
+        payload = res.result if isinstance(res.result, dict) else {}
+        status = str(payload.get("status") or "")
+        if status in ("not_approved", "denied"):
+            return f"the request was not approved ({status})"
+        if not self._router.is_retry_safe(name):
+            return "it may have side effects, so it is never re-run automatically"
+        return ""

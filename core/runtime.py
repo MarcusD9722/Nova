@@ -22,11 +22,16 @@ from core.policy.summarizer import SummarizerLLM
 from core.policy.storyteller import StorytellerLLM, is_story_request, story_system_prompt
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
-from core.intent import is_question, is_purely_conversational
+from core.intent import (asks_about_work, is_question,
+                         is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
     describes_a_change,
     asks_current_project,
+    classify_removal,
+    REMOVAL_AMBIGUOUS,
+    REMOVAL_UNSUPPORTED,
+    REMOVAL_WHOLE_PROJECT,
     approves_without_naming_a_change,
     authorize_project_mutation,
     cancels_pending_change,
@@ -959,7 +964,14 @@ class RuntimeManager:
             # two numbers drifted apart in the first place.
             approved = await self._permission_broker.await_decision(decision["request_id"])
             if not approved:
+                # WHICH kind of "no" this was. "declined or timed out" told the
+                # user Nova did not know which had happened, when the broker
+                # knew exactly, and left the answer step nothing precise to say.
+                outcome = self._permission_broker.settled_as(decision["request_id"])
                 return {"ok": False, "status": "not_approved",
+                        "outcome": outcome or "not_approved",
+                        "capability": capability,
+                        "target": str(details.get("project") or ""),
                         "note": "You didn't approve it (declined or timed out) — nothing was touched."}
             return None
 
@@ -1636,6 +1648,18 @@ class RuntimeManager:
                     return self._no_such_project(wanted)
                 slug = await pb.last_active()
         if slug:
+            # Decided BEFORE authorisation, because this is a refusal rather
+            # than a mutation. "Retire flappy-bird." is not an affirmative
+            # instruction by the mutation grammar, so gating it behind
+            # `may_mutate` meant it never reached the explanation and fell
+            # through to the model to answer however it liked.
+            if classify_removal(t, slug=slug) == REMOVAL_UNSUPPORTED:
+                logger.info("project_removal_unsupported", slug=slug)
+                return (f"I don't have a way to retire or archive a project — "
+                        f"there's no such state for me to move '{slug}' into. I "
+                        f"can delete it (it goes to the trash and can be "
+                        f"restored), or leave it exactly where it is. Which "
+                        f"would you like?")
             if STATUS_WORDS_RE.search(t):
                 return pb.status_text(slug)
             if RESUME_WORDS_RE.search(t) and may_mutate:
@@ -1660,6 +1684,36 @@ class RuntimeManager:
             # denials, retrospectives, deliberation, and messages whose subject
             # is Nova herself rather than a project.
             if may_mutate:
+                # An instruction to make the project STOP EXISTING is not an
+                # instruction to edit it. This branch treated every authorised
+                # mutation as an improve, so "Please delete with-you, I mean
+                # it." started an autonomous code edit of with-you and answered
+                # "working on those improvements" — a real write to disk, the
+                # permission gate never reached, and the delete never done.
+                #
+                # Returning None hands the turn to the tool loop, where
+                # `project.delete` lives behind its admin-tier approval. The
+                # authoritative operation is the only thing allowed to remove a
+                # project; this pre-pass may not do it conversationally.
+                removal = classify_removal(t, slug=slug)
+                if removal == REMOVAL_WHOLE_PROJECT:
+                    # The authoritative operation is the only thing allowed to
+                    # remove a project, and it lives behind an admin-tier
+                    # approval in the tool loop.
+                    logger.info("project_removal_deferred_to_tool", slug=slug)
+                    return None
+                if removal == REMOVAL_AMBIGUOUS:
+                    # "Delete it from my projects." A removal command whose
+                    # object cannot be identified. Falling through to the edit
+                    # path here is what made D4's sibling: the instruction was
+                    # handed to ProjectBuilder.improve as an EDIT and Nova
+                    # answered "working on those improvements". An uncertain
+                    # destructive intent performs no side effect at all.
+                    logger.info("project_removal_ambiguous", slug=slug)
+                    return (f"I want to be sure before I touch anything — do you "
+                            f"mean delete the whole '{slug}' project, or remove "
+                            f"something inside it? Tell me which and I'll do it.")
+
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
                 # THE APPROVAL TURN. "Okay, make that change." names no change;
@@ -1786,6 +1840,45 @@ class RuntimeManager:
         # has to be unique so artifacts are attributable to the turn that made
         # them rather than smeared across the whole conversation.
         turn_uid = uuid4().hex
+
+        def _unapproved_notice(results: list[dict[str, Any]]) -> str:
+            """What Nova must say when a gated action did not happen.
+
+            Marcus asked to delete a project, never saw an approval prompt, the
+            window timed out — and Nova answered "I'll take with-you off the
+            list". The tool result reaching the answer step was already
+            truthful ("FAILED: ... nothing was touched") and the instruction
+            above it already says to trust it. The model said otherwise anyway.
+
+            So this is not left to prose. The authoritative outcome is composed
+            here, from the tool's own structured payload, and carried in the
+            final text regardless of what the model produced. Execution truth is
+            not something to ask a model to be careful about.
+
+            Empty when nothing was refused, so an ordinary turn is untouched.
+            """
+            lines: list[str] = []
+            for r in results or []:
+                if r.get("ok"):
+                    continue
+                payload = r.get("result") if isinstance(r.get("result"), dict) else {}
+                if str(payload.get("status") or "") not in ("not_approved", "denied"):
+                    continue
+                cap = str(payload.get("capability") or r.get("tool") or "that")
+                target = str(payload.get("target") or "").strip()
+                what = {"project.delete": f"delete {target}" if target else "delete it",
+                        "project.purge": f"permanently remove {target}" if target else "purge it",
+                        "project.trash": f"move {target} to the trash" if target else "trash it",
+                        }.get(cap, f"run {cap}")
+                outcome = str(payload.get("outcome") or "")
+                why = {
+                    "timeout": "approval timed out and nothing changed",
+                    "rejected": "you said no, so nothing changed",
+                    "cancelled": "the request was withdrawn and nothing changed",
+                    "abandoned": "the request was withdrawn and nothing changed",
+                }.get(outcome, "it was not approved, so nothing changed")
+                lines.append(f"I didn't {what}; {why}.")
+            return " ".join(lines)
 
         async def _finish(reply: str, tool_calls: list[dict[str, Any]], mode: str = "chat") -> None:
             # Working context sees every reply, including the ones that return
@@ -2081,6 +2174,17 @@ class RuntimeManager:
         # budget work exists to avoid. It earns its place only when the user
         # actually pointed at it, or when it is recent enough to still be "on
         # screen" in any meaningful sense.
+        # Status questions are answered from the record, never from the
+        # transcript. Measured on 4e0e458: asking "What failed?" with a failed
+        # step and its error sitting in the database produced an answer prompt
+        # containing none of it - not the step, not the error, not the goal.
+        work_context = ""
+        try:
+            if asks_about_work(clean_user):
+                work_context = await self._memory.describe_work_state()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("work_state_summary_failed", error=str(e)[:160])
+
         artifact_context = ""
         current_set = self._artifacts.latest_result_set(str(conversation_id))
         if current_set is not None and (referenced is not None
@@ -2165,6 +2269,9 @@ class RuntimeManager:
             # the moment it reads like the other two blocks she will quote it as
             # today's.
             + episodic_context
+            # Before live tool output and after history: this IS current state,
+            # and it outranks anything remembered.
+            + work_context
             + tools_context
             # Say "a reasoning block", never the literal tag. Measured on this
             # model (tests/bench_empty_generations.py, 30 samples per variant):
@@ -2227,6 +2334,10 @@ class RuntimeManager:
             if not reply:
                 reply = "Sorry — I came up empty on that one."
             yield {"type": "token", "text": reply}
+            notice = _unapproved_notice(tool_results)
+            if notice:
+                reply = f"{notice} {reply}".strip()
+                yield {"type": "token", "text": " " + notice}
             await _finish(reply, tool_results, mode="deep")
             yield {"type": "done", "full_text": reply, "tool_calls": tool_results}
             return
@@ -2319,6 +2430,11 @@ class RuntimeManager:
                 logger.warning("chat_stream_salvage_failed")
         if not reply:
             reply = "Sorry — I came up empty on that one."
+        # Stated first, because it is the part that is true.
+        notice = _unapproved_notice(tool_results)
+        if notice:
+            reply = f"{notice} {reply}".strip()
+            yield {"type": "token", "text": " " + notice}
         await _finish(reply, tool_results)
         yield {"type": "done", "full_text": reply, "tool_calls": tool_results}
 

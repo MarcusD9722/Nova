@@ -25,6 +25,7 @@ import MapsSheet from "./overlays/SmartHomeSheet";
 import WebSheet from "./overlays/WebSheet";
 import MemorySheet from "./overlays/MemorySheet";
 import TasksSheet from "./overlays/TasksSheet";
+import PermissionPrompt from "./components/PermissionPrompt";
 import SystemSheet from "./overlays/SystemSheet";
 import ImprovementsSheet from "./overlays/ImprovementsSheet";
 import ScreenVisionSheet from "./overlays/ScreenVisionSheet";
@@ -2240,6 +2241,11 @@ export default function App() {
       >
         <WebSheet />
       </OverlayHost>
+
+      {/* Approval for permission-gated capabilities. Not an overlay: it must
+          be reachable whatever panel is open, because the action is already
+          waiting and the window is 120 seconds. */}
+      <PermissionPrompt liveEvents={novaEvents} />
 
       <OverlayHost
         open={activeOverlay === "memory"}
