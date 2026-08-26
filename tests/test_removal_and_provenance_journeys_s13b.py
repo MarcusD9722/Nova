@@ -311,6 +311,35 @@ async def journey_eleven_current_vs_history(nova):
     check(str(legacy[0].get("message")).startswith("a legacy"),
           j.step("and is still readable"))
 
+    # 22-25  the FENCED writers. The supervisor's decision events go through a
+    # different path from the standalone writer above, and it is the path that
+    # knows the run it is applying - so it is the one most able to get this
+    # wrong silently.
+    g2 = await m.create_goal(project_name=GAME, title="wire the score",
+                             objective="score", success_criteria="works")
+    await m.enqueue_goal_task(goal_id=g2, project_name=GAME,
+                              tool_name="__decide__", args={})
+    d = await m.claim_next_goal_task()
+    while d and str(d.get("goal_id")) != str(g2):
+        await m.complete_goal_task(task_id=str(d["task_id"]), status="done",
+                                   result={"ok": True}, error="",
+                                   expected_generation=int(d["generation"]))
+        d = await m.claim_next_goal_task()
+    check(d is not None, j.step("a decide task is claimed"))
+    applied = await m.apply_tool_decision(
+        goal_id=g2, project_name=GAME,
+        expected_generation=int(d["generation"]), task_id=str(d["task_id"]),
+        tool_name="code.write", args={})
+    check(applied is True, j.step(f"a fenced decision applies ({applied})"))
+    fenced = await m.list_progress_events(goal_id=str(g2), limit=20)
+    plans = [e for e in fenced if str(e.get("kind")) == "plan"]
+    check(len(plans) == 1, j.step(f"it recorded its plan ({len(plans)})"))
+    check(plans and plans[0].get("generation") == int(d["generation"]),
+          j.step(f"stamped with the run it applied "
+                 f"({[e.get('generation') for e in plans]})"))
+    check(plans and str(plans[0].get("task_id")) == str(d["task_id"]),
+          j.step("and with the decide task that produced it"))
+
     check(j.n >= 15, f"the journey ran {j.n} checked transitions")
     return j.n
 
