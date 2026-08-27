@@ -58,6 +58,15 @@ class SQLiteMemoryBackend:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute("PRAGMA journal_mode=WAL;")
                 await db.execute("PRAGMA synchronous=NORMAL;")
+                # BEFORE anything is created. `CREATE TABLE IF NOT EXISTS` does
+                # not rebuild a table that is already there, so this is the only
+                # moment at which "did this database exist already?" can still
+                # be answered — and `_apply_migrations` needs the answer.
+                pre_existing: set[str] = set()
+                async with db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table';") as cur:
+                    async for row in cur:
+                        pre_existing.add(str(row[0]))
                 await db.execute(
                     """
                     CREATE TABLE IF NOT EXISTS conversations (
@@ -494,7 +503,7 @@ class SQLiteMemoryBackend:
                 for _sql in EPISODIC_DDL:
                     await db.execute(_sql)
 
-                await self._apply_migrations(db)
+                await self._apply_migrations(db, fresh_db=not pre_existing)
 
                 await db.commit()
             self._initialized = True
@@ -631,7 +640,8 @@ class SQLiteMemoryBackend:
         ),
     ]
 
-    async def _apply_migrations(self, db: "aiosqlite.Connection") -> None:
+    async def _apply_migrations(self, db: "aiosqlite.Connection", *,
+                                fresh_db: bool = False) -> None:
         await db.execute(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);"
         )
@@ -640,14 +650,32 @@ class SQLiteMemoryBackend:
         current = int(row[0]) if row else 0
 
         latest = max(v for v, _, _ in self._MIGRATIONS)
-        if current == 0:
-            # Fresh DB (or a pre-versioning DB, which by definition matches
-            # today's create block): stamp latest without replaying history.
+        if current == 0 and fresh_db:
+            # A database this call CREATED. The create block above builds the
+            # latest schema, so there is genuinely nothing to replay.
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, description, applied_at) VALUES(?, ?, ?)",
                 (latest, "stamped current (create block builds latest schema)", self._now_iso()),
             )
             return
+        # An UNSTAMPED database that already existed predates versioning, and
+        # the assumption that it "by definition matches today's create block"
+        # was false: `CREATE TABLE IF NOT EXISTS` leaves an existing table
+        # exactly as it was. Stamping such a database as fully migrated marked
+        # every migration done and applied none of them — so a `tasks` table
+        # written before goal generations existed never got its `generation`
+        # column, and the first query that selected one failed with `no such
+        # column: generation`. Not degraded: unreadable, on every start.
+        #
+        # `_migrate_tasks_schema` masked how much this covered, because it
+        # back-fills most of those columns by hand. It does not back-fill
+        # `generation`, and it never covered any other table.
+        #
+        # So an old database replays from the beginning. Every statement in
+        # the list is `ADD COLUMN`, `CREATE ... IF NOT EXISTS` or a back-fill
+        # `UPDATE`; columns the create block already built raise "duplicate
+        # column name" and are tolerated below, exactly as they are for a
+        # table an older database never had at all.
 
         for version, description, statements in sorted(self._MIGRATIONS, key=lambda m: m[0]):
             if version <= current:
