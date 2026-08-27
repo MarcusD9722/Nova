@@ -58,7 +58,7 @@ PY = REPO / "venv" / "Scripts" / "python.exe"
 #: Everything the child needs to find the SAME durable state as its siblings.
 #: Deliberately explicit rather than inherited: a child that silently picked up
 #: the parent's environment could pass while reading a different database.
-def child_env(root: Path) -> dict[str, str]:
+def child_env(root: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env.update({
         "PYTHONIOENCODING": "utf-8",
@@ -74,6 +74,9 @@ def child_env(root: Path) -> dict[str, str]:
         "NOVA_DEV_MODE": "1",
         "NOVA_IT_WATCHDOG_S": "300",
     })
+    # A restart is also how a machine picks up a CHANGED configuration, so a
+    # step can differ from its siblings in exactly the variables it names.
+    env.update({str(k): str(v) for k, v in (extra or {}).items()})
     return env
 
 
@@ -146,6 +149,7 @@ class StepFailed(RuntimeError):
 def run_step(root: Path, body: str, *, full: bool = False,
              kill_after: float | None = None,
              expect_crash: bool = False,
+             env: dict[str, str] | None = None,
              timeout: float = 240.0) -> list[dict]:
     """Run one scenario in a fresh interpreter. Returns what it emitted.
 
@@ -159,7 +163,7 @@ def run_step(root: Path, body: str, *, full: bool = False,
                           body=textwrap.indent(textwrap.dedent(body),
                                                "        " if full else "    "))
     proc = subprocess.Popen(
-        [str(PY), "-c", src], cwd=str(REPO), env=child_env(root),
+        [str(PY), "-c", src], cwd=str(REPO), env=child_env(root, env),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace")
 
