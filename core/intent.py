@@ -149,7 +149,23 @@ _WORK_STATUS_RE = re.compile(
     r"what should happen next|what(?:'s| is) next|where (?:are|were) we|"
     r"what(?:'s| is| are) (?:you|nova) working on|"
     r"what(?:'s| is) the status|how(?:'s| is) it going with|"
-    r"did (?:it|that) (?:all )?(?:work|finish|succeed|run)"
+    r"did (?:it|that) (?:all )?(?:work|finish|succeed|run)|"
+    # "Is anything still running?" - the first thing a person asks on
+    # coming back to a machine that restarted, and a question whose only
+    # honest source is the record: the transcript begins AFTER the restart.
+    # A subject is required, so "is the tap still running" is not this.
+    r"(?:is|are) (?:anything|it|they|those|the (?:tasks?|steps?|jobs?|work|build))"
+    r"(?: still| currently)? (?:running|going|in progress|under ?way)|"
+    r"anything (?:still |currently )?(?:running|in progress|under ?way)|"
+    # The same question aimed at Nova rather than at the queue.
+    # "working on" takes a THING here, not a time: "are you working on
+    # Sunday?" is a question about a diary, not about a queue.
+    r"(?:are you|is nova) (?:still |currently )?working on"
+    r"(?! (?:sun|mon|tues|wednes|thurs|fri|satur)day\b| (?:the )?weekend| holidays?| tonight| tomorrow| later)|"
+    # Only with a WORK noun, so it does not swallow "what's going on
+    # with your day".
+    r"what(?:'s| is) going on with (?:the|my|your|our) "
+    r"(?:work|tasks?|steps?|jobs?|build|project|goals?)"
     r")\b", re.IGNORECASE)
 
 

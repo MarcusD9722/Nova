@@ -156,6 +156,62 @@ async def test_b_a_misleading_premise_is_corrected_from_the_record():
               "and it is the durable record that contradicts it")
 
 
+async def test_b2_asking_whether_anything_is_still_running():
+    """§12. The natural question after a restart, and the one whose only
+    honest source is the record: the transcript is empty, so a model asked
+    "is anything still running?" with nothing attached answers from nothing."""
+    check.section("§12 'is anything still running?' after the process died")
+    with _tmp() as td:
+        root = Path(td) / "n"
+        run_step(root, SEED)
+        asked = run_step(root, ASK + '''
+    await mem.cancel_pending_background_work()
+    out = {}
+    for q in ("Is anything still running?",
+              # Each of the next two is caught by ONE branch only. Without
+              # them the branches cover for each other and either could be
+              # deleted with every assertion still green.
+              "Are the tasks still running?",     # needs the subject branch
+              "Anything still running?",          # needs the bare branch
+              "Are you still working on the pause menu?",
+              "What's going on with my work?",
+              "Is anything in progress?"):
+        out[q] = await ask(q)
+    emit({"grounding": out})
+''', full=True)
+        ground = one(asked, "grounding") or {}
+        for q, g in sorted(ground.items()):
+            check("The work you are actually tracking" in g,
+                  f"{q!r} is answered from the record")
+        # And the failure is in front of it, not just any state.
+        check(all(MARKER in g for g in ground.values()),
+              "each of them can see the step that failed")
+
+
+async def test_b3_ordinary_talk_is_left_alone():
+    """COUNTER-TEST. Attaching state to every turn would be its own defect:
+    the record is only attached when the turn is genuinely about the work."""
+    check.section("§12 turns that are not about the work stay untouched")
+    with _tmp() as td:
+        root = Path(td) / "n"
+        run_step(root, SEED)
+        asked = run_step(root, ASK + '''
+    await mem.cancel_pending_background_work()
+    out = {}
+    for q in ("Is the tap still running?",
+              "Are you working on Sunday?",
+              "What's going on with your day?",
+              "Everything is fine, thanks.",
+              "I finished my coffee."):
+        out[q] = await ask(q)
+    emit({"grounding": out})
+''', full=True)
+        ground = one(asked, "grounding") or {}
+        for q, g in sorted(ground.items()):
+            check("The work you are actually tracking" not in g,
+                  f"{q!r} is left alone")
+
+
 async def test_c_a_checkpoint_survives_and_still_knows_its_baseline():
     check.section("§15/W6 a checkpoint, a crash, and the file it was planned against")
     with _tmp() as td:
@@ -250,6 +306,8 @@ async def test_d_an_undisturbed_checkpoint_still_applies_after_a_restart():
 async def main() -> None:
     await test_a_fresh_process_answers_from_the_record()
     await test_b_a_misleading_premise_is_corrected_from_the_record()
+    await test_b2_asking_whether_anything_is_still_running()
+    await test_b3_ordinary_talk_is_left_alone()
     await test_c_a_checkpoint_survives_and_still_knows_its_baseline()
     await test_d_an_undisturbed_checkpoint_still_applies_after_a_restart()
     check.finish()
