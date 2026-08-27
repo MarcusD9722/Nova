@@ -149,19 +149,45 @@ _WORK_STATUS_RE = re.compile(
     r"what should happen next|what(?:'s| is) next|where (?:are|were) we|"
     r"what(?:'s| is| are) (?:you|nova) working on|"
     r"what(?:'s| is) the status|how(?:'s| is) it going with|"
-    r"did (?:it|that) (?:work|finish|succeed|run)"
+    r"did (?:it|that) (?:all )?(?:work|finish|succeed|run)"
     r")\b", re.IGNORECASE)
 
 
-def asks_about_work(text: str) -> bool:
-    """Is this a question about the state of Nova's own work?
+#: A CLAIM about the work rather than a question about it: "so everything
+#: finished, right?", "that all went through, yes?", "it's all done then".
+#:
+#: These are the most dangerous phrasing of all and were the ones missed. A
+#: question invites Nova to look something up; a premise invites her to agree.
+#: With no durable state in front of the model, agreeing is exactly what
+#: happens - and agreeing that everything succeeded when a step failed is a
+#: worse answer than any amount of vagueness.
+#:
+#: Two parts, both required: something that scopes the WORK (everything, it,
+#: that, the tasks) and something that asserts an OUTCOME (finished, worked,
+#: done, went through, succeeded). "Everything is fine" is not a claim about
+#: task outcomes; "everything finished" is.
+_WORK_PREMISE_RE = re.compile(
+    r"\b(everything|it|that|those|they|the (?:tasks?|steps?|work|jobs?))\b"
+    r"[^.?!]{0,40}?"
+    r"\b(finish(?:ed)?|worked|work out|done|complete[ds]?|went through|"
+    r"succeed(?:ed)?|ran ok(?:ay)?|all set|sorted)\b",
+    re.IGNORECASE)
 
-    Deliberately a closed list of question shapes rather than a keyword sniff:
-    it decides only whether to ATTACH authoritative state to the answer, and
-    attaching it to an unrelated turn is prompt bloat, while missing one leaves
-    the model answering from memory.
+
+def asks_about_work(text: str) -> bool:
+    """Is this turn about the state of Nova's own work?
+
+    Deliberately closed shapes rather than a keyword sniff: this decides only
+    whether to ATTACH authoritative state to the answer. Attaching it to an
+    unrelated turn is prompt bloat; missing one leaves the model answering from
+    memory, which after a restart is nothing at all.
+
+    Both a QUESTION about the work and a CLAIM about it count. The claim is the
+    case that matters most: "so everything finished successfully, right?" asks
+    Nova to agree, and she can only decline from the record.
     """
-    return bool(_WORK_STATUS_RE.search(text or ""))
+    raw = text or ""
+    return bool(_WORK_STATUS_RE.search(raw) or _WORK_PREMISE_RE.search(raw))
 
 
 def is_purely_conversational(text: str) -> bool:
