@@ -241,6 +241,53 @@ only *runnable* continuation belongs to R3.
 
 ---
 
+## The one red run, and what it is honestly worth
+
+The soak produced exactly one failure in 160 suite runs: the
+foreground/background suite hung and was killed at its 240 s timeout, against
+a median of 32.7 s. That suite is the one that boots the real backend against
+a root whose previous writer was `os._exit`-killed, so it is the right place
+to be suspicious.
+
+**The evidence it left was the word "timeout"** — and chasing that turned up a
+diagnostic blind spot three faults deep, each of which alone would have
+defeated the other two:
+
+1. children never armed a watchdog at all. `harness.run()` arms faulthandler,
+   but the restart-harness preamble calls `asyncio.run(_main())` directly, so
+   `NOVA_IT_WATCHDOG_S` in the child environment did nothing for the whole
+   stage;
+2. even armed, 300 s sat ABOVE the 240 s parent timeout, so the parent would
+   always have killed the child first;
+3. and `run_step` discarded the child's stdout and stderr on timeout, throwing
+   away anything it had managed to say.
+
+All three are fixed: faulthandler is armed inside both preambles, the watchdog
+is derived from each step's own timeout so it always fires first, and the
+child's output is preserved in the failure. Verified by handing the harness a
+child that hangs on purpose — the watchdog fired at 25 s of a 45 s budget and
+produced every thread's stack, where before there was one word.
+
+**The hang itself is unreproduced.** 25 dedicated runs afterwards: zero
+failures, 29–35 s, no outlier at all. Total exposure is one failure in 40
+observed runs of that suite.
+
+What can honestly be said:
+
+- the failing run was the FIRST test process after a Windows reboot, and was
+  7× the median while the 34 runs around it clustered within 6 s of each other;
+- a latent race would more usually show a tail — some runs at 60 s, some at
+  90 s — rather than one run at 245 s and everything else inside a 6 s band;
+- but 25 clean runs do not prove absence, and "the machine was busy" is the
+  convenient answer, which is reason to distrust it rather than to adopt it.
+
+So it is recorded as **unexplained, not resolved**. The material change is that
+the next occurrence — in a gate, a soak, or a user's machine — will produce
+every thread's stack instead of a word. If it never recurs, that costs nothing;
+if it does, the diagnosis is already waiting.
+
+---
+
 ## Recorded, not fixed
 
 - **A request older than the audit read window is never closed out.** It stays

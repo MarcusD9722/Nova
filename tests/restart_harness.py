@@ -58,7 +58,8 @@ PY = REPO / "venv" / "Scripts" / "python.exe"
 #: Everything the child needs to find the SAME durable state as its siblings.
 #: Deliberately explicit rather than inherited: a child that silently picked up
 #: the parent's environment could pass while reading a different database.
-def child_env(root: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
+def child_env(root: Path, extra: dict[str, str] | None = None, *,
+              watchdog: float = 180.0) -> dict[str, str]:
     env = dict(os.environ)
     env.update({
         "PYTHONIOENCODING": "utf-8",
@@ -72,7 +73,9 @@ def child_env(root: Path, extra: dict[str, str] | None = None) -> dict[str, str]
         "NOVA_RESEARCH": "0",
         "NOVA_TTS_PREWARM": "0",
         "NOVA_DEV_MODE": "1",
-        "NOVA_IT_WATCHDOG_S": "300",
+        # Set by run_step from the step's own timeout, so it is always BELOW
+        # it. A watchdog above the parent's patience can never fire.
+        "NOVA_IT_WATCHDOG_S": str(watchdog),
     })
     # A restart is also how a machine picks up a CHANGED configuration, so a
     # step can differ from its siblings in exactly the variables it names.
@@ -95,6 +98,16 @@ import asyncio, json, os, sys
 from pathlib import Path
 REPO = Path(r"{repo}")
 sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "tests"))
+# A hung child is worse than a failing one: it says nothing at all. Armed here
+# rather than in harness.run(), which these children never call - which is why
+# NOVA_IT_WATCHDOG_S was doing nothing in them until a soak went looking.
+import faulthandler
+try:
+    _WD = float(os.getenv("NOVA_IT_WATCHDOG_S", "") or 0)
+except ValueError:
+    _WD = 0.0
+if _WD > 0:
+    faulthandler.dump_traceback_later(_WD, exit=True)
 _OUT = []
 def emit(d):
     _OUT.append(dict(d))
@@ -124,6 +137,16 @@ import asyncio, json, os, sys
 from pathlib import Path
 REPO = Path(r"{repo}")
 sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "tests"))
+# A hung child is worse than a failing one: it says nothing at all. Armed here
+# rather than in harness.run(), which these children never call - which is why
+# NOVA_IT_WATCHDOG_S was doing nothing in them until a soak went looking.
+import faulthandler
+try:
+    _WD = float(os.getenv("NOVA_IT_WATCHDOG_S", "") or 0)
+except ValueError:
+    _WD = 0.0
+if _WD > 0:
+    faulthandler.dump_traceback_later(_WD, exit=True)
 _OUT = []
 def emit(d):
     _OUT.append(dict(d))
@@ -163,7 +186,8 @@ def run_step(root: Path, body: str, *, full: bool = False,
                           body=textwrap.indent(textwrap.dedent(body),
                                                "        " if full else "    "))
     proc = subprocess.Popen(
-        [str(PY), "-c", src], cwd=str(REPO), env=child_env(root, env),
+        [str(PY), "-c", src], cwd=str(REPO),
+        env=child_env(root, env, watchdog=max(15.0, timeout - 20.0)),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace")
 
@@ -184,8 +208,19 @@ def run_step(root: Path, body: str, *, full: bool = False,
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Kill it, then READ IT. Throwing the output away here is what turned a
+        # real hang into an unexplainable one: the watchdog dump, if it fired,
+        # is in that stderr.
         proc.kill()
-        raise StepFailed(f"child timed out after {timeout}s")
+        try:
+            out, err = proc.communicate(timeout=30)
+        except Exception:  # noqa: BLE001
+            out, err = "", ""
+        raise StepFailed(
+            f"child timed out after {timeout}s (watchdog was set to "
+            f"{max(15.0, timeout - 20.0):g}s)\n"
+            f"STDOUT:\n{(out or '')[-2000:]}\n"
+            f"STDERR:\n{(err or '')[-4000:]}")
     if expect_crash:
         # A placed CRASH() is a non-zero exit BY DESIGN. Exiting cleanly means
         # the boundary was never reached, which would make the whole window
