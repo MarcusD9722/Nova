@@ -399,9 +399,9 @@ async def test_o_ownership_survives_the_project_pointer_moving():
               "A's goal is still A's")
         check(_goal(one(after, "goals"), b)[3] == CALC,
               "B's goal is still B's")
-        check(all(t[5] in (GAME, CALC) for t in tasks),
+        check(len(tasks) >= 2 and all(t[5] in (GAME, CALC) for t in tasks),
               f"nothing was reattributed anywhere else "
-              f"({sorted({t[5] for t in tasks})})")
+              f"({len(tasks)} steps across {sorted({t[5] for t in tasks})})")
 
 
 async def main() -> None:

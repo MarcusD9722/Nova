@@ -113,8 +113,9 @@ async def test_a_completed_work_is_never_replayed():
               f"three boots see identical rows ({len(boots[0])} rows)")
         check(boots[0][0][2] == "done" and boots[0][0][3] == "succeeded",
               f"still done/succeeded ({boots[0][0][2]}/{boots[0][0][3]})")
-        check(all(c is None for c in claims),
-              f"and never offered for execution again ({claims})")
+        check(len(claims) == 3 and all(c is None for c in claims),
+              f"and never offered for execution again, at any of the three "
+              f"boots ({claims})")
 
 
 async def test_b_one_retry_stays_one_retry():

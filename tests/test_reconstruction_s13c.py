@@ -129,8 +129,11 @@ async def test_a_fresh_process_answers_from_the_record():
               "'What was cancelled?' is given a cancelled goal")
         check("revision" in ground.get("What can resume?", ""),
               "'What can resume?' is given which revision each goal is on")
-        check(all("from the record" in v for v in ground.values() if v),
-              "and every answer is labelled as the record, not recollection")
+        unlabelled = [q for q, v in ground.items()
+                      if "from the record" not in v]
+        check(len(ground) == 6 and not unlabelled,
+              f"every one of the six answers is labelled as the record, not "
+              f"recollection ({unlabelled or len(ground)})")
 
         # The decisive one: this process has never spoken to anyone.
         check(one(asked, "transcript_was_empty") is True,

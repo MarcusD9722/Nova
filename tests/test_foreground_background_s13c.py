@@ -107,8 +107,9 @@ async def test_a_the_first_words_after_a_restart_are_already_recovered():
 ''', full=True)
         rows = one(seen, "rows") or []
         ground = one(seen, "ground") or ""
-        check(not any(r[1] in ("queued", "running") for r in rows),
-              f"the first turn finds nothing still in flight ({rows})")
+        check(len(rows) == 2 and not any(r[1] in ("queued", "running")
+                                        for r in rows),
+              f"both steps are there and neither is still in flight ({rows})")
         check(not _bad_pairs(rows),
               f"and no row describes an impossible state ({_bad_pairs(rows)})")
         work_block = ground.split("The work you are actually tracking", 1)
