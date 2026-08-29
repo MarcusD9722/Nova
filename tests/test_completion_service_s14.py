@@ -356,9 +356,11 @@ async def test_h_human_criteria_survive_the_round_trip():
         check(v.state == PASSING and v.criteria[0].verdict == HUMAN_PENDING,
               f"a machine pass leaves it awaiting a person ({v.state})")
 
-        await w.svc.record_human_decision(slug=SLUG, criterion_id=ids[0],
-                                          accepted=True, actor="marcus",
-                                          detail="it looks right")
+        did = await w.svc.ask_human(slug=SLUG, criterion_id=ids[0],
+                                    prompt="does the layout look right?")
+        await w.svc.resolve_human_decision(decision_id=did, accepted=True,
+                                           actor="marcus", channel="chat",
+                                           detail="it looks right")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == COMPLETE,
               f"an explicit human acceptance completes it ({v.state})")

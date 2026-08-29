@@ -85,9 +85,41 @@ COMPLETION_DDL: tuple[str, ...] = (
         task_id         TEXT,
         generation      INTEGER,
         attempt         INTEGER,
+        -- The human decision this evidence came from, for a waiver. A waived
+        -- row without one is not honoured: it is an acceptance nobody asked
+        -- for.
+        decision_id     TEXT,
         created_at      TEXT NOT NULL
     );
     """,
+    # A question Nova asked a person, and the answer if one came back.
+    #
+    # WHY THIS EXISTS. `record_human_decision(actor="Marcus")` was attribution,
+    # not proof: any code could type the name. A waiver now requires a pending
+    # row that Nova ASKED FOR first, and each row can be redeemed once. That
+    # does not make a caller inside the process honest — nothing in-process can
+    # — but it makes two specific forgeries impossible rather than merely
+    # discouraged: a waiver nobody was ever asked for, and a waiver replayed
+    # from an answer already given. What remains is auditable: every acceptance
+    # points at the question that produced it, its channel, and its moment.
+    """
+    CREATE TABLE IF NOT EXISTS human_decisions (
+        decision_id  TEXT PRIMARY KEY,
+        project_name TEXT NOT NULL,
+        criterion_id TEXT NOT NULL,
+        revision     INTEGER NOT NULL,
+        prompt       TEXT NOT NULL DEFAULT '',
+        requested_at TEXT NOT NULL,
+        resolved_at  TEXT,
+        accepted     INTEGER,
+        actor        TEXT NOT NULL DEFAULT '',
+        -- How the answer arrived. Only channels the API layer supplies for a
+        -- real user interaction are honoured as acceptance.
+        channel      TEXT NOT NULL DEFAULT ''
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_human_decisions_open "
+    "ON human_decisions(project_name, criterion_id, resolved_at);",
     "CREATE INDEX IF NOT EXISTS idx_criteria_project "
     "ON acceptance_criteria(project_name, revision, superseded_at);",
     "CREATE INDEX IF NOT EXISTS idx_evidence_criterion "

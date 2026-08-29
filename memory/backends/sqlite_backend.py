@@ -3026,13 +3026,82 @@ class SQLiteMemoryBackend:
             await db.commit()
             return int(cur.rowcount or 0) == 1
 
+    async def open_human_decision(self, *, project_name: str, criterion_id: str,
+                                  revision: int, prompt: str) -> str:
+        """Record that Nova ASKED a person about a criterion. Returns its id."""
+        await self.initialize()
+        did = uuid4().hex
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO human_decisions(decision_id, project_name, "
+                "criterion_id, revision, prompt, requested_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (did, project_name, criterion_id, int(revision), prompt,
+                 self._now_iso()))
+            await db.commit()
+        return did
+
+    async def close_human_decision(self, *, decision_id: str, accepted: bool,
+                                   actor: str, channel: str) -> bool:
+        """Answer a pending question. False if it was already answered.
+
+        Guarded on `resolved_at IS NULL` in the same statement that sets it, so
+        an answer can be redeemed exactly once and a replayed acceptance
+        changes nothing.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE human_decisions SET resolved_at=?, accepted=?, "
+                "actor=?, channel=? "
+                "WHERE decision_id=? AND resolved_at IS NULL",
+                (self._now_iso(), 1 if accepted else 0, actor, channel,
+                 decision_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def get_human_decision(self, *, decision_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT decision_id, project_name, criterion_id, revision, "
+                "prompt, requested_at, resolved_at, accepted, actor, channel "
+                "FROM human_decisions WHERE decision_id=?", (decision_id,))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"decision_id": row[0], "project_name": row[1],
+                "criterion_id": row[2], "revision": int(row[3]),
+                "prompt": row[4], "requested_at": row[5], "resolved_at": row[6],
+                "accepted": None if row[7] is None else bool(row[7]),
+                "actor": row[8], "channel": row[9]}
+
+    async def list_human_decisions(self, *, project_name: str,
+                                   open_only: bool = False) -> list[dict[str, Any]]:
+        await self.initialize()
+        q = ("SELECT decision_id, project_name, criterion_id, revision, prompt, "
+             "requested_at, resolved_at, accepted, actor, channel "
+             "FROM human_decisions WHERE project_name=?")
+        if open_only:
+            q += " AND resolved_at IS NULL"
+        q += " ORDER BY requested_at ASC"
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, (project_name,))
+            rows = await cur.fetchall()
+        return [{"decision_id": r[0], "project_name": r[1], "criterion_id": r[2],
+                 "revision": int(r[3]), "prompt": r[4], "requested_at": r[5],
+                 "resolved_at": r[6],
+                 "accepted": None if r[7] is None else bool(r[7]),
+                 "actor": r[8], "channel": r[9]} for r in rows]
+
     async def record_acceptance_evidence(self, *, criterion_id: str,
                                          project_name: str, revision: int,
                                          artifact_digest: str, verdict: str,
                                          detail: str = "", error: str = "",
                                          task_id: str | None = None,
                                          generation: int | None = None,
-                                         attempt: int | None = None) -> str:
+                                         attempt: int | None = None,
+                                         decision_id: str | None = None) -> str:
         """Record one observation about one criterion. Returns its id.
 
         Append-only on purpose. A criterion that passed and later failed has
@@ -3046,12 +3115,13 @@ class SQLiteMemoryBackend:
             await db.execute(
                 "INSERT INTO acceptance_evidence(evidence_id, criterion_id, "
                 "project_name, revision, artifact_digest, verdict, detail, "
-                "error, task_id, generation, attempt, created_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "error, task_id, generation, attempt, decision_id, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (eid, criterion_id, project_name, int(revision), artifact_digest,
                  verdict, detail, error, task_id,
                  None if generation is None else int(generation),
-                 None if attempt is None else int(attempt), self._now_iso()))
+                 None if attempt is None else int(attempt), decision_id,
+                 self._now_iso()))
             await db.commit()
         return eid
 
@@ -3062,7 +3132,8 @@ class SQLiteMemoryBackend:
         await self.initialize()
         q = ("SELECT evidence_id, criterion_id, project_name, revision, "
              "artifact_digest, verdict, detail, error, task_id, generation, "
-             "attempt, created_at FROM acceptance_evidence WHERE project_name=?")
+             "attempt, created_at, decision_id "
+             "FROM acceptance_evidence WHERE project_name=?")
         params: list[Any] = [project_name]
         if revision is not None:
             q += " AND revision=?"
@@ -3075,5 +3146,6 @@ class SQLiteMemoryBackend:
         return [{"evidence_id": r[0], "criterion_id": r[1], "project_name": r[2],
                  "revision": int(r[3]), "artifact_digest": r[4], "verdict": r[5],
                  "detail": r[6], "error": r[7], "task_id": r[8],
-                 "generation": r[9], "attempt": r[10], "created_at": r[11]}
+                 "generation": r[9], "attempt": r[10], "created_at": r[11],
+                 "decision_id": r[12]}
                 for r in rows]

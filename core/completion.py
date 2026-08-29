@@ -134,6 +134,9 @@ class Evidence:
     task_id: str | None = None
     generation: int | None = None
     attempt: int | None = None
+    #: For a waiver, the human decision it answers. A waived row without one is
+    #: an acceptance nobody was asked for, and is not honoured.
+    decision_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,14 @@ def current_verdict_for(criterion: Criterion,
 
     latest = admissible[-1]
     verdict = latest.verdict if latest.verdict in VERDICTS else PENDING
+    if verdict == WAIVED and not latest.decision_id:
+        # An acceptance that answers no question. The service cannot produce
+        # one any more, but a row written directly to the store could, and the
+        # derivation is the last place that can refuse it.
+        return CriterionStatus(
+            criterion=criterion, verdict=HUMAN_PENDING, evidence=latest,
+            stale_reason="this was recorded as accepted, but it answers no "
+                         "question anyone was asked, so it is not honoured")
     # A machine check can never satisfy a criterion only a person can judge.
     # Recording one is a bug in the caller; refusing to honour it here is the
     # difference between a guard and a suggestion.

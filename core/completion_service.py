@@ -50,6 +50,12 @@ logger = get_logger(__name__)
 #: behalf is not a machine's to do, and it has its own path.
 RECORDABLE = frozenset({PASSED, FAILED, HUMAN_PENDING, INCONCLUSIVE})
 
+#: Channels through which a real person can answer. The API layer supplies one
+#: of these for an interaction that actually reached a human; anything else is
+#: code asserting a human decision on its own authority, which is the thing the
+#: pending-decision mechanism exists to make visible.
+USER_CHANNELS = frozenset({"chat", "ui", "voice", "api"})
+
 
 @dataclass(frozen=True)
 class CheckContext:
@@ -288,29 +294,79 @@ class CompletionService:
             verdict=verdict, detail=detail, error=error, task_id=task_id,
             generation=generation, attempt=attempt)
 
-    async def record_human_decision(self, *, slug: str, criterion_id: str,
-                                    accepted: bool, actor: str,
-                                    detail: str = "") -> str:
-        """A person accepted or rejected a criterion. The ONLY path to a waiver.
+    async def ask_human(self, *, slug: str, criterion_id: str,
+                        prompt: str = "") -> str:
+        """Ask a person to judge a criterion. Returns the pending decision id.
 
-        `actor` is required and recorded, so an acceptance can always be
-        attributed to somebody. A decision is judged against what is on disk at
-        the moment it is given — unlike a machine check, a person looked at the
-        thing as it is now, so the current digest is the honest stamp.
+        Nova asking is what makes a later acceptance answerable to something.
+        A waiver with no question behind it is an acceptance nobody was ever
+        asked for, and there is now no way to record one.
+        """
+        req = await self._memory.current_requirement(project_name=slug)
+        if req is None:
+            raise ValueError(f"no requirement recorded for {slug!r}")
+        did = await self._memory.open_human_decision(
+            project_name=slug, criterion_id=criterion_id,
+            revision=int(req["revision"]), prompt=prompt)
+        logger.info("completion_human_asked", project=slug,
+                    criterion=criterion_id, decision=did)
+        return did
+
+    async def resolve_human_decision(self, *, decision_id: str, accepted: bool,
+                                     actor: str, channel: str,
+                                     detail: str = "") -> str:
+        """Answer a question Nova asked. The ONLY path to a waiver.
+
+        WHAT THIS PROVES, AND WHAT IT DOES NOT.
+
+        It does not prove a human was present. Nothing inside the process can:
+        code that can call this can pass any `actor` string it likes, and
+        claiming otherwise would be security theatre. What it does prove is
+        narrower and real:
+
+          * the acceptance answers a question Nova ASKED — no unsolicited
+            waivers, because a waiver needs a pending row to redeem;
+          * it is redeemed exactly ONCE — the guard is in the same statement
+            that resolves it, so a replayed answer changes nothing;
+          * it names a channel, and only channels a person can actually reach
+            Nova through are honoured — so a machine accepting on its own
+            authority has to record that it did, and that shows up in the
+            audit rather than looking like Marcus;
+          * every acceptance points at its question, its moment and its actor.
+
+        The remaining trust boundary is the API layer: `channel` is only as
+        honest as the caller supplying it, and the caller that matters is the
+        HTTP endpoint a person clicks. That is where a human is or is not.
         """
         who = str(actor or "").strip()
         if not who:
             raise ValueError("a human decision must name who made it")
-        req = await self._memory.current_requirement(project_name=slug)
-        if req is None:
-            raise ValueError(f"no requirement recorded for {slug!r}")
-        note = f"accepted by {who}" if accepted else f"rejected by {who}"
+        if channel not in USER_CHANNELS:
+            raise ValueError(
+                f"{channel!r} is not a channel a person answers through "
+                f"(expected one of {sorted(USER_CHANNELS)}); code accepting on "
+                "its own authority must say so rather than borrow a name")
+        pending = await self._memory.get_human_decision(decision_id=decision_id)
+        if pending is None:
+            raise ValueError(f"no such decision {decision_id!r}: an acceptance "
+                             "must answer a question that was actually asked")
+        claimed = await self._memory.close_human_decision(
+            decision_id=decision_id, accepted=accepted, actor=who,
+            channel=channel)
+        if not claimed:
+            raise ValueError(
+                f"decision {decision_id!r} was already answered "
+                f"({pending.get('resolved_at')}); an answer is redeemable once")
+        note = f"accepted by {who} via {channel}" if accepted else \
+               f"rejected by {who} via {channel}"
         return await self._memory.record_acceptance_evidence(
-            criterion_id=criterion_id, project_name=slug,
-            revision=int(req["revision"]),
-            artifact_digest=implementation_digest(self.project_path(slug)),
+            criterion_id=pending["criterion_id"], project_name=pending["project_name"],
+            revision=int(pending["revision"]),
+            artifact_digest=implementation_digest(
+                self.project_path(pending["project_name"])),
             verdict=WAIVED if accepted else FAILED,
-            detail=f"{note}{': ' + detail if detail else ''}", error="")
+            detail=f"{note}{': ' + detail if detail else ''}", error="",
+            decision_id=decision_id)
 
     # ── deriving ────────────────────────────────────────────────────────────
 
@@ -335,7 +391,7 @@ class CompletionService:
                      revision=int(e["revision"]), artifact_digest=e["artifact_digest"],
                      detail=e["detail"], error=e["error"], created_at=e["created_at"],
                      task_id=e["task_id"], generation=e["generation"],
-                     attempt=e["attempt"])
+                     attempt=e["attempt"], decision_id=e.get("decision_id"))
             for e in ev_rows
         ]
         path = self.project_path(slug)

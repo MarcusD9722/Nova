@@ -269,9 +269,11 @@ async def test_5_only_a_person_can_accept_on_a_persons_behalf():
         check((await w.svc.evaluate(slug=SLUG)).state != COMPLETE,
               "so it cannot complete itself")
 
-        await w.svc.record_human_decision(slug=SLUG, criterion_id=ids[0],
-                                          accepted=True, actor="marcus",
-                                          detail="looks right")
+        did = await w.svc.ask_human(slug=SLUG, criterion_id=ids[0],
+                                    prompt="does the layout look right?")
+        await w.svc.resolve_human_decision(decision_id=did, accepted=True,
+                                           actor="marcus", channel="chat",
+                                           detail="looks right")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == COMPLETE,
               f"an explicit person completes it ({v.state})")
@@ -279,6 +281,86 @@ async def test_5_only_a_person_can_accept_on_a_persons_behalf():
         accepted = [r for r in rows if r["verdict"] == WAIVED]
         check(accepted and "marcus" in (accepted[-1]["detail"] or ""),
               "and the acceptance records who gave it")
+        check(accepted and accepted[-1]["decision_id"] == did,
+              "and points at the question it answered")
+
+
+async def test_5b_a_waiver_must_answer_a_question_that_was_asked():
+    check.section("§5 attribution is not proof, so a waiver needs a question")
+    with _tmp() as td:
+        w = await World(td).start()
+        rev = await w.svc.record_request(slug=SLUG, request_text="a nice layout")
+        ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
+            {"text": "looks right", "origin_quote": "a nice layout",
+             "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
+        w.write("main.py", "print('ui')\n")
+
+        # An acceptance for a question nobody asked.
+        bad = None
+        try:
+            await w.svc.resolve_human_decision(
+                decision_id="made-up", accepted=True, actor="marcus",
+                channel="chat")
+        except ValueError as e:
+            bad = str(e)
+        check(bad and "actually asked" in bad,
+              f"an invented decision id is refused ({str(bad)[:55]!r})")
+
+        # A machine naming a channel a person cannot answer through.
+        did = await w.svc.ask_human(slug=SLUG, criterion_id=ids[0], prompt="?")
+        wrong = None
+        try:
+            await w.svc.resolve_human_decision(
+                decision_id=did, accepted=True, actor="marcus",
+                channel="autonomy-worker")
+        except ValueError as e:
+            wrong = str(e)
+        check(wrong and "not a channel a person answers through" in wrong,
+              f"and so is a channel no person reaches Nova through "
+              f"({str(wrong)[:55]!r})")
+
+        # Answered once, and only once.
+        await w.svc.resolve_human_decision(decision_id=did, accepted=True,
+                                           actor="marcus", channel="ui")
+        replay = None
+        try:
+            await w.svc.resolve_human_decision(decision_id=did, accepted=True,
+                                               actor="marcus", channel="ui")
+        except ValueError as e:
+            replay = str(e)
+        check(replay and "redeemable once" in replay,
+              f"a replayed answer is refused ({str(replay)[:55]!r})")
+        rows = [r for r in await w.mem.list_acceptance_evidence(project_name=SLUG)
+                if r["verdict"] == WAIVED]
+        check(len(rows) == 1,
+              f"and only one acceptance was ever recorded ({len(rows)})")
+
+
+async def test_5c_a_waiver_written_straight_to_the_store_is_not_honoured():
+    check.section("§5 the derivation refuses an acceptance with no question")
+    with _tmp() as td:
+        w = await World(td).start()
+        rev = await w.svc.record_request(slug=SLUG, request_text="a nice layout")
+        ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
+            {"text": "looks right", "origin_quote": "a nice layout",
+             "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
+        w.write("main.py", "print('ui')\n")
+
+        # Bypassing the service entirely — the last line of defence.
+        from core.completion_artifacts import implementation_digest
+        await w.mem.record_acceptance_evidence(
+            criterion_id=ids[0], project_name=SLUG, revision=rev,
+            artifact_digest=implementation_digest(w.path), verdict=WAIVED,
+            detail="accepted by marcus", decision_id=None)
+
+        v = await w.svc.evaluate(slug=SLUG)
+        check(v.state != COMPLETE,
+              f"a waiver with no decision behind it does not complete ({v.state})")
+        check(any("answers no question" in s.stale_reason for s in v.criteria),
+              f"and the reason says why "
+              f"({[s.stale_reason[:40] for s in v.criteria]})")
 
 
 async def test_6_a_half_built_contract_never_goes_live():
@@ -324,6 +406,8 @@ async def main() -> None:
     await test_4a_an_origin_quote_must_be_a_real_span_of_the_request()
     await test_4b_an_incomplete_decomposition_cannot_complete()
     await test_5_only_a_person_can_accept_on_a_persons_behalf()
+    await test_5b_a_waiver_must_answer_a_question_that_was_asked()
+    await test_5c_a_waiver_written_straight_to_the_store_is_not_honoured()
     await test_6_a_half_built_contract_never_goes_live()
     check.finish()
 

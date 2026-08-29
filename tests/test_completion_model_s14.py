@@ -47,9 +47,14 @@ def crit(cid: str, *, required=True, kind="machine", rev=1, text=None) -> Criter
                      required=required, verify_kind=kind, revision=rev)
 
 
-def ev(cid: str, verdict: str, *, rev=1, digest=DIGEST) -> Evidence:
+def ev(cid: str, verdict: str, *, rev=1, digest=DIGEST, decision=None) -> Evidence:
+    # A waiver carries the human decision it answers. Defaulted here so the
+    # ordinary cases stay readable, but never defaulted in production: an
+    # acceptance with no question behind it is refused by the derivation.
+    if verdict == WAIVED and decision is None:
+        decision = f"decision-for-{cid}"
     return Evidence(criterion_id=cid, verdict=verdict, revision=rev,
-                    artifact_digest=digest)
+                    artifact_digest=digest, decision_id=decision)
 
 
 def state(criteria, evidence, *, rev=1, digest=DIGEST, impl=True,
@@ -124,6 +129,12 @@ async def test_d_a_machine_cannot_satisfy_a_human_criterion():
     v2 = state([human], [ev("look", WAIVED)])
     check(v2.state == COMPLETE,
           f"an explicit acceptance completes it ({v2.state})")
+    # ...but only one that answers a question somebody was actually asked.
+    v3 = state([human], [ev("look", WAIVED, decision="")])
+    check(v3.state != COMPLETE,
+          f"an acceptance with no decision behind it is not honoured ({v3.state})")
+    check("answers no question" in v3.criteria[0].stale_reason,
+          f"and the reason says why ({v3.criteria[0].stale_reason[:45]!r})")
 
 
 async def test_e_evidence_is_fenced_to_its_revision_and_artifact():

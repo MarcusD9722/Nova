@@ -3558,20 +3558,47 @@ class MemoryUnifier:
             return await self._sqlite.supersede_acceptance_criterion(
                 criterion_id=criterion_id, by_revision=by_revision, reason=reason)
 
+    async def open_human_decision(self, *, project_name: str, criterion_id: str,
+                                  revision: int, prompt: str) -> str:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.open_human_decision(
+                project_name=project_name, criterion_id=criterion_id,
+                revision=revision, prompt=prompt)
+
+    async def close_human_decision(self, *, decision_id: str, accepted: bool,
+                                   actor: str, channel: str) -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.close_human_decision(
+                decision_id=decision_id, accepted=accepted, actor=actor,
+                channel=channel)
+
+    async def get_human_decision(self, *, decision_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.get_human_decision(decision_id=decision_id)
+
+    async def list_human_decisions(self, *, project_name: str,
+                                   open_only: bool = False) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_human_decisions(
+            project_name=project_name, open_only=open_only)
+
     async def record_acceptance_evidence(self, *, criterion_id: str,
                                          project_name: str, revision: int,
                                          artifact_digest: str, verdict: str,
                                          detail: str = "", error: str = "",
                                          task_id: str | None = None,
                                          generation: int | None = None,
-                                         attempt: int | None = None) -> str:
+                                         attempt: int | None = None,
+                                         decision_id: str | None = None) -> str:
         await self.initialize()
         async with self._write_lock:
             return await self._sqlite.record_acceptance_evidence(
                 criterion_id=criterion_id, project_name=project_name,
                 revision=revision, artifact_digest=artifact_digest,
                 verdict=verdict, detail=detail, error=error, task_id=task_id,
-                generation=generation, attempt=attempt)
+                generation=generation, attempt=attempt, decision_id=decision_id)
 
     async def list_acceptance_evidence(self, *, project_name: str,
                                        revision: int | None = None,
