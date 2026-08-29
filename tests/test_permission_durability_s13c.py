@@ -38,7 +38,7 @@ os.environ.setdefault("NOVA_IT_WATCHDOG_S", "1800")
 
 from harness import Checks, run  # noqa: E402
 
-from restart_harness import one, run_step  # noqa: E402
+from restart_harness import one, prepare_root, run_step  # noqa: E402
 
 check = Checks()
 
@@ -322,12 +322,84 @@ async def test_e_the_audit_trail_is_append_only_across_restarts():
               f"after five boots over the same history ({closed_now})")
 
 
+async def test_f_a_long_trail_is_read_from_its_end():
+    """The trail is append-only and never truncated, so a machine that has run
+    for a year has a large one. The broker reads the END of it rather than all
+    of it - which means a torn first line to step over, and a limit past which
+    a very old unanswered request is simply not recovered. Both are behaviour,
+    so both are pinned here."""
+    check.section("§17 a trail too big to read whole")
+    with _tmp() as td:
+        root = Path(td) / "n"
+        prepare_root(root)
+        trail = root / "memory_data" / "permission_audit.jsonl"
+        trail.parent.mkdir(parents=True, exist_ok=True)
+
+        # One unanswered request right at the start, then more than a megabyte
+        # of settled ones on top of it, then one unanswered request at the end.
+        ancient = "a" * 12
+        recent = "z" * 12
+        with trail.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": "2026-01-01T00:00:00+00:00",
+                                 "capability": "project.delete",
+                                 "outcome": "pending",
+                                 "request_id": ancient}) + "\n")
+            i = 0
+            while trail.stat().st_size < (1 << 20) + 4096:
+                rid = f"{i:012d}"
+                fh.write(json.dumps({"ts": "2026-01-01T00:00:00+00:00",
+                                     "capability": "computer.click",
+                                     "outcome": "pending",
+                                     "request_id": rid}) + "\n")
+                fh.write(json.dumps({"ts": "2026-01-01T00:00:01+00:00",
+                                     "outcome": "approved",
+                                     "request_id": rid}) + "\n")
+                fh.flush()
+                i += 1
+            fh.write(json.dumps({"ts": "2026-01-01T00:00:02+00:00",
+                                 "capability": "project.delete",
+                                 "outcome": "pending",
+                                 "request_id": recent}) + "\n")
+        size = trail.stat().st_size
+        check(size > (1 << 20),
+              f"the trail really is bigger than the read window ({size:,} bytes)")
+
+        seen = run_step(root, f'''
+    b = nova.runtime.permission_broker
+    emit({{"recent": b.settled_as("{recent}"), "ancient": b.settled_as("{ancient}"),
+           "pending": b.pending()}})
+''', full=True)
+
+        check(one(seen, "recent") == "interrupted_by_restart",
+              f"the recent unanswered request is closed out "
+              f"({one(seen, 'recent')!r})")
+        check(one(seen, "pending") == [],
+              f"and nothing from the trail became clickable "
+              f"({one(seen, 'pending')})")
+        # Beyond the window it is simply not recovered. That is the intended
+        # way to degrade - an old request that nobody can click on any more
+        # matters less than a boot whose cost grows with the machine's age -
+        # but it IS a limit, so it is written down rather than assumed.
+        check(one(seen, "ancient") == "",
+              f"a request older than the window is left alone, not guessed at "
+              f"({one(seen, 'ancient')!r})")
+
+        # And the torn line the seek lands on is stepped over, not parsed: the
+        # trail is still readable and still appends correctly afterwards.
+        after = audit(root)
+        closed = [r for r in after if r.get("outcome") == "interrupted_by_restart"]
+        check(len(closed) == 1 and str(closed[0].get("request_id")) == recent,
+              f"exactly one close-out was written, for the right request "
+              f"({[str(r.get('request_id')) for r in closed][:3]})")
+
+
 async def main() -> None:
     await test_a_a_request_the_crash_interrupted_cannot_be_approved_later()
     await test_b_an_approval_before_the_crash_does_not_run_again_after_it()
     await test_c_a_restart_never_grants_more_permission()
     await test_d_a_refusal_survives_the_restart_as_a_refusal()
     await test_e_the_audit_trail_is_append_only_across_restarts()
+    await test_f_a_long_trail_is_read_from_its_end()
     check.finish()
 
 

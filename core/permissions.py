@@ -120,6 +120,14 @@ class PermissionBroker:
     #: click on are at the end of it.
     _RECOVER_TAIL = 2000
 
+    #: ...and how much of the file to actually READ to find those lines. The
+    #: first version read the whole thing and then sliced, which is fine for a
+    #: week and not fine for a year: the cost grew with everything the machine
+    #: had ever asked, forever, on every boot. Seeking instead makes it flat.
+    #: Sized so that 2000 entries fit comfortably; if they do not, fewer are
+    #: recovered, which is the correct way to degrade.
+    _RECOVER_BYTES = 1 << 20
+
     #: Outcomes that END a request. `late_approval_ignored`, `unknown_request`
     #: and friends are entries ABOUT a late answer, not endings, so reading them
     #: as one would overwrite the real ending with a footnote to it.
@@ -160,7 +168,17 @@ class PermissionBroker:
         try:
             if not path.exists():
                 return
-            lines = path.read_text(encoding="utf-8").splitlines()[-self._RECOVER_TAIL:]
+            with path.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - self._RECOVER_BYTES))
+                blob = fh.read()
+            # The seek usually lands mid-line. That fragment is handled by
+            # the parse below, which already tolerates an unreadable entry -
+            # dropping the first line unconditionally would instead discard a
+            # GOOD entry on every occasion the seek landed on a boundary.
+            lines = blob.decode("utf-8", errors="replace").splitlines()
+            lines = lines[-self._RECOVER_TAIL:]
         except OSError as e:  # noqa: BLE001
             logger.debug("permission_audit_read_failed", error=str(e)[:160])
             return

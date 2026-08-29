@@ -51,8 +51,14 @@ def pcts(samples: list[float]) -> str:
     return f"P50 {p50 * 1000:7.1f}ms   P90 {p90 * 1000:7.1f}ms   (n={len(s)})"
 
 
-def audit_file(path: Path, lines: int) -> None:
-    """A plausible trail: mostly settled requests, a few still open."""
+def audit_file(path: Path, lines: int, *, open_every: int = 10) -> None:
+    """A trail of `lines` requests, one in `open_every` never answered.
+
+    `open_every` matters more than the length. A request left open costs a
+    close-out WRITE on the next boot; an answered one costs only the read. A
+    person answers one request at a time, so a file with a tenth of them still
+    open is a worst case rather than a typical one - so both are measured.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         for i in range(lines):
@@ -62,20 +68,25 @@ def audit_file(path: Path, lines: int) -> None:
                                  "tier": "standard", "details": {"i": i},
                                  "outcome": "pending",
                                  "request_id": rid}) + "\n")
-            if i % 10 != 0:          # nine in ten got an answer
+            if open_every <= 0 or i % open_every != 0:
                 fh.write(json.dumps({"ts": "2026-01-01T00:00:01+00:00",
                                      "outcome": "approved",
                                      "request_id": rid, "by": "user"}) + "\n")
 
 
-def time_broker(lines: int) -> list[float]:
+def time_broker(lines: int, *, open_every: int = 10,
+                second: bool = False) -> list[float]:
+    """`second=True` times the boot AFTER one has already closed the file out,
+    which is the steady state: every later boot finds them all terminal."""
     from core.permissions import PermissionBroker
     out = []
     for _ in range(RUNS):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             p = Path(td) / "permission_audit.jsonl"
             if lines:
-                audit_file(p, lines)
+                audit_file(p, lines, open_every=open_every)
+            if second:
+                PermissionBroker(mode="guarded", audit_path=p)
             t0 = time.perf_counter()
             PermissionBroker(mode="guarded", audit_path=p)
             out.append(time.perf_counter() - t0)
@@ -139,7 +150,7 @@ async def time_second_open() -> list[float]:
 async def time_full_boot() -> list[float]:
     from harness import boot
     out = []
-    for _ in range(max(3, RUNS // 3)):
+    for _ in range(max(6, RUNS)):
         t0 = time.perf_counter()
         async with boot(default_reply="Sure."):
             out.append(time.perf_counter() - t0)
@@ -153,8 +164,12 @@ async def main() -> None:
 
     print("\nPermissionBroker construction (reads its own audit tail)")
     for lines in (0, 100, 2_000, 10_000):
-        label = f"  audit {lines:>6,} requests"
-        print(f"{label:<32} {pcts(time_broker(lines))}")
+        label = f"  audit {lines:>6,}, 1 in 10 open"
+        print(f"{label:<34} {pcts(time_broker(lines))}")
+    print(f"{'  audit 10,000, one left open':<34} "
+          f"{pcts(time_broker(10_000, open_every=0))}")
+    print(f"{'  audit 10,000, every later boot':<34} "
+          f"{pcts(time_broker(10_000, second=True))}")
 
     print("\nMemoryUnifier.initialize()")
     print(f"{'  brand-new database':<32} {pcts(await time_initialize(old_db=False))}")
