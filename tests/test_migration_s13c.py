@@ -48,6 +48,12 @@ from harness import Checks, run  # noqa: E402
 
 from restart_harness import one, prepare_root, run_step  # noqa: E402
 
+from memory.backends.sqlite_backend import SQLiteMemoryBackend  # noqa: E402
+
+#: The newest migration this build knows about, read from the source of truth
+#: rather than copied into an assertion that then goes stale.
+LATEST_MIGRATION = max(v for v, _, _ in SQLiteMemoryBackend._MIGRATIONS)
+
 check = Checks()
 
 OLD = "1970-01-01T00:00:00+00:00"
@@ -347,9 +353,13 @@ async def test_f_a_brand_new_database_is_not_replayed_over():
         run_step(root, READ_BACK)
         vers = [v for (v,) in raw(root, "SELECT version FROM schema_version "
                                         "ORDER BY version")]
-        check(vers == [8],
-              f"a fresh database is stamped current, not walked through "
-              f"history ({vers})")
+        # Derived, not pinned. The property is "stamped with the latest, once"
+        # - the number itself moves every time a migration is added, and
+        # hardcoding it made this suite fail for the wrong reason the first
+        # time Stage 14 added one.
+        check(vers == [LATEST_MIGRATION],
+              f"a fresh database is stamped current ({LATEST_MIGRATION}), not "
+              f"walked through history ({vers})")
         check("generation" in columns(root, "tasks")
               and "outcome" in columns(root, "tasks"),
               "and it has the latest schema anyway")
@@ -357,7 +367,7 @@ async def test_f_a_brand_new_database_is_not_replayed_over():
         # And it stays that way: a second boot neither replays nor re-stamps.
         run_step(root, READ_BACK)
         check([v for (v,) in raw(root, "SELECT version FROM schema_version "
-                                       "ORDER BY version")] == [8],
+                                       "ORDER BY version")] == [LATEST_MIGRATION],
               "a second boot changes nothing")
 
 

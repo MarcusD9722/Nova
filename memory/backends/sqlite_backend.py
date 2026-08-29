@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import aiosqlite
 
+from memory.completion_schema import COMPLETION_DDL
 from memory.episodic_schema import EPISODIC_DDL, EPISODIC_MIGRATION
 
 
@@ -500,6 +501,9 @@ class SQLiteMemoryBackend:
                 # early (no table yet) and the DDL builds the full schema.
                 # Same order as `turns` above: migrate, THEN index.
                 await self._migrate_episodes_schema(db)
+                for _sql in COMPLETION_DDL:
+                    await db.execute(_sql)
+
                 for _sql in EPISODIC_DDL:
                     await db.execute(_sql)
 
@@ -636,6 +640,21 @@ class SQLiteMemoryBackend:
                 # refused if the goal has moved on.
                 "ALTER TABLE goals ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
                 "ALTER TABLE tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+            ],
+        ),
+        (
+            9,
+            "Stage 14: durable acceptance criteria and completion evidence",
+            [
+                # WHY: "complete" was derived from whether the program started
+                # and whether Nova's own generated tests objected. The user's
+                # request was not part of that decision, so nothing could be
+                # compared against it. These tables are where the request and
+                # its acceptance criteria become durable facts.
+                #
+                # The SAME list the create block uses, so a fresh database and
+                # an upgraded one cannot disagree about the shape.
+                *COMPLETION_DDL,
             ],
         ),
     ]
@@ -2838,3 +2857,171 @@ class SQLiteMemoryBackend:
                 await db.execute(f"UPDATE progress_events SET acknowledged=1 WHERE event_id IN ({placeholders})", ids)
                 await db.commit()
         return [dict(event_id=r[0], goal_id=r[1], kind=r[2], message=r[3], created_at=r[4]) for r in rows]
+
+
+    # ── Stage 14: acceptance criteria and completion evidence ───────────────
+    #
+    # Everything here RECORDS. Nothing here decides. The current state of a
+    # project is derived from these rows by `core.completion.derive_state`, so
+    # there is deliberately no `set_completion_state` to call: a writer that
+    # wanted to declare a project complete would have to produce evidence for
+    # every required criterion, which is the whole point.
+
+    async def record_requirement(self, *, project_name: str, request_text: str,
+                                 source: str = "user", note: str = "") -> int:
+        """Record what the user asked for. Returns the new revision number.
+
+        A new revision is what a CORRECTION is: the user changed their mind, so
+        evidence gathered under the old revision stops counting toward the
+        current state. Recording the same text twice is still a new revision —
+        it is the caller's job to know whether the request actually changed,
+        and guessing here would silently swallow a real correction that
+        happened to be worded identically.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM project_requirements "
+                "WHERE project_name=?", (project_name,))
+            row = await cur.fetchone()
+            nxt = int((row[0] if row else 0) or 0) + 1
+            await db.execute(
+                "INSERT INTO project_requirements(project_name, revision, "
+                "request_text, source, note, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (project_name, nxt, request_text, source, note, now))
+            await db.commit()
+        return nxt
+
+    async def current_requirement(self, *, project_name: str) -> dict[str, Any] | None:
+        """The newest recorded request for this project, or None."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT project_name, revision, request_text, source, note, created_at "
+                "FROM project_requirements WHERE project_name=? "
+                "ORDER BY revision DESC LIMIT 1", (project_name,))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"project_name": row[0], "revision": int(row[1]),
+                "request_text": row[2], "source": row[3], "note": row[4],
+                "created_at": row[5]}
+
+    async def add_acceptance_criterion(self, *, project_name: str, revision: int,
+                                       text: str, origin_quote: str,
+                                       source: str = "user", required: bool = True,
+                                       verify_kind: str = "machine",
+                                       carried_from: str | None = None) -> str:
+        """Add one criterion to a requirement revision. Returns its id."""
+        await self.initialize()
+        cid = uuid4().hex
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO acceptance_criteria(criterion_id, project_name, "
+                "revision, text, origin_quote, source, required, verify_kind, "
+                "created_at, carried_from) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cid, project_name, int(revision), text, origin_quote, source,
+                 1 if required else 0, verify_kind, self._now_iso(), carried_from))
+            await db.commit()
+        return cid
+
+    async def list_acceptance_criteria(self, *, project_name: str,
+                                       revision: int | None = None,
+                                       include_superseded: bool = False
+                                       ) -> list[dict[str, Any]]:
+        """Criteria for a revision, oldest first. Superseded ones are excluded
+        unless asked for — they are history, and history does not block."""
+        await self.initialize()
+        q = ("SELECT criterion_id, project_name, revision, text, origin_quote, "
+             "source, required, verify_kind, created_at, superseded_at, "
+             "superseded_by_revision, supersede_reason, carried_from "
+             "FROM acceptance_criteria WHERE project_name=?")
+        params: list[Any] = [project_name]
+        if revision is not None:
+            q += " AND revision=?"
+            params.append(int(revision))
+        if not include_superseded:
+            q += " AND superseded_at IS NULL"
+        q += " ORDER BY created_at ASC, rowid ASC"
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        return [{"criterion_id": r[0], "project_name": r[1], "revision": int(r[2]),
+                 "text": r[3], "origin_quote": r[4], "source": r[5],
+                 "required": bool(r[6]), "verify_kind": r[7], "created_at": r[8],
+                 "superseded_at": r[9], "superseded_by_revision": r[10],
+                 "supersede_reason": r[11], "carried_from": r[12]}
+                for r in rows]
+
+    async def supersede_acceptance_criterion(self, *, criterion_id: str,
+                                             by_revision: int,
+                                             reason: str = "") -> bool:
+        """Retire a criterion, attributably.
+
+        A criterion can only leave the contract by an explicit act that names
+        the revision retiring it. This is what stops a replan from quietly
+        dropping a requirement: forgetting to mention it does nothing, because
+        nothing here is derived from what the newest plan happens to list.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE acceptance_criteria SET superseded_at=?, "
+                "superseded_by_revision=?, supersede_reason=? "
+                "WHERE criterion_id=? AND superseded_at IS NULL",
+                (self._now_iso(), int(by_revision), reason, criterion_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def record_acceptance_evidence(self, *, criterion_id: str,
+                                         project_name: str, revision: int,
+                                         artifact_digest: str, verdict: str,
+                                         detail: str = "", error: str = "",
+                                         task_id: str | None = None,
+                                         generation: int | None = None,
+                                         attempt: int | None = None) -> str:
+        """Record one observation about one criterion. Returns its id.
+
+        Append-only on purpose. A criterion that passed and later failed has
+        two rows, and both are true about the moment they describe; collapsing
+        them into one column is how a stale pass becomes indistinguishable from
+        a current one.
+        """
+        await self.initialize()
+        eid = uuid4().hex
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO acceptance_evidence(evidence_id, criterion_id, "
+                "project_name, revision, artifact_digest, verdict, detail, "
+                "error, task_id, generation, attempt, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (eid, criterion_id, project_name, int(revision), artifact_digest,
+                 verdict, detail, error, task_id,
+                 None if generation is None else int(generation),
+                 None if attempt is None else int(attempt), self._now_iso()))
+            await db.commit()
+        return eid
+
+    async def list_acceptance_evidence(self, *, project_name: str,
+                                       revision: int | None = None,
+                                       limit: int = 500) -> list[dict[str, Any]]:
+        """Evidence oldest first, so the last admissible row is the current one."""
+        await self.initialize()
+        q = ("SELECT evidence_id, criterion_id, project_name, revision, "
+             "artifact_digest, verdict, detail, error, task_id, generation, "
+             "attempt, created_at FROM acceptance_evidence WHERE project_name=?")
+        params: list[Any] = [project_name]
+        if revision is not None:
+            q += " AND revision=?"
+            params.append(int(revision))
+        q += " ORDER BY created_at ASC, rowid ASC LIMIT ?"
+        params.append(int(limit))
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        return [{"evidence_id": r[0], "criterion_id": r[1], "project_name": r[2],
+                 "revision": int(r[3]), "artifact_digest": r[4], "verdict": r[5],
+                 "detail": r[6], "error": r[7], "task_id": r[8],
+                 "generation": r[9], "attempt": r[10], "created_at": r[11]}
+                for r in rows]
