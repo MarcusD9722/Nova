@@ -65,6 +65,7 @@ class World:
             {"text": "adds two numbers", "origin_quote": "can add"},
             {"text": "subtracts two numbers", "origin_quote": "and subtract"},
         ])
+        await self.svc.seal_contract(slug=SLUG, revision=rev)
         return rev, ids
 
 
@@ -107,8 +108,9 @@ async def test_b_the_stage14_calculator_cannot_be_complete():
         check(v.state == SCAFFOLDED,
               f"files alone do not demonstrate anything ({v.state})")
 
-        await w.svc.record_verdict(slug=SLUG, criterion_id=add_id,
-                                   verdict=PASSED, detail="add(2,3) == 5")
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=add_id),
+            verdict=PASSED, detail="add(2,3) == 5")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == PARTIALLY_IMPLEMENTED,
               f"proving addition does not complete the project ({v.state})")
@@ -117,8 +119,9 @@ async def test_b_the_stage14_calculator_cannot_be_complete():
               f"({[s.criterion.text for s in v.outstanding]})")
 
         # The old rule's inputs, recorded honestly, still cannot complete it.
-        await w.svc.record_verdict(slug=SLUG, criterion_id=sub_id,
-                                   verdict="inconclusive",
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=sub_id),
+            verdict="inconclusive",
                                    detail="no automated logic tests were applicable")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state != COMPLETE,
@@ -127,9 +130,12 @@ async def test_b_the_stage14_calculator_cannot_be_complete():
         # Only actually demonstrating it completes it.
         w.write("main.py", "def add(a, b):\n    return a + b\n\n\n"
                            "def subtract(a, b):\n    return a - b\n")
-        await w.svc.record_verdict(slug=SLUG, criterion_id=add_id, verdict=PASSED)
-        await w.svc.record_verdict(slug=SLUG, criterion_id=sub_id,
-                                   verdict=PASSED, detail="subtract(5,3) == 2")
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=add_id),
+            verdict=PASSED)
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=sub_id),
+            verdict=PASSED, detail="subtract(5,3) == 2")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == COMPLETE,
               f"both criteria demonstrated on the current code is COMPLETE ({v.state})")
@@ -142,15 +148,22 @@ async def test_c_recording_a_verdict_does_not_invalidate_it():
         rev, (add_id, sub_id) = await w.seed()
         w.write("main.py", "def add(a, b):\n    return a + b\n\n"
                            "def subtract(a, b):\n    return a - b\n")
-        await w.svc.record_verdict(slug=SLUG, criterion_id=add_id, verdict=PASSED)
-        await w.svc.record_verdict(slug=SLUG, criterion_id=sub_id, verdict=PASSED)
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=add_id),
+            verdict=PASSED)
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=sub_id),
+            verdict=PASSED)
         check((await w.svc.evaluate(slug=SLUG)).state == COMPLETE, "COMPLETE")
 
         # Everything Nova writes while RECORDING that verdict.
         w.write("PROJECT.md", "## Status\ncomplete\n## Progress log\n- done\n")
         w.write("test_main.py", "from main import add\nassert add(1, 1) == 2\n")
         w.write("nova_check.py", "assert True\n")
-        (w.path / ".nova").mkdir(exist_ok=True)
+        # Declared, because scaffolding is known by provenance now: Nova says
+        # which files are hers rather than guessing from what they are called.
+        await w.svc.declare_scaffold(slug=SLUG,
+                                     paths=["test_main.py", "nova_check.py"])
         (w.path / ".nova" / "evidence.json").write_text("{}", encoding="utf-8")
 
         v = await w.svc.evaluate(slug=SLUG)
@@ -174,8 +187,12 @@ async def test_d_a_correction_invalidates_the_old_contract():
         rev1, (add_id, sub_id) = await w.seed()
         w.write("main.py", "def add(a, b):\n    return a + b\n\n"
                            "def subtract(a, b):\n    return a - b\n")
-        await w.svc.record_verdict(slug=SLUG, criterion_id=add_id, verdict=PASSED)
-        await w.svc.record_verdict(slug=SLUG, criterion_id=sub_id, verdict=PASSED)
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=add_id),
+            verdict=PASSED)
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=sub_id),
+            verdict=PASSED)
         check((await w.svc.evaluate(slug=SLUG)).state == COMPLETE, "COMPLETE at R1")
 
         # The user adds a requirement.
@@ -215,9 +232,12 @@ async def test_e_a_criterion_cannot_vanish_by_being_forgotten():
         rev2 = await w.svc.record_request(slug=SLUG,
                                           request_text="just addition now")
         # Carrying forward while explicitly retiring subtraction.
+        # "just addition now" does not contain "can add", so the surviving
+        # criterion must be re-anchored to words the NEW request actually has.
         await w.svc.carry_forward(slug=SLUG, from_revision=rev1, to_revision=rev2,
                                   drop_criterion_ids=[sub_id],
-                                  drop_reason="the user removed subtraction")
+                                  drop_reason="the user removed subtraction",
+                                  reanchor={add_id: "just addition"})
         rows = await w.mem.list_acceptance_criteria(project_name=SLUG, revision=rev2)
         check([r["text"] for r in rows] == ["adds two numbers"],
               f"only the surviving criterion is on R2 ({[r['text'] for r in rows]})")
@@ -231,8 +251,13 @@ async def test_e_a_criterion_cannot_vanish_by_being_forgotten():
               f"and why ({retired[0]['supersede_reason'] if retired else ''!r})")
 
         w.write("main.py", "def add(a, b):\n    return a + b\n")
+        # The narrowed contract still has to be sealed: R2 asks only for
+        # addition, and the single carried criterion covers it.
+        await w.svc.seal_contract(slug=SLUG, revision=rev2)
         await w.svc.record_verdict(
-            slug=SLUG, criterion_id=rows[0]["criterion_id"], verdict=PASSED)
+            context=await w.svc.begin_check(
+                slug=SLUG, criterion_id=rows[0]["criterion_id"]),
+            verdict=PASSED)
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == COMPLETE,
               f"and the narrowed contract can be completed ({v.state})")
@@ -259,14 +284,19 @@ async def test_f_legacy_complete_is_not_authority():
         # record what would prove it, then prove it.
         rev = await w.svc.record_request(slug=SLUG, request_text=REQUEST)
         ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
-            {"text": "adds two numbers", "origin_quote": "can add"}])
+            {"text": "adds two numbers", "origin_quote": "can add"},
+            {"text": "subtracts two numbers", "origin_quote": "and subtract"}])
         v = await w.svc.evaluate(slug=SLUG, legacy_status="complete")
         check(v.state == SCAFFOLDED,
               f"recording the contract alone does not restore it ({v.state})")
-        await w.svc.record_verdict(slug=SLUG, criterion_id=ids[0], verdict=PASSED)
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
+        for cid in ids:
+            await w.svc.record_verdict(
+                context=await w.svc.begin_check(slug=SLUG, criterion_id=cid),
+                verdict=PASSED)
         v = await w.svc.evaluate(slug=SLUG, legacy_status="complete")
         check(v.state == COMPLETE,
-              f"only current evidence does ({v.state})")
+              f"only a sealed contract with current evidence does ({v.state})")
 
 
 async def test_g_evidence_is_stamped_by_the_service_not_the_caller():
@@ -275,7 +305,9 @@ async def test_g_evidence_is_stamped_by_the_service_not_the_caller():
         w = await World(td).start()
         rev, (add_id, _) = await w.seed()
         w.write("main.py", "def add(a, b):\n    return a + b\n")
-        await w.svc.record_verdict(slug=SLUG, criterion_id=add_id, verdict=PASSED)
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=add_id),
+            verdict=PASSED)
         rows = await w.mem.list_acceptance_evidence(project_name=SLUG)
         check(len(rows) == 1, f"one row recorded ({len(rows)})")
         check(rows[0]["revision"] == rev,
@@ -286,8 +318,9 @@ async def test_g_evidence_is_stamped_by_the_service_not_the_caller():
 
         bad = None
         try:
-            await w.svc.record_verdict(slug=SLUG, criterion_id=add_id,
-                                       verdict="looks about right")
+            await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=add_id),
+            verdict="looks about right")
         except ValueError as e:
             bad = str(e)
         check(bad and "not a recordable verdict" in bad,
@@ -312,16 +345,20 @@ async def test_h_human_criteria_survive_the_round_trip():
         ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
             {"text": "the layout looks right to Marcus",
              "origin_quote": "a nice layout", "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
         w.write("main.py", "print('ui')\n")
 
-        await w.svc.record_verdict(slug=SLUG, criterion_id=ids[0], verdict=PASSED,
+        await w.svc.record_verdict(
+            context=await w.svc.begin_check(slug=SLUG, criterion_id=ids[0]),
+            verdict=PASSED,
                                    detail="a model thought it looked fine")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == PASSING and v.criteria[0].verdict == HUMAN_PENDING,
               f"a machine pass leaves it awaiting a person ({v.state})")
 
-        await w.svc.record_verdict(slug=SLUG, criterion_id=ids[0], verdict=WAIVED,
-                                   detail="Marcus said it looks right")
+        await w.svc.record_human_decision(slug=SLUG, criterion_id=ids[0],
+                                          accepted=True, actor="marcus",
+                                          detail="it looks right")
         v = await w.svc.evaluate(slug=SLUG)
         check(v.state == COMPLETE,
               f"an explicit human acceptance completes it ({v.state})")

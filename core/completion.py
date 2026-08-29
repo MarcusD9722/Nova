@@ -204,9 +204,16 @@ def current_verdict_for(criterion: Criterion,
                             f"{ev.revision}, and the requirement is now on "
                             f"{revision}")
             continue
-        if artifact_digest and ev.artifact_digest and ev.artifact_digest != artifact_digest:
+        if ev.artifact_digest != artifact_digest:
+            # EXACT equality, in both directions. The first version skipped this
+            # comparison when either side was empty, which made evidence
+            # recorded against no implementation at all a wildcard: it went on
+            # certifying whatever was built afterwards, because "" was treated
+            # as "no opinion" rather than as "there was nothing here".
+            was = ev.artifact_digest[:12] or "no implementation"
+            now = artifact_digest[:12] or "no implementation"
             stale_reason = ("the implementation changed after this was checked "
-                            f"({ev.artifact_digest[:12]} -> {artifact_digest[:12]})")
+                            f"({was} -> {now})")
             continue
         admissible.append(ev)
 
@@ -250,6 +257,7 @@ def derive_state(*,
                  revision: int,
                  artifact_digest: str,
                  has_implementation: bool,
+                 contract_sealed: bool = True,
                  legacy_status: str = "") -> Verdict:
     """The one deterministic answer to "what state is this in now?".
 
@@ -322,6 +330,15 @@ def derive_state(*,
         return out(PASSING, "no criterion is marked required, so completion "
                             "cannot be established")
     if not outstanding:
+        if not contract_sealed:
+            # Everything recorded passes, but the contract was never agreed to
+            # be the whole of what was asked. Completing here would mean
+            # "everything we happened to write down is done", which is exactly
+            # how a forgotten requirement becomes a finished project.
+            return out(PASSING,
+                       "every recorded criterion passes, but the acceptance "
+                       "contract for this revision has not been sealed, so it "
+                       "is not established that these are all of them")
         return out(COMPLETE,
                    f"all {len(required)} required criteria have current "
                    f"passing or explicitly accepted evidence")

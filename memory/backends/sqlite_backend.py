@@ -2898,7 +2898,8 @@ class SQLiteMemoryBackend:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT project_name, revision, request_text, source, note, created_at "
+                "SELECT project_name, revision, request_text, source, note, "
+                "created_at, sealed_at "
                 "FROM project_requirements WHERE project_name=? "
                 "ORDER BY revision DESC LIMIT 1", (project_name,))
             row = await cur.fetchone()
@@ -2906,7 +2907,58 @@ class SQLiteMemoryBackend:
             return None
         return {"project_name": row[0], "revision": int(row[1]),
                 "request_text": row[2], "source": row[3], "note": row[4],
-                "created_at": row[5]}
+                "created_at": row[5], "sealed_at": row[6]}
+
+    async def seal_requirement(self, *, project_name: str, revision: int) -> bool:
+        """Mark a revision's acceptance contract as agreed and whole.
+
+        One statement, so a crash cannot leave it half-sealed, and guarded on
+        `sealed_at IS NULL` so sealing twice is a no-op rather than a second
+        opinion.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE project_requirements SET sealed_at=? "
+                "WHERE project_name=? AND revision=? AND sealed_at IS NULL",
+                (self._now_iso(), project_name, int(revision)))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def add_acceptance_criteria_batch(
+            self, *, project_name: str, revision: int,
+            specs: list[dict[str, Any]]) -> list[str]:
+        """Write a whole set of criteria, or none of them.
+
+        One transaction. Writing them one at a time meant an abort partway
+        through left a contract that was neither the old one nor the new one,
+        and nothing downstream could tell that anything was missing — the
+        criteria that never got written leave no trace of their absence.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        ids = [uuid4().hex for _ in specs]
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                for cid, spec in zip(ids, specs):
+                    await db.execute(
+                        "INSERT INTO acceptance_criteria(criterion_id, "
+                        "project_name, revision, text, origin_quote, source, "
+                        "required, verify_kind, created_at, carried_from) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (cid, project_name, int(revision),
+                         str(spec.get("text") or ""),
+                         str(spec.get("origin_quote") or ""),
+                         str(spec.get("source") or "user"),
+                         1 if spec.get("required", True) else 0,
+                         str(spec.get("verify_kind") or "machine"), now,
+                         spec.get("carried_from")))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return ids
 
     async def add_acceptance_criterion(self, *, project_name: str, revision: int,
                                        text: str, origin_quote: str,

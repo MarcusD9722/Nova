@@ -32,7 +32,7 @@ from core.completion import (  # noqa: E402
     Criterion, Evidence, derive_state,
 )
 from core.completion_artifacts import (  # noqa: E402
-    implementation_digest, implementation_files,
+    declare_scaffold, implementation_digest, implementation_files,
 )
 
 check = Checks()
@@ -216,18 +216,27 @@ async def test_j_the_artifact_set_excludes_what_recording_a_verdict_writes():
               f"and the set is the source files ({implementation_files(proj)})")
 
         # Everything below is written BY the act of checking or recording.
+        # Nova DECLARES the files she writes; she does not get to assume that
+        # anything named like a test is hers, because a user asking for a test
+        # runner owns test_engine.py and tests.py.
         (proj / "PROJECT.md").write_text("## Status\ncomplete\n", encoding="utf-8")
         (proj / "test_main.py").write_text("assert True\n", encoding="utf-8")
         (proj / "nova_check.py").write_text("assert True\n", encoding="utf-8")
-        (proj / ".nova").mkdir()
+        declare_scaffold(proj, ["test_main.py", "nova_check.py"])
         (proj / ".nova" / "evidence.json").write_text("{}", encoding="utf-8")
         (proj / "__pycache__").mkdir()
         (proj / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"\x00\x01")
 
         after = implementation_digest(proj)
         check(after == before,
-              "writing the status, the generated test, the repro check and the "
-              "evidence file leaves the digest untouched")
+              "writing the status, a DECLARED generated test, a declared repro "
+              "check and the evidence file leaves the digest untouched")
+
+        # ...and the same files, undeclared, ARE the implementation.
+        (proj / "mine_test_helper.py").write_text("HELPER = 1\n", encoding="utf-8")
+        check(implementation_digest(proj) != after,
+              "while an undeclared file counts, whatever it is called")
+        (proj / "mine_test_helper.py").unlink()
 
         # ...but a real change to the implementation does move it.
         (proj / "sub" / "engine.py").write_text("X = 2\n", encoding="utf-8")

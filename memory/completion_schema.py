@@ -33,6 +33,12 @@ COMPLETION_DDL: tuple[str, ...] = (
         source       TEXT NOT NULL,
         note         TEXT NOT NULL DEFAULT '',
         created_at   TEXT NOT NULL,
+        -- When the acceptance contract for this revision was agreed to be the
+        -- WHOLE of what was asked. Until then the criteria recorded are a
+        -- draft: they may each be sound and still, together, miss half the
+        -- request, and completing on a draft is how a forgotten requirement
+        -- becomes a finished project.
+        sealed_at    TEXT,
         PRIMARY KEY (project_name, revision)
     );
     """,
