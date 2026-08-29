@@ -326,4 +326,92 @@ and the test tree — but the gate is worth stating rather than assuming.
 
 ## Verification
 
-*(gate and soak results appended below on completion)*
+### Three consecutive full gates
+
+All three on the same head, `c0fa4604c8b369a3366dffdc43fab34bbd391a26`, with
+the working tree unchanged between them (verified before each):
+
+| gate | result | exit |
+|---|---|---|
+| 1 | 152 / 152 | 0 |
+| 2 | 152 / 152 | 0 |
+| 3 | 152 / 152 | 0 |
+
+No suite went red in any of the three. Captured from the child process rather
+than with `Out-File`: `run_tests.ps1` uses `Write-Host`, which bypasses the
+pipeline, and piping it inside PowerShell produces a 0-byte log — a trap this
+programme has already fallen into once.
+
+**Ordering, stated rather than implied.** This report is the only thing that
+changed after those gates ran, in a `docs/`-only commit. A report cannot
+contain the results of a run over itself, and the alternative — gating a head
+whose report claims results it does not yet have — would be worse. Nothing
+executable differs between the gated head and the final one.
+
+### Soak (§21)
+
+160 suite runs, each a fresh process against a fresh directory:
+
+| section | runs | median | result |
+|---|---|---|---|
+| restart states | 20 | 27.1 s | clean |
+| crash windows | 20 | 50.9 s | clean |
+| replay safety | 20 | 87.9 s | clean |
+| revision isolation | 20 | 28.7 s | clean |
+| permission durability | 20 | 57.7 s | clean |
+| migration | 10 | 14.0 s | clean |
+| reconstruction | 10 | 60.2 s | clean |
+| foreground / background | 10 | 32.7 s | **1 hang** (see above) |
+| journeys | 10 | 100.7 s | clean |
+
+Plus 25 further dedicated runs of the foreground/background suite while hunting
+that hang: all clean, 29–35 s.
+
+### Generated restart sequences (§19)
+
+| seed | sequences | result |
+|---|---|---|
+| 0 | 300 | 300/300 held every invariant |
+| 100,000 | 500 | 500/500 |
+| 250,000 | 300 | 300/300 |
+| 500,000 | 300 | 300/300 |
+
+**1,400 sequences**, 1,832 interpreter lives in the first two batches alone,
+with RESTART_CLEAN and RESTART_CRASH as ordinary members of the action
+alphabet.
+
+### Journeys (§13)
+
+Six journeys, **231 genuine state transitions**, counted by diffing
+authoritative rows by identity after every life. J1 56, J2 32, J3 63, J4 30,
+J5 25, J6 25.
+
+### Frontend (§24)
+
+`npm run build` green (vite, 22.6 s). No frontend file changed in this stage.
+
+---
+
+## What this does and does not establish
+
+**Established.** Across real process boundaries — not `stop()` then `start()` on
+a live object — Nova reconstructs what happened, what did not, what may
+continue and what must never continue, from durable rows alone. Interrupted
+work is `unknown` rather than guessed either way; a worker from a run that
+ended cannot finish it; a permission request the crash interrupted cannot be
+approved afterwards and is no longer misdescribed in the audit; an old database
+opens and answers honestly instead of failing to open; and a person asking any
+of the ordinary questions after a restart is answered from the record rather
+than from an empty transcript.
+
+**Not established.** One hang, once, unreproduced in 25 dedicated attempts and
+absent from all three gates — recorded above as unexplained rather than
+resolved. And the limits under "Recorded, not fixed" are limits, not proofs.
+
+Three green gates are not by themselves an argument that this is right; they
+are an argument that it is not obviously wrong. The argument that it is right
+is the mutation ledger and the sequences, and both are written down above
+including the parts where my own tests were the thing at fault.
+
+**Not merged, and not proposed for merge here.** Stage 13C is submitted for
+independent review.
