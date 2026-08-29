@@ -113,6 +113,117 @@ class PermissionBroker:
         #: audited as what it actually was instead of as a fresh approval. Ids
         #: only, never details, and bounded.
         self._settled: dict[str, str] = {}
+        self._recover_from_audit()
+
+    #: How far back a new process reads its own trail. The file is append-only
+    #: and grows for the life of the machine; the requests a person could still
+    #: click on are at the end of it.
+    _RECOVER_TAIL = 2000
+
+    #: ...and how much of the file to actually READ to find those lines. The
+    #: first version read the whole thing and then sliced, which is fine for a
+    #: week and not fine for a year: the cost grew with everything the machine
+    #: had ever asked, forever, on every boot. Seeking instead makes it flat.
+    #: Sized so that 2000 entries fit comfortably; if they do not, fewer are
+    #: recovered, which is the correct way to degrade.
+    _RECOVER_BYTES = 1 << 20
+
+    #: Outcomes that END a request. `late_approval_ignored`, `unknown_request`
+    #: and friends are entries ABOUT a late answer, not endings, so reading them
+    #: as one would overwrite the real ending with a footnote to it.
+    _ENDINGS = frozenset({"approved", "rejected", "timeout", "cancelled",
+                          "abandoned", "already_settled", "interrupted_by_restart"})
+
+    def _recover_from_audit(self) -> None:
+        """Learn from the durable trail how earlier lives' requests ended.
+
+        Everything about a permission request except the audit line is in
+        memory: the pending future, the answer, how it finished. A restart
+        erases all of it, and the old broker then had exactly one thing to say
+        about any id from before — "no request with this id was ever pending".
+        For a request that WAS pending, recorded on disk one line up, that is
+        not a gap; it is a false statement in a security log. It also left
+        `settled_as` empty, so a user who had DECLINED something was told only
+        that their click did nothing, never that their refusal still stood.
+
+        So a new broker reads the tail of its own trail and rebuilds two things:
+
+          * how each request ENDED, so a late click is audited as the late
+            answer to a decided request, and `settled_as` can still say which
+            decision it was;
+          * which requests ended NOWHERE — the ones the process was still
+            holding when it died. Those get one terminal entry of their own,
+            because a request left `pending` for ever reads as still waiting,
+            and "still waiting" is the one thing it certainly is not.
+
+        Nothing here can make an action runnable. `_pending` stays empty: no
+        future is restored, so `resolve()` cannot approve any of these and
+        `pending()` has nothing to offer. This is only about what is TRUE
+        afterwards. It assumes one Nova per memory directory — the same
+        assumption startup already makes when it closes out in-flight work.
+        """
+        path = self._audit_path
+        if path is None:
+            return
+        try:
+            if not path.exists():
+                return
+            with path.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - self._RECOVER_BYTES))
+                blob = fh.read()
+            # The seek usually lands mid-line. That fragment is handled by
+            # the parse below, which already tolerates an unreadable entry -
+            # dropping the first line unconditionally would instead discard a
+            # GOOD entry on every occasion the seek landed on a boundary.
+            lines = blob.decode("utf-8", errors="replace").splitlines()
+            lines = lines[-self._RECOVER_TAIL:]
+        except OSError as e:  # noqa: BLE001
+            logger.debug("permission_audit_read_failed", error=str(e)[:160])
+            return
+
+        rows: list[dict[str, Any]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # A crash mid-write can tear the last line. One unreadable entry
+                # is not a reason to abandon the rest of the history.
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+
+        # What `audit_log()` shows now spans lives, so the endpoint that exists
+        # to show the trail stops disagreeing with the file it is written to.
+        self._recent = rows[-500:]
+
+        opened: dict[str, dict[str, Any]] = {}
+        ended: dict[str, str] = {}
+        for row in rows:
+            rid = str(row.get("request_id") or "")
+            if not rid:
+                continue                      # allow/deny are decided, not tracked
+            outcome = str(row.get("outcome") or "")
+            if outcome == "pending":
+                opened[rid] = row
+                ended.pop(rid, None)
+            elif outcome in self._ENDINGS:
+                ended[rid] = outcome
+        for rid, outcome in ended.items():
+            self._settle(rid, outcome)
+        for rid, row in opened.items():
+            if rid in ended:
+                continue
+            self._settle(rid, "interrupted_by_restart")
+            self._audit({"outcome": "interrupted_by_restart", "request_id": rid,
+                         "capability": str(row.get("capability") or ""),
+                         "reason": "Nova stopped before this was answered; "
+                                   "nothing was executed, and it can no longer "
+                                   "be approved"})
 
     @property
     def mode(self) -> str:

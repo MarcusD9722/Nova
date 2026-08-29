@@ -390,13 +390,21 @@ class Nova:
 @contextlib.asynccontextmanager
 async def boot(*, env: dict[str, str] | None = None,
                rules: Iterable[tuple[Any, Any]] = (),
-               default_reply: str | None = None):
+               default_reply: str | None = None,
+               root: Path | str | None = None):
     """Boot the real backend into a throwaway root; tear it down after.
 
     `env` overrides harness defaults (see `_base_env`). `rules` is sugar for
     `ScriptedLLM.when` pairs. Everything is restored on exit.
+
+    `root` boots against an EXISTING directory and does not delete it, which is
+    what makes a restart testable: the durable store has to outlive the process
+    that wrote it, or "it survived a restart" only means "the object was
+    reconstructed from itself". Callers that pass nothing keep the old
+    throwaway behaviour exactly.
     """
-    root = Path(tempfile.mkdtemp(prefix="nova-it-"))
+    keep_root = root is not None
+    root = Path(root) if keep_root else Path(tempfile.mkdtemp(prefix="nova-it-"))
     for sub in ("model", "projects", "memory_data", "voices"):
         (root / sub).mkdir(parents=True, exist_ok=True)
     (root / "model" / "harness-stub.gguf").write_bytes(b"")
@@ -451,8 +459,10 @@ async def boot(*, env: dict[str, str] | None = None,
         os.environ.clear()
         os.environ.update(saved)
         # Windows holds the SQLite file briefly after close; losing the temp
-        # dir is not a test failure.
-        shutil.rmtree(root, ignore_errors=True)
+        # dir is not a test failure. A caller-supplied root is NEVER removed:
+        # it is the durable state the next process is going to open.
+        if not keep_root:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def run(main: Callable[[], Any]) -> None:

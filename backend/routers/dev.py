@@ -65,20 +65,46 @@ async def permissions_audit(limit: int = Query(100)) -> dict:
     return {"mode": b.mode, "audit": b.audit_log(limit=int(limit)), "pending": b.pending()}
 
 
+#: What to tell someone whose click arrived too late, per ending. Only endings
+#: a person can actually meet a stale button on are named; anything else falls
+#: back to the general sentence.
+_RESOLVE_NOTES = {
+    "interrupted_by_restart":
+        "Nova restarted before that was answered, so the request is gone — "
+        "nothing was executed. Ask again if you still want it.",
+    "timeout":
+        "That request timed out waiting for an answer — nothing was executed.",
+    "approved": "You already approved that one; it has already run.",
+    "rejected": "You already declined that one — nothing was executed.",
+    "cancelled":
+        "That request was withdrawn before you answered — nothing was executed.",
+    "abandoned":
+        "Whatever was waiting on that request stopped waiting — nothing was executed.",
+}
+
+
 @router.post("/permissions/resolve")
 async def permissions_resolve(req: PermissionResolveRequest) -> dict:
     """Approve or deny a pending action that needed Marcus's confirmation."""
     if STATE.runtime is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    ok = STATE.runtime.permission_broker.resolve(req.request_id, bool(req.approved))
+    broker = STATE.runtime.permission_broker
+    ok = broker.resolve(req.request_id, bool(req.approved))
     # `approved` echoes the CLICK; `applied` says whether it did anything. The old
     # shape returned approved=true for a request that had already timed out, so
     # the UI could report a deletion that never ran.
     out = {"resolved": ok, "applied": ok, "request_id": req.request_id,
            "approved": bool(req.approved)}
     if not ok:
-        out["note"] = ("That request was no longer waiting (it timed out, was "
-                       "withdrawn, or was already answered) — nothing was executed.")
+        # WHICH kind of "no longer waiting". The broker knows — including,
+        # since it reads its own durable trail at startup, that Nova restarted
+        # while the request was still open. Listing every possibility to a
+        # person who is owed one specific answer is a way of not answering.
+        settled = broker.settled_as(req.request_id)
+        out["settled_as"] = settled
+        out["note"] = _RESOLVE_NOTES.get(settled) or (
+            "That request was no longer waiting (it timed out, was "
+            "withdrawn, or was already answered) — nothing was executed.")
     return out
 
 
