@@ -209,6 +209,19 @@ def current_verdict_for(criterion: Criterion,
     for ev in evidence:
         if ev.criterion_id != criterion.criterion_id:
             continue
+        # DEFENCE IN DEPTH, AND MEASURED AS SUCH. No sequence of public
+        # service calls can reach this branch: evidence is keyed by criterion
+        # id, and `carry_forward` mints a NEW id at every revision, so a result
+        # recorded under an old revision belongs to a criterion that is no
+        # longer live. A stale CheckContext redeemed after a correction, and a
+        # human decision asked before one and resolved after, were both tried:
+        # zero rows crossed a revision onto a live criterion. The digest fence
+        # below is what actually catches staleness in practice. This one is
+        # kept because it costs nothing and stops being unreachable the moment
+        # anyone makes carry_forward preserve ids -- a plausible refactor that
+        # would otherwise silently admit evidence for superseded requirements.
+        # It is covered by unit tests over Evidence directly, not by the
+        # generated sequences, and saying so beats implying it is exercised.
         if int(ev.revision) != int(revision):
             stale_reason = (f"evidence was gathered for requirement revision "
                             f"{ev.revision}, and the requirement is now on "

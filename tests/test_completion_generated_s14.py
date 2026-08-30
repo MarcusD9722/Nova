@@ -57,6 +57,11 @@ from memory.unifier import MemoryUnifier  # noqa: E402
 check = Checks()
 
 SEQUENCES = int(os.getenv("NOVA_S14_SEQS", "500"))
+# The harness arms a 180s faulthandler watchdog that exits the process. At
+# roughly two seconds a sequence, 500 of them outrun it and the run dies with
+# exit 139 and a thread dump that looks like a hang and is not one. Scale the
+# budget with the workload; an explicit setting still wins.
+os.environ.setdefault("NOVA_IT_WATCHDOG_S", str(max(180, SEQUENCES * 8)))
 BASE_SEED = int(os.getenv("NOVA_S14_SEED", "0"))
 PROJECTS = ("alpha", "beta")
 
@@ -67,8 +72,57 @@ ACTIONS = [
     "ADD_CRITERION", "ADD_CRITERION", "SEAL", "IMPLEMENT", "IMPLEMENT",
     "PASS", "PASS", "FAIL", "INCONCLUSIVE", "ASK_HUMAN", "HUMAN_ACCEPT",
     "CORRECTION", "DRIFT", "STALE_PASS", "DUPLICATE", "RESTART", "REPAIR",
-    "SWITCH_PROJECT",
+    "SWITCH_PROJECT", "CARRY_FORWARD", "FORGED_WAIVER",
 ]
+
+
+#: What the sequences actually reached. A suite that never leaves IDEA passes
+#: every invariant here while proving nothing, so the run reports this and
+#: fails if the interesting states were not exercised.
+COVERAGE: dict[str, int] = {}
+
+
+def seen(key: str) -> None:
+    COVERAGE[key] = COVERAGE.get(key, 0) + 1
+
+
+def _pool(oracle: "Oracle", slug: str) -> list[str]:
+    """The base noise, plus weight on whatever this project still lacks.
+
+    Without this the walk reached COMPLETE zero times in twenty sequences and
+    every invariant held vacuously. The bias decides which action is more
+    LIKELY, never which is legal -- corrections, drift, stale results and
+    restarts stay in the pool throughout.
+    """
+    st = oracle.p[slug]
+    rev = st["revision"]
+    live = st["criteria"].get(rev, [])
+    pool = list(ACTIONS)
+    if st.get("carryable"):
+        return pool + ["CARRY_FORWARD"] * 4
+    if not live:
+        return pool + ["ADD_CRITERION"] * 5
+    if _uncovered(st):
+        return pool + ["ADD_CRITERION"] * 4
+    if not st["sealed"].get(rev):
+        return pool + ["SEAL"] * 5
+    if not st["implemented"]:
+        return pool + ["IMPLEMENT"] * 5
+    verdicts = oracle.admissible(slug)
+    if any(v == HUMAN_PENDING for v in verdicts.values()):
+        return pool + ["ASK_HUMAN"] * 3 + ["HUMAN_ACCEPT"] * 4
+    return pool + ["PASS"] * 4 + ["REPAIR"] * 2
+
+
+def _clauses(st: dict) -> list[str]:
+    return [c.strip() for c in st["request"].split(" and ") if c.strip()]
+
+
+def _uncovered(st: dict) -> list[str]:
+    """Clauses of the current request that no live criterion quotes."""
+    quotes = st.setdefault("quotes", {}).get(st["revision"], [])
+    return [c for c in _clauses(st)
+            if not any(c in q or q in c for q in quotes)]
 
 
 class Oracle:
@@ -164,9 +218,9 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
             oracle.p[s]["request"] = text
             history.append(f"REQUEST({s}, {text!r}) -> rev {rev}")
 
-        n = rng.randint(8, 22)
+        n = rng.randint(14, 34)
         for step in range(n):
-            action = rng.choice(ACTIONS)
+            action = rng.choice(_pool(oracle, current))
             st = oracle.p[current]
             rev = st["revision"]
             live = st["criteria"].get(rev, [])
@@ -174,13 +228,15 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
 
             try:
                 if action == "ADD_CRITERION" and not st["sealed"].get(rev):
-                    part = rng.choice(st["request"].split(" and "))
+                    gaps = _uncovered(st)
+                    part = rng.choice(gaps or _clauses(st))
                     kind = "human" if rng.random() < 0.25 else "machine"
                     ids = await svc.set_criteria(
                         slug=current, revision=rev,
                         criteria=[{"text": f"does {part}",
                                    "origin_quote": part, "verify_kind": kind}])
                     st["criteria"].setdefault(rev, []).extend(ids)
+                    st.setdefault("quotes", {}).setdefault(rev, []).append(part)
                     for cid in ids:
                         st["kinds"][cid] = kind
                     history.append(f"ADD_CRITERION({current}, {part!r}, {kind})")
@@ -206,7 +262,10 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
                     history.append(f"IMPLEMENT({current}) -> {st['digest'][:8]}")
 
                 elif action in ("PASS", "FAIL", "INCONCLUSIVE") and live:
-                    cid = rng.choice(live)
+                    done = oracle.admissible(current)
+                    unmet = [c for c in live
+                             if done.get(c) not in (PASSED, WAIVED)]
+                    cid = rng.choice(unmet or live)
                     verdict = {"PASS": PASSED, "FAIL": FAILED,
                                "INCONCLUSIVE": INCONCLUSIVE}[action]
                     ctx = await svc.begin_check(slug=current, criterion_id=cid)
@@ -219,7 +278,11 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
                     history.append(f"{action}({current}, {cid[:6]})")
 
                 elif action == "ASK_HUMAN" and live:
-                    cid = rng.choice(live)
+                    done = oracle.admissible(current)
+                    unmet = [c for c in live
+                             if st["kinds"].get(c) == "human"
+                             and done.get(c) != WAIVED]
+                    cid = rng.choice(unmet or live)
                     did = await svc.ask_human(slug=current, criterion_id=cid,
                                               prompt="?")
                     st.setdefault("open", []).append((did, cid))
@@ -241,6 +304,7 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
                     text = st["request"] + " and " + rng.choice(REQUEST_PARTS)
                     new_rev = await svc.record_request(slug=current,
                                                        request_text=text)
+                    st["carryable"] = rev if st["criteria"].get(rev) else None
                     st["revision"] = new_rev
                     st["request"] = text
                     history.append(f"CORRECTION({current}) -> rev {new_rev}")
@@ -271,6 +335,40 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
                         decision_id=old.get("decision"))
                     st["evidence"].append(dict(old))
                     history.append(f"DUPLICATE({current})")
+
+                elif action == "FORGED_WAIVER" and live:
+                    cid = rng.choice(live)
+                    await mem.record_acceptance_evidence(
+                        criterion_id=cid, project_name=current,
+                        revision=st["revision"], artifact_digest=st["digest"],
+                        verdict=WAIVED,
+                        detail="a waived row with nothing behind it")
+                    st["evidence"].append(
+                        {"criterion": cid, "revision": st["revision"],
+                         "digest": st["digest"], "verdict": WAIVED,
+                         "decision": None})
+                    history.append(f"FORGED_WAIVER({current}, {cid[:6]})")
+
+                elif action == "CARRY_FORWARD" and st.get("carryable"):
+                    frm = st["carryable"]
+                    try:
+                        moved = await svc.carry_forward(
+                            slug=current, from_revision=frm, to_revision=rev)
+                    except ValueError as e:
+                        history.append(f"CARRY_FORWARD({current}) refused: "
+                                       f"{str(e)[:50]}")
+                        moved = []
+                    if moved:
+                        old_ids = st["criteria"].get(frm, [])
+                        st["criteria"].setdefault(rev, []).extend(moved)
+                        for new_id, old_id in zip(moved, old_ids):
+                            st["kinds"][new_id] = st["kinds"].get(old_id,
+                                                                  "machine")
+                        st.setdefault("quotes", {}).setdefault(rev, []).extend(
+                            st.get("quotes", {}).get(frm, []))
+                        st["carryable"] = None
+                        history.append(f"CARRY_FORWARD({current}) -> "
+                                       f"{len(moved)} carried, no evidence")
 
                 elif action == "RESTART":
                     # A new service and a new memory handle on the SAME store.
@@ -303,7 +401,9 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
             # ── check every project after every step ────────────────────────
             for slug in PROJECTS:
                 actual = (await svc.evaluate(slug=slug)).state
+                seen("state:" + actual)
                 for name, requirement in oracle.expectations(slug):
+                    seen("invariant:" + requirement)
                     ok = True
                     if requirement == "must be idea":
                         ok = actual == IDEA
@@ -347,6 +447,14 @@ async def test_generated_completion_sequences():
                 break
     for report in failures:
         print("\n  VIOLATION\n" + report)
+    for key in sorted(COVERAGE):
+        print(f"    {key:<34} {COVERAGE[key]}")
+    for required in ("state:complete", "state:failing", "state:passing",
+                     "state:partially_implemented", "state:scaffolded",
+                     "invariant:must be complete", "invariant:must be failing",
+                     "invariant:must not be complete"):
+        check(COVERAGE.get(required, 0) >= 5,
+              f"{required} was exercised {COVERAGE.get(required, 0)} times")
     check(not failures,
           f"{SEQUENCES - len(failures)}/{SEQUENCES} sequences held every "
           f"invariant" + (f" ({len(failures)} failed)" if failures else ""))
