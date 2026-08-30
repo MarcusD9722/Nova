@@ -3560,6 +3560,13 @@ class MemoryUnifier:
             return await self._sqlite.supersede_acceptance_criterion(
                 criterion_id=criterion_id, by_revision=by_revision, reason=reason)
 
+    async def claim_state_announcement(self, *, project_name: str, revision: int,
+                                       state: str) -> str | None:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.claim_state_announcement(
+                project_name=project_name, revision=revision, state=state)
+
     async def open_human_decision(self, *, project_name: str, criterion_id: str,
                                   revision: int, prompt: str,
                                   artifact_digest: str = "") -> str:

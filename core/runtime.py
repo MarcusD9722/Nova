@@ -632,7 +632,7 @@ class RuntimeManager:
         from core.completion_service import CompletionService
         self._completion = CompletionService(memory=memory,
                                              projects_dir=projects_dir)
-        self._announcer = CompletionAnnouncer()
+        self._announcer = CompletionAnnouncer(memory=memory)
 
         # Autonomous project builder (builds real projects in projects_dir).
         self._project_builder = ProjectBuilder(

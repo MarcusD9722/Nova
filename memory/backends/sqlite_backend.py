@@ -3028,6 +3028,46 @@ class SQLiteMemoryBackend:
             await db.commit()
             return int(cur.rowcount or 0) == 1
 
+    async def claim_state_announcement(self, *, project_name: str, revision: int,
+                                       state: str) -> str | None:
+        """Claim the right to announce this state. None if already announced.
+
+        Returns the PREVIOUS announced state (possibly "") when this call is
+        the one that transitioned, and None when the state is unchanged — so a
+        second evaluation, a replayed callback, or a restart that re-derives
+        the same answer announces nothing.
+
+        One statement, so two callers racing produce one announcement: the
+        upsert's DO UPDATE is guarded on the state actually differing, and
+        SQLite reports zero changed rows when that guard excludes it.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "SELECT state FROM completion_announcements "
+                    "WHERE project_name=? AND revision=?",
+                    (project_name, int(revision)))
+                row = await cur.fetchone()
+                previous = row[0] if row else ""
+                if row is not None and str(row[0]) == str(state):
+                    await db.execute("COMMIT")
+                    return None
+                await db.execute(
+                    "INSERT INTO completion_announcements(project_name, "
+                    "revision, state, announced_at) VALUES(?, ?, ?, ?) "
+                    "ON CONFLICT(project_name, revision) DO UPDATE SET "
+                    "state=excluded.state, announced_at=excluded.announced_at "
+                    "WHERE completion_announcements.state != excluded.state",
+                    (project_name, int(revision), state, now))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return previous
+
     async def open_human_decision(self, *, project_name: str, criterion_id: str,
                                   revision: int, prompt: str,
                                   artifact_digest: str = "") -> str:

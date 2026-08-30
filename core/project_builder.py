@@ -311,7 +311,7 @@ class ProjectBuilder:
         from core.completion_service import CompletionService
         self._completion = completion or CompletionService(
             memory=memory, projects_dir=self._projects_dir)
-        self._announcer = announcer or CompletionAnnouncer()
+        self._announcer = announcer or CompletionAnnouncer(memory=memory)
 
     @property
     def completion(self):
@@ -952,7 +952,7 @@ class ProjectBuilder:
                 await self._save_fact(slug, "next_steps", "; ".join(suggestions))
             await self._save_fact(slug, "last_worked", _now_str())
 
-            self._announcer.announce(
+            await self._announcer.announce(
                 slug=slug, verdict=verdict, reason="build finished",
                 extra={"summary": clip(summary, 200), "files": written,
                        "run": clip(run, 120), "suggestions": suggestions,
@@ -970,7 +970,7 @@ class ProjectBuilder:
                                        log_lines=[f"Build failed: {e}"])
                 await self._save_fact(slug, "status", verdict.state)
                 await self._save_fact(slug, "last_error", str(e)[:200])
-                self._announcer.announce(slug=slug, verdict=verdict,
+                await self._announcer.announce(slug=slug, verdict=verdict,
                                          reason=f"build failed: {str(e)[:120]}",
                                          extra={"mode": "build"})
             except Exception:
@@ -1611,7 +1611,7 @@ class ProjectBuilder:
             )
             await self._save_fact(slug, "status", verdict.state)
             await self._save_fact(slug, "last_worked", _now_str())
-            self._announcer.announce(
+            await self._announcer.announce(
                 slug=slug, verdict=verdict, reason="improvement finished",
                 extra={"requested": clip(summary, 200), "files": changed,
                        "not_changed": fail_reasons[:5], "mode": "improve",

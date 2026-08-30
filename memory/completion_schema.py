@@ -129,6 +129,23 @@ COMPLETION_DDL: tuple[str, ...] = (
         channel      TEXT NOT NULL DEFAULT ''
     );
     """,
+    # The last state ANNOUNCED for a (project, revision).
+    #
+    # Measured: with this ledger in process memory only, a fresh runtime on the
+    # same durable root re-announced project.completed for a revision that had
+    # completed long ago and had not changed - once per restart, for ever,
+    # because `previous` was always "" in a new process. Exactly-once has to be
+    # scoped to the TRANSITION, and a transition outlives the process that saw
+    # it, so the ledger has to as well.
+    """
+    CREATE TABLE IF NOT EXISTS completion_announcements (
+        project_name TEXT NOT NULL,
+        revision     INTEGER NOT NULL,
+        state        TEXT NOT NULL,
+        announced_at TEXT NOT NULL,
+        PRIMARY KEY (project_name, revision)
+    );
+    """,
     "CREATE INDEX IF NOT EXISTS idx_human_decisions_open "
     "ON human_decisions(project_name, criterion_id, resolved_at);",
     "CREATE INDEX IF NOT EXISTS idx_criteria_project "
