@@ -113,6 +113,14 @@ class PermissionBroker:
         #: audited as what it actually was instead of as a fresh approval. Ids
         #: only, never details, and bounded.
         self._settled: dict[str, str] = {}
+        #: request_id -> what that request would DO, for as long as it is live.
+        #: `pending()` used to return bare ids, so a caller holding two live
+        #: requests could not tell which one would delete which project without
+        #: correlating against the audit trail by hand. The information was
+        #: never lost -- the audit has it -- but the layer that answers "what
+        #: is waiting for you?" was dropping it and leaving the consumer to
+        #: guess. Cleared the moment a request stops being live.
+        self._pending_meta: dict[str, dict[str, Any]] = {}
         self._recover_from_audit()
 
     #: How far back a new process reads its own trail. The file is append-only
@@ -269,6 +277,9 @@ class PermissionBroker:
 
         request_id = uuid4().hex[:12]
         self._pending[request_id] = asyncio.get_event_loop().create_future()
+        self._pending_meta[request_id] = {
+            "capability": capability, "tier": TIER_NAMES[tier],
+            "details": dict(details or {}), "requested_at": self._now()}
         self._audit({**base, "outcome": "pending", "request_id": request_id})
         BUS.publish("permission.requested", {"request_id": request_id, "capability": capability,
                                              "tier": TIER_NAMES[tier], "details": details or {}})
@@ -297,6 +308,7 @@ class PermissionBroker:
         `resolve()` refuses a settled request regardless of what any client shows.
         """
         fut = self._pending.pop(str(request_id), None)
+        self._pending_meta.pop(str(request_id), None)
         if fut is None:
             return False
         if not fut.done():
@@ -334,6 +346,7 @@ class PermissionBroker:
         # the two when reading the audit trail.
         ignored = "late_approval_ignored" if approved else "late_rejection_ignored"
         fut = self._pending.pop(rid, None)
+        self._pending_meta.pop(rid, None)
 
         if fut is None:
             prior = self._settled.get(rid)
@@ -394,7 +407,16 @@ class PermissionBroker:
         return str(self._settled.get(str(request_id)) or "")
 
     def pending(self) -> list[dict[str, Any]]:
-        return [{"request_id": rid} for rid in self._pending]
+        """What is waiting for an answer, and what each one would do.
+
+        A person cannot approve an id. Anything that lists pending requests --
+        an approval UI, `/permissions/audit`, a test deciding which of two
+        deletions to allow -- needs the capability and the target, and having
+        to rebuild that by matching ids against the audit trail is how the
+        wrong one gets approved.
+        """
+        return [{"request_id": rid, **self._pending_meta.get(rid, {})}
+                for rid in self._pending]
 
     def audit_log(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return list(reversed(self._recent[-int(limit):]))
