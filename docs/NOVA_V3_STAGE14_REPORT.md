@@ -232,8 +232,58 @@ this suite passed 20/20 while reaching `complete` zero times.
 
 ### Six journeys (§14)
 
-**282 authoritative state observations, 174 of them transitions**, every one
-read back from the evaluator against the database. All seven states reached.
+The first submission reported 282 authoritative *observations* and only 174
+transitions, and the review was right to block on it: the requirement is more
+than 225 meaningful **transitions**, and half of what there was came from one
+loop repeating a single drift forty times. Repetition is not coverage.
+
+The journeys were rebuilt around distinct Stage 14 properties, and the counter
+was made stricter rather than looser:
+
+- a transition is counted **only** when an authoritative read differs from the
+  previous authoritative read. Reading twice, asserting twice about one read,
+  or acting without changing anything all count zero;
+- **the first read of a project is not counted at all.** It is the baseline —
+  the project did not move to get there — and counting one per project was
+  seven transitions of bookkeeping. Excluding them cost 7 and is correct;
+- a step that only *observes* a project may never record a transition, which
+  is asserted, and which caught a real instance the moment it was added;
+- every counted transition prints as `from -> to (what caused it)`, so the
+  total is auditable line by line rather than asserted;
+- the totals are **summed from per-journey counters**, never typed in.
+
+| journey | transitions | what it walks |
+|---|---|---|
+| J1 | 32 | build, refute, repair, six corrections, re-anchoring, retirement, undecided checks, an optional-only contract |
+| J2 | 42 | human confirmation: stale by drift, stale by *requirement change*, refused then granted, retired, and a decision that goes stale before it is answered |
+| J3 | 48 | seventeen distinct kinds of artifact change, three of which must NOT invalidate, plus drift against a *failure* |
+| J4 | 32 | sealing, a correction un-covering a sealed contract, explicit retirement, undecided checks at two revisions |
+| J5a | 37 | two live projects alternating, with attribution asserted after every action |
+| J5b | 15 | the other half of that, including a correction that moves one and not the other |
+| J6 | 28 | a restart between every *kind* of transition, five criteria settled one at a time across processes, drift while down, ledger reconciliation |
+| **TOTAL** | **234** | 469 authoritative reads, 7 baselines excluded |
+
+**22 distinct kinds of transition** (`from -> to` pairs), and every one of the
+seven states is the **destination** of a real transition, not merely observed
+in passing. `idea` as a destination exists only in one place and had to be
+constructed deliberately: a correction recorded *before the first file exists*,
+where nothing has been agreed for the new revision and nothing has been built.
+
+**Do the new assertions kill anything?** Twelve mutants relevant to the new
+journey material were run against the journeys suite **alone**: ten died there,
+including `an undecided check counts as satisfied`, `an unsealed contract can
+complete`, `a machine check can satisfy a human criterion`, `the announcement
+ledger is ignored`, and both artifact-set exclusions. Two survived — an empty
+evidence digest, and a waiver with no decision behind it — because no sequence
+of journey actions can write either row: the service refuses. Those two claims
+were **withdrawn** from the journeys rather than left standing.
+
+Two failures found while extending, both mine, both traced before being fixed:
+a project asserted COMPLETE on a contract nobody had sealed (it is `passing`,
+by design, and the reason string says so), and two deletion cases that returned
+the project to an artifact set that had **already been proven**, so the earlier
+evidence legitimately described it again — the same property asserted
+deliberately three lines further down.
 
 ### Restart and durability (§16)
 
@@ -306,23 +356,39 @@ below were run from scratch on that head.
 
 ### Three consecutive full gates
 
-All three on head `c1db7d1c9fbecf2cf0c0214496065a27db846f28`, tree
-`117b480a97e068d165a5ef1cda857d9b5f88a0cb`, with the tree hash and the working
-tree both re-checked immediately before each gate started:
+An earlier set of three gates passed 165/165 on `c1db7d1`. They are **not**
+counted. The journey work changed the test tree afterwards, which makes those
+runs preliminary by definition: a gate describes the head it ran on, and that
+head is no longer the final one.
+
+The counted gates all ran on head
+`cbfef0d4f18310de3779974728fde6790cc9f399`, tree
+`a26d131b603bdc962c48d63fd4de9735bc6eca9a`. Before each one, both the tree hash
+and the working tree were re-checked, with the check scoped to the
+**executable** paths (`core`, `backend`, `memory`, `tests`, `frontend`) so that
+a docs-only difference could not silently pass as "unchanged" and nothing
+executable could silently differ:
 
 | gate | started | result | exit |
 |---|---|---|---|
-| 1 | 01:50:46 | **165 / 165** | 0 |
-| 2 | 02:40:56 | **165 / 165** | 0 |
-| 3 | 03:38:25 | **165 / 165** | 0 |
+| 1 | 09:57:48 | **165 / 165** | 0 |
+| 2 | 10:51:35 | **165 / 165** | 0 |
+| 3 | 11:45:46 | **165 / 165** | 0 |
 
-No suite went red in any of the three. That includes the frozen Stage 13A,
-13B and 13C suites, which run in every gate — the completion work did not
-disturb the restart, durability or reconstruction guarantees they pin.
+No suite went red in any of the three. That includes the frozen Stage 13A, 13B
+and 13C suites, which run in every gate; they were also run individually
+against this tree beforehand — **25 of 25 pass**, so the completion work did
+not disturb the restart, durability or reconstruction guarantees they pin.
 
 Output was captured from the child process rather than piped inside
 PowerShell: `run_tests.ps1` uses `Write-Host`, which bypasses the pipeline and
 produces a 0-byte log, a trap this programme has fallen into before.
+
+**Frontend.** `npm run build` in `frontend/` succeeds on this tree (24.1s,
+chunk-size advisories only, all pre-existing). `node --check` is not a valid
+gate for `.jsx` — node rejects the extension outright — so the vite build is
+the syntax gate. No frontend file changed in this stage; the build was re-run
+because the executable tree did.
 
 **Ordering, stated rather than implied.** This report is the only thing that
 changed after those gates ran, in a `docs/`-only commit. A report cannot
