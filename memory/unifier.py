@@ -3515,11 +3515,13 @@ class MemoryUnifier:
         await self.initialize()
         return await self._sqlite.current_requirement(project_name=project_name)
 
-    async def seal_requirement(self, *, project_name: str, revision: int) -> bool:
+    async def seal_requirement(self, *, project_name: str, revision: int,
+                               seal_mode: str = "auto") -> bool:
         await self.initialize()
         async with self._write_lock:
             return await self._sqlite.seal_requirement(
-                project_name=project_name, revision=revision)
+                project_name=project_name, revision=revision,
+                seal_mode=seal_mode)
 
     async def add_acceptance_criteria_batch(self, *, project_name: str,
                                             revision: int,

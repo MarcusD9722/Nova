@@ -156,7 +156,8 @@ class CompletionService:
                 "written for the requirement in force")
         return req
 
-    async def seal_contract(self, *, slug: str, revision: int) -> list[str]:
+    async def seal_contract(self, *, slug: str, revision: int,
+                            seal_mode: str = "auto") -> list[str]:
         """Agree that these criteria are the WHOLE of what was asked.
 
         Refuses while any separately-asked-for clause of the request is quoted
@@ -181,9 +182,10 @@ class CompletionService:
                 f"not cover everything that was asked for. No criterion quotes: "
                 + "; ".join(repr(m) for m in missing))
         await self._memory.seal_requirement(project_name=slug,
-                                            revision=int(revision))
+                                            revision=int(revision),
+                                            seal_mode=seal_mode)
         logger.info("completion_contract_sealed", project=slug, revision=revision,
-                    criteria=len(rows))
+                    criteria=len(rows), mode=seal_mode)
         return [r["origin_quote"] for r in rows]
 
     async def declare_scaffold(self, *, slug: str, paths: Sequence[str]) -> set[str]:
@@ -423,5 +425,7 @@ class CompletionService:
             artifact_digest=implementation_digest(path),
             has_implementation=has_implementation(path),
             contract_sealed=bool(req and req.get("sealed_at")),
+            seal_mode=str((req or {}).get("seal_mode") or ""),
+            request_text=str((req or {}).get("request_text") or ""),
             legacy_status=legacy_status,
         )

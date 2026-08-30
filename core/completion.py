@@ -167,6 +167,13 @@ class Verdict:
     #: into `state` — see `legacy_note`.
     legacy_status: str = ""
     legacy_note: str = ""
+    #: "" (unsealed), "auto" (Nova decomposed and sealed it) or "human" (a
+    #: person confirmed the contract IS the request). Auto-sealing proves the
+    #: request is covered, never that each criterion MEANS what its clause
+    #: means — so the difference is reported rather than flattened.
+    seal_mode: str = ""
+    #: The user's durable words, so a reader can compare contract to request.
+    request_text: str = ""
 
     @property
     def is_complete(self) -> bool:
@@ -269,6 +276,8 @@ def derive_state(*,
                  artifact_digest: str,
                  has_implementation: bool,
                  contract_sealed: bool = True,
+                 seal_mode: str = "",
+                 request_text: str = "",
                  legacy_status: str = "") -> Verdict:
     """The one deterministic answer to "what state is this in now?".
 
@@ -318,7 +327,8 @@ def derive_state(*,
                        criteria=statuses, revision=revision,
                        artifact_digest=artifact_digest,
                        outstanding=outstanding, failing=failing,
-                       legacy_status=legacy_status, legacy_note=legacy_note)
+                       legacy_status=legacy_status, legacy_note=legacy_note,
+                       seal_mode=seal_mode, request_text=request_text)
 
     if not has_requirement:
         return out(IDEA, "no durable requirement has been recorded")

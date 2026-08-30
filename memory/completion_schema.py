@@ -39,6 +39,13 @@ COMPLETION_DDL: tuple[str, ...] = (
         -- request, and completing on a draft is how a forgotten requirement
         -- becomes a finished project.
         sealed_at    TEXT,
+        -- 'auto' when Nova decomposed the request and sealed it herself, or
+        -- 'human' when a person confirmed the contract IS the request. Both
+        -- are sealed; they are not equally strong provenance, and a report
+        -- that hid the difference would be overclaiming. Auto-sealing proves
+        -- the request is COVERED, never that each criterion means what the
+        -- clause it quotes means.
+        seal_mode    TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (project_name, revision)
     );
     """,

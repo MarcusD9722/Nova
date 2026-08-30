@@ -628,6 +628,12 @@ class RuntimeManager:
             tick_seconds=tick,
         )
 
+        from core.completion_events import CompletionAnnouncer
+        from core.completion_service import CompletionService
+        self._completion = CompletionService(memory=memory,
+                                             projects_dir=projects_dir)
+        self._announcer = CompletionAnnouncer()
+
         # Autonomous project builder (builds real projects in projects_dir).
         self._project_builder = ProjectBuilder(
             projects_dir=projects_dir,
@@ -638,6 +644,11 @@ class RuntimeManager:
             # actually reaches the thing that writes code. Without this the
             # builder bypassed the router and the `coder` role had no consumer.
             models=self._models,
+            # Stage 14: one completion authority for the whole runtime, and
+            # one announcer, so "has this already been announced?" is a
+            # question about the process rather than about one build.
+            completion=self._completion,
+            announcer=self._announcer,
         )
 
         async def _tool_project_start(args: dict[str, Any]) -> dict[str, Any]:

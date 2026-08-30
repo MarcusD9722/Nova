@@ -2899,7 +2899,7 @@ class SQLiteMemoryBackend:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT project_name, revision, request_text, source, note, "
-                "created_at, sealed_at "
+                "created_at, sealed_at, seal_mode "
                 "FROM project_requirements WHERE project_name=? "
                 "ORDER BY revision DESC LIMIT 1", (project_name,))
             row = await cur.fetchone()
@@ -2907,9 +2907,11 @@ class SQLiteMemoryBackend:
             return None
         return {"project_name": row[0], "revision": int(row[1]),
                 "request_text": row[2], "source": row[3], "note": row[4],
-                "created_at": row[5], "sealed_at": row[6]}
+                "created_at": row[5], "sealed_at": row[6],
+                "seal_mode": row[7] or ""}
 
-    async def seal_requirement(self, *, project_name: str, revision: int) -> bool:
+    async def seal_requirement(self, *, project_name: str, revision: int,
+                               seal_mode: str = "auto") -> bool:
         """Mark a revision's acceptance contract as agreed and whole.
 
         One statement, so a crash cannot leave it half-sealed, and guarded on
@@ -2919,9 +2921,9 @@ class SQLiteMemoryBackend:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE project_requirements SET sealed_at=? "
+                "UPDATE project_requirements SET sealed_at=?, seal_mode=? "
                 "WHERE project_name=? AND revision=? AND sealed_at IS NULL",
-                (self._now_iso(), project_name, int(revision)))
+                (self._now_iso(), seal_mode, project_name, int(revision)))
             await db.commit()
             return int(cur.rowcount or 0) == 1
 
