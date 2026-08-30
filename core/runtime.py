@@ -22,7 +22,9 @@ from core.policy.summarizer import SummarizerLLM
 from core.policy.storyteller import StorytellerLLM, is_story_request, story_system_prompt
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
-from core.intent import (asks_about_work, is_question,
+from core.completion import STATES
+from core.intent import (asks_about_work, mentions_completion,
+                         is_question,
                          is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
@@ -1169,6 +1171,45 @@ class RuntimeManager:
     def society(self) -> AgentSociety:
         return self._society
 
+    async def _completion_context(self, text: str) -> str:
+        """Completion grounding for the project this turn is about.
+
+        The project named in the message wins; otherwise the one last worked
+        on. Named beats pointer because a person who says "is the calculator
+        done?" is asking about the calculator, whatever Nova touched last.
+        """
+        try:
+            pb = self._project_builder
+            named = pb.known_slug_in_text(text)
+            # Attach when the turn is recognisably about the work, OR when it
+            # names a project Nova actually has and uses a finishedness word.
+            # The second is what distinguishes "is the calculator ready?" from
+            # "is the kettle ready?" — a distinction no pattern can make, and
+            # the resolver makes for free.
+            if not (asks_about_work(text)
+                    or (named and mentions_completion(text))):
+                return ""
+            slug = named or await pb.last_active()
+            if not slug:
+                return ""
+            legacy = ""
+            try:
+                rec = await self._memory.get_latest_fact(f"project:{slug}",
+                                                         "status")
+                value = str(getattr(rec, "value", "") or "")
+                # A pre-Stage-14 status string is history. Passing it in lets
+                # the verdict say so rather than leaving the model to find a
+                # stale "complete" elsewhere and believe it.
+                if value and value not in STATES:
+                    legacy = value
+            except Exception:  # noqa: BLE001
+                legacy = ""
+            return await self._completion.describe_for_chat(slug=slug,
+                                                            legacy_status=legacy)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("completion_context_failed", error=str(e)[:160])
+            return ""
+
     @property
     def permission_broker(self) -> PermissionBroker:
         return self._permission_broker
@@ -2196,6 +2237,14 @@ class RuntimeManager:
         try:
             if asks_about_work(clean_user):
                 work_context = await self._memory.describe_work_state()
+            # A PROJECT's completion is a different question from a goal's task
+            # rows, and describe_work_state cannot see it: a project with
+            # acceptance criteria has no goal rows at all, so it returned "" and
+            # the model answered "is it done?" from an empty prompt. Decided
+            # separately, because "is the calculator ready?" is a completion
+            # question and "is the kettle ready?" is not, and only the project
+            # resolver can tell those apart.
+            work_context += await self._completion_context(clean_user)
         except Exception as e:  # noqa: BLE001
             logger.debug("work_state_summary_failed", error=str(e)[:160])
 

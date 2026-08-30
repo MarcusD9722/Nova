@@ -165,7 +165,29 @@ _WORK_STATUS_RE = re.compile(
     # Only with a WORK noun, so it does not swallow "what's going on
     # with your day".
     r"what(?:'s| is) going on with (?:the|my|your|our) "
-    r"(?:work|tasks?|steps?|jobs?|build|project|goals?)"
+    r"(?:work|tasks?|steps?|jobs?|build|project|goals?)|"
+    # COMPLETION questions about a project. Measured before adding
+    # these: five of nine natural phrasings attached no record at all,
+    # so "did everything pass?" was answered from an empty prompt while
+    # a criterion sat FAILING with its error on disk.
+    r"did (?:you|nova) (?:finish|complete) (?:it|that|this|them|everything|all of (?:it|them)|the (?:project|build|work|game|app|script|code))|"
+    r"did (?:everything|it all|they all|all of (?:it|them)) pass|"
+    r"(?:is|are) (?:it|that|this|they|the (?:project|build|work)) (?:all )?done|"
+    r"(?:which|what) (?:requirement|criteri(?:on|a)|check|test)s? "
+    r"(?:is|are) (?:failing|outstanding|left|still)|"
+    r"can i (?:use|try|run|ship) (?:it|this|that) (?:now|yet)|"
+    r"(?:is|are) (?:it|they) ready (?:now|yet|to use)|"
+    r"(?:any|are there any|there aren.t any) (?:failures?|failing|broken) "
+    r"(?:left|remaining|still)|"
+    r"what still needs (?:doing|work|verif\w*|check\w*|prov\w*)|"
+    r"(?:is|are) (?:it|that) (?:complete|finished)|"
+    # "looks like we're done here" / "you finished all of it" - claims
+    # about the work in the second person, which the premise detector
+    # misses because it requires the SCOPE word before the outcome word
+    # and these put it after. Restricted to we/you so "I am done with my
+    # coffee" stays a sentence about coffee.
+    r"(?:we|you)(?:'re| are| have|'ve)? (?:all )?done\b|"
+    r"(?:we|you) (?:have |'ve )?finished (?:all of )?(?:it|them|everything)"
     r")\b", re.IGNORECASE)
 
 
@@ -183,11 +205,31 @@ _WORK_STATUS_RE = re.compile(
 #: done, went through, succeeded). "Everything is fine" is not a claim about
 #: task outcomes; "everything finished" is.
 _WORK_PREMISE_RE = re.compile(
-    r"\b(everything|it|that|those|they|the (?:tasks?|steps?|work|jobs?))\b"
+    r"\b(everything|it|that(?!\s+\w+\s+(?:was|were|is|are)\b)|those|they|the (?:tasks?|steps?|work|jobs?))\b"
     r"[^.?!]{0,40}?"
     r"\b(finish(?:ed)?|worked|work out|done|complete[ds]?|went through|"
     r"succeed(?:ed)?|ran ok(?:ay)?|all set|sorted)\b",
     re.IGNORECASE)
+
+
+#: Words that ask whether something is FINISHED, as opposed to asking about it
+#: at all. On their own these decide nothing — "is the kettle ready?" and "is
+#: the calculator ready?" are the same sentence — so they are only consulted
+#: alongside a name that is known to BE a project. See
+#: `RuntimeManager._completion_context`: the resolver knows which nouns are
+#: projects, and no amount of regex ever will.
+_COMPLETION_WORDS = re.compile(
+    r"\b(done|finished|complete[ds]?|completion|ready|working|passing|passed|"
+    r"failing|failed|broken|left|outstanding|remaining|usable|ship(?:pable)?)\b",
+    re.IGNORECASE)
+
+
+def mentions_completion(text: str) -> bool:
+    """Whether this turn contains a finishedness word at all.
+
+    Deliberately loose, and deliberately never used alone.
+    """
+    return bool(_COMPLETION_WORDS.search(text or ""))
 
 
 def asks_about_work(text: str) -> bool:

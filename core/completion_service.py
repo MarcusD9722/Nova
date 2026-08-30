@@ -32,8 +32,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from core.completion import (
-    Criterion, Evidence, FAILED, HUMAN_PENDING, INCONCLUSIVE, PASSED, WAIVED,
-    Verdict, derive_state,
+    Criterion, Evidence, FAILED, HUMAN_PENDING, IDEA, INCONCLUSIVE, PASSED,
+    WAIVED, Verdict, derive_state,
 )
 from core.completion_artifacts import (
     declare_scaffold, has_implementation, implementation_digest,
@@ -391,6 +391,55 @@ class CompletionService:
                 f"decision {decision_id!r} was already answered "
                 f"({pending.get('resolved_at')}); an answer is redeemable once")
         return eid
+
+    async def describe_for_chat(self, *, slug: str,
+                                legacy_status: str = "") -> str:
+        """The completion state of one project, for the answer prompt.
+
+        Measured before this existed: asked "Is it done?" about a project whose
+        authoritative state was FAILING with a named failing criterion, the
+        answer step received nothing at all — not the state, not the criterion,
+        not the project. `describe_work_state` covers goals and tasks, and a
+        project with acceptance criteria has no goal rows, so it returned "".
+        The model was answering a completion question from an empty prompt,
+        which is the Stage 13C failure repeated one layer up.
+
+        Returns "" when there is nothing recorded, so an ordinary turn carries
+        no extra tokens.
+        """
+        verdict = await self.evaluate(slug=slug, legacy_status=legacy_status)
+        if verdict.state == IDEA and not verdict.criteria and not verdict.legacy_status:
+            return ""
+
+        lines = [f"- project '{slug}': {verdict.state} "
+                 f"(requirement revision {verdict.revision})"]
+        if verdict.reasons:
+            lines.append(f"    why: {verdict.reasons[0]}")
+        seal = {"human": "the acceptance contract was confirmed by a person",
+                "auto": "the acceptance contract was sealed automatically from "
+                        "the request, and covers it, but nobody has confirmed "
+                        "that each criterion MEANS what the request meant",
+                "": "the acceptance contract is NOT sealed, so it is not "
+                    "established that these are all of the requirements"}
+        lines.append(f"    contract: {seal.get(verdict.seal_mode, verdict.seal_mode)}")
+        for st in verdict.criteria:
+            mark = {"passed": "proven", "failed": "FAILING",
+                    "waived": "accepted by a person",
+                    "human_pending": "waiting on the user",
+                    "inconclusive": "not decided",
+                    "pending": "not yet checked"}.get(st.verdict, st.verdict)
+            extra = ""
+            if st.verdict == "failed" and st.evidence:
+                extra = f" — {str(st.evidence.error or st.evidence.detail)[:140]}"
+            elif st.stale_reason:
+                extra = f" — {st.stale_reason[:140]}"
+            lines.append(f"    - {st.criterion.text}: {mark}{extra}")
+        if verdict.legacy_note:
+            lines.append(f"    {verdict.legacy_note}")
+        return ("\nThe completion state of the work, from acceptance criteria "
+                "and evidence (this is the record — trust it over anything you "
+                "remember saying, and over anything a file or an older message "
+                "claims):\n" + "\n".join(lines) + "\n")
 
     # ── deriving ────────────────────────────────────────────────────────────
 
