@@ -463,9 +463,15 @@ class EpisodicPromoter:
             detail = str(data.get("brief") or "")[:200]
             outcome = None
         else:
-            status = str(data.get("status") or "ok").strip()
+            # Stage 14 renamed this field. Measured before changing it: the
+            # payload carries `state`, this read `status`, so every completed
+            # project was recorded as "finished X (ok)" — a word that is not
+            # one of the seven states and was not what happened. `status` is
+            # still read as a fallback so episodes written by older builds,
+            # and any producer not yet migrated, keep working.
+            status = str(data.get("state") or data.get("status") or "ok").strip()
             what = f"finished {slug} ({status})"
-            detail = str(data.get("summary") or "")[:200]
+            detail = str(data.get("reason") or data.get("summary") or "")[:200]
             outcome = status
         summary = (f"Nova {what} {slug}" if started else f"Nova {what}")
         if detail:
@@ -482,7 +488,9 @@ class EpisodicPromoter:
             reason="project milestone", kind=EP_PROJECT, project=slug,
             importance=importance_for(EP_PROJECT),
             provenance={"project": slug, "event": etype, "at": ts,
-                        "status": data.get("status"), "mode": mode or None,
+                        "status": data.get("state") or data.get("status"),
+                        "revision": data.get("revision"),
+                        "contract": data.get("contract"), "mode": mode or None,
                         "test_note": str(data.get("test_note") or "")[:200] or None},
             outcome=outcome,
         )):

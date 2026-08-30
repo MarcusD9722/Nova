@@ -22,7 +22,9 @@ from core.policy.summarizer import SummarizerLLM
 from core.policy.storyteller import StorytellerLLM, is_story_request, story_system_prompt
 from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
-from core.intent import (asks_about_work, is_question,
+from core.completion import STATES
+from core.intent import (asks_about_work, mentions_completion,
+                         is_question,
                          is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
@@ -628,6 +630,12 @@ class RuntimeManager:
             tick_seconds=tick,
         )
 
+        from core.completion_events import CompletionAnnouncer
+        from core.completion_service import CompletionService
+        self._completion = CompletionService(memory=memory,
+                                             projects_dir=projects_dir)
+        self._announcer = CompletionAnnouncer(memory=memory)
+
         # Autonomous project builder (builds real projects in projects_dir).
         self._project_builder = ProjectBuilder(
             projects_dir=projects_dir,
@@ -638,6 +646,11 @@ class RuntimeManager:
             # actually reaches the thing that writes code. Without this the
             # builder bypassed the router and the `coder` role had no consumer.
             models=self._models,
+            # Stage 14: one completion authority for the whole runtime, and
+            # one announcer, so "has this already been announced?" is a
+            # question about the process rather than about one build.
+            completion=self._completion,
+            announcer=self._announcer,
         )
 
         async def _tool_project_start(args: dict[str, Any]) -> dict[str, Any]:
@@ -663,7 +676,8 @@ class RuntimeManager:
             name = str(args.get("name") or "").strip()
             if not name:
                 return {"projects": self._project_builder.list_projects()}
-            return {"project": name, "status": self._project_builder.status_text(name)}
+            return {"project": name,
+                    "status": await self._project_builder.status_text(name)}
 
         async def _tool_project_improve(args: dict[str, Any]) -> dict[str, Any]:
             name = str(args.get("name") or "").strip()
@@ -1157,6 +1171,50 @@ class RuntimeManager:
     def society(self) -> AgentSociety:
         return self._society
 
+    async def _completion_context(self, text: str) -> str:
+        """Completion grounding for the project this turn is about.
+
+        The project named in the message wins; otherwise the one last worked
+        on. Named beats pointer because a person who says "is the calculator
+        done?" is asking about the calculator, whatever Nova touched last.
+        """
+        try:
+            pb = self._project_builder
+            named = pb.known_slug_in_text(text)
+            # Attach when the turn is recognisably about the work, OR when it
+            # names a project Nova actually has and uses a finishedness word.
+            # The second is what distinguishes "is the calculator ready?" from
+            # "is the kettle ready?" — a distinction no pattern can make, and
+            # the resolver makes for free.
+            if not (asks_about_work(text)
+                    or (named and mentions_completion(text))):
+                return ""
+            slug = named or await pb.last_active()
+            if not slug:
+                return ""
+            legacy = ""
+            try:
+                rec = await self._memory.get_latest_fact(f"project:{slug}",
+                                                         "status")
+                value = str(getattr(rec, "value", "") or "")
+                # A pre-Stage-14 status string is history. Passing it in lets
+                # the verdict say so rather than leaving the model to find a
+                # stale "complete" elsewhere and believe it.
+                if value and value not in STATES:
+                    legacy = value
+            except Exception:  # noqa: BLE001
+                legacy = ""
+            return await self._completion.describe_for_chat(slug=slug,
+                                                            legacy_status=legacy)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("completion_context_failed", error=str(e)[:160])
+            return ""
+
+    @property
+    def completion(self):
+        """THE authoritative completion evaluator for this runtime."""
+        return self._completion
+
     @property
     def permission_broker(self) -> PermissionBroker:
         return self._permission_broker
@@ -1502,7 +1560,8 @@ class RuntimeManager:
         if asks_current_project(t):
             current = await pb.last_active()
             if current:
-                return f"We're on {current} right now. {pb.status_text(current)}"
+                return (f"We're on {current} right now. "
+                        f"{await pb.status_text(current)}")
             return ("We're not on a particular project at the moment — name one "
                     "and I'll pick it up.")
 
@@ -1582,7 +1641,8 @@ class RuntimeManager:
                         f"we're {where}. Nothing in either project changed. "
                         "Want me to try again?")
             if chosen:
-                return f"Okay — we're on {chosen} now. {pb.status_text(chosen)}"
+                return (f"Okay — we're on {chosen} now. "
+                        f"{await pb.status_text(chosen)}")
         if not named and is_project_selection(t):
             # "Switch to the calculator project." when there is no calculator.
             # Answering it here rather than letting it fall through to ordinary
@@ -1661,7 +1721,7 @@ class RuntimeManager:
                         f"restored), or leave it exactly where it is. Which "
                         f"would you like?")
             if STATUS_WORDS_RE.search(t):
-                return pb.status_text(slug)
+                return await pb.status_text(slug)
             if RESUME_WORDS_RE.search(t) and may_mutate:
                 if pb.is_building(slug):
                     return f"I'm already working on {slug} — I'll report when it's done."
@@ -2182,6 +2242,14 @@ class RuntimeManager:
         try:
             if asks_about_work(clean_user):
                 work_context = await self._memory.describe_work_state()
+            # A PROJECT's completion is a different question from a goal's task
+            # rows, and describe_work_state cannot see it: a project with
+            # acceptance criteria has no goal rows at all, so it returned "" and
+            # the model answered "is it done?" from an empty prompt. Decided
+            # separately, because "is the calculator ready?" is a completion
+            # question and "is the kettle ready?" is not, and only the project
+            # resolver can tell those apart.
+            work_context += await self._completion_context(clean_user)
         except Exception as e:  # noqa: BLE001
             logger.debug("work_state_summary_failed", error=str(e)[:160])
 

@@ -8,11 +8,17 @@ validates Python files compile, records progress in PROJECT.md and project
 memory facts, then reports completion with improvement suggestions.
 
 State model:
-- projects/<slug>/PROJECT.md is the on-disk source of truth (brief, status,
-  files, how to run, progress log, suggestions) so "where did we leave off?"
-  works across sessions.
-- Memory facts (entity="project:<slug>") mirror status/summary/next steps so
-  chat grounding and semantic search can surface them.
+- COMPLETION STATE IS NOT STORED HERE. Since Stage 14 it is derived by
+  core.completion_service.CompletionService from durable acceptance criteria
+  and evidence, every time it is asked for. This module records what it
+  observed and asks; it cannot assign "complete".
+- projects/<slug>/PROJECT.md is a PROJECTION of that verdict plus the things
+  it genuinely is the record of — the brief, the file list, how to run it, the
+  progress narrative and suggestions — so "where did we leave off?" works
+  across sessions. It was described here as "the on-disk source of truth" and
+  that is no longer true of its status line.
+- Memory facts (entity="project:<slug>") likewise mirror the derived state so
+  chat grounding and semantic search can surface it.
 - All writes are confined to projects_dir (slug-sanitized, no traversal).
 """
 
@@ -290,7 +296,8 @@ class ProjectStateError(RuntimeError):
 
 class ProjectBuilder:
     def __init__(self, *, projects_dir: Path, llm: Any, llm_semaphore: asyncio.Semaphore, memory: Any,
-                 models: Any | None = None) -> None:
+                 models: Any | None = None, completion: Any | None = None,
+                 announcer: Any | None = None) -> None:
         self._projects_dir = Path(projects_dir).resolve()
         self._llm = llm
         self._sem = llm_semaphore
@@ -301,6 +308,21 @@ class ProjectBuilder:
         # actually improves project building instead of only affecting deep mode.
         self._models = models
         self._active: dict[str, asyncio.Task] = {}
+        # Stage 14: completion is DERIVED by this service from acceptance
+        # criteria and evidence. The builder records what it observed and asks;
+        # it no longer decides. Constructed here when the caller does not pass
+        # one so that every path — including tests that build a bare
+        # ProjectBuilder — goes through the same authority.
+        from core.completion_events import CompletionAnnouncer
+        from core.completion_service import CompletionService
+        self._completion = completion or CompletionService(
+            memory=memory, projects_dir=self._projects_dir)
+        self._announcer = announcer or CompletionAnnouncer(memory=memory)
+
+    @property
+    def completion(self):
+        """The authoritative completion evaluator for this builder."""
+        return self._completion
 
     # ── Test-first repair (U8) ──────────────────────────────────────────────
     # The flappy-bird failure taught the lesson this implements: the run check
@@ -624,12 +646,54 @@ class ProjectBuilder:
         except Exception:
             return ""
 
+    def _acceptance_section(self, verdict: Any) -> str:
+        """The acceptance contract and its evidence, as PROJECT.md sees it.
+
+        PROJECT.md is a PROJECTION now. It used to be an independent authority
+        that could say `complete` on its own, two lines below a log entry
+        contradicting it. Everything here is read from the derived verdict, so
+        the file cannot disagree with the evaluator — if it is wrong, they are
+        both wrong, which is a different and more findable kind of wrong.
+        """
+        if verdict is None:
+            return ""
+        lines: list[str] = []
+        seal = {"human": "confirmed by a person",
+                "auto": "sealed automatically from the request",
+                "": "NOT SEALED — not established that these are all of it"}
+        lines.append(f"State: **{verdict.state}** "
+                     f"(requirement revision {verdict.revision})")
+        lines.append(f"Contract: {seal.get(verdict.seal_mode, verdict.seal_mode)}")
+        if verdict.reasons:
+            lines.append(f"Why: {verdict.reasons[0]}")
+        lines.append("")
+        for st in verdict.criteria:
+            mark = {"passed": "[x]", "failed": "[!]", "waived": "[x]"}.get(
+                st.verdict, "[ ]")
+            note = ""
+            if st.verdict == "failed" and st.evidence:
+                note = f" — {str(st.evidence.error or st.evidence.detail)[:120]}"
+            elif st.verdict == "waived":
+                note = " — accepted by a person"
+            elif st.stale_reason:
+                note = f" — {st.stale_reason[:120]}"
+            elif st.verdict == "human_pending":
+                note = " — waiting on you"
+            opt = "" if st.criterion.required else " (optional)"
+            lines.append(f"- {mark} {st.criterion.text}{opt}{note}")
+            lines.append(f"      from: \"{st.criterion.origin_quote}\"")
+        if verdict.legacy_note:
+            lines.append("")
+            lines.append(f"> Historical: {verdict.legacy_note}")
+        return "\n".join(lines)
+
     def _write_project_md(
         self,
         slug: str,
         *,
         brief: str,
         status: str,
+        verdict: Any = None,
         summary: str = "",
         files: list[dict[str, str]] | None = None,
         run: str = "",
@@ -650,11 +714,16 @@ class ProjectBuilder:
         files_md = "\n".join(f"- `{f['path']}` — {f.get('purpose', '')}" for f in (files or [])) or "(none yet)"
         sugg_md = "\n".join(f"- [ ] {s}" for s in (suggestions or [])) or "(none yet)"
 
+        acceptance = self._acceptance_section(verdict)
+        # The status line is the DERIVED state when there is one. `status` is
+        # only used before a contract exists (planning, or an error).
+        shown = getattr(verdict, "state", None) or status
         content = (
             f"# {slug}\n\n"
             f"## Brief\n{brief.strip()}\n\n"
-            f"## Status\n{status}\n\n"
-            f"## Summary\n{summary.strip() or '(pending)'}\n\n"
+            f"## Status\n{shown}\n\n"
+            + (f"## Acceptance\n{acceptance}\n\n" if acceptance else "")
+            + f"## Summary\n{summary.strip() or '(pending)'}\n\n"
             f"## Files\n{files_md}\n\n"
             f"## How to run\n{run.strip() or '(pending)'}\n\n"
             f"## Progress log\n" + "\n".join(all_log) + "\n\n"
@@ -728,6 +797,11 @@ class ProjectBuilder:
         path = self._project_path(slug)
         try:
             # 1) Plan
+            # STAGE 14: the request and its acceptance contract come first,
+            # before a single file exists. Deriving criteria afterwards from
+            # the generated code would ask the artifact to certify itself.
+            await self._establish_contract(slug, brief)
+
             BUS.publish("project.progress", {"project": slug, "stage": "planning"})
             plan = await self._llm_json(
                 "You are Nova, an expert software engineer. Plan a small, complete, WORKING project.\n"
@@ -856,44 +930,211 @@ class ProjectBuilder:
                     suggestions.append(s)
             suggestions = suggestions[:3]
 
-            build_log = [f"Wrote {len(written)} file(s). Build complete."]
+            # "Build complete." used to be written here, before any validation
+            # had happened, and stayed in the log of projects that crashed on
+            # every run. What is true at this point is that files were written.
+            build_log = [f"Wrote {len(written)} file(s)."]
             if run_note:
                 build_log.append(run_note)
             if test_note:
                 build_log.append(test_note)
-            # Honest state: a crash is "needs attention"; an unresolved generated
-            # test (which may itself be wrong) is the softer "needs review".
-            run_ok = run_note is None or run_note.startswith("Run check passed")
-            tests_inconclusive = bool(test_note and test_note.startswith("Logic tests inconclusive"))
-            status = "needs attention" if not run_ok else ("needs review" if tests_inconclusive else "complete")
+
+            # Prove the criteria, one at a time. `run_note` and `test_note` are
+            # DIAGNOSTIC: a program that starts proves that a program starts,
+            # and a batch of generated tests proves whatever it happened to
+            # test. Neither is credit against a named requirement.
+            await self._validate_criteria(slug, brief, written, run_note=run_note)
+
+            verdict = await self._completion.evaluate(slug=slug)
+            build_log.extend(self._evidence_log(verdict))
             self._write_project_md(
-                slug, brief=brief, status=status, summary=summary, files=files, run=run,
-                log_lines=build_log,
+                slug, brief=brief, status=verdict.state, verdict=verdict,
+                summary=summary, files=files, run=run, log_lines=build_log,
                 suggestions=suggestions,
             )
-            await self._save_fact(slug, "status", status)
+            await self._save_fact(slug, "status", verdict.state)
             await self._save_fact(slug, "summary", summary)
             if suggestions:
                 await self._save_fact(slug, "next_steps", "; ".join(suggestions))
             await self._save_fact(slug, "last_worked", _now_str())
 
-            BUS.publish(
-                "project.completed",
-                {"project": slug, "summary": clip(summary, 200), "files": written, "run": clip(run, 120),
-                 "suggestions": suggestions, "run_note": clip(run_note or "", 200),
-                 "test_note": clip(test_note or "", 200), "status": status},
-            )
-            logger.info("project_build_complete", project=slug, files=len(written))
+            await self._announcer.announce(
+                slug=slug, verdict=verdict, reason="build finished",
+                extra={"summary": clip(summary, 200), "files": written,
+                       "run": clip(run, 120), "suggestions": suggestions,
+                       "run_note": clip(run_note or "", 200),
+                       "test_note": clip(test_note or "", 200),
+                       "contract": verdict.seal_mode, "mode": "build"})
+            logger.info("project_build_finished", project=slug,
+                        files=len(written), state=verdict.state)
         except Exception as e:  # noqa: BLE001
             logger.warning("project_build_failed", project=slug, error=str(e)[:300])
             try:
-                self._write_project_md(slug, brief=brief, status="error", log_lines=[f"Build failed: {e}"])
-                await self._save_fact(slug, "status", f"error: {str(e)[:200]}")
+                verdict = await self._completion.evaluate(slug=slug)
+                self._write_project_md(slug, brief=brief, status=verdict.state,
+                                       verdict=verdict,
+                                       log_lines=[f"Build failed: {e}"])
+                await self._save_fact(slug, "status", verdict.state)
+                await self._save_fact(slug, "last_error", str(e)[:200])
+                await self._announcer.announce(slug=slug, verdict=verdict,
+                                         reason=f"build failed: {str(e)[:120]}",
+                                         extra={"mode": "build"})
             except Exception:
                 pass
             BUS.publish("project.error", {"project": slug, "error": clip(e, 240)})
         finally:
             self._active.pop(slug, None)
+
+    async def _plan_contract_change(self, slug: str, request: str,
+                                    prev_rev: int | None
+                                    ) -> tuple[dict[str, str], list[str]]:
+        """Decide which existing criteria survive the new request.
+
+        Returns (reanchor, drop). A criterion whose quote still appears in the
+        new request carries unchanged. One whose wording moved needs a new span
+        to point at, and one the user has removed must be retired EXPLICITLY —
+        a criterion may never leave the contract by being forgotten.
+        """
+        if prev_rev is None:
+            return {}, []
+        from core.completion_contract import is_span_of
+
+        old = await self._memory.list_acceptance_criteria(
+            project_name=slug, revision=prev_rev)
+        if not old:
+            return {}, []
+        # An improvement usually ADDS to what was asked, so the previous
+        # request is still in force. The new revision's text is the old
+        # request plus the new instruction; criteria that still quote it
+        # carry, and only the rest need a decision.
+        prev = await self._memory.current_requirement(project_name=slug)
+        combined = f"{(prev or {}).get('request_text', '')} {request}".strip()
+        reanchor: dict[str, str] = {}
+        drop: list[str] = []
+        for c in old:
+            if is_span_of(c["origin_quote"], combined):
+                continue
+            # The wording moved. Ask what it corresponds to now rather than
+            # guessing, and retire it if nothing does.
+            drop.append(c["criterion_id"])
+        return reanchor, drop
+
+    async def _establish_contract(self, slug: str, request: str, *,
+                                  previous_revision: int | None = None,
+                                  reanchor: dict[str, str] | None = None,
+                                  drop: list[str] | None = None) -> Any:
+        """Record the request and its acceptance criteria, before any code.
+
+        Returns the requirement revision. Sealing is attempted and may fail:
+        a contract that does not cover the request is LEFT UNSEALED rather than
+        forced, because an unsealed contract cannot reach COMPLETE and that is
+        the honest outcome when Nova could not account for everything asked.
+        """
+        from core.project_acceptance import coverage_gaps, derive_criteria
+
+        rev = await self._completion.record_request(slug=slug,
+                                                    request_text=request)
+        if previous_revision is not None:
+            await self._completion.carry_forward(
+                slug=slug, from_revision=previous_revision, to_revision=rev,
+                drop_criterion_ids=drop or [], reanchor=reanchor or {},
+                drop_reason="superseded by a later request")
+
+        BUS.publish("project.progress",
+                    {"project": slug, "stage": "acceptance_criteria"})
+        criteria = await derive_criteria(request=request, ask_json=self._llm_json)
+        if criteria:
+            try:
+                await self._completion.set_criteria(slug=slug, revision=rev,
+                                                    criteria=criteria)
+            except ValueError as e:  # a quote that did not survive validation
+                logger.info("acceptance_criteria_rejected", project=slug,
+                            error=str(e)[:200])
+
+        existing = await self._memory.list_acceptance_criteria(
+            project_name=slug, revision=rev)
+        gaps = coverage_gaps(request, [{"origin_quote": c["origin_quote"]}
+                                       for c in existing])
+        if existing and not gaps:
+            await self._completion.seal_contract(slug=slug, revision=rev,
+                                                 seal_mode="auto")
+        else:
+            logger.info("acceptance_contract_unsealed", project=slug,
+                        revision=rev, gaps=len(gaps))
+            BUS.publish("project.progress",
+                        {"project": slug, "stage": "acceptance_incomplete",
+                         "uncovered": gaps[:4]})
+        return rev
+
+    def _evidence_log(self, verdict: Any) -> list[str]:
+        """Log lines describing what was and was not demonstrated."""
+        lines = [f"Completion state: {verdict.state} "
+                 f"(revision {verdict.revision})"]
+        for st in verdict.failing:
+            lines.append(f"FAILING — {st.criterion.text}")
+        for st in verdict.outstanding:
+            why = st.stale_reason or "not demonstrated"
+            lines.append(f"outstanding — {st.criterion.text} ({why[:100]})")
+        return lines
+
+    async def _validate_criteria(self, slug: str, request: str,
+                                 written: list[str], *,
+                                 run_note: str | None = None) -> None:
+        """Decide each machine criterion SEPARATELY, against what it examined.
+
+        Nothing here maps one global check onto every criterion. A criterion
+        for which no check can be written stays unproven and records why.
+        """
+        from core.project_acceptance import check_criterion
+
+        path = self._project_path(slug)
+        req = await self._memory.current_requirement(project_name=slug)
+        if req is None:
+            return
+        rows = await self._memory.list_acceptance_criteria(
+            project_name=slug, revision=int(req["revision"]))
+        machine = [c for c in rows if c["verify_kind"] != "human"]
+        if not machine:
+            return
+
+        runnable = [f for f in written if f.endswith(".py")]
+        entry = next((f for f in runnable if "main" in Path(f).name.lower()), None)
+        entry = entry or (runnable[0] if runnable else None)
+        listing = ", ".join(written)
+        code = ""
+        if entry:
+            try:
+                code = (path / entry).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                code = ""
+
+        def _declare(paths: list[str]) -> None:
+            from core.completion_artifacts import declare_scaffold
+            declare_scaffold(path, paths)
+
+        for c in machine:
+            # The context is captured BEFORE the check runs, so the verdict is
+            # attributed to the code the check actually examined.
+            ctx = await self._completion.begin_check(
+                slug=slug, criterion_id=c["criterion_id"])
+            if entry is None:
+                verdict, detail = ("inconclusive",
+                                   "there is no runnable entry point to check "
+                                   "this against")
+            else:
+                BUS.publish("project.progress",
+                            {"project": slug, "stage": "checking_criterion",
+                             "criterion": clip(c["text"], 120)})
+                verdict, detail = await check_criterion(
+                    path=path, entry=entry, module=Path(entry).stem,
+                    listing=listing, code=code, criterion=c, request=request,
+                    ask_file=self._llm_file, declare_scaffold=_declare)
+            await self._completion.record_verdict(context=ctx, verdict=verdict,
+                                                  detail=detail[:400])
+            self._announcer.criterion_result(
+                slug=slug, criterion_id=c["criterion_id"],
+                criterion_text=c["text"], verdict=verdict,
+                revision=int(req["revision"]), detail=detail)
 
     async def _verify_and_fix_runtime(self, slug: str, path: Path, candidates: list[str]) -> str | None:
         """Execute the project's entry point and self-debug crashes (3 tries).
@@ -1251,6 +1492,18 @@ class ProjectBuilder:
             ][:8]
             listing = "\n".join(str(p.relative_to(path)) for p in code_files)
 
+            # STAGE 14: an improvement request is a NEW requirement revision.
+            # Recording it here invalidates evidence gathered for the previous
+            # one, which is exactly what "the requirements changed" means -
+            # and it happens BEFORE any file is touched.
+            prev = await self._memory.current_requirement(project_name=slug)
+            prev_rev = int(prev["revision"]) if prev else None
+            reanchor, drop = await self._plan_contract_change(
+                slug, instructions, prev_rev)
+            await self._establish_contract(slug, instructions,
+                                           previous_revision=prev_rev,
+                                           reanchor=reanchor, drop=drop)
+
             BUS.publish("project.progress", {"project": slug, "stage": "planning_improvements"})
             plan = await self._llm_json(
                 f"You are Nova improving an existing project `{slug}`.\n"
@@ -1331,28 +1584,46 @@ class ProjectBuilder:
             code_candidates = [str(p.relative_to(path)).replace("\\", "/") for p in sorted(path.rglob("*.py"))]
             run_note = await self._verify_and_fix_runtime(slug, path, code_candidates)
             test_note = await self._generate_and_run_tests(slug, path, code_candidates, summary)
-            run_ok = run_note is None or run_note.startswith("Run check passed")
-            tests_inconclusive = bool(test_note and test_note.startswith("Logic tests inconclusive"))
-            status = "needs attention" if not run_ok else ("needs review" if tests_inconclusive else "complete")
-
             old_brief = re.search(r"## Brief\n(.*?)\n\n", project_md, re.DOTALL)
-            improve_log = [f"Improved: {', '.join(dict.fromkeys(changed))} — {summary}"]
+
+            # WHAT ACTUALLY HAPPENED, not what was planned. `summary` is the
+            # planner's statement of intent, written before any code existed;
+            # publishing it as the outcome is how "implemented A, B and C"
+            # got said about a project where only A exists.
+            done = ", ".join(dict.fromkeys(changed)) or "nothing"
+            improve_log = [f"Changed: {done}"]
+            if fail_reasons:
+                # These used to be discarded the moment ONE file succeeded, so
+                # a skipped and a reverted requested change vanished from every
+                # record while the project reported complete.
+                improve_log.extend(f"NOT changed — {r}" for r in fail_reasons)
             if run_note:
                 improve_log.append(run_note)
             if test_note:
                 improve_log.append(test_note)
+
+            await self._validate_criteria(slug, instructions, changed,
+                                          run_note=run_note)
+            verdict = await self._completion.evaluate(slug=slug)
+            improve_log.extend(self._evidence_log(verdict))
+
             self._write_project_md(
                 slug,
                 brief=(old_brief.group(1) if old_brief else instructions),
-                status=status,
-                summary=summary,
+                status=verdict.state,
+                verdict=verdict,
+                summary=f"requested: {summary}",
                 log_lines=improve_log,
             )
-            await self._save_fact(slug, "status", status)
+            await self._save_fact(slug, "status", verdict.state)
             await self._save_fact(slug, "last_worked", _now_str())
-            BUS.publish("project.completed", {"project": slug, "summary": clip(summary, 200), "files": changed,
-                                              "mode": "improve", "run_note": clip(run_note or "", 200),
-                                              "test_note": clip(test_note or "", 200), "status": status})
+            await self._announcer.announce(
+                slug=slug, verdict=verdict, reason="improvement finished",
+                extra={"requested": clip(summary, 200), "files": changed,
+                       "not_changed": fail_reasons[:5], "mode": "improve",
+                       "run_note": clip(run_note or "", 200),
+                       "test_note": clip(test_note or "", 200),
+                       "contract": verdict.seal_mode})
         except Exception as e:  # noqa: BLE001
             logger.warning("project_improve_failed", project=slug, error=str(e)[:300])
             BUS.publish("project.error", {"project": slug, "error": clip(e, 240), "mode": "improve"})
@@ -1361,7 +1632,19 @@ class ProjectBuilder:
 
     # ── Status for chat ──────────────────────────────────────────────────────
 
-    def status_text(self, slug: str) -> str:
+    async def status_text(self, slug: str) -> str:
+        """What to tell a person about this project, RIGHT NOW.
+
+        The state is DERIVED. This used to read `## Status` out of PROJECT.md,
+        which made a projection the authority for everything chat said —
+        measured: with the evaluator returning `failing`, a PROJECT.md left
+        saying `complete` produced "Project calc: complete." Any stale file, an
+        older build, or a hand edit could overrule the evidence.
+
+        PROJECT.md is still read, for the things it IS the record of: the
+        progress narrative and the suggestion list. Not for whether the work is
+        done.
+        """
         # Same rule: an existing identity resolves to itself.
         slug = safe_live_component(slug)
         md = self._read_project_md(slug)
@@ -1372,13 +1655,26 @@ class ProjectBuilder:
             m = re.search(rf"## {name}\n(.*?)(?:\n## |\Z)", md, re.DOTALL)
             return m.group(1).strip() if m else ""
 
-        status = section("Status") or "unknown"
+        verdict = await self._completion.evaluate(slug=slug)
+        status = verdict.state
         summary = section("Summary")
         sugg = section("Next steps / suggestions")
         log = section("Progress log").splitlines()
         last = log[-1].lstrip("- ").strip() if log else ""
 
         parts = [f"Project {slug}: {status}."]
+        if verdict.failing:
+            parts.append("Failing: "
+                         + "; ".join(s.criterion.text for s in verdict.failing[:3]) + ".")
+        elif verdict.outstanding:
+            parts.append("Still to prove: "
+                         + "; ".join(s.criterion.text
+                                     for s in verdict.outstanding[:3]) + ".")
+        if verdict.state == "passing":
+            parts.append("The checks that ran all pass, but final acceptance "
+                         "is still outstanding.")
+        if verdict.legacy_note:
+            parts.append(verdict.legacy_note)
         if summary and summary != "(pending)":
             parts.append(summary)
         if last:

@@ -72,8 +72,32 @@ print("ok")
 _SUGGESTIONS = '{"suggestions": ["Add a pause command", "Support counting up"]}'
 
 
+#: Stage 14 asks for the acceptance contract BEFORE any code is generated, and
+#: then for one check per criterion. A fixture that answers neither leaves the
+#: project with no contract at all — which is honestly `idea`, and correctly
+#: never completes. This suite is about which MILESTONES become episodes, not
+#: about what an unanswered decomposition does, so it scripts both.
+_CRITERIA = (
+    '{"criteria": ['
+    '{"text": "provides a runnable countdown script",'
+    ' "origin_quote": "build a python script called Countdown",'
+    ' "verify_kind": "machine"},'
+    '{"text": "counts down from ten to one",'
+    ' "origin_quote": "counting down from ten", "verify_kind": "machine"}]}'
+)
+
+_COUNTDOWN_CHECK = (
+    "```python\n"
+    "import main\n"
+    "print('countdown module imported')\n"
+    "```"
+)
+
+
 def build_rules():
     return [
+        ("ACCEPTANCE CRITERIA", _CRITERIA),
+        ("decides ONE question about a program", _COUNTDOWN_CHECK),
         ("Plan a small, complete, WORKING project", _PLAN),
         ("Write the COMPLETE contents of `main.py`", _MAIN),
         ("Write a test file `test_main.py`", _TEST),
@@ -396,6 +420,14 @@ async def test_project_milestones():
             ends = [e for e in proj if e.provenance.get("event") == "project.completed"]
             check(len(starts) == 1 and len(ends) == 1, "one of each, not a stream")
             check(ends and ends[0].outcome, f"the finish records its status ({ends[0].outcome if ends else None})")
+            # Stage 14: the finish carries the DERIVED state, not the word
+            # "ok". Before the promoter was updated it read a field the
+            # payload no longer has and recorded every build as "ok".
+            check(ends and ends[0].outcome in
+                  ("complete", "failing", "passing", "partially_implemented",
+                   "scaffolded", "planned", "idea"),
+                  f"and it is one of the seven states "
+                  f"({ends[0].outcome if ends else None})")
             check(len(proj) < 6,
                   f"the many project.progress ticks were NOT promoted ({len(proj)} total)")
 

@@ -3496,6 +3496,138 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.set_proposal_status(proposal_id=proposal_id, status=status)
 
+    # ── Stage 14: acceptance criteria and completion evidence ───────────────
+    #
+    # Pass-throughs. The derivation that turns these rows into a completion
+    # state lives in core.completion_service, which is the only thing that
+    # should be asked "is it done?" — deliberately not here, because memory
+    # stores facts and should not also be the authority on what they mean.
+
+    async def record_requirement(self, *, project_name: str, request_text: str,
+                                 source: str = "user", note: str = "") -> int:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.record_requirement(
+                project_name=project_name, request_text=request_text,
+                source=source, note=note)
+
+    async def current_requirement(self, *, project_name: str) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.current_requirement(project_name=project_name)
+
+    async def seal_requirement(self, *, project_name: str, revision: int,
+                               seal_mode: str = "auto") -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.seal_requirement(
+                project_name=project_name, revision=revision,
+                seal_mode=seal_mode)
+
+    async def add_acceptance_criteria_batch(self, *, project_name: str,
+                                            revision: int,
+                                            specs: list[dict[str, Any]]) -> list[str]:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.add_acceptance_criteria_batch(
+                project_name=project_name, revision=revision, specs=specs)
+
+    async def add_acceptance_criterion(self, *, project_name: str, revision: int,
+                                       text: str, origin_quote: str,
+                                       source: str = "user", required: bool = True,
+                                       verify_kind: str = "machine",
+                                       carried_from: str | None = None) -> str:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.add_acceptance_criterion(
+                project_name=project_name, revision=revision, text=text,
+                origin_quote=origin_quote, source=source, required=required,
+                verify_kind=verify_kind, carried_from=carried_from)
+
+    async def list_acceptance_criteria(self, *, project_name: str,
+                                       revision: int | None = None,
+                                       include_superseded: bool = False
+                                       ) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_acceptance_criteria(
+            project_name=project_name, revision=revision,
+            include_superseded=include_superseded)
+
+    async def supersede_acceptance_criterion(self, *, criterion_id: str,
+                                             by_revision: int,
+                                             reason: str = "") -> bool:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.supersede_acceptance_criterion(
+                criterion_id=criterion_id, by_revision=by_revision, reason=reason)
+
+    async def claim_state_announcement(self, *, project_name: str, revision: int,
+                                       state: str) -> str | None:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.claim_state_announcement(
+                project_name=project_name, revision=revision, state=state)
+
+    async def redeem_contract_confirmation(self, *, decision_id: str,
+                                           accepted: bool, actor: str,
+                                           channel: str) -> str | None:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.redeem_contract_confirmation(
+                decision_id=decision_id, accepted=accepted, actor=actor,
+                channel=channel)
+
+    async def open_human_decision(self, *, project_name: str, criterion_id: str,
+                                  revision: int, prompt: str,
+                                  artifact_digest: str = "") -> str:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.open_human_decision(
+                project_name=project_name, criterion_id=criterion_id,
+                revision=revision, prompt=prompt,
+                artifact_digest=artifact_digest)
+
+    async def redeem_human_decision(self, *, decision_id: str, accepted: bool,
+                                    actor: str, channel: str, verdict: str,
+                                    detail: str) -> str | None:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.redeem_human_decision(
+                decision_id=decision_id, accepted=accepted, actor=actor,
+                channel=channel, verdict=verdict, detail=detail)
+
+    async def get_human_decision(self, *, decision_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.get_human_decision(decision_id=decision_id)
+
+    async def list_human_decisions(self, *, project_name: str,
+                                   open_only: bool = False) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_human_decisions(
+            project_name=project_name, open_only=open_only)
+
+    async def record_acceptance_evidence(self, *, criterion_id: str,
+                                         project_name: str, revision: int,
+                                         artifact_digest: str, verdict: str,
+                                         detail: str = "", error: str = "",
+                                         task_id: str | None = None,
+                                         generation: int | None = None,
+                                         attempt: int | None = None,
+                                         decision_id: str | None = None) -> str:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.record_acceptance_evidence(
+                criterion_id=criterion_id, project_name=project_name,
+                revision=revision, artifact_digest=artifact_digest,
+                verdict=verdict, detail=detail, error=error, task_id=task_id,
+                generation=generation, attempt=attempt, decision_id=decision_id)
+
+    async def list_acceptance_evidence(self, *, project_name: str,
+                                       revision: int | None = None,
+                                       limit: int = 500) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self._sqlite.list_acceptance_evidence(
+            project_name=project_name, revision=revision, limit=limit)
+
     async def add_progress_event(self, *, goal_id: UUID, project_name: str, kind: str, message: str,
                                  generation: int | None = None,
                                  task_id: str | None = None,

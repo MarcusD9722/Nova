@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import aiosqlite
 
+from memory.completion_schema import COMPLETION_DDL
 from memory.episodic_schema import EPISODIC_DDL, EPISODIC_MIGRATION
 
 
@@ -500,6 +501,9 @@ class SQLiteMemoryBackend:
                 # early (no table yet) and the DDL builds the full schema.
                 # Same order as `turns` above: migrate, THEN index.
                 await self._migrate_episodes_schema(db)
+                for _sql in COMPLETION_DDL:
+                    await db.execute(_sql)
+
                 for _sql in EPISODIC_DDL:
                     await db.execute(_sql)
 
@@ -636,6 +640,21 @@ class SQLiteMemoryBackend:
                 # refused if the goal has moved on.
                 "ALTER TABLE goals ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
                 "ALTER TABLE tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+            ],
+        ),
+        (
+            9,
+            "Stage 14: durable acceptance criteria and completion evidence",
+            [
+                # WHY: "complete" was derived from whether the program started
+                # and whether Nova's own generated tests objected. The user's
+                # request was not part of that decision, so nothing could be
+                # compared against it. These tables are where the request and
+                # its acceptance criteria become durable facts.
+                #
+                # The SAME list the create block uses, so a fresh database and
+                # an upgraded one cannot disagree about the shape.
+                *COMPLETION_DDL,
             ],
         ),
     ]
@@ -2838,3 +2857,416 @@ class SQLiteMemoryBackend:
                 await db.execute(f"UPDATE progress_events SET acknowledged=1 WHERE event_id IN ({placeholders})", ids)
                 await db.commit()
         return [dict(event_id=r[0], goal_id=r[1], kind=r[2], message=r[3], created_at=r[4]) for r in rows]
+
+
+    # ── Stage 14: acceptance criteria and completion evidence ───────────────
+    #
+    # Everything here RECORDS. Nothing here decides. The current state of a
+    # project is derived from these rows by `core.completion.derive_state`, so
+    # there is deliberately no `set_completion_state` to call: a writer that
+    # wanted to declare a project complete would have to produce evidence for
+    # every required criterion, which is the whole point.
+
+    async def record_requirement(self, *, project_name: str, request_text: str,
+                                 source: str = "user", note: str = "") -> int:
+        """Record what the user asked for. Returns the new revision number.
+
+        A new revision is what a CORRECTION is: the user changed their mind, so
+        evidence gathered under the old revision stops counting toward the
+        current state. Recording the same text twice is still a new revision —
+        it is the caller's job to know whether the request actually changed,
+        and guessing here would silently swallow a real correction that
+        happened to be worded identically.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM project_requirements "
+                "WHERE project_name=?", (project_name,))
+            row = await cur.fetchone()
+            nxt = int((row[0] if row else 0) or 0) + 1
+            await db.execute(
+                "INSERT INTO project_requirements(project_name, revision, "
+                "request_text, source, note, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (project_name, nxt, request_text, source, note, now))
+            await db.commit()
+        return nxt
+
+    async def current_requirement(self, *, project_name: str) -> dict[str, Any] | None:
+        """The newest recorded request for this project, or None."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT project_name, revision, request_text, source, note, "
+                "created_at, sealed_at, seal_mode "
+                "FROM project_requirements WHERE project_name=? "
+                "ORDER BY revision DESC LIMIT 1", (project_name,))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"project_name": row[0], "revision": int(row[1]),
+                "request_text": row[2], "source": row[3], "note": row[4],
+                "created_at": row[5], "sealed_at": row[6],
+                "seal_mode": row[7] or ""}
+
+    async def seal_requirement(self, *, project_name: str, revision: int,
+                               seal_mode: str = "auto") -> bool:
+        """Mark a revision's acceptance contract as agreed and whole.
+
+        One statement, so a crash cannot leave it half-sealed, and guarded on
+        `sealed_at IS NULL` so sealing twice is a no-op rather than a second
+        opinion.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE project_requirements SET sealed_at=?, seal_mode=? "
+                "WHERE project_name=? AND revision=? AND sealed_at IS NULL",
+                (self._now_iso(), seal_mode, project_name, int(revision)))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def add_acceptance_criteria_batch(
+            self, *, project_name: str, revision: int,
+            specs: list[dict[str, Any]]) -> list[str]:
+        """Write a whole set of criteria, or none of them.
+
+        One transaction. Writing them one at a time meant an abort partway
+        through left a contract that was neither the old one nor the new one,
+        and nothing downstream could tell that anything was missing — the
+        criteria that never got written leave no trace of their absence.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        ids = [uuid4().hex for _ in specs]
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                for cid, spec in zip(ids, specs):
+                    await db.execute(
+                        "INSERT INTO acceptance_criteria(criterion_id, "
+                        "project_name, revision, text, origin_quote, source, "
+                        "required, verify_kind, created_at, carried_from) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (cid, project_name, int(revision),
+                         str(spec.get("text") or ""),
+                         str(spec.get("origin_quote") or ""),
+                         str(spec.get("source") or "user"),
+                         1 if spec.get("required", True) else 0,
+                         str(spec.get("verify_kind") or "machine"), now,
+                         spec.get("carried_from")))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return ids
+
+    async def add_acceptance_criterion(self, *, project_name: str, revision: int,
+                                       text: str, origin_quote: str,
+                                       source: str = "user", required: bool = True,
+                                       verify_kind: str = "machine",
+                                       carried_from: str | None = None) -> str:
+        """Add one criterion to a requirement revision. Returns its id."""
+        await self.initialize()
+        cid = uuid4().hex
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO acceptance_criteria(criterion_id, project_name, "
+                "revision, text, origin_quote, source, required, verify_kind, "
+                "created_at, carried_from) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cid, project_name, int(revision), text, origin_quote, source,
+                 1 if required else 0, verify_kind, self._now_iso(), carried_from))
+            await db.commit()
+        return cid
+
+    async def list_acceptance_criteria(self, *, project_name: str,
+                                       revision: int | None = None,
+                                       include_superseded: bool = False
+                                       ) -> list[dict[str, Any]]:
+        """Criteria for a revision, oldest first. Superseded ones are excluded
+        unless asked for — they are history, and history does not block."""
+        await self.initialize()
+        q = ("SELECT criterion_id, project_name, revision, text, origin_quote, "
+             "source, required, verify_kind, created_at, superseded_at, "
+             "superseded_by_revision, supersede_reason, carried_from "
+             "FROM acceptance_criteria WHERE project_name=?")
+        params: list[Any] = [project_name]
+        if revision is not None:
+            q += " AND revision=?"
+            params.append(int(revision))
+        if not include_superseded:
+            q += " AND superseded_at IS NULL"
+        q += " ORDER BY created_at ASC, rowid ASC"
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        return [{"criterion_id": r[0], "project_name": r[1], "revision": int(r[2]),
+                 "text": r[3], "origin_quote": r[4], "source": r[5],
+                 "required": bool(r[6]), "verify_kind": r[7], "created_at": r[8],
+                 "superseded_at": r[9], "superseded_by_revision": r[10],
+                 "supersede_reason": r[11], "carried_from": r[12]}
+                for r in rows]
+
+    async def supersede_acceptance_criterion(self, *, criterion_id: str,
+                                             by_revision: int,
+                                             reason: str = "") -> bool:
+        """Retire a criterion, attributably.
+
+        A criterion can only leave the contract by an explicit act that names
+        the revision retiring it. This is what stops a replan from quietly
+        dropping a requirement: forgetting to mention it does nothing, because
+        nothing here is derived from what the newest plan happens to list.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE acceptance_criteria SET superseded_at=?, "
+                "superseded_by_revision=?, supersede_reason=? "
+                "WHERE criterion_id=? AND superseded_at IS NULL",
+                (self._now_iso(), int(by_revision), reason, criterion_id))
+            await db.commit()
+            return int(cur.rowcount or 0) == 1
+
+    async def claim_state_announcement(self, *, project_name: str, revision: int,
+                                       state: str) -> str | None:
+        """Claim the right to announce this state. None if already announced.
+
+        Returns the PREVIOUS announced state (possibly "") when this call is
+        the one that transitioned, and None when the state is unchanged — so a
+        second evaluation, a replayed callback, or a restart that re-derives
+        the same answer announces nothing.
+
+        One statement, so two callers racing produce one announcement: the
+        upsert's DO UPDATE is guarded on the state actually differing, and
+        SQLite reports zero changed rows when that guard excludes it.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "SELECT state FROM completion_announcements "
+                    "WHERE project_name=? AND revision=?",
+                    (project_name, int(revision)))
+                row = await cur.fetchone()
+                previous = row[0] if row else ""
+                if row is not None and str(row[0]) == str(state):
+                    await db.execute("COMMIT")
+                    return None
+                await db.execute(
+                    "INSERT INTO completion_announcements(project_name, "
+                    "revision, state, announced_at) VALUES(?, ?, ?, ?) "
+                    "ON CONFLICT(project_name, revision) DO UPDATE SET "
+                    "state=excluded.state, announced_at=excluded.announced_at "
+                    "WHERE completion_announcements.state != excluded.state",
+                    (project_name, int(revision), state, now))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return previous
+
+    async def redeem_contract_confirmation(self, *, decision_id: str,
+                                           accepted: bool, actor: str,
+                                           channel: str) -> str | None:
+        """Answer a contract-confirmation question and record the seal.
+
+        One transaction, for the same reason every other redemption is: as two,
+        a crash between them consumes the person's answer and leaves the
+        contract still reading `auto`, with no legal retry.
+
+        Returns the requirement revision confirmed, or None if the decision was
+        already answered.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "UPDATE human_decisions SET resolved_at=?, accepted=?, "
+                    "actor=?, channel=? "
+                    "WHERE decision_id=? AND resolved_at IS NULL",
+                    (now, 1 if accepted else 0, actor, channel, decision_id))
+                if int(cur.rowcount or 0) != 1:
+                    await db.execute("ROLLBACK")
+                    return None
+                cur2 = await db.execute(
+                    "SELECT project_name, revision FROM human_decisions "
+                    "WHERE decision_id=?", (decision_id,))
+                row = await cur2.fetchone()
+                if accepted:
+                    # Only the mode changes. `sealed_at` is not touched: the
+                    # contract was already sealed, and a confirmation is a
+                    # statement about its PROVENANCE, not a second sealing.
+                    await db.execute(
+                        "UPDATE project_requirements SET seal_mode='human' "
+                        "WHERE project_name=? AND revision=? "
+                        "AND sealed_at IS NOT NULL",
+                        (row[0], int(row[1])))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return str(row[1])
+
+    async def open_human_decision(self, *, project_name: str, criterion_id: str,
+                                  revision: int, prompt: str,
+                                  artifact_digest: str = "") -> str:
+        """Record that Nova ASKED a person about a criterion. Returns its id.
+
+        The digest is captured HERE, at the moment of asking, because that is
+        what the person is being shown. Stamping the answer with whatever the
+        project has become since would let a judgement of one screen certify a
+        different one.
+        """
+        await self.initialize()
+        did = uuid4().hex
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO human_decisions(decision_id, project_name, "
+                "criterion_id, revision, prompt, artifact_digest, requested_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (did, project_name, criterion_id, int(revision), prompt,
+                 artifact_digest, self._now_iso()))
+            await db.commit()
+        return did
+
+    async def redeem_human_decision(self, *, decision_id: str, accepted: bool,
+                                    actor: str, channel: str,
+                                    verdict: str, detail: str) -> str | None:
+        """Answer a question AND record the evidence, or do neither.
+
+        These were two transactions. A crash between them left the decision
+        permanently redeemed with no evidence written and no legal retry — the
+        person's answer was consumed and nothing recorded it, which is the one
+        outcome worse than losing the answer outright.
+
+        Now one transaction: BEGIN IMMEDIATE takes the write lock up front, the
+        UPDATE is guarded on `resolved_at IS NULL`, and the evidence INSERT
+        only happens if that UPDATE claimed the row. Returns the evidence id,
+        or None if the decision was already answered.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        eid = uuid4().hex
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "UPDATE human_decisions SET resolved_at=?, accepted=?, "
+                    "actor=?, channel=? "
+                    "WHERE decision_id=? AND resolved_at IS NULL",
+                    (now, 1 if accepted else 0, actor, channel, decision_id))
+                if int(cur.rowcount or 0) != 1:
+                    await db.execute("ROLLBACK")
+                    return None
+                cur2 = await db.execute(
+                    "SELECT project_name, criterion_id, revision, artifact_digest "
+                    "FROM human_decisions WHERE decision_id=?", (decision_id,))
+                row = await cur2.fetchone()
+                await db.execute(
+                    "INSERT INTO acceptance_evidence(evidence_id, criterion_id, "
+                    "project_name, revision, artifact_digest, verdict, detail, "
+                    "error, task_id, generation, attempt, decision_id, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, NULL, ?, ?)",
+                    (eid, row[1], row[0], int(row[2]), row[3], verdict, detail,
+                     decision_id, now))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return eid
+
+    async def get_human_decision(self, *, decision_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT decision_id, project_name, criterion_id, revision, "
+                "prompt, requested_at, resolved_at, accepted, actor, channel, "
+                "artifact_digest FROM human_decisions WHERE decision_id=?",
+                (decision_id,))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"decision_id": row[0], "project_name": row[1],
+                "criterion_id": row[2], "revision": int(row[3]),
+                "prompt": row[4], "requested_at": row[5], "resolved_at": row[6],
+                "accepted": None if row[7] is None else bool(row[7]),
+                "actor": row[8], "channel": row[9], "artifact_digest": row[10]}
+
+    async def list_human_decisions(self, *, project_name: str,
+                                   open_only: bool = False) -> list[dict[str, Any]]:
+        await self.initialize()
+        q = ("SELECT decision_id, project_name, criterion_id, revision, prompt, "
+             "requested_at, resolved_at, accepted, actor, channel "
+             "FROM human_decisions WHERE project_name=?")
+        if open_only:
+            q += " AND resolved_at IS NULL"
+        q += " ORDER BY requested_at ASC"
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, (project_name,))
+            rows = await cur.fetchall()
+        return [{"decision_id": r[0], "project_name": r[1], "criterion_id": r[2],
+                 "revision": int(r[3]), "prompt": r[4], "requested_at": r[5],
+                 "resolved_at": r[6],
+                 "accepted": None if r[7] is None else bool(r[7]),
+                 "actor": r[8], "channel": r[9]} for r in rows]
+
+    async def record_acceptance_evidence(self, *, criterion_id: str,
+                                         project_name: str, revision: int,
+                                         artifact_digest: str, verdict: str,
+                                         detail: str = "", error: str = "",
+                                         task_id: str | None = None,
+                                         generation: int | None = None,
+                                         attempt: int | None = None,
+                                         decision_id: str | None = None) -> str:
+        """Record one observation about one criterion. Returns its id.
+
+        Append-only on purpose. A criterion that passed and later failed has
+        two rows, and both are true about the moment they describe; collapsing
+        them into one column is how a stale pass becomes indistinguishable from
+        a current one.
+        """
+        await self.initialize()
+        eid = uuid4().hex
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO acceptance_evidence(evidence_id, criterion_id, "
+                "project_name, revision, artifact_digest, verdict, detail, "
+                "error, task_id, generation, attempt, decision_id, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (eid, criterion_id, project_name, int(revision), artifact_digest,
+                 verdict, detail, error, task_id,
+                 None if generation is None else int(generation),
+                 None if attempt is None else int(attempt), decision_id,
+                 self._now_iso()))
+            await db.commit()
+        return eid
+
+    async def list_acceptance_evidence(self, *, project_name: str,
+                                       revision: int | None = None,
+                                       limit: int = 500) -> list[dict[str, Any]]:
+        """Evidence oldest first, so the last admissible row is the current one."""
+        await self.initialize()
+        q = ("SELECT evidence_id, criterion_id, project_name, revision, "
+             "artifact_digest, verdict, detail, error, task_id, generation, "
+             "attempt, created_at, decision_id "
+             "FROM acceptance_evidence WHERE project_name=?")
+        params: list[Any] = [project_name]
+        if revision is not None:
+            q += " AND revision=?"
+            params.append(int(revision))
+        q += " ORDER BY created_at ASC, rowid ASC LIMIT ?"
+        params.append(int(limit))
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        return [{"evidence_id": r[0], "criterion_id": r[1], "project_name": r[2],
+                 "revision": int(r[3]), "artifact_digest": r[4], "verdict": r[5],
+                 "detail": r[6], "error": r[7], "task_id": r[8],
+                 "generation": r[9], "attempt": r[10], "created_at": r[11],
+                 "decision_id": r[12]}
+                for r in rows]

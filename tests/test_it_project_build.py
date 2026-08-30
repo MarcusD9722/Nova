@@ -112,8 +112,22 @@ async def main() -> None:
 
         check.section("PROJECT.md reports what really happened")
         doc = (project / "PROJECT.md").read_text(encoding="utf-8")
-        check(md_section(doc, "Status") == "complete",
-              f"status is 'complete' for a build that genuinely passed ({md_section(doc, 'Status')!r})")
+        # This assertion used to read `== "complete"`, and it was the belief
+        # Stage 14 exists to remove: the build wrote files, the run check
+        # passed, the logic tests passed, therefore complete. None of that says
+        # anything about whether what the PERSON ASKED FOR was delivered.
+        #
+        # This test's scripted model has no rule for the acceptance-criteria
+        # prompt, so it answers "Working on it.", no criteria are agreed, and
+        # the contract is never sealed. A build with no agreed definition of
+        # done cannot be done. It is SCAFFOLDED: the files are real, and
+        # nothing about them has been demonstrated.
+        status = md_section(doc, "Status")
+        check(status == "scaffolded",
+              f"a build with no agreed criteria is scaffolded, not complete "
+              f"({status!r})")
+        check("complete" not in status.lower(),
+              "and PROJECT.md does not claim completion for it")
         log = md_section(doc, "Progress log")
         check("Run check passed" in log, "the run check result is recorded")
         check("Logic tests passed" in log, "the logic-test result is recorded")
@@ -141,7 +155,13 @@ async def main() -> None:
         doc = (project / "PROJECT.md").read_text(encoding="utf-8") if (project / "PROJECT.md").exists() else ""
         status = md_section(doc, "Status")
         log = md_section(doc, "Progress log")
-        check(status == "error", f"PROJECT.md records the error state (got {status!r})")
+        # There is no "error" status any more: the state is derived from what
+        # is recorded, and for a build whose generation came back empty there
+        # is a requirement, no criteria, and no files. That is an idea. The
+        # failure itself is in the log, which is asserted below.
+        check(status == "idea",
+              f"a build that produced nothing is an idea, not an achievement "
+              f"({status!r})")
         check("complete" not in status.lower(), "it never claims to be complete")
         check("came back empty" in log,
               f"the log says what actually failed ({log.splitlines()[-1][:90] if log else ''!r})")
