@@ -35,10 +35,11 @@ PROJECTIONS = "tests/test_completion_projections_s14.py"
 CHAT = "tests/test_completion_chat_s14.py"
 SEMANTICS = "tests/test_completion_semantics_s14.py"
 ISOLATION = "tests/test_completion_isolation_s14.py"
+JOURNEYS = "tests/test_completion_journeys_s14.py"
 
 #: Everything, for confirming a survival rather than assuming one.
 ALL_SUITES = [MODEL, SERVICE, FENCING, TRUTH, EVENTS, PROJECTIONS, CHAT,
-              SEMANTICS, ISOLATION]
+              SEMANTICS, ISOLATION, JOURNEYS]
 
 COMPLETION = "core/completion.py"
 SERVICE_PY = "core/completion_service.py"
@@ -57,7 +58,7 @@ MUTANTS: list[tuple] = [
         return out(COMPLETE, "there are files")
     if not outstanding:
         if not contract_sealed:''',
-     [MODEL, TRUTH]),
+     [MODEL, TRUTH, JOURNEYS]),
 
     ("M120", "a criterion that FAILED is not counted as failing", COMPLETION,
      '''    failing = tuple(s for s in required if s.verdict == FAILED)''',
@@ -68,7 +69,7 @@ MUTANTS: list[tuple] = [
      '''    outstanding = tuple(s for s in required if s.verdict not in SATISFYING
                         and s.verdict != FAILED)''',
      '''    outstanding = ()''',
-     [MODEL, TRUTH]),
+     [MODEL, TRUTH, JOURNEYS]),
 
     ("M122", "human_pending counts as satisfied", COMPLETION,
      '''SATISFYING = frozenset({PASSED, WAIVED})''',
@@ -78,7 +79,7 @@ MUTANTS: list[tuple] = [
     ("M123", "an inconclusive check counts as satisfied", COMPLETION,
      '''SATISFYING = frozenset({PASSED, WAIVED})''',
      '''SATISFYING = frozenset({PASSED, WAIVED, INCONCLUSIVE})''',
-     [MODEL, TRUTH]),
+     [MODEL, TRUTH, JOURNEYS]),
 
     ("M124", "an empty criteria set completes", COMPLETION,
      '''        return out(IDEA, "a requirement exists but no acceptance criteria have "
@@ -89,7 +90,7 @@ MUTANTS: list[tuple] = [
     ("M125", "no REQUIRED criteria still completes", COMPLETION,
      '''    if not required:''',
      '''    if False:''',
-     [MODEL]),
+     [MODEL, JOURNEYS]),
 
     # ── the fences ─────────────────────────────────────────────────────────
     ("M126", "evidence from an earlier revision still counts", COMPLETION,
@@ -100,12 +101,12 @@ MUTANTS: list[tuple] = [
     ("M127", "evidence about a different artifact still counts", COMPLETION,
      '''        if ev.artifact_digest != artifact_digest:''',
      '''        if False:''',
-     [MODEL, FENCING]),
+     [MODEL, FENCING, JOURNEYS]),
 
     ("M128", "an empty digest matches any artifact", COMPLETION,
      '''        if ev.artifact_digest != artifact_digest:''',
      '''        if ev.artifact_digest and artifact_digest and ev.artifact_digest != artifact_digest:''',
-     [FENCING, MODEL]),
+     [FENCING, MODEL]),  # not JOURNEYS: no journey can write an empty digest
 
     ("M129", "a verdict is stamped when recorded, not when checked", SERVICE_PY,
      '''            revision=context.revision, artifact_digest=context.artifact_digest,''',
@@ -118,7 +119,7 @@ MUTANTS: list[tuple] = [
     ("M130", "an unsealed contract can complete", COMPLETION,
      '''        if not contract_sealed:''',
      '''        if False:''',
-     [SEMANTICS, MODEL]),
+     [SEMANTICS, MODEL, JOURNEYS]),
 
     ("M131", "a sealed contract can still be extended", SERVICE_PY,
      '''        if req.get("sealed_at"):''',
@@ -138,12 +139,12 @@ MUTANTS: list[tuple] = [
     ("M134", "a waiver needs no human decision behind it", COMPLETION,
      '''    if verdict == WAIVED and not latest.decision_id:''',
      '''    if False:''',
-     [FENCING]),
+     [FENCING]),  # not JOURNEYS: a waiver there always has a decision
 
     ("M135", "a machine check can satisfy a human criterion", COMPLETION,
      '''    if criterion.verify_kind == "human" and verdict == PASSED:''',
      '''    if False:''',
-     [MODEL, FENCING]),
+     [MODEL, FENCING, JOURNEYS]),
 
     # ── events ─────────────────────────────────────────────────────────────
     ("M136", "project.completed fires for any state", EVENTS_PY,
@@ -158,7 +159,7 @@ MUTANTS: list[tuple] = [
      '''        previous = await self._claim(slug, verdict)
         if previous is None:
             previous = ""''',
-     [EVENTS]),
+     [EVENTS, JOURNEYS]),
 
     ("M138", "the ledger is not scoped to the project", EVENTS_PY,
      '''        return await self._memory.claim_state_announcement(
@@ -222,14 +223,14 @@ MUTANTS: list[tuple] = [
             continue''',
      '''        if False:
             continue''',
-     [MODEL, FENCING]),
+     [MODEL, FENCING, JOURNEYS]),
 
     ("M147", "PROJECT.md counts as implementation", ARTIFACTS,
      '''        if parts[-1] in _DERIVED_NAMES:
             continue''',
      '''        if False:
             continue''',
-     [MODEL, PROJECTIONS]),
+     [MODEL, PROJECTIONS, JOURNEYS]),
 
     ("M148", "a clause split on 'and' is not required to be covered", CONTRACT,
      '''        if any(p in clause or clause in p for p in pieces):
