@@ -300,6 +300,21 @@ only files on disk:
 
 ### Soak (§15)
 
+**Which head each figure was measured on**, because the tree moved twice after
+the first soak and an unqualified number would be a claim about code that was
+not the code:
+
+- the full soak below, and the performance ladder that follows it, were
+  measured on `b72a0cb` — before the `scaffolded` change in `c1db7d1` and
+  before the journey rebuild in `cbfef0d`;
+- everything they cover was re-run on the final head `cbfef0d` three times
+  over, inside the three counted gates, including the 500-sequence generated
+  suite at its default;
+- and the suites that actually *changed* after `b72a0cb` were soaked again on
+  `cbfef0d` directly: **53 runs, no failures** (journeys ×10, model ×10, truth
+  ×10, fencing ×10, projections ×8, restart ×5), plus **300/300 generated
+  sequences on seed 1,300,000**, a seed nothing had run before.
+
 **209 runs, 85.5 minutes, no failures.** One red run in twenty would have been
 a finding, not noise.
 
@@ -345,6 +360,12 @@ so the next person has them rather than my reassurance.
 A hundred projects in one store cost **0.5 MB**, and one project's state is
 unaffected by the other 99 (28–38 ms p90). Each recorded check costs 0.38 KB.
 
+These timings were taken on `b72a0cb`. Nothing in `c1db7d1` or `cbfef0d`
+touches the query path they measure — the first added a branch to
+`derive_state` for a project with no criteria, the second changed only tests —
+but they have not been re-measured on the final head, and that is stated rather
+than glossed.
+
 ### What gate 1 found
 
 The first gate run came back **164/165**. The failure was real and is written
@@ -384,8 +405,9 @@ Output was captured from the child process rather than piped inside
 PowerShell: `run_tests.ps1` uses `Write-Host`, which bypasses the pipeline and
 produces a 0-byte log, a trap this programme has fallen into before.
 
-**Frontend.** `npm run build` in `frontend/` succeeds on this tree (24.1s,
-chunk-size advisories only, all pre-existing). `node --check` is not a valid
+**Frontend.** `npm run build` in `frontend/` succeeds on this tree — 24.1s, and
+22.8s when re-run against the final head at merge time (node v24.18.0), with
+chunk-size advisories only, all pre-existing. `node --check` is not a valid
 gate for `.jsx` — node rejects the extension outright — so the vite build is
 the syntax gate. No frontend file changed in this stage; the build was re-run
 because the executable tree did.
@@ -395,6 +417,33 @@ changed after those gates ran, in a `docs/`-only commit. A report cannot
 contain the results of a run over itself, and gating a head whose report claims
 results it does not yet have would be worse. Nothing executable differs between
 the gated head and the final one.
+
+---
+
+## Recorded, not fixed
+
+**The revision fence cannot fire in production.** Measured, not inferred; kept
+as defence in depth and labelled as such in `core/completion.py`. It stops
+being unreachable the moment `carry_forward` preserves criterion ids.
+
+**Two mutants have no journey coverage, deliberately.** An empty evidence
+digest and a waiver with no decision behind it cannot be produced by any
+sequence of public service calls — the service refuses to write either row. The
+journeys' claim to cover them was withdrawn rather than left standing; both die
+in the unit-level suites that can construct such rows directly.
+
+**Performance was not re-measured on the final head.** The ladder was taken on
+`b72a0cb`. Nothing since touches the query path it measures, but it has not
+been re-run and is not claimed to have been.
+
+**A hang inherited from Stage 13C.** Seen once in forty runs during that stage,
+never reproduced in twenty-five attempts, and absent from every gate since,
+including the six run in this stage. Still classified UNEXPLAINED. Nothing in
+Stage 14 addressed it and nothing here should be read as having done so.
+
+**Nothing volunteers.** Completion state is derived correctly and reported
+honestly when something asks. Nova does not spontaneously tell you a project
+stopped being complete.
 
 ---
 
