@@ -346,6 +346,19 @@ def derive_state(*,
     if not has_requirement:
         return out(IDEA, "no durable requirement has been recorded")
     if not crits:
+        # No criteria were ever agreed, so nothing can be shown to be done.
+        # But calling a directory of working code an IDEA is a false statement
+        # in the other direction, and it produced a PROJECT.md whose Status
+        # said "idea" four lines above a log saying "Run check passed / Logic
+        # tests passed". A document contradicting itself is the defect this
+        # stage exists to remove; understating is not exempt from that.
+        # SCAFFOLDED is the honest word for "these files exist and nothing
+        # about them has been demonstrated", which is exactly the situation.
+        if has_implementation:
+            return out(SCAFFOLDED,
+                       "files exist, but no acceptance criteria were agreed "
+                       "for this request, so nothing about them has been "
+                       "demonstrated")
         return out(IDEA, "a requirement exists but no acceptance criteria have "
                          "been agreed for it")
     if failing:

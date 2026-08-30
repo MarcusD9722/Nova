@@ -180,9 +180,20 @@ async def test_g_an_empty_required_set_cannot_certify_anything():
           f"a project with no REQUIRED criteria is not COMPLETE ({v.state})")
     check("no criterion is marked required" in " ".join(v.reasons),
           f"and the reason says why ({v.reasons})")
-    # And the degenerate case that would make every all(...) true.
-    check(state([], []).state == IDEA,
-          "no criteria at all is IDEA, never COMPLETE")
+    # And the degenerate case that would make every all(...) true. With no
+    # criteria the answer depends on whether anything was built, and neither
+    # answer is COMPLETE: files with no agreed criteria are SCAFFOLDED (they
+    # exist, nothing about them is demonstrated), and no files is an IDEA.
+    with_files = state([], [], impl=True)
+    without = state([], [], impl=False)
+    check(with_files.state == SCAFFOLDED,
+          f"files with no agreed criteria are SCAFFOLDED ({with_files.state})")
+    check("no acceptance criteria were agreed" in " ".join(with_files.reasons),
+          f"and the reason says no criteria were agreed ({with_files.reasons})")
+    check(without.state == IDEA,
+          f"nothing built and nothing agreed is IDEA ({without.state})")
+    check(COMPLETE not in (with_files.state, without.state),
+          "and an empty criteria set never certifies anything")
 
 
 async def test_h_legacy_status_is_history_not_evidence():

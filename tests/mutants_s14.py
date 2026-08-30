@@ -81,11 +81,9 @@ MUTANTS: list[tuple] = [
      [MODEL, TRUTH]),
 
     ("M124", "an empty criteria set completes", COMPLETION,
-     '''    if not crits:
-        return out(IDEA, "a requirement exists but no acceptance criteria have "
+     '''        return out(IDEA, "a requirement exists but no acceptance criteria have "
                          "been agreed for it")''',
-     '''    if not crits:
-        return out(COMPLETE, "nothing was required")''',
+     '''        return out(COMPLETE, "nothing was required")''',
      [MODEL, SERVICE]),
 
     ("M125", "no REQUIRED criteria still completes", COMPLETION,

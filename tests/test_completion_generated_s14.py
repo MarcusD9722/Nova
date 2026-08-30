@@ -179,7 +179,11 @@ class Oracle:
             out.append(("no requirement", "must be idea"))
             return out
         if not live:
-            out.append(("no criteria", "must be idea"))
+            # Files with no agreed criteria are SCAFFOLDED, not IDEA: nothing
+            # is demonstrated, but claiming nothing was built is its own lie.
+            out.append(("no criteria",
+                        "must be scaffolded" if st["implemented"]
+                        else "must be idea"))
             return out
         if any(v == FAILED for v in verdicts.values()):
             out.append(("a required criterion is refuted", "must be failing"))
@@ -407,6 +411,8 @@ async def one_sequence(seed: int) -> tuple[bool, str]:
                     ok = True
                     if requirement == "must be idea":
                         ok = actual == IDEA
+                    elif requirement == "must be scaffolded":
+                        ok = actual == SCAFFOLDED
                     elif requirement == "must be failing":
                         ok = actual == FAILING
                     elif requirement == "must be complete":
@@ -452,6 +458,7 @@ async def test_generated_completion_sequences():
     for required in ("state:complete", "state:failing", "state:passing",
                      "state:partially_implemented", "state:scaffolded",
                      "invariant:must be complete", "invariant:must be failing",
+                     "invariant:must be scaffolded",
                      "invariant:must not be complete"):
         check(COVERAGE.get(required, 0) >= 5,
               f"{required} was exercised {COVERAGE.get(required, 0)} times")
