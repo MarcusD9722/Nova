@@ -3559,20 +3559,23 @@ class MemoryUnifier:
                 criterion_id=criterion_id, by_revision=by_revision, reason=reason)
 
     async def open_human_decision(self, *, project_name: str, criterion_id: str,
-                                  revision: int, prompt: str) -> str:
+                                  revision: int, prompt: str,
+                                  artifact_digest: str = "") -> str:
         await self.initialize()
         async with self._write_lock:
             return await self._sqlite.open_human_decision(
                 project_name=project_name, criterion_id=criterion_id,
-                revision=revision, prompt=prompt)
+                revision=revision, prompt=prompt,
+                artifact_digest=artifact_digest)
 
-    async def close_human_decision(self, *, decision_id: str, accepted: bool,
-                                   actor: str, channel: str) -> bool:
+    async def redeem_human_decision(self, *, decision_id: str, accepted: bool,
+                                    actor: str, channel: str, verdict: str,
+                                    detail: str) -> str | None:
         await self.initialize()
         async with self._write_lock:
-            return await self._sqlite.close_human_decision(
+            return await self._sqlite.redeem_human_decision(
                 decision_id=decision_id, accepted=accepted, actor=actor,
-                channel=channel)
+                channel=channel, verdict=verdict, detail=detail)
 
     async def get_human_decision(self, *, decision_id: str) -> dict[str, Any] | None:
         await self.initialize()

@@ -305,9 +305,28 @@ class CompletionService:
         req = await self._memory.current_requirement(project_name=slug)
         if req is None:
             raise ValueError(f"no requirement recorded for {slug!r}")
+        # A question has to be ABOUT something. Opening one against an id that
+        # is not a live criterion of this project's current revision produces a
+        # decision that can later be redeemed into evidence attached to
+        # nothing — and the derivation would never see it, so the acceptance
+        # would simply vanish.
+        live = await self._memory.list_acceptance_criteria(
+            project_name=slug, revision=int(req["revision"]))
+        if not any(c["criterion_id"] == criterion_id for c in live):
+            everywhere = await self._memory.list_acceptance_criteria(
+                project_name=slug, include_superseded=True)
+            known = any(c["criterion_id"] == criterion_id for c in everywhere)
+            raise ValueError(
+                f"criterion {criterion_id!r} is "
+                + ("superseded or on an earlier revision of "
+                   if known else "not a criterion of ")
+                + f"{slug!r} (current revision {req['revision']}); a question "
+                  "may only be asked about a criterion in force")
         did = await self._memory.open_human_decision(
             project_name=slug, criterion_id=criterion_id,
-            revision=int(req["revision"]), prompt=prompt)
+            revision=int(req["revision"]), prompt=prompt,
+            # Captured at ASK time: this is what the person is being shown.
+            artifact_digest=implementation_digest(self.project_path(slug)))
         logger.info("completion_human_asked", project=slug,
                     criterion=criterion_id, decision=did)
         return did
@@ -350,23 +369,26 @@ class CompletionService:
         if pending is None:
             raise ValueError(f"no such decision {decision_id!r}: an acceptance "
                              "must answer a question that was actually asked")
-        claimed = await self._memory.close_human_decision(
+        note = f"accepted by {who} via {channel}" if accepted else \
+               f"rejected by {who} via {channel}"
+        # Redemption and evidence are ONE transaction. As two, a crash between
+        # them consumed the person's answer and recorded nothing, and the
+        # replay guard then refused the retry — the answer was gone and the
+        # criterion was still unproven, with no way to reach either state
+        # again.
+        #
+        # The evidence is stamped with the digest captured when the question
+        # was ASKED, not with whatever is on disk now: the person judged what
+        # they were shown.
+        eid = await self._memory.redeem_human_decision(
             decision_id=decision_id, accepted=accepted, actor=who,
-            channel=channel)
-        if not claimed:
+            channel=channel, verdict=WAIVED if accepted else FAILED,
+            detail=f"{note}{': ' + detail if detail else ''}")
+        if eid is None:
             raise ValueError(
                 f"decision {decision_id!r} was already answered "
                 f"({pending.get('resolved_at')}); an answer is redeemable once")
-        note = f"accepted by {who} via {channel}" if accepted else \
-               f"rejected by {who} via {channel}"
-        return await self._memory.record_acceptance_evidence(
-            criterion_id=pending["criterion_id"], project_name=pending["project_name"],
-            revision=int(pending["revision"]),
-            artifact_digest=implementation_digest(
-                self.project_path(pending["project_name"])),
-            verdict=WAIVED if accepted else FAILED,
-            detail=f"{note}{': ' + detail if detail else ''}", error="",
-            decision_id=decision_id)
+        return eid
 
     # ── deriving ────────────────────────────────────────────────────────────
 

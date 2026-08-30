@@ -33,7 +33,9 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 from harness import Checks, run  # noqa: E402
 
 from core.completion import COMPLETE, PASSED, WAIVED  # noqa: E402
-from core.completion_artifacts import implementation_files  # noqa: E402
+from core.completion_artifacts import (  # noqa: E402
+    implementation_digest, implementation_files,
+)
 from core.completion_service import CompletionService  # noqa: E402
 from memory.unifier import MemoryUnifier  # noqa: E402
 
@@ -398,6 +400,174 @@ async def test_6_a_half_built_contract_never_goes_live():
               "and the old revision's evidence does not carry it")
 
 
+
+
+async def test_5d_a_judgement_of_the_old_screen_does_not_certify_the_new_one():
+    check.section("§6 the human answer belongs to what was ASKED about")
+    with _tmp() as td:
+        w = await World(td).start()
+        rev = await w.svc.record_request(slug=SLUG, request_text="a nice layout")
+        ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
+            {"text": "the layout looks right", "origin_quote": "a nice layout",
+             "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
+        w.write("main.py", "print('the layout they were shown')\n")
+        h1 = implementation_digest(w.path)
+
+        did = await w.svc.ask_human(slug=SLUG, criterion_id=ids[0],
+                                    prompt="does this look right?")
+        # The project changes while the person is deciding.
+        w.write("main.py", "print('something else entirely')\n")
+        h2 = implementation_digest(w.path)
+        check(h1 != h2, "the project really did change while they decided")
+
+        await w.svc.resolve_human_decision(decision_id=did, accepted=True,
+                                           actor="marcus", channel="chat")
+        rows = [r for r in await w.mem.list_acceptance_evidence(project_name=SLUG)
+                if r["verdict"] == WAIVED]
+        check(rows and rows[-1]["artifact_digest"] == h1,
+              "the acceptance is stamped with what they were shown, not with "
+              "what the project became")
+        v = await w.svc.evaluate(slug=SLUG)
+        check(v.state != COMPLETE,
+              f"so it does not certify the layout they never saw ({v.state})")
+        check(any("implementation changed" in c.stale_reason for c in v.criteria),
+              "and says the implementation moved after they were asked")
+
+
+async def test_5e_redeeming_an_answer_is_all_or_nothing():
+    check.section("§5 a consumed answer that recorded nothing is unrecoverable")
+    import aiosqlite
+
+    with _tmp() as td:
+        w = await World(td).start()
+        rev = await w.svc.record_request(slug=SLUG, request_text="a nice layout")
+        ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
+            {"text": "looks right", "origin_quote": "a nice layout",
+             "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
+        w.write("main.py", "print('ui')\n")
+        did = await w.svc.ask_human(slug=SLUG, criterion_id=ids[0], prompt="?")
+
+        # Fault injected at the exact seam: the decision row has been claimed,
+        # and writing the evidence fails. As two transactions this burned the
+        # answer and recorded nothing, and the replay guard then refused the
+        # retry - the worst of both.
+        original = aiosqlite.Connection.execute
+
+        async def failing(self, sql, parameters=None):
+            if "INSERT INTO acceptance_evidence" in str(sql):
+                raise RuntimeError("the process died between the two writes")
+            return await original(self, sql, parameters)
+
+        aiosqlite.Connection.execute = failing
+        died = None
+        try:
+            await w.svc.resolve_human_decision(decision_id=did, accepted=True,
+                                               actor="marcus", channel="chat")
+        except RuntimeError as e:
+            died = str(e)
+        finally:
+            aiosqlite.Connection.execute = original
+        check(died and "died between" in died, "the write really did fail")
+
+        row = await w.mem.get_human_decision(decision_id=did)
+        evidence = [r for r in await w.mem.list_acceptance_evidence(project_name=SLUG)
+                    if r["verdict"] == WAIVED]
+        check(row["resolved_at"] is None,
+              f"the answer was NOT consumed ({row['resolved_at']})")
+        check(evidence == [], f"and no evidence was written ({len(evidence)})")
+
+        # ...so the person can answer again, and it lands.
+        eid = await w.svc.resolve_human_decision(
+            decision_id=did, accepted=True, actor="marcus", channel="chat")
+        check(bool(eid), "the retry is legal and records the acceptance")
+        check((await w.svc.evaluate(slug=SLUG)).state == COMPLETE,
+              "and completes the project")
+
+
+async def test_5f_two_answers_at_once_produce_exactly_one():
+    check.section("§5 concurrent redemption yields one decision, one evidence")
+    import asyncio
+
+    with _tmp() as td:
+        w = await World(td).start()
+        rev = await w.svc.record_request(slug=SLUG, request_text="a nice layout")
+        ids = await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
+            {"text": "looks right", "origin_quote": "a nice layout",
+             "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev)
+        w.write("main.py", "print('ui')\n")
+        did = await w.svc.ask_human(slug=SLUG, criterion_id=ids[0], prompt="?")
+
+        async def answer(who):
+            try:
+                return await w.svc.resolve_human_decision(
+                    decision_id=did, accepted=True, actor=who, channel="ui")
+            except ValueError as e:
+                return e
+
+        results = await asyncio.gather(answer("marcus"), answer("marcus-again"))
+        ok = [r for r in results if isinstance(r, str)]
+        refused = [r for r in results if isinstance(r, ValueError)]
+        check(len(ok) == 1 and len(refused) == 1,
+              f"exactly one answer is accepted ({len(ok)} ok, {len(refused)} refused)")
+        check(refused and "redeemable once" in str(refused[0]),
+              f"and the loser is told why ({str(refused[0])[:45]!r})")
+
+        evidence = [r for r in await w.mem.list_acceptance_evidence(project_name=SLUG)
+                    if r["verdict"] == WAIVED]
+        check(len(evidence) == 1,
+              f"and exactly one piece of evidence exists ({len(evidence)})")
+        row = await w.mem.get_human_decision(decision_id=did)
+        check(evidence[0]["decision_id"] == did and row["resolved_at"],
+              "paired with the one decision it answered")
+
+
+async def test_5g_a_question_must_be_about_a_criterion_in_force():
+    check.section("§5 a decision needs a real, current, live target")
+    with _tmp() as td:
+        w = await World(td).start()
+        rev1 = await w.svc.record_request(slug=SLUG, request_text="a nice layout")
+        ids = await w.svc.set_criteria(slug=SLUG, revision=rev1, criteria=[
+            {"text": "looks right", "origin_quote": "a nice layout",
+             "verify_kind": "human"}])
+        await w.svc.seal_contract(slug=SLUG, revision=rev1)
+
+        bad = None
+        try:
+            await w.svc.ask_human(slug=SLUG, criterion_id="not-a-criterion",
+                                  prompt="?")
+        except ValueError as e:
+            bad = str(e)
+        check(bad and "not a criterion of" in bad,
+              f"an id that is not a criterion is refused ({str(bad)[:50]!r})")
+
+        # A criterion superseded by a later revision is no longer in force.
+        rev2 = await w.svc.record_request(slug=SLUG,
+                                          request_text="a nicer layout")
+        await w.svc.carry_forward(slug=SLUG, from_revision=rev1,
+                                  to_revision=rev2,
+                                  reanchor={ids[0]: "a nicer layout"})
+        stale = None
+        try:
+            await w.svc.ask_human(slug=SLUG, criterion_id=ids[0], prompt="?")
+        except ValueError as e:
+            stale = str(e)
+        check(stale and "superseded or on an earlier revision" in stale,
+              f"and so is one the requirement has moved past "
+              f"({str(stale)[:50]!r})")
+
+        # The carried criterion at the current revision IS askable.
+        live = await w.mem.list_acceptance_criteria(project_name=SLUG,
+                                                    revision=rev2)
+        did = await w.svc.ask_human(slug=SLUG,
+                                    criterion_id=live[0]["criterion_id"],
+                                    prompt="?")
+        check(bool(did), "while the criterion in force can be asked about")
+
+
+
 async def main() -> None:
     await test_1a_a_pass_earned_against_h1_does_not_certify_h2()
     await test_1b_a_pass_earned_under_r1_does_not_certify_r2()
@@ -408,6 +578,10 @@ async def main() -> None:
     await test_5_only_a_person_can_accept_on_a_persons_behalf()
     await test_5b_a_waiver_must_answer_a_question_that_was_asked()
     await test_5c_a_waiver_written_straight_to_the_store_is_not_honoured()
+    await test_5d_a_judgement_of_the_old_screen_does_not_certify_the_new_one()
+    await test_5e_redeeming_an_answer_is_all_or_nothing()
+    await test_5f_two_answers_at_once_produce_exactly_one()
+    await test_5g_a_question_must_be_about_a_criterion_in_force()
     await test_6_a_half_built_contract_never_goes_live()
     check.finish()
 

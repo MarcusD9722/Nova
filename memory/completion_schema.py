@@ -109,6 +109,10 @@ COMPLETION_DDL: tuple[str, ...] = (
         criterion_id TEXT NOT NULL,
         revision     INTEGER NOT NULL,
         prompt       TEXT NOT NULL DEFAULT '',
+        -- What the person was looking at when they were ASKED. The answer is
+        -- about this, not about whatever the project became while they were
+        -- deciding: a judgement of the old screen cannot certify the new one.
+        artifact_digest TEXT NOT NULL DEFAULT '',
         requested_at TEXT NOT NULL,
         resolved_at  TEXT,
         accepted     INTEGER,

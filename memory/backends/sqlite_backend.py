@@ -3027,46 +3027,81 @@ class SQLiteMemoryBackend:
             return int(cur.rowcount or 0) == 1
 
     async def open_human_decision(self, *, project_name: str, criterion_id: str,
-                                  revision: int, prompt: str) -> str:
-        """Record that Nova ASKED a person about a criterion. Returns its id."""
+                                  revision: int, prompt: str,
+                                  artifact_digest: str = "") -> str:
+        """Record that Nova ASKED a person about a criterion. Returns its id.
+
+        The digest is captured HERE, at the moment of asking, because that is
+        what the person is being shown. Stamping the answer with whatever the
+        project has become since would let a judgement of one screen certify a
+        different one.
+        """
         await self.initialize()
         did = uuid4().hex
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO human_decisions(decision_id, project_name, "
-                "criterion_id, revision, prompt, requested_at) "
-                "VALUES(?, ?, ?, ?, ?, ?)",
+                "criterion_id, revision, prompt, artifact_digest, requested_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
                 (did, project_name, criterion_id, int(revision), prompt,
-                 self._now_iso()))
+                 artifact_digest, self._now_iso()))
             await db.commit()
         return did
 
-    async def close_human_decision(self, *, decision_id: str, accepted: bool,
-                                   actor: str, channel: str) -> bool:
-        """Answer a pending question. False if it was already answered.
+    async def redeem_human_decision(self, *, decision_id: str, accepted: bool,
+                                    actor: str, channel: str,
+                                    verdict: str, detail: str) -> str | None:
+        """Answer a question AND record the evidence, or do neither.
 
-        Guarded on `resolved_at IS NULL` in the same statement that sets it, so
-        an answer can be redeemed exactly once and a replayed acceptance
-        changes nothing.
+        These were two transactions. A crash between them left the decision
+        permanently redeemed with no evidence written and no legal retry — the
+        person's answer was consumed and nothing recorded it, which is the one
+        outcome worse than losing the answer outright.
+
+        Now one transaction: BEGIN IMMEDIATE takes the write lock up front, the
+        UPDATE is guarded on `resolved_at IS NULL`, and the evidence INSERT
+        only happens if that UPDATE claimed the row. Returns the evidence id,
+        or None if the decision was already answered.
         """
         await self.initialize()
-        async with aiosqlite.connect(self._db_path) as db:
-            cur = await db.execute(
-                "UPDATE human_decisions SET resolved_at=?, accepted=?, "
-                "actor=?, channel=? "
-                "WHERE decision_id=? AND resolved_at IS NULL",
-                (self._now_iso(), 1 if accepted else 0, actor, channel,
-                 decision_id))
-            await db.commit()
-            return int(cur.rowcount or 0) == 1
+        now = self._now_iso()
+        eid = uuid4().hex
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "UPDATE human_decisions SET resolved_at=?, accepted=?, "
+                    "actor=?, channel=? "
+                    "WHERE decision_id=? AND resolved_at IS NULL",
+                    (now, 1 if accepted else 0, actor, channel, decision_id))
+                if int(cur.rowcount or 0) != 1:
+                    await db.execute("ROLLBACK")
+                    return None
+                cur2 = await db.execute(
+                    "SELECT project_name, criterion_id, revision, artifact_digest "
+                    "FROM human_decisions WHERE decision_id=?", (decision_id,))
+                row = await cur2.fetchone()
+                await db.execute(
+                    "INSERT INTO acceptance_evidence(evidence_id, criterion_id, "
+                    "project_name, revision, artifact_digest, verdict, detail, "
+                    "error, task_id, generation, attempt, decision_id, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, NULL, ?, ?)",
+                    (eid, row[1], row[0], int(row[2]), row[3], verdict, detail,
+                     decision_id, now))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return eid
 
     async def get_human_decision(self, *, decision_id: str) -> dict[str, Any] | None:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT decision_id, project_name, criterion_id, revision, "
-                "prompt, requested_at, resolved_at, accepted, actor, channel "
-                "FROM human_decisions WHERE decision_id=?", (decision_id,))
+                "prompt, requested_at, resolved_at, accepted, actor, channel, "
+                "artifact_digest FROM human_decisions WHERE decision_id=?",
+                (decision_id,))
             row = await cur.fetchone()
         if row is None:
             return None
@@ -3074,7 +3109,7 @@ class SQLiteMemoryBackend:
                 "criterion_id": row[2], "revision": int(row[3]),
                 "prompt": row[4], "requested_at": row[5], "resolved_at": row[6],
                 "accepted": None if row[7] is None else bool(row[7]),
-                "actor": row[8], "channel": row[9]}
+                "actor": row[8], "channel": row[9], "artifact_digest": row[10]}
 
     async def list_human_decisions(self, *, project_name: str,
                                    open_only: bool = False) -> list[dict[str, Any]]:
