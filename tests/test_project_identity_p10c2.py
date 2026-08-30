@@ -775,7 +775,7 @@ async def test_every_existing_identity_operation_resolves_to_itself():
         (legacy / "PROJECT.md").write_text("# legacy status\n", encoding="utf-8")
 
         # status_text must read the LEGACY project, not a canonical sibling.
-        text = pb.status_text("My_Old.Project")
+        text = await pb.status_text("My_Old.Project")
         check("don't have a project" not in text,
               f"status_text finds the legacy project ({text[:60]!r})")
 

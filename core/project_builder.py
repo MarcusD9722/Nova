@@ -8,11 +8,17 @@ validates Python files compile, records progress in PROJECT.md and project
 memory facts, then reports completion with improvement suggestions.
 
 State model:
-- projects/<slug>/PROJECT.md is the on-disk source of truth (brief, status,
-  files, how to run, progress log, suggestions) so "where did we leave off?"
-  works across sessions.
-- Memory facts (entity="project:<slug>") mirror status/summary/next steps so
-  chat grounding and semantic search can surface them.
+- COMPLETION STATE IS NOT STORED HERE. Since Stage 14 it is derived by
+  core.completion_service.CompletionService from durable acceptance criteria
+  and evidence, every time it is asked for. This module records what it
+  observed and asks; it cannot assign "complete".
+- projects/<slug>/PROJECT.md is a PROJECTION of that verdict plus the things
+  it genuinely is the record of — the brief, the file list, how to run it, the
+  progress narrative and suggestions — so "where did we leave off?" works
+  across sessions. It was described here as "the on-disk source of truth" and
+  that is no longer true of its status line.
+- Memory facts (entity="project:<slug>") likewise mirror the derived state so
+  chat grounding and semantic search can surface it.
 - All writes are confined to projects_dir (slug-sanitized, no traversal).
 """
 
@@ -1626,7 +1632,19 @@ class ProjectBuilder:
 
     # ── Status for chat ──────────────────────────────────────────────────────
 
-    def status_text(self, slug: str) -> str:
+    async def status_text(self, slug: str) -> str:
+        """What to tell a person about this project, RIGHT NOW.
+
+        The state is DERIVED. This used to read `## Status` out of PROJECT.md,
+        which made a projection the authority for everything chat said —
+        measured: with the evaluator returning `failing`, a PROJECT.md left
+        saying `complete` produced "Project calc: complete." Any stale file, an
+        older build, or a hand edit could overrule the evidence.
+
+        PROJECT.md is still read, for the things it IS the record of: the
+        progress narrative and the suggestion list. Not for whether the work is
+        done.
+        """
         # Same rule: an existing identity resolves to itself.
         slug = safe_live_component(slug)
         md = self._read_project_md(slug)
@@ -1637,13 +1655,26 @@ class ProjectBuilder:
             m = re.search(rf"## {name}\n(.*?)(?:\n## |\Z)", md, re.DOTALL)
             return m.group(1).strip() if m else ""
 
-        status = section("Status") or "unknown"
+        verdict = await self._completion.evaluate(slug=slug)
+        status = verdict.state
         summary = section("Summary")
         sugg = section("Next steps / suggestions")
         log = section("Progress log").splitlines()
         last = log[-1].lstrip("- ").strip() if log else ""
 
         parts = [f"Project {slug}: {status}."]
+        if verdict.failing:
+            parts.append("Failing: "
+                         + "; ".join(s.criterion.text for s in verdict.failing[:3]) + ".")
+        elif verdict.outstanding:
+            parts.append("Still to prove: "
+                         + "; ".join(s.criterion.text
+                                     for s in verdict.outstanding[:3]) + ".")
+        if verdict.state == "passing":
+            parts.append("The checks that ran all pass, but final acceptance "
+                         "is still outstanding.")
+        if verdict.legacy_note:
+            parts.append(verdict.legacy_note)
         if summary and summary != "(pending)":
             parts.append(summary)
         if last:

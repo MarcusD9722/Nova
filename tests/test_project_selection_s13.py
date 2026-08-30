@@ -587,9 +587,10 @@ async def test_the_manager_and_builder_agree_in_every_case():
             check((chosen == slug) is is_project,
                   f"{slug}: select agrees ({chosen!r})")
 
-            unknown = "don't have a project" in pb.status_text(slug).lower()
+            status = await pb.status_text(slug)
+            unknown = "don't have a project" in status.lower()
             check(unknown is not is_project,
-                  f"{slug}: status agrees ({pb.status_text(slug)[:50]!r})")
+                  f"{slug}: status agrees ({status[:50]!r})")
 
         # C. a stale pointer aimed at the identity-less directory. This is the
         #    one that used to escape: the pointer lives in memory and the

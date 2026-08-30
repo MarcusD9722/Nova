@@ -674,7 +674,8 @@ class RuntimeManager:
             name = str(args.get("name") or "").strip()
             if not name:
                 return {"projects": self._project_builder.list_projects()}
-            return {"project": name, "status": self._project_builder.status_text(name)}
+            return {"project": name,
+                    "status": await self._project_builder.status_text(name)}
 
         async def _tool_project_improve(args: dict[str, Any]) -> dict[str, Any]:
             name = str(args.get("name") or "").strip()
@@ -1513,7 +1514,8 @@ class RuntimeManager:
         if asks_current_project(t):
             current = await pb.last_active()
             if current:
-                return f"We're on {current} right now. {pb.status_text(current)}"
+                return (f"We're on {current} right now. "
+                        f"{await pb.status_text(current)}")
             return ("We're not on a particular project at the moment — name one "
                     "and I'll pick it up.")
 
@@ -1593,7 +1595,8 @@ class RuntimeManager:
                         f"we're {where}. Nothing in either project changed. "
                         "Want me to try again?")
             if chosen:
-                return f"Okay — we're on {chosen} now. {pb.status_text(chosen)}"
+                return (f"Okay — we're on {chosen} now. "
+                        f"{await pb.status_text(chosen)}")
         if not named and is_project_selection(t):
             # "Switch to the calculator project." when there is no calculator.
             # Answering it here rather than letting it fall through to ordinary
@@ -1672,7 +1675,7 @@ class RuntimeManager:
                         f"restored), or leave it exactly where it is. Which "
                         f"would you like?")
             if STATUS_WORDS_RE.search(t):
-                return pb.status_text(slug)
+                return await pb.status_text(slug)
             if RESUME_WORDS_RE.search(t) and may_mutate:
                 if pb.is_building(slug):
                     return f"I'm already working on {slug} — I'll report when it's done."
