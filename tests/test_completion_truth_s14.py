@@ -319,11 +319,113 @@ async def test_s14_1_partial_improvement():
               f"({len(completion_events('widget'))})")
 
 
+async def test_s14_a_fabricated_quote_does_not_cost_the_honest_criteria():
+    """M145: the per-item quote filter, and why dropping it loses everything.
+
+    `set_criteria` is atomic on purpose — a contract revision lands whole or
+    not at all. `_establish_contract` catches its refusal and carries on. Put
+    those two together and one hallucinated quote among three would discard
+    the two truthful criteria as well, leaving a project with NO contract:
+
+        filter present   2 criteria recorded, contract sealed
+        filter removed   0 criteria recorded, contract unsealed
+
+    Measured on both sides before this test was written. Nothing else asserts
+    the surviving-criteria half, which is the half that distinguishes "the bad
+    one was dropped" from "the whole batch was refused".
+    """
+    check.section("a fabricated quote costs only itself")
+    request = "a tracker that adds an entry and shows a total"
+    with _tmp() as td:
+        root = Path(td)
+        (root / "projects" / "trk").mkdir(parents=True)
+        mem = MemoryUnifier(root / "memory_data", enable_chroma=False)
+        await mem.initialize()
+        pb = ProjectBuilder(projects_dir=root / "projects",
+                            llm=Script(), llm_semaphore=asyncio.Semaphore(1),
+                            memory=mem)
+
+        async def fabricating_model(prompt, **kw):
+            # Two quotes the user actually wrote, one the model invented.
+            return {"criteria": [
+                {"text": "adds an entry", "origin_quote": "adds an entry",
+                 "verify_kind": "machine"},
+                {"text": "shows a total", "origin_quote": "shows a total",
+                 "verify_kind": "machine"},
+                {"text": "exports to CSV",
+                 "origin_quote": "exports the data to a CSV file",
+                 "verify_kind": "machine"},
+            ]}
+
+        pb._llm_json = fabricating_model
+        rev = await pb._establish_contract("trk", request)
+        rows = await mem.list_acceptance_criteria(project_name="trk",
+                                                  revision=rev)
+        quotes = [r["origin_quote"] for r in rows]
+
+        check(not any("CSV" in q for q in quotes),
+              f"the invented quote is not recorded ({quotes})")
+        check(any(q == "adds an entry" for q in quotes)
+              and any(q == "shows a total" for q in quotes),
+              f"and BOTH truthful criteria survive it ({quotes})")
+        check(len(rows) == 2, f"exactly the two the user asked for ({len(rows)})")
+
+        req = await mem.current_requirement(project_name="trk")
+        check(bool(req and req.get("sealed_at")),
+              "so the contract still seals, rather than being lost whole")
+
+
+async def test_s14_project_md_states_the_verdict_over_a_stale_status():
+    """M140: a guard that no production caller can currently reach.
+
+    Every call site that passes a verdict passes `status=verdict.state`, so
+    the `or status` fallback is only exercised by calls with no verdict — and
+    the mutant `shown = status` is indistinguishable through those. That makes
+    the guard an unreachable defence, which is the exact failure mode worth
+    testing directly rather than leaving decorative.
+
+    This calls the writer with a status that CONTRADICTS the verdict, which
+    production does not do, and asserts the verdict wins. It is a unit-level
+    contract on the writer, not a claim about a reachable production path.
+    """
+    check.section("PROJECT.md follows the verdict, not its caller")
+    with _tmp() as td:
+        root = Path(td)
+        (root / "projects" / "gamma").mkdir(parents=True)
+        mem = MemoryUnifier(root / "memory_data", enable_chroma=False)
+        await mem.initialize()
+        pb = ProjectBuilder(projects_dir=root / "projects",
+                            llm=Script(), llm_semaphore=asyncio.Semaphore(1),
+                            memory=mem)
+
+        rev = await pb.completion.record_request(
+            slug="gamma", request_text="a thing that works")
+        await pb.completion.set_criteria(
+            slug="gamma", revision=rev,
+            criteria=[{"text": "it works", "origin_quote": "works",
+                       "verify_kind": "machine"}])
+        verdict = await pb.completion.evaluate(slug="gamma")
+
+        # A caller that believes the project is complete, and a verdict that
+        # says otherwise. The file must not repeat the caller.
+        pb._write_project_md("gamma", brief="a thing that works",
+                             status=COMPLETE, verdict=verdict)
+        md = (root / "projects" / "gamma" / "PROJECT.md").read_text(
+            encoding="utf-8")
+        status_line = md.split("## Status", 1)[1].strip().splitlines()[0]
+        check(status_line == verdict.state,
+              f"the file states the verdict ({status_line!r})")
+        check(status_line != COMPLETE,
+              "and not the status it was handed")
+
+
 async def main() -> None:
     await test_s14_2_a_calculator_that_cannot_subtract()
     await test_s14_2b_then_subtraction_is_implemented_and_proven()
     await test_s14_3_a_program_that_crashes_every_run()
     await test_s14_1_partial_improvement()
+    await test_s14_a_fabricated_quote_does_not_cost_the_honest_criteria()
+    await test_s14_project_md_states_the_verdict_over_a_stale_status()
     check.finish()
 
 
