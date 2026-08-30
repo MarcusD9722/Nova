@@ -3567,6 +3567,15 @@ class MemoryUnifier:
             return await self._sqlite.claim_state_announcement(
                 project_name=project_name, revision=revision, state=state)
 
+    async def redeem_contract_confirmation(self, *, decision_id: str,
+                                           accepted: bool, actor: str,
+                                           channel: str) -> str | None:
+        await self.initialize()
+        async with self._write_lock:
+            return await self._sqlite.redeem_contract_confirmation(
+                decision_id=decision_id, accepted=accepted, actor=actor,
+                channel=channel)
+
     async def open_human_decision(self, *, project_name: str, criterion_id: str,
                                   revision: int, prompt: str,
                                   artifact_digest: str = "") -> str:

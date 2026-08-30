@@ -326,9 +326,26 @@ async def test_g_evidence_is_stamped_by_the_service_not_the_caller():
         check(bad and "not a recordable verdict" in bad,
               f"an invented verdict is refused ({str(bad)[:50]!r})")
 
-        missing = None
+        # Order matters here, and getting it wrong measures the wrong guard.
+        # `rev` is sealed AND current, so this meets the seal check. Creating a
+        # later revision first would make `rev` non-current and trip the
+        # "not the current requirement" guard instead — also correct, but not
+        # the rule being asserted.
+        sealed_again = None
         try:
             await w.svc.set_criteria(slug=SLUG, revision=rev, criteria=[
+                {"text": "adds two numbers", "origin_quote": "can add"}])
+        except ValueError as e:
+            sealed_again = str(e)
+        check(sealed_again and "already" in sealed_again and "sealed" in sealed_again,
+              f"a SEALED contract refuses additions outright "
+              f"({str(sealed_again)[:60]!r})")
+
+        # Now a fresh, unsealed, current revision for the origin-quote rule.
+        rev2 = await w.svc.record_request(slug=SLUG, request_text=REQUEST)
+        missing = None
+        try:
+            await w.svc.set_criteria(slug=SLUG, revision=rev2, criteria=[
                 {"text": "it should feel nice"}])
         except ValueError as e:
             missing = str(e)

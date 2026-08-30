@@ -1211,6 +1211,11 @@ class RuntimeManager:
             return ""
 
     @property
+    def completion(self):
+        """THE authoritative completion evaluator for this runtime."""
+        return self._completion
+
+    @property
     def permission_broker(self) -> PermissionBroker:
         return self._permission_broker
 

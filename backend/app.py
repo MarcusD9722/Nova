@@ -432,11 +432,13 @@ app.add_middleware(
 
 # ── Routers (Phase 0.6): domain endpoints live in backend/routers/ ───────────
 from backend.routers import autonomy as _r_autonomy  # noqa: E402
+from backend.routers import completion as _r_completion  # noqa: E402
 from backend.routers import dev as _r_dev  # noqa: E402
 from backend.routers import memory_api as _r_memory  # noqa: E402
 from backend.routers import speaker as _r_speaker  # noqa: E402
 from backend.routers import web_maps as _r_web_maps  # noqa: E402
 
+app.include_router(_r_completion.router)
 app.include_router(_r_dev.router)
 app.include_router(_r_autonomy.router)
 app.include_router(_r_memory.router)

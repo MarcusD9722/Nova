@@ -56,6 +56,10 @@ RECORDABLE = frozenset({PASSED, FAILED, HUMAN_PENDING, INCONCLUSIVE})
 #: pending-decision mechanism exists to make visible.
 USER_CHANNELS = frozenset({"chat", "ui", "voice", "api"})
 
+#: The `criterion_id` a contract-level decision carries. Not a criterion, so
+#: no evidence is ever attached to it and the evaluator never sees it.
+CONTRACT_TARGET = "__contract__"
+
 
 @dataclass(frozen=True)
 class CheckContext:
@@ -112,6 +116,17 @@ class CompletionService:
         somebody's impression of it, and a criterion without one is refused.
         """
         req = await self._requirement_at(slug, revision)
+        if req.get("sealed_at"):
+            # A seal says "these are ALL of the requirements". Measured before
+            # this guard: criteria could be added afterwards and the contract
+            # still read as sealed — and, once human confirmation existed,
+            # still read as CONFIRMED, for a contract the person never saw.
+            # Wanting more is a new requirement revision, which is the whole
+            # mechanism for wanting more.
+            raise ValueError(
+                f"the contract for {slug!r} revision {revision} is already "
+                "sealed; record a new requirement revision to change what is "
+                "being asked for")
         specs: list[dict[str, Any]] = []
         for spec in criteria:
             text = str(spec.get("text") or "").strip()
@@ -187,6 +202,98 @@ class CompletionService:
         logger.info("completion_contract_sealed", project=slug, revision=revision,
                     criteria=len(rows), mode=seal_mode)
         return [r["origin_quote"] for r in rows]
+
+    async def contract_summary(self, *, slug: str,
+                               revision: int | None = None) -> dict[str, Any]:
+        """The sealed contract, as something a person can be shown and asked
+        to confirm.
+
+        This exists because of a boundary the system cannot police. A criterion
+        may quote the request perfectly and still mean less than it: measured,
+        "the game has a score variable" quoting "score increases when a target
+        is hit" seals, passes, and COMPLETES. One broad criterion quoting a
+        three-feature request does the same. Coverage catches a clause nobody
+        quoted; nothing catches a clause quoted badly.
+
+        So the contract is made visible and confirmable instead. A confirmation
+        does not prove the criteria are semantically equivalent to the request
+        — nothing available here could — it records that a person read them and
+        said yes.
+        """
+        req = await self._memory.current_requirement(project_name=slug)
+        if req is None:
+            return {}
+        rev = int(revision if revision is not None else req["revision"])
+        rows = await self._memory.list_acceptance_criteria(
+            project_name=slug, revision=rev)
+        return {
+            "project": slug,
+            "revision": rev,
+            "request": req["request_text"],
+            "sealed": bool(req.get("sealed_at")),
+            "seal_mode": req.get("seal_mode") or "",
+            "criteria": [{"criterion_id": r["criterion_id"], "text": r["text"],
+                          "origin_quote": r["origin_quote"],
+                          "required": bool(r["required"]),
+                          "verify_kind": r["verify_kind"]} for r in rows],
+        }
+
+    async def ask_contract_confirmation(self, *, slug: str,
+                                        revision: int | None = None) -> str:
+        """Ask a person whether this contract IS what they asked for."""
+        summary = await self.contract_summary(slug=slug, revision=revision)
+        if not summary:
+            raise ValueError(f"no requirement recorded for {slug!r}")
+        if not summary["sealed"]:
+            raise ValueError(
+                f"the contract for {slug!r} revision {summary['revision']} is "
+                "not sealed; there is nothing settled to confirm")
+        lines = "; ".join(f"{c['text']} (from \"{c['origin_quote']}\")"
+                          for c in summary["criteria"])
+        did = await self._memory.open_human_decision(
+            project_name=slug, criterion_id=CONTRACT_TARGET,
+            revision=summary["revision"],
+            prompt=(f"You asked for: {summary['request']}\n"
+                    f"I will treat it as done when: {lines}\n"
+                    "Is that the right list?"),
+            artifact_digest=implementation_digest(self.project_path(slug)))
+        logger.info("contract_confirmation_asked", project=slug,
+                    revision=summary["revision"], decision=did)
+        return did
+
+    async def resolve_contract_confirmation(self, *, decision_id: str,
+                                            accepted: bool, actor: str,
+                                            channel: str) -> int:
+        """Answer a contract-confirmation question. Returns the revision.
+
+        The same rules as any human decision: the question must exist, the
+        channel must be one a person answers through, and the answer is
+        redeemable exactly once. Accepting moves the contract's provenance from
+        `auto` to `human` — a statement about who agreed the list, and nothing
+        more than that.
+        """
+        who = str(actor or "").strip()
+        if not who:
+            raise ValueError("a human decision must name who made it")
+        if channel not in USER_CHANNELS:
+            raise ValueError(
+                f"{channel!r} is not a channel a person answers through "
+                f"(expected one of {sorted(USER_CHANNELS)})")
+        pending = await self._memory.get_human_decision(decision_id=decision_id)
+        if pending is None:
+            raise ValueError(f"no such decision {decision_id!r}")
+        if pending["criterion_id"] != CONTRACT_TARGET:
+            raise ValueError(
+                f"decision {decision_id!r} is about a criterion, not a "
+                "contract; use resolve_human_decision")
+        rev = await self._memory.redeem_contract_confirmation(
+            decision_id=decision_id, accepted=accepted, actor=who,
+            channel=channel)
+        if rev is None:
+            raise ValueError(
+                f"decision {decision_id!r} was already answered "
+                f"({pending.get('resolved_at')}); an answer is redeemable once")
+        return int(rev)
 
     async def declare_scaffold(self, *, slug: str, paths: Sequence[str]) -> set[str]:
         """Record that Nova wrote these files as validation scaffolding.
@@ -371,6 +478,14 @@ class CompletionService:
         if pending is None:
             raise ValueError(f"no such decision {decision_id!r}: an acceptance "
                              "must answer a question that was actually asked")
+        if pending["criterion_id"] == CONTRACT_TARGET:
+            # A contract question has no criterion to attach evidence to.
+            # Answering it here wrote a row against "__contract__" that the
+            # evaluator never reads, so the person's answer disappeared
+            # without a trace and without an error.
+            raise ValueError(
+                f"decision {decision_id!r} asks about the whole acceptance "
+                "contract, not one criterion; use resolve_contract_confirmation")
         note = f"accepted by {who} via {channel}" if accepted else \
                f"rejected by {who} via {channel}"
         # Redemption and evidence are ONE transaction. As two, a crash between

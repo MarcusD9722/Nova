@@ -3068,6 +3068,50 @@ class SQLiteMemoryBackend:
                 raise
         return previous
 
+    async def redeem_contract_confirmation(self, *, decision_id: str,
+                                           accepted: bool, actor: str,
+                                           channel: str) -> str | None:
+        """Answer a contract-confirmation question and record the seal.
+
+        One transaction, for the same reason every other redemption is: as two,
+        a crash between them consumes the person's answer and leaves the
+        contract still reading `auto`, with no legal retry.
+
+        Returns the requirement revision confirmed, or None if the decision was
+        already answered.
+        """
+        await self.initialize()
+        now = self._now_iso()
+        async with aiosqlite.connect(self._db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "UPDATE human_decisions SET resolved_at=?, accepted=?, "
+                    "actor=?, channel=? "
+                    "WHERE decision_id=? AND resolved_at IS NULL",
+                    (now, 1 if accepted else 0, actor, channel, decision_id))
+                if int(cur.rowcount or 0) != 1:
+                    await db.execute("ROLLBACK")
+                    return None
+                cur2 = await db.execute(
+                    "SELECT project_name, revision FROM human_decisions "
+                    "WHERE decision_id=?", (decision_id,))
+                row = await cur2.fetchone()
+                if accepted:
+                    # Only the mode changes. `sealed_at` is not touched: the
+                    # contract was already sealed, and a confirmation is a
+                    # statement about its PROVENANCE, not a second sealing.
+                    await db.execute(
+                        "UPDATE project_requirements SET seal_mode='human' "
+                        "WHERE project_name=? AND revision=? "
+                        "AND sealed_at IS NOT NULL",
+                        (row[0], int(row[1])))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return str(row[1])
+
     async def open_human_decision(self, *, project_name: str, criterion_id: str,
                                   revision: int, prompt: str,
                                   artifact_digest: str = "") -> str:
