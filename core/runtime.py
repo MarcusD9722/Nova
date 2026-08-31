@@ -2318,10 +2318,16 @@ class RuntimeManager:
         # containing none of it - not the step, not the error, not the goal.
         work_context = ""
         try:
-            # ONE scope decision for both builders below. Computed here rather
-            # than twice, because the bug was them disagreeing.
-            _scope = await self._work_scope(clean_user)
+            # ONE scope decision, shared by both builders below -- but only
+            # computed when something is actually going to use it. Resolving it
+            # eagerly cost every ordinary turn a 2.3 ms project-name scan, and
+            # cost any turn containing a pronoun ("that was funny") a
+            # last-active read at 7.8 ms p50 / 64 ms p90, for an answer nobody
+            # asked for. `_UNSET` means "nothing needed it yet"; the completion
+            # builder resolves it itself if its own gate passes.
+            _scope: Any = _UNSET
             if asks_about_work(clean_user):
+                _scope = await self._work_scope(clean_user)
                 if _scope is None:
                     work_context = await self._memory.describe_work_state()
                 elif _scope:

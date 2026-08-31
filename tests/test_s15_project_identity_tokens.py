@@ -86,6 +86,44 @@ async def test_a_slug_must_be_a_whole_token():
                   f"{text!r} still resolves to {want!r} (got {got!r})")
 
 
+async def test_the_compact_path_respects_words_too():
+    """The half the first fix missed.
+
+    Slugs are also matched with all separators stripped, so "flappybird" finds
+    `flappy-bird`. That comparison was done against the WHOLE message
+    compacted, which destroys exactly the boundaries the exact and spaced paths
+    had just been taught to respect:
+
+        "unflappybirds everywhere" -> flappy-bird
+        "the notepads are cheap"   -> note-pad
+        "repackaged goods"         -> pack-age
+
+    Compacting runs of up to four consecutive WORDS keeps both directions
+    working while making the comparison an equality test rather than a
+    substring scan.
+    """
+    check.section("I40 the compact match is a word match, not a substring")
+    async with boot(default_reply="Sure.") as nova:
+        pb = nova.runtime._project_builder
+        for n in ("flappy-bird", "note-pad", "pack-age", "scone"):
+            make(nova, n)
+
+        for text in ("unflappybirds everywhere", "the notepads are cheap",
+                     "repackaged goods", "I ate scones",
+                     "she is unflappable"):
+            got = pb.known_slug_in_text(text)
+            check(got is None, f"{text!r} names no project (got {got!r})")
+
+        for text, want in (("is flappybird ok?", "flappy-bird"),
+                           ("how is flappy bird doing?", "flappy-bird"),
+                           ("my notepad is open", "note-pad"),
+                           ("the package arrived", "pack-age"),
+                           ("that's a scone", "scone")):
+            got = pb.known_slug_in_text(text)
+            check(got == want,
+                  f"{text!r} still resolves to {want!r} (got {got!r})")
+
+
 async def test_an_ordinary_question_does_not_redirect_the_turn():
     """The consequence, through the production path rather than the resolver.
 
@@ -187,6 +225,7 @@ async def test_ordinary_conversation_does_not_touch_project_state():
 
 async def main() -> None:
     await test_a_slug_must_be_a_whole_token()
+    await test_the_compact_path_respects_words_too()
     await test_an_ordinary_question_does_not_redirect_the_turn()
     await test_ordinary_conversation_does_not_touch_project_state()
     check.finish()

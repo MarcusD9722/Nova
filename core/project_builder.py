@@ -461,9 +461,34 @@ class ProjectBuilder:
         return re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])",
                          haystack) is not None
 
+    #: The compact form of every run of up to four consecutive WORDS in the
+    #: text. Compacting the whole string instead ("flappy bird" -> the entire
+    #: message with separators stripped) destroys the boundaries the exact and
+    #: spaced paths were just taught to respect, and lets a slug match inside a
+    #: longer word all over again:
+    #:
+    #:     "unflappybirds everywhere" -> flappy-bird
+    #:     "the notepads are cheap"   -> note-pad
+    #:     "repackaged goods"         -> pack-age
+    #:
+    #: Joining word RUNS keeps both directions working -- "flappy bird" and
+    #: "flappybird" both produce "flappybird" -- while "notepads" produces
+    #: "notepads" and matches nothing. Four words because the caller only
+    #: reaches this path for slugs of at most four parts.
+    @staticmethod
+    def _compact_windows(text: str, max_words: int = 4) -> set[str]:
+        words = re.findall(r"[a-z0-9]+", text)
+        out: set[str] = set()
+        for i in range(len(words)):
+            joined = ""
+            for j in range(i, min(i + max_words, len(words))):
+                joined += words[j]
+                out.add(joined)
+        return out
+
     def known_slug_in_text(self, text: str) -> str | None:
         lowered = (text or "").lower()
-        compact = re.sub(r"[^a-z0-9]", "", lowered)
+        compact = self._compact_windows(lowered)
         exact_slug: list[str] = []
         spaced_slug: list[str] = []
         compact_only: list[str] = []
@@ -485,6 +510,8 @@ class ProjectBuilder:
             # minimum length so short slugs don't match unrelated text.
             s_compact = s.replace("-", "")
             if part_count <= 4 and len(s_compact) >= 5 and s_compact in compact:
+                # `compact` is a SET of word-run compactions, so this is an
+                # equality test against whole words, not a substring scan.
                 compact_only.append(s)
         # Priority order:
         # 1) Exact hyphenated slug mention typed by the user (strongest signal)

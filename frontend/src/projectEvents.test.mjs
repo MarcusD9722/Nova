@@ -9,7 +9,7 @@
  * Run:  node src/projectEvents.test.mjs   (from frontend/)
  */
 
-import { PROJECT_REPORT_TYPES, unfinishedReport } from "./projectEvents.js";
+import { PROJECT_REPORT_TYPES, completedReport, unfinishedReport } from "./projectEvents.js";
 
 let failed = 0;
 function check(cond, label) {
@@ -96,6 +96,51 @@ console.log("\nthe hook listens for the right things");
         "project.completed still is");
   check(PROJECT_REPORT_TYPES.includes("project.error"),
         "and so is project.error");
+}
+
+console.log("\na completed build reports success, and only success");
+{
+  const built = {
+    seq: 50,
+    type: "project.completed",
+    data: {
+      project: "calc", state: "complete", mode: "build",
+      summary: "a calculator", files: ["main.py"], run: "python main.py",
+      suggestions: ["add memory"],
+    },
+  };
+  const r = completedReport(built) || { text: "", speak: "" };
+  check(completedReport(built) !== null, "produces a report");
+  check(/✅/.test(r.text), "says it is built");
+  check(r.text.includes("main.py"), "lists the files");
+  check(r.text.includes("python main.py"), "says how to run it");
+  check(r.text.includes("add memory"), "and passes on the suggestions");
+
+  // `project.completed` carries no `status` — verified against a real build's
+  // payload — so the old "needs attention" branches were unreachable. A stray
+  // one must not resurrect them.
+  const withStatus = {
+    seq: 51,
+    type: "project.completed",
+    data: { ...built.data, status: "needs attention" },
+  };
+  const r2 = completedReport(withStatus) || { text: "" };
+  check(r2.text === r.text,
+        "a stray `status` field cannot turn a completion into a warning");
+
+  const improved = {
+    seq: 52,
+    type: "project.completed",
+    data: { project: "calc", state: "complete", mode: "improve",
+            summary: "made it faster" },
+  };
+  const r3 = completedReport(improved) || { text: "" };
+  check(/could NOT verify/i.test(r3.text),
+        "an improvement says what it could not verify");
+  check(!/✅/.test(r3.text), "and does not claim a clean build");
+
+  check(completedReport({ seq: 53, type: "project.state_changed", data: {} }) === null,
+        "and it ignores state_changed, which unfinishedReport owns");
 }
 
 console.log(failed ? `\nRESULT: FAILURES (${failed})` : "\nRESULT: ALL PASS");

@@ -68,3 +68,16 @@ inside a longer word is not an identity. Violated and fixed: `one` matched
 **I43 — a request that is waiting must say what it is waiting to do.** Anything
 that lists pending decisions has to carry enough to decide, or the consumer
 guesses. Violated and fixed: `pending()` returned bare ids.
+
+**I44 — a fix must cover every path that had the defect, not the one that was
+demonstrated.** Token matching was fixed on the exact and spaced paths and left
+on the compact path, where stripping separators from both sides destroys the
+boundaries the other two had just been taught to respect. `unflappybirds` still
+resolved to `flappy-bird`. Found by auditing the fix rather than by a new
+failure.
+
+**I45 — grounding a turn must not cost a turn that needs no grounding.**
+Resolving the scope eagerly charged every ordinary message a 2.3 ms project-name
+scan, and any message containing a pronoun a 7.8 ms p50 / 64 ms p90 database
+read, for an answer nothing would use. Correct and wasteful is still a
+regression.
