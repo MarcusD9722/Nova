@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { PROJECT_REPORT_TYPES, unfinishedReport } from "../projectEvents";
 
 // Bus-event side effects extracted verbatim from App.jsx (Phase 0.6 of
 // docs/ROADMAP.md) — behavior unchanged. Each block tracks its own last-seen
@@ -24,7 +25,7 @@ export default function useNovaBusEffects({ novaEvents, appendNovaMessage, speak
     const fresh = novaEvents.filter(
       (ev) =>
         (ev.seq || 0) > lastProjectEventSeqRef.current &&
-        (ev.type === "project.completed" || ev.type === "project.error")
+        PROJECT_REPORT_TYPES.includes(ev.type)
     );
     if (!fresh.length) {
       const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
@@ -39,7 +40,16 @@ export default function useNovaBusEffects({ novaEvents, appendNovaMessage, speak
 
     fresh.forEach((ev) => {
       const d = ev.data || {};
-      if (ev.type === "project.completed") {
+      if (ev.type === "project.state_changed") {
+        // A build that stopped without completing. `project.completed` no
+        // longer fires for these (Stage 14 narrowed it to real completions),
+        // so without this the run ends in silence.
+        const report = unfinishedReport(ev);
+        if (report) {
+          appendNovaMessage(`nova-project-${ev.seq}`, report.text);
+          speakNotice(report.speak);
+        }
+      } else if (ev.type === "project.completed") {
         const files = Array.isArray(d.files) && d.files.length ? d.files.join(", ") : "";
         const suggestions =
           Array.isArray(d.suggestions) && d.suggestions.length

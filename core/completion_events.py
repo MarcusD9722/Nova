@@ -75,6 +75,13 @@ class CompletionAnnouncer:
             "state": verdict.state,
             "revision": verdict.revision,
             "reason": reason or (verdict.reasons[0] if verdict.reasons else ""),
+            # WHY THE STATE IS WHAT IT IS, kept separate from why the
+            # announcement happened. A caller-supplied reason ("build
+            # finished") describes the OCCASION and overwrites `reason`, so a
+            # consumer that wanted the explanation -- "2 required criteria are
+            # currently failing" -- was reading the occasion instead and had no
+            # way to tell the difference.
+            "state_reason": (verdict.reasons[0] if verdict.reasons else ""),
             "outstanding": [s.criterion.text for s in verdict.outstanding][:5],
             "failing": [s.criterion.text for s in verdict.failing][:5],
             "contract": verdict.seal_mode,

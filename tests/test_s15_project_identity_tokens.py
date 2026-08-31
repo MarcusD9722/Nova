@@ -134,9 +134,61 @@ async def test_an_ordinary_question_does_not_redirect_the_turn():
               f"({'leaked' if chr(39) + 'one' + chr(39) in ground else 'clean'})")
 
 
+async def test_ordinary_conversation_does_not_touch_project_state():
+    """I6, end to end: nine ordinary project names, fourteen ordinary turns.
+
+    Every one of these sentences used to name a project. "gamekeeper" was
+    `game`, "notebook" was `note`, "botany" was `bot`, "develop" was `dev`,
+    "website" was `web`, "application" was `api`... and "Is it done?" was `one`.
+    """
+    check.section("I6 unrelated conversation does not alter project state")
+    names = ["one", "cat", "api", "app", "dev", "web", "bot", "note", "game"]
+    sentences = [
+        "Is it done?",
+        "what a catastrophe that was",
+        "the application is running slowly",
+        "I'm done for today, thanks",
+        "can you develop that idea a bit more?",
+        "the website was gone when I checked",
+        "that's a scone, not a biscuit",
+        "my notebook is full",
+        "the gamekeeper called",
+        "botany is interesting",
+        "what's the capital of Canada?",
+    ]
+    async with boot(default_reply="Sure.") as nova:
+        pb = nova.runtime._project_builder
+        for n in names:
+            make(nova, n)
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="game", confidence=0.99)
+
+        start = await pb.last_active()
+        check(start == "game", f"the current project starts as game ({start})")
+
+        matched = [(t, pb.known_slug_in_text(t)) for t in sentences]
+        wrong = [(t, m) for t, m in matched if m is not None]
+        check(not wrong,
+              f"none of {len(sentences)} ordinary sentences names a project "
+              f"({wrong[:2]})")
+
+        moved = []
+        for text in sentences:
+            before = await pb.last_active()
+            await nova.brain.chat(text, conversation_id=str(uuid4()))
+            after = await pb.last_active()
+            if after != before:
+                moved.append((text, before, after))
+        check(not moved,
+              f"and no turn moved the current project ({moved[:2]})")
+        check(await pb.last_active() == "game",
+              f"which is still game ({await pb.last_active()})")
+
+
 async def main() -> None:
     await test_a_slug_must_be_a_whole_token()
     await test_an_ordinary_question_does_not_redirect_the_turn()
+    await test_ordinary_conversation_does_not_touch_project_state()
     check.finish()
 
 
