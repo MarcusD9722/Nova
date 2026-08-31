@@ -224,11 +224,67 @@ async def test_a_referential_question_keeps_stage_14s_narrow_scope():
               f"({'found' if 'failing' in g3 else g3[:70]!r})")
 
 
+async def test_goals_obey_the_same_scope_as_completion():
+    """The other half of the same question.
+
+    `describe_work_state` takes a project filter and was called without one, so
+    "is it done?" -- a question about ONE project -- carried every other
+    project's goals. Measured: a FAILED goal belonging to a project the user
+    never mentioned, sitting in the grounding for a question about a different
+    one. Completion had already been taught the difference; goals had not, and
+    two builders deciding scope independently is the defect itself.
+    """
+    check.section("I20/I39 goals and completion agree about scope")
+    async with boot(default_reply="Sure.") as nova:
+        await _project(nova, "mine")
+        await _project(nova, "theirs")
+        g_mine = await nova.memory.create_goal(
+            project_name="mine", title="the thing I am working on",
+            objective="mine")
+        g_theirs = await nova.memory.create_goal(
+            project_name="theirs", title="a totally unrelated goal",
+            objective="theirs")
+        await nova.memory.update_goal_status(goal_id=g_theirs, status="failed")
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="mine", confidence=0.99)
+
+        prompts = Prompts(nova)
+
+        # Referential: one project.
+        await nova.brain.chat("Is it done?", conversation_id=str(uuid4()))
+        one = next((p for p in prompts.seen if "goal '" in p), "")
+        check("the thing I am working on" in one,
+              "a referential question carries the current project's goal")
+        check("a totally unrelated goal" not in one,
+              f"and NOT another project's failed goal "
+              f"({'leaked' if 'unrelated' in one else 'clean'})")
+
+        # Survey: every project.
+        prompts.clear()
+        await nova.brain.chat("How is the work going?",
+                              conversation_id=str(uuid4()))
+        survey = next((p for p in prompts.seen if "goal '" in p), "")
+        check("the thing I am working on" in survey
+              and "a totally unrelated goal" in survey,
+              "a survey question carries both, which is what it asked for")
+
+        # Referential, pointing at nothing: no goals at all.
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="vanished", confidence=0.99)
+        prompts.clear()
+        await nova.brain.chat("Is it done?", conversation_id=str(uuid4()))
+        none = next((p for p in prompts.seen if "goal '" in p), "")
+        check(not none,
+              f"a question pointing at nothing carries nobody's goals "
+              f"({'still leaked' if none else 'clean'})")
+
+
 async def main() -> None:
     await test_a_general_question_cannot_omit_a_failing_project()
     await test_a_named_project_is_still_the_whole_scope()
     await test_the_general_scope_is_bounded()
     await test_a_referential_question_keeps_stage_14s_narrow_scope()
+    await test_goals_obey_the_same_scope_as_completion()
     check.finish()
 
 

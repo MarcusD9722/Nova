@@ -299,6 +299,11 @@ def _format_weather_reply(city: str, payload: dict[str, Any]) -> str:
     return f"Right now in {city}, it is {temp} degrees Fahrenheit with {description}. Humidity is {humidity}%."
 
 
+#: "the caller did not pass a scope", which is not the same as `None`
+#: ("every project"). Without this the default would silently mean survey.
+_UNSET = object()
+
+
 @dataclass
 class ChatTurnResult:
     conversation_id: UUID
@@ -1176,12 +1181,39 @@ class RuntimeManager:
     #: turn one turn into a digest of every project on the machine either.
     _COMPLETION_CONTEXT_PROJECTS = 5
 
-    async def _completion_context(self, text: str) -> str:
-        """Completion grounding for the project this turn is about.
+    async def _work_scope(self, text: str) -> list[str] | None:
+        """Which projects this turn is about. `None` means "all of them".
 
-        The project named in the message wins; otherwise the one last worked
-        on. Named beats pointer because a person who says "is the calculator
-        done?" is asking about the calculator, whatever Nova touched last.
+        THE SCOPE OF A QUESTION IS A PROPERTY OF THE QUESTION. Two context
+        builders answering the same turn cannot each decide it for themselves,
+        which is exactly what they were doing: completion described one project
+        while `describe_work_state` described every project, so "is it done?"
+        arrived at the model carrying another project's FAILED goal.
+
+          named       -> that project, and only that one
+          referential -> the current project, or NOTHING if the pointer is
+                         stale. "Is it done?" about a project that no longer
+                         exists is answered about nothing, never about
+                         whatever else happens to be lying around
+          survey      -> all of them ("how is the work going?")
+        """
+        pb = self._project_builder
+        named = pb.known_slug_in_text(text)
+        if named:
+            return [named]
+        if refers_to_one_thing(text):
+            current = await pb.last_active()
+            return [current] if current else []
+        return None
+
+    async def _completion_context(self, text: str,
+                                  scope: list[str] | None | object = _UNSET
+                                  ) -> str:
+        """Completion grounding for the projects this turn is about.
+
+        `scope` comes from `_work_scope`. It is passed in rather than
+        recomputed so that this and the goal/task summary are provably talking
+        about the same projects.
         """
         try:
             pb = self._project_builder
@@ -1194,6 +1226,8 @@ class RuntimeManager:
             if not (asks_about_work(text)
                     or (named and mentions_completion(text))):
                 return ""
+            if scope is _UNSET:
+                scope = await self._work_scope(text)
 
             # WHICH projects this answer is allowed to be about.
             #
@@ -1214,26 +1248,20 @@ class RuntimeManager:
             # across EVERY project; this one answered them about one. Two
             # context builders disagreeing about the scope of the same question
             # is the defect — not either one on its own.
-            if named:
-                slugs = [named]
-            elif refers_to_one_thing(text):
-                # "Is it done?" points at ONE thing. Stage 14 established that
-                # answering it about a project the person did not mean is a
-                # defect in its own right -- including when the pointer names a
-                # project that no longer exists, where the honest answer is
-                # about nothing at all rather than about whatever else is
-                # lying around.
+            if scope is None:
+                # A survey. Describe the same population the goal summary
+                # describes, preferring the current project, bounded so one
+                # turn does not become a digest of the whole machine. Only
+                # projects with a recorded requirement: one indexed query,
+                # rather than digesting every directory on disk.
                 current = await pb.last_active()
-                slugs = [current] if current else []
-            else:
-                current = await pb.last_active()
-                # Only projects that have a recorded requirement: one indexed
-                # query, rather than digesting every directory on disk.
                 contracted = await self._memory.projects_with_requirements(
                     limit=self._COMPLETION_CONTEXT_PROJECTS)
                 slugs = ([current] if current else []) + [
                     s for s in contracted if s != current]
                 slugs = slugs[:self._COMPLETION_CONTEXT_PROJECTS]
+            else:
+                slugs = list(scope)
             if not slugs:
                 return ""
 
@@ -2290,8 +2318,18 @@ class RuntimeManager:
         # containing none of it - not the step, not the error, not the goal.
         work_context = ""
         try:
+            # ONE scope decision for both builders below. Computed here rather
+            # than twice, because the bug was them disagreeing.
+            _scope = await self._work_scope(clean_user)
             if asks_about_work(clean_user):
-                work_context = await self._memory.describe_work_state()
+                if _scope is None:
+                    work_context = await self._memory.describe_work_state()
+                elif _scope:
+                    work_context = await self._memory.describe_work_state(
+                        project_name=_scope[0])
+                # An empty scope means the turn points at a project that is not
+                # there. Goals belonging to OTHER projects are not an answer to
+                # it, so nothing is attached.
             # A PROJECT's completion is a different question from a goal's task
             # rows, and describe_work_state cannot see it: a project with
             # acceptance criteria has no goal rows at all, so it returned "" and
@@ -2299,7 +2337,8 @@ class RuntimeManager:
             # separately, because "is the calculator ready?" is a completion
             # question and "is the kettle ready?" is not, and only the project
             # resolver can tell those apart.
-            work_context += await self._completion_context(clean_user)
+            work_context += await self._completion_context(clean_user,
+                                                           scope=_scope)
         except Exception as e:  # noqa: BLE001
             logger.debug("work_state_summary_failed", error=str(e)[:160])
 
