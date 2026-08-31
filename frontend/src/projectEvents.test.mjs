@@ -143,5 +143,115 @@ console.log("\na completed build reports success, and only success");
         "and it ignores state_changed, which unfinishedReport owns");
 }
 
+// ── the state matrix the review asked for ──────────────────────────────────
+//
+// Every completion state the evaluator can hold, plus the four ways an event
+// stream misbehaves. The property under test is one-directional and is the
+// whole point: the UI may under-claim, never over-claim. It must never present
+// a success the authoritative evaluator does not support.
+
+function stateChanged(state, extra = {}) {
+  return {
+    seq: 100,
+    type: "project.state_changed",
+    data: {
+      project: "calc", current: state, state, revision: 1, mode: "build",
+      reason: "build finished",
+      state_reason: `the evaluator says ${state}`,
+      ...extra,
+    },
+  };
+}
+
+const SUCCESS = /✅|is built/;
+
+console.log("\nevery completion state, and what the UI may claim");
+{
+  for (const state of ["idea", "planned", "scaffolded",
+                       "partially_implemented", "failing", "passing"]) {
+    const r = unfinishedReport(stateChanged(state));
+    check(r !== null, `${state}: produces a report`);
+    check(r !== null && !SUCCESS.test(r.text),
+          `${state}: does NOT claim success`);
+    check(r !== null && r.text.includes(state),
+          `${state}: names the state it is in`);
+  }
+
+  // `passing` is the trap: everything checkable passes, and it is still not
+  // complete, because a person has not confirmed what only a person can.
+  const passing = unfinishedReport(stateChanged("passing", {
+    outstanding: ["looks right on a phone"],
+  }));
+  check(passing !== null && /isn't finished/.test(passing.text),
+        "passing: says it is not finished, however well it is going");
+  check(passing !== null && passing.text.includes("looks right on a phone"),
+        "passing: and names what is still owed");
+
+  // COMPLETE is the only state that may claim success, and only through the
+  // event that means it.
+  check(unfinishedReport(stateChanged("complete")) === null,
+        "complete: produces no warning here");
+  const done = completedReport({
+    seq: 101, type: "project.completed",
+    data: { project: "calc", state: "complete", mode: "build" },
+  });
+  check(done !== null && SUCCESS.test(done.text),
+        "complete: and project.completed is where success is claimed");
+}
+
+console.log("\nstale, duplicate, missing, and post-restart events");
+{
+  // STALE: an old event still says complete while the project has moved on.
+  // The UI cannot know this from the event alone -- which is exactly why the
+  // hook filters on a seq watermark rather than trusting arrival order. What
+  // this file can assert is that a stale `state_changed` for a non-complete
+  // state never becomes a success claim.
+  const stale = unfinishedReport(stateChanged("failing", { seq: 1 }));
+  check(stale !== null && !SUCCESS.test(stale.text),
+        "stale: an old failing event still reads as a failure");
+
+  // DUPLICATE: the same event twice must produce the same message, so the
+  // hook's seq filter is the only thing that has to dedupe, and it cannot be
+  // confused by a differing render.
+  const a = unfinishedReport(stateChanged("failing"));
+  const b = unfinishedReport(stateChanged("failing"));
+  check(a.text === b.text && a.speak === b.speak,
+        "duplicate: identical payloads render identically");
+
+  // MISSING: no event at all. Nothing is claimed, which is the honest failure
+  // mode -- silence about a success is safe, silence about a failure is the
+  // bug this file exists for and is covered by the backend contract test.
+  check(unfinishedReport(null) === null && completedReport(null) === null,
+        "missing: no event produces no message");
+  check(unfinishedReport({ type: "project.state_changed" }) === null,
+        "missing: an event with no data produces no message");
+
+  // AFTER RESTART: a fresh process re-announces nothing (the durable ledger),
+  // but a replayed event can still arrive at a reconnecting UI. A replayed
+  // NON-complete state must stay non-complete.
+  const replayed = unfinishedReport(stateChanged("failing", { previous: null }));
+  check(replayed !== null && !SUCCESS.test(replayed.text),
+        "after restart: a replayed failing event is still a failure");
+}
+
+console.log("\nthe UI can never invent a success");
+{
+  // The one-directional property, stated as one assertion over everything a
+  // state_changed event can carry.
+  const invented = ["idea", "planned", "scaffolded", "partially_implemented",
+                    "failing", "passing"]
+    .map((s) => unfinishedReport(stateChanged(s, {
+      // every field that might tempt a renderer into optimism
+      run_note: "Run check passed (main.py).",
+      test_note: "Logic tests passed.",
+      summary: "a finished calculator",
+      files: ["main.py"],
+    })))
+    .filter((r) => r && SUCCESS.test(r.text));
+  check(invented.length === 0,
+        `no non-complete state renders as success, even with passing run and `
+        + `test notes attached (${invented.length} did)`);
+}
+
 console.log(failed ? `\nRESULT: FAILURES (${failed})` : "\nRESULT: ALL PASS");
 process.exit(failed ? 1 : 0);

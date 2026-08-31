@@ -455,11 +455,49 @@ class ProjectBuilder:
     #: Lookarounds rather than , because slugs contain hyphens and  sits
     #: in the middle of `flappy-bird`.
     @staticmethod
-    def _mentions_token(needle: str, haystack: str) -> bool:
+    def _mention_span(needle: str, haystack: str) -> tuple[int, int] | None:
+        """WHERE the name appears, or None. The span is what disambiguates.
+
+        Two projects can both legitimately match one message: with `cat` and
+        `cat-tracker` on disk, "open the cat tracker" matches `cat` as an exact
+        token and `cat-tracker` as a spaced phrase. Tier priority alone picked
+        `cat` -- and since a named project outranks the current one everywhere,
+        "delete the cat tracker" resolved to `cat`, a destructive command
+        aimed at the wrong project.
+
+        Length alone is not the answer either: it would break the case tier
+        priority exists for. "flappy-bird is still frozen" must resolve to
+        `flappy-bird`, not to a project called `still-frozen` whose spaced form
+        also appears -- and `still-frozen` is the longer name.
+
+        The two cases differ in whether the matches OVERLAP. `cat` sits inside
+        the span `cat tracker` occupies; `still frozen` sits somewhere else in
+        the sentence entirely. So the span decides, and tier priority still
+        decides between candidates that do not overlap.
+        """
         if not needle:
-            return False
-        return re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])",
-                         haystack) is not None
+            return None
+        m = re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])",
+                      haystack)
+        return (m.start(), m.end()) if m else None
+
+    @classmethod
+    def _mentions_token(cls, needle: str, haystack: str) -> bool:
+        return cls._mention_span(needle, haystack) is not None
+
+    @staticmethod
+    def _drop_covered(cands: list[tuple[str, tuple[int, int]]]
+                      ) -> list[str]:
+        """Remove any name whose mention sits INSIDE another name's mention."""
+        keep: list[str] = []
+        for slug, (lo, hi) in cands:
+            covered = any(
+                other != slug and o_lo <= lo and hi <= o_hi
+                and (o_hi - o_lo) > (hi - lo)
+                for other, (o_lo, o_hi) in cands)
+            if not covered:
+                keep.append(slug)
+        return keep
 
     #: The compact form of every run of up to four consecutive WORDS in the
     #: text. Compacting the whole string instead ("flappy bird" -> the entire
@@ -489,20 +527,22 @@ class ProjectBuilder:
     def known_slug_in_text(self, text: str) -> str | None:
         lowered = (text or "").lower()
         compact = self._compact_windows(lowered)
-        exact_slug: list[str] = []
-        spaced_slug: list[str] = []
+        exact_slug: list[tuple[str, tuple[int, int]]] = []
+        spaced_slug: list[tuple[str, tuple[int, int]]] = []
         compact_only: list[str] = []
         for s in self.list_projects():
             part_count = len([p for p in s.split("-") if p])
-            if self._mentions_token(s, lowered):
-                exact_slug.append(s)
+            span = self._mention_span(s, lowered)
+            if span is not None:
+                exact_slug.append((s, span))
                 continue
             # Very long slugs (many hyphen-separated words) are often just
             # sentence-like artifacts from earlier routing mistakes. Avoid
             # treating those as a spaced phrase match inside normal prose.
-            if part_count <= 6 and self._mentions_token(s.replace("-", " "),
-                                                         lowered):
-                spaced_slug.append(s)
+            spaced = (self._mention_span(s.replace("-", " "), lowered)
+                      if part_count <= 6 else None)
+            if spaced is not None:
+                spaced_slug.append((s, spaced))
                 continue
             # Slugs are single mashed-together words ("flappybird") but users
             # naturally type them with spaces ("flappy bird") — compare with
@@ -519,10 +559,17 @@ class ProjectBuilder:
         # 3) Compact fuzzy match ("flappybird")
         # This prevents complaint text from outranking an explicitly named
         # project, e.g. "flappy-bird is still frozen...".
-        if exact_slug:
-            return max(exact_slug, key=len)
-        if spaced_slug:
-            return max(spaced_slug, key=len)
+        # A name that appears INSIDE another name's mention loses to it,
+        # whichever tier each matched in: "the cat tracker" is one mention, not
+        # two. Candidates that matched somewhere else in the sentence are
+        # untouched, so tier priority still settles those.
+        surviving = self._drop_covered(exact_slug + spaced_slug)
+        exact = [s for s, _ in exact_slug if s in surviving]
+        spaced = [s for s, _ in spaced_slug if s in surviving]
+        if exact:
+            return max(exact, key=len)
+        if spaced:
+            return max(spaced, key=len)
         # Longest compact match still wins among fuzzy-only candidates.
         return max(compact_only, key=len) if compact_only else None
 
