@@ -24,7 +24,7 @@ from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.completion import STATES
 from core.intent import (asks_about_work, mentions_completion,
-                         is_question,
+                         is_question, refers_to_one_thing,
                          is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
@@ -1171,6 +1171,11 @@ class RuntimeManager:
     def society(self) -> AgentSociety:
         return self._society
 
+    #: How many projects a GENERAL work question may describe. A question about
+    #: "the work" should not silently omit a failing project, and should not
+    #: turn one turn into a digest of every project on the machine either.
+    _COMPLETION_CONTEXT_PROJECTS = 5
+
     async def _completion_context(self, text: str) -> str:
         """Completion grounding for the project this turn is about.
 
@@ -1189,23 +1194,68 @@ class RuntimeManager:
             if not (asks_about_work(text)
                     or (named and mentions_completion(text))):
                 return ""
-            slug = named or await pb.last_active()
-            if not slug:
+
+            # WHICH projects this answer is allowed to be about.
+            #
+            # A named project is the whole scope: "is the calculator done?" is
+            # about the calculator. But a GENERAL question — "how is the work
+            # going?" — is not about one project, and treating it as though it
+            # were is how a failing project became invisible. Measured: two
+            # projects, one with a goal marked done and one FAILING its
+            # acceptance criteria, produced an answer prompt containing
+            #
+            #     - goal 'ship the alpha feature' (alpha): done, revision 0
+            #
+            # and nothing whatsoever about the project that was failing,
+            # because completion described only `last_active`. Nova said
+            # "Everything looks fine."
+            #
+            # `describe_work_state` already answers general work questions
+            # across EVERY project; this one answered them about one. Two
+            # context builders disagreeing about the scope of the same question
+            # is the defect — not either one on its own.
+            if named:
+                slugs = [named]
+            elif refers_to_one_thing(text):
+                # "Is it done?" points at ONE thing. Stage 14 established that
+                # answering it about a project the person did not mean is a
+                # defect in its own right -- including when the pointer names a
+                # project that no longer exists, where the honest answer is
+                # about nothing at all rather than about whatever else is
+                # lying around.
+                current = await pb.last_active()
+                slugs = [current] if current else []
+            else:
+                current = await pb.last_active()
+                # Only projects that have a recorded requirement: one indexed
+                # query, rather than digesting every directory on disk.
+                contracted = await self._memory.projects_with_requirements(
+                    limit=self._COMPLETION_CONTEXT_PROJECTS)
+                slugs = ([current] if current else []) + [
+                    s for s in contracted if s != current]
+                slugs = slugs[:self._COMPLETION_CONTEXT_PROJECTS]
+            if not slugs:
                 return ""
-            legacy = ""
-            try:
-                rec = await self._memory.get_latest_fact(f"project:{slug}",
-                                                         "status")
-                value = str(getattr(rec, "value", "") or "")
-                # A pre-Stage-14 status string is history. Passing it in lets
-                # the verdict say so rather than leaving the model to find a
-                # stale "complete" elsewhere and believe it.
-                if value and value not in STATES:
-                    legacy = value
-            except Exception:  # noqa: BLE001
+
+            out: list[str] = []
+            for slug in slugs:
                 legacy = ""
-            return await self._completion.describe_for_chat(slug=slug,
-                                                            legacy_status=legacy)
+                try:
+                    rec = await self._memory.get_latest_fact(f"project:{slug}",
+                                                             "status")
+                    value = str(getattr(rec, "value", "") or "")
+                    # A pre-Stage-14 status string is history. Passing it in
+                    # lets the verdict say so rather than leaving the model to
+                    # find a stale "complete" elsewhere and believe it.
+                    if value and value not in STATES:
+                        legacy = value
+                except Exception:  # noqa: BLE001
+                    legacy = ""
+                # Returns "" for a project with nothing recorded, so a project
+                # that was merely scaffolded adds no tokens.
+                out.append(await self._completion.describe_for_chat(
+                    slug=slug, legacy_status=legacy))
+            return "".join(o for o in out if o)
         except Exception as e:  # noqa: BLE001
             logger.debug("completion_context_failed", error=str(e)[:160])
             return ""

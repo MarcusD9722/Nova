@@ -232,6 +232,32 @@ def mentions_completion(text: str) -> bool:
     return bool(_COMPLETION_WORDS.search(text or ""))
 
 
+#: Words that can only be POINTING at something already in play. Their presence
+#: is what separates "is it done?" from "how is the work going?" — the first is
+#: a question about one thing and has a wrong answer if it describes a different
+#: project; the second is a question about the work and has a wrong answer if it
+#: leaves a failing project out.
+_REFERENTIAL_RE = re.compile(
+    r"\b(it|its|it's|that|this|they|them|those|these)\b", re.IGNORECASE)
+
+
+def refers_to_one_thing(text: str) -> bool:
+    """Is this turn pointing at a particular thing rather than surveying?
+
+    Used only to decide the SCOPE of the completion record attached to an
+    answer. Stage 14 established that "is it done?" must never be answered
+    about a project the person did not mean — including when the current
+    project no longer exists, where the honest answer is about nothing at all.
+    Stage 15 found the other half: "how is the work going?" answered about one
+    project omitted a different project that was failing.
+
+    Both are true, and they are different questions. A pronoun is the cheapest
+    honest signal that a question has one subject already in play; nothing here
+    tries to work out WHICH thing it points at, only that it points.
+    """
+    return bool(_REFERENTIAL_RE.search(text or ""))
+
+
 def asks_about_work(text: str) -> bool:
     """Is this turn about the state of Nova's own work?
 

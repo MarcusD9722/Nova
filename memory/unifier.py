@@ -3515,6 +3515,10 @@ class MemoryUnifier:
         await self.initialize()
         return await self._sqlite.current_requirement(project_name=project_name)
 
+    async def projects_with_requirements(self, *, limit: int = 50) -> list[str]:
+        await self.initialize()
+        return await self._sqlite.projects_with_requirements(limit=limit)
+
     async def seal_requirement(self, *, project_name: str, revision: int,
                                seal_mode: str = "auto") -> bool:
         await self.initialize()

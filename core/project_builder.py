@@ -440,6 +440,27 @@ class ProjectBuilder:
         """Projects, by the ONE definition in `core.project_names`."""
         return list_project_dirs(self._projects_dir)
 
+    #: A slug mention has to be a WHOLE token, not a run of letters inside a
+    #: longer word. `"one" in "Is it done?"` is true, and it made a project
+    #: called `one` the subject of a question that never mentioned it -- which
+    #: then outranked the current project everywhere this resolver is used:
+    #: selection, resume, status, mutation and the completion record attached
+    #: to an answer. Measured, with projects `one` and `cat` on disk:
+    #:
+    #:     "Is it done?"             -> one     (d-ONE)
+    #:     "what a catastrophe"      -> cat     (CAT-astrophe)
+    #:     "the application is slow" -> cat     (appli-CAT-ion)
+    #:     "that's a scone"          -> one     (sc-ONE)
+    #:
+    #: Lookarounds rather than , because slugs contain hyphens and  sits
+    #: in the middle of `flappy-bird`.
+    @staticmethod
+    def _mentions_token(needle: str, haystack: str) -> bool:
+        if not needle:
+            return False
+        return re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])",
+                         haystack) is not None
+
     def known_slug_in_text(self, text: str) -> str | None:
         lowered = (text or "").lower()
         compact = re.sub(r"[^a-z0-9]", "", lowered)
@@ -448,13 +469,14 @@ class ProjectBuilder:
         compact_only: list[str] = []
         for s in self.list_projects():
             part_count = len([p for p in s.split("-") if p])
-            if s in lowered:
+            if self._mentions_token(s, lowered):
                 exact_slug.append(s)
                 continue
             # Very long slugs (many hyphen-separated words) are often just
             # sentence-like artifacts from earlier routing mistakes. Avoid
             # treating those as a spaced phrase match inside normal prose.
-            if part_count <= 6 and s.replace("-", " ") in lowered:
+            if part_count <= 6 and self._mentions_token(s.replace("-", " "),
+                                                         lowered):
                 spaced_slug.append(s)
                 continue
             # Slugs are single mashed-together words ("flappybird") but users
