@@ -61,6 +61,7 @@ __all__ = [
     "REMOVAL_WHOLE_PROJECT",
     "REMOVAL_INSIDE_PROJECT",
     "REMOVAL_AMBIGUOUS",
+    "removal_object_tokens",
     "REMOVAL_UNSUPPORTED",
 ]
 
@@ -698,6 +699,29 @@ def _head_and_tokens(obj: str) -> tuple[str, list[str]]:
     tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9'-]*", (obj or "").lower())
               if t not in _EMPTY_OBJECT]
     return (tokens[-1] if tokens else ""), tokens
+
+
+def removal_object_tokens(text: str) -> list[list[str]]:
+    """The content tokens of each thing a removal verb is acting on.
+
+    `classify_removal` answers WHAT KIND of removal this is. This answers WHAT
+    IT NAMES, which the caller needs for a question the classifier deliberately
+    cannot answer on its own: whether the named thing could be a project other
+    than the current one. The classifier is given one slug and knows nothing
+    about the rest of the machine, and that is the right shape for it -- so the
+    ambiguity check lives at the call site, which does know.
+
+    Returns one token list per removal verb found, empty lists dropped.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    out: list[list[str]] = []
+    for m in _REMOVAL_VERB_RE.finditer(raw):
+        _, tokens = _head_and_tokens(_object_of(raw, m))
+        if tokens:
+            out.append(list(tokens))
+    return out
 
 
 def classify_removal(text: str, *, slug: str = "") -> str:

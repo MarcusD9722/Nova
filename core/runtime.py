@@ -1593,6 +1593,33 @@ class RuntimeManager:
         return ("I don't have any projects yet — tell me what to build and "
                 "I'll start one.")
 
+    def _removal_names_another_project(self, text: str, slug: str) -> list[str]:
+        """Projects OTHER than `slug` whose name contains what is being removed.
+
+        A removal object counts as confusable when its tokens are a subset of
+        another project's slug tokens: "tracker" against `bug-tracker` does,
+        "login button" against `login-page` does not. Subset rather than
+        substring, so this cannot repeat the defect it is guarding against.
+        """
+        from core.project_intent import removal_object_tokens
+
+        current = {p for p in str(slug or "").split("-") if p}
+        hits: list[str] = []
+        for tokens in removal_object_tokens(text):
+            want = {w for t in tokens for w in str(t).lower().split("-") if w}
+            if not want:
+                continue
+            for other in self._project_builder.list_projects():
+                if other == slug:
+                    continue
+                if want <= {p for p in other.split("-") if p} and other not in hits:
+                    hits.append(other)
+        # A thing that is only ever a part of the CURRENT project's own name is
+        # an edit, not another project. That is Stage 13B's rule and it stays.
+        if not hits and current:
+            return []
+        return hits
+
     async def _project_prepass(self, text: str,
                                conversation_id: Any = None) -> str | None:
         """Detect project build/status/resume/improve intents and act on them."""
@@ -1851,6 +1878,34 @@ class RuntimeManager:
                     return (f"I want to be sure before I touch anything — do you "
                             f"mean delete the whole '{slug}' project, or remove "
                             f"something inside it? Tell me which and I'll do it.")
+
+                # AN OBJECT THAT COULD BE ANOTHER PROJECT.
+                #
+                # `classify_removal` is given one slug and knows nothing about
+                # the rest of the machine, so it reads "delete tracker" as a
+                # thing inside the current project -- correctly, by its own
+                # rule, which exists because "bird" must not mean flappy-bird.
+                # But with `cat-tracker` current and `bug-tracker` also on
+                # disk, "delete tracker" names a component of BOTH, and Nova
+                # answered "working on those improvements to cat-tracker" and
+                # started editing it. Measured: project.started fired on a
+                # project the person may well have been asking to delete.
+                #
+                # The rule the file already states two paragraphs up is the
+                # one that settles it: an uncertain destructive intent performs
+                # no side effect at all. Narrow on purpose -- it fires only
+                # when the named thing is a token-subset of some OTHER
+                # project's name, so a component of the CURRENT project's own
+                # name stays an inside-project edit and Stage 13B's rule is
+                # untouched.
+                confusable = self._removal_names_another_project(t, slug)
+                if confusable:
+                    logger.info("project_removal_confusable", slug=slug,
+                                candidates=confusable[:3])
+                    others = ", ".join(f"'{c}'" for c in confusable[:3])
+                    return (f"I'd rather ask than guess: do you mean the "
+                            f"{others} project, or something inside "
+                            f"'{slug}'? Tell me which and I'll do it.")
 
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
