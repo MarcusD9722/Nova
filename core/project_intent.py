@@ -181,9 +181,12 @@ _DELIBERATIVE_RE = re.compile(
 #: Only a clause that CLOSES the sentence is the speaker qualifying their
 #: own request.
 _TRAILING_DEFERRAL_RE = re.compile(
-    r"(?:,|;|-)?\s*(?:but|though|although)?\s*"
-    r"\b(?:not|no)\s+(?:just\s+)?yet"
-    r"(?:\s+(?:though|however))?\s*[.!?]?\s*$",
+    r"(?:,|;|:|-)?\s*(?:but|though|although|however)?\s*"
+    r"\bnot\s+(?:just\s+)?"
+    r"(?:yet|(?:right\s+)?now|for\s+now|at\s+the\s+moment|"
+    r"for\s+the\s+moment|for\s+the\s+time\s+being|"
+    r"until\s+later|till\s+later|until\s+then)"
+    r"(?:\s*,?\s*(?:though|however))?\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
 
@@ -841,6 +844,18 @@ def defers_a_change(text: str) -> bool:
                 or _TRAILING_DEFERRAL_RE.search(raw))
 
 
+#: "No, ..." / "Nope — ..." / "Nah, ...": a correction opener. Only ever
+#: stripped inside `carries_a_proposal`, where the sentence has already
+#: been refused authorisation and the remaining question is what it
+#: proposes. It is NOT a preamble in general -- "No, I was not
+#: complaining." must keep failing, and it does, because what is left of
+#: it is not an instruction either.
+_CORRECTION_OPENER_RE = re.compile(
+    r"^(?:no|nope|nah|not\s+that)\s*[,.;:-]+\s*",
+    re.IGNORECASE,
+)
+
+
 def carries_a_proposal(text: str) -> bool:
     """Does this turn say WHAT to change, or only WHEN NOT to?
 
@@ -889,8 +904,19 @@ def carries_a_proposal(text: str) -> bool:
     # the user had not deferred it", so any clause that does the deferring has
     # to go -- otherwise the re-check trips over the very deferral being
     # stripped and every deferred proposal reads as no proposal at all.
+    # BOTH deferral forms come out before the grammar is applied. The
+    # docstring's rule is "a sentence that WOULD have authorised the change if
+    # the user had not deferred it", so any clause that does the deferring has
+    # to go -- otherwise the re-check trips over the very deferral being
+    # stripped and every deferred proposal reads as no proposal at all.
     rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw)
     rest = _TRAILING_DEFERRAL_RE.sub(" ", rest).strip().rstrip(",;-").strip()
+    # ...and so does a leading correction opener. "No, add a parallax
+    # background instead" proposes a parallax background; the grammar is
+    # anchored at the start of the sentence, so without this the "No," hides
+    # the instruction behind it and the correction is silently dropped --
+    # leaving the plan it was correcting still approvable.
+    rest = _CORRECTION_OPENER_RE.sub("", rest, count=1).strip()
     if not rest:
         return False
     return bool(authorize_project_mutation(rest, complaint=False).allowed)
