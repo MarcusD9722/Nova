@@ -32,6 +32,7 @@ from core.project_intent import (
     asks_current_project,
     classify_removal,
     REMOVAL_AMBIGUOUS,
+    REMOVAL_INSIDE_PROJECT,
     REMOVAL_UNSUPPORTED,
     REMOVAL_WHOLE_PROJECT,
     approves_without_naming_a_change,
@@ -1861,6 +1862,39 @@ class RuntimeManager:
                 # authoritative operation is the only thing allowed to remove a
                 # project; this pre-pass may not do it conversationally.
                 removal = classify_removal(t, slug=slug)
+
+                # A BARE COMMON WORD THAT HAPPENS TO BE A PROJECT NAME.
+                #
+                # "delete the sidebar", said while working on `blog`, with a
+                # project called `sidebar` also on disk. The name resolver finds
+                # `sidebar` (it is a real project and the word is right there),
+                # named beats pointer as it must, and the classifier -- now
+                # asked about `sidebar` rather than about `blog` -- says WHOLE
+                # PROJECT. Measured: a permission request to delete an entire
+                # project, from a sentence that most plausibly meant "take the
+                # sidebar out of my blog". Classified against `blog` the very
+                # same words are an inside-project edit.
+                #
+                # Only for a name that is ONE bare word. `bug-tracker` and
+                # "bug tracker" name an identity and go straight to the gated
+                # tool as before; `sidebar` is a common noun that a person
+                # could equally be pointing at inside the thing they are
+                # working on. And only when it is not the project already in
+                # hand -- "delete the sidebar" while ON sidebar means the
+                # project, and nothing here interferes.
+                current_slug = await pb.last_active()
+                if (removal == REMOVAL_WHOLE_PROJECT and slug
+                        and current_slug and slug != current_slug
+                        and "-" not in slug
+                        and classify_removal(t, slug=current_slug)
+                        == REMOVAL_INSIDE_PROJECT):
+                    logger.info("project_removal_bare_word_ambiguous",
+                                named=slug, current=current_slug)
+                    return (f"I'd rather ask than guess: do you mean delete "
+                            f"the whole '{slug}' project, or take the {slug} "
+                            f"out of '{current_slug}'? Tell me which and I'll "
+                            f"do it.")
+
                 if removal == REMOVAL_WHOLE_PROJECT:
                     # The authoritative operation is the only thing allowed to
                     # remove a project, and it lives behind an admin-tier
