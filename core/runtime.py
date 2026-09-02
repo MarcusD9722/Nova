@@ -1720,7 +1720,8 @@ class RuntimeManager:
             # e88104c, "Don't build it yet." replaced a pending parallax
             # background and a later "Go ahead." ran those words.
             is_proposal = (reason == "no affirmative instruction"
-                           or (reason == "vetoed: prohibition"
+                           or (reason in ("vetoed: prohibition",
+                                          "vetoed: deferral")
                                and defers_a_change(t)
                                and carries_a_proposal(t)))
             if is_proposal and in_play:

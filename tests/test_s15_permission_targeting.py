@@ -40,7 +40,7 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 
 from harness import Checks, boot, run  # noqa: E402
 
-from core.event_bus import BUS  # noqa: E402
+from s15_bus import Recorder  # noqa: E402
 
 check = Checks()
 
@@ -159,16 +159,16 @@ async def test_two_live_requests_are_told_apart_and_only_one_runs():
             # The other is left to time out on its own, which is the point:
             # answering one question is not answering both.
 
-        before = len(BUS.recent(600))
-        await asyncio.gather(
-            nova.brain.chat("Delete the project proj-goes",
-                            conversation_id=str(uuid4())),
-            nova.brain.chat("Delete the project proj-keep",
-                            conversation_id=str(uuid4())),
-            approve_only_the_doomed_one())
-        new = BUS.recent(600)[before:]
-
-        asked = [e for e in new if e.type == "permission.requested"]
+        with Recorder() as rec:
+            await asyncio.gather(
+                nova.brain.chat("Delete the project proj-goes",
+                                conversation_id=str(uuid4())),
+                nova.brain.chat("Delete the project proj-keep",
+                                conversation_id=str(uuid4())),
+                approve_only_the_doomed_one())
+            asked = rec.of("permission.requested")
+            expired_outcomes = [str(e.data.get("outcome"))
+                                for e in rec.of("permission.expired")]
         check(len(asked) == 2, f"two requests were raised ({len(asked)})")
         check(sorted(picked.values()) == ["proj-goes", "proj-keep"],
               f"and the two live requests named DIFFERENT targets ({picked})")
@@ -178,11 +178,9 @@ async def test_two_live_requests_are_told_apart_and_only_one_runs():
         check((keep / "PROJECT.md").exists(),
               "and the one nobody approved is still on disk")
 
-        expired = [str(e.data.get("outcome")) for e in new
-                   if e.type == "permission.expired"]
-        check(expired == ["timeout"],
+        check(expired_outcomes == ["timeout"],
               f"exactly one request timed out, and it ended as a timeout "
-              f"({expired})")
+              f"({expired_outcomes})")
         check(broker.pending() == [],
               f"nothing is left waiting ({broker.pending()})")
 

@@ -40,7 +40,7 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 
 from harness import Checks, boot, run  # noqa: E402
 
-from core.event_bus import BUS  # noqa: E402
+from s15_bus import Recorder  # noqa: E402
 
 check = Checks()
 
@@ -135,20 +135,26 @@ async def observe(nova, text: str, *, slugs: list[str] | None = None) -> Observe
         return await real_exec(call, *a, **k)
 
     pb._build, pb._improve, router.execute = spy_build, spy_improve, spy_exec
-    n0 = len(BUS.recent(900))
+    # A real subscription. `BUS.recent(900)` reads a 100-deep deque, so a
+    # position watermark into it stops meaning anything once a build publishes
+    # more than a hundred events -- and "no permission was requested" would
+    # then be a statement about the wrong window.
+    rec = Recorder()
+    rec.__enter__()
     try:
         res = await nova.brain.chat(text, conversation_id=str(uuid4()))
         obs.reply = str(res.assistant_text)
         for _ in range(100):
+            rec.drain()
             if not any(pb.is_building(p) for p in pb.list_projects()):
                 break
             await asyncio.sleep(0.05)
     finally:
         pb._build, pb._improve, router.execute = real_build, real_improve, real_exec
+        rec.__exit__()
 
-    new = BUS.recent(900)[n0:]
-    obs.started = [e for e in new if e.type == "project.started"]
-    obs.permission = [e for e in new if e.type == "permission.requested"]
+    obs.started = rec.of("project.started")
+    obs.permission = rec.of("permission.requested")
     obs.files_after = digest_tree(nova.projects_dir)
     for slug in watch:
         obs.completion_after[slug] = (

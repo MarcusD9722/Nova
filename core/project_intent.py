@@ -162,8 +162,38 @@ _DELIBERATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A TRAILING deferral clause: "..., but not yet.", "..., not yet though."
+#:
+#: `_DEFERRED_PROHIBITION_RE` needs a negated imperative ("don't change it
+#: yet"), so a bare trailing "not yet" was invisible and the sentence was
+#: treated as an ordinary authorised instruction. Measured: "Actually make
+#: the bird fall slower instead, not yet though." edited the project
+#: immediately, having been told not to.
+#:
+#: DELIBERATELY ANCHORED AT THE END. "not yet" far more often describes the
+#: WORLD than the timing of the request, and reading those as deferrals
+#: would refuse work that was actually asked for:
+#:
+#:     "The score is not showing yet, add it."    an instruction, now
+#:     "It is not done yet, keep going."          an instruction, now
+#:     "Make it slower, but not yet."             a deferral
+#:
+#: Only a clause that CLOSES the sentence is the speaker qualifying their
+#: own request.
+_TRAILING_DEFERRAL_RE = re.compile(
+    r"(?:,|;|-)?\s*(?:but|though|although)?\s*"
+    r"\b(?:not|no)\s+(?:just\s+)?yet"
+    r"(?:\s+(?:though|however))?\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
 _VETOES = (
     ("prohibition", _PROHIBITION_RE),
+    # A deferral is not a prohibition: it wants the change, later. It gets its
+    # own name so the refusal reason says which one refused, and so the caller
+    # can turn it into a pending proposal rather than dropping it.
+    ("deferral", _TRAILING_DEFERRAL_RE),
     ("denial", _DENIAL_RE),
     ("retrospective", _RETROSPECTIVE_RE),
     ("self_target", _SELF_TARGET_RE),
@@ -800,8 +830,15 @@ def defers_a_change(text: str) -> bool:
     it wants it not to happen. Only the first may become a pending proposal, and
     the qualifier has to modify the PROHIBITION rather than merely appear
     somewhere in the sentence.
+
+    Two shapes qualify. A negated imperative with a time qualifier ("don't
+    change anything yet"), and a trailing clause that qualifies the request the
+    speaker just made ("..., but not yet"). The second was missing, and a
+    sentence carrying it was executed immediately.
     """
-    return bool(_DEFERRED_PROHIBITION_RE.search((text or "").strip()))
+    raw = (text or "").strip()
+    return bool(_DEFERRED_PROHIBITION_RE.search(raw)
+                or _TRAILING_DEFERRAL_RE.search(raw))
 
 
 def carries_a_proposal(text: str) -> bool:
@@ -847,7 +884,13 @@ def carries_a_proposal(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return False
-    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw).strip()
+    # BOTH deferral forms come out before the grammar is applied. The
+    # docstring's rule is "a sentence that WOULD have authorised the change if
+    # the user had not deferred it", so any clause that does the deferring has
+    # to go -- otherwise the re-check trips over the very deferral being
+    # stripped and every deferred proposal reads as no proposal at all.
+    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw)
+    rest = _TRAILING_DEFERRAL_RE.sub(" ", rest).strip().rstrip(",;-").strip()
     if not rest:
         return False
     return bool(authorize_project_mutation(rest, complaint=False).allowed)

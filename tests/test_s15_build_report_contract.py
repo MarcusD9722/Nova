@@ -43,7 +43,7 @@ os.environ.setdefault("NOVA_PROJECT_LOGIC_TESTS", "0")
 from harness import Checks, boot, run  # noqa: E402
 
 from core.completion import COMPLETE  # noqa: E402
-from core.event_bus import BUS  # noqa: E402
+from s15_bus import Recorder  # noqa: E402
 
 check = Checks()
 
@@ -85,19 +85,19 @@ def script(nova, code: str) -> None:
     nova.llm.rules.insert(0, nova.llm.rules.pop())
 
 
-def events_for(new, slug: str, etype: str) -> list:
-    return [e for e in new
-            if e.type == etype and str(e.data.get("project") or "") == slug]
+def events_for(rec, slug: str, etype: str) -> list:
+    return rec.for_project(etype, slug)
 
 
 async def test_a_failed_build_tells_the_ui_something():
     check.section("I19/I32 a build that fails does not finish in silence")
     async with boot(default_reply="Sure.") as nova:
         script(nova, ONLY_ADD)
-        before = len(BUS.recent(900))
-        await nova.runtime._project_builder._build(
-            "calc", "a calculator that can add and subtract")
-        new = BUS.recent(900)[before:]
+        with Recorder() as rec:
+            await nova.runtime._project_builder._build(
+                "calc", "a calculator that can add and subtract")
+            rec.drain()
+        new = rec
 
         verdict = await nova.runtime.completion.evaluate(slug="calc")
         check(verdict.state != COMPLETE,
@@ -133,9 +133,8 @@ async def test_a_failed_build_tells_the_ui_something():
 
         # The event the UI listens for exists, and carries enough to write an
         # honest sentence without asking the backend anything else.
-        reportable = [e for e in new if e.type in UI_REPORT_TYPES
-                      and str(e.data.get("project") or "") == "calc"
-                      and e.type != "project.progress"]
+        reportable = [e for t in UI_REPORT_TYPES if t != "project.progress"
+                      for e in new.for_project(t, "calc")]
         check(bool(reportable),
               f"so the UI has something to report ({[e.type for e in reportable]})")
 
@@ -144,10 +143,11 @@ async def test_a_successful_build_still_uses_project_completed():
     check.section("the good path is unchanged")
     async with boot(default_reply="Sure.") as nova:
         script(nova, BOTH)
-        before = len(BUS.recent(900))
-        await nova.runtime._project_builder._build(
-            "calc2", "a calculator that can add and subtract")
-        new = BUS.recent(900)[before:]
+        with Recorder() as rec:
+            await nova.runtime._project_builder._build(
+                "calc2", "a calculator that can add and subtract")
+            rec.drain()
+        new = rec
 
         verdict = await nova.runtime.completion.evaluate(slug="calc2")
         check(verdict.state == COMPLETE,

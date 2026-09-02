@@ -47,7 +47,7 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 
 from harness import Checks, boot, run  # noqa: E402
 
-from core.event_bus import BUS  # noqa: E402
+from s15_bus import Recorder  # noqa: E402
 
 check = Checks()
 
@@ -64,18 +64,23 @@ def seed(nova, name: str) -> Path:
 
 
 async def turn(nova, text: str) -> tuple[str, list, list]:
-    """One real turn. Returns (reply, project.started, permission.requested)."""
-    n0 = len(BUS.recent(800))
-    res = await nova.brain.chat(text, conversation_id=str(uuid4()))
-    new = BUS.recent(800)[n0:]
-    for _ in range(80):
-        pb = nova.runtime._project_builder
-        if not any(pb.is_building(p) for p in pb.list_projects()):
-            break
-        await asyncio.sleep(0.05)
-    return (str(res.assistant_text),
-            [e for e in new if e.type == "project.started"],
-            [e for e in new if e.type == "permission.requested"])
+    """One real turn. Returns (reply, project.started, permission.requested).
+
+    A real subscription, not `BUS.recent()[n:]`: the history deque holds 100
+    events and a build publishes more than that, so the slice selects the
+    wrong window exactly when the test matters most.
+    """
+    pb = nova.runtime._project_builder
+    with Recorder() as rec:
+        res = await nova.brain.chat(text, conversation_id=str(uuid4()))
+        for _ in range(80):
+            rec.drain()
+            if not any(pb.is_building(p) for p in pb.list_projects()):
+                break
+            await asyncio.sleep(0.05)
+        return (str(res.assistant_text),
+                rec.of("project.started"),
+                rec.of("permission.requested"))
 
 
 async def test_a_removal_that_could_mean_another_project_asks():
