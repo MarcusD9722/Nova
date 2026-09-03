@@ -268,6 +268,92 @@ async def test_the_api_and_events_do_not_confuse_the_two_words():
               f"and carries no `state` ({sorted(goals[0])})")
 
 
+async def test_agreement_adds_no_second_sentence():
+    """The fix must not make every answer noisier.
+
+    When both axes agree there is nothing to disambiguate, and a second
+    sentence would be clutter at best and confusing at worst.
+    """
+    check.section("axes agreeing: one answer, not two")
+    async with boot(default_reply="Sure.") as nova:
+        await project(nova, "alpha")
+        await contract(nova, "alpha", PASSED)
+        await goal(nova, "alpha", "build the adder", outcome="done")
+
+        said = await status_of(nova, "alpha")
+        check("complete" in said.lower(),
+              f"the artifact is complete ({said[:50]!r})")
+        check("did not all succeed" not in said,
+              f"and nothing is appended about failed work ({said[:110]!r})")
+        check("still planned work outstanding" not in said,
+              f"nor about outstanding work ({said[:110]!r})")
+
+        # A project with no goals at all is likewise unadorned.
+        await project(nova, "bravo")
+        await contract(nova, "bravo", PASSED)
+        plain = await status_of(nova, "bravo")
+        check("did not all succeed" not in plain
+              and "still planned work" not in plain,
+              f"a project with no goals says nothing about them ({plain[:90]!r})")
+
+
+async def test_an_explicit_completion_question_keeps_completion_authoritative():
+    check.section("a completion question is answered by the completion record")
+    async with boot(default_reply="Sure.") as nova:
+        await project(nova, "alpha")
+        await contract(nova, "alpha", PASSED)
+        await goal(nova, "alpha", "add the adder", outcome="failed")
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="alpha", confidence=0.99)
+
+        seen: list[str] = []
+
+        def cap(prompt: str) -> str:
+            seen.append(prompt)
+            return "Sure."
+
+        nova.llm.when(lambda _p: True, cap, label="cap")
+        nova.llm.rules.insert(0, nova.llm.rules.pop())
+
+        await nova.brain.chat("Is alpha done?", conversation_id=str(uuid4()))
+        joined = chr(10).join(seen)
+        check("project 'alpha': complete" in joined,
+              f"the completion record is what grounds it "
+              f"({'found' if 'complete' in joined else joined[:60]!r})")
+        # The goal axis must not have REPLACED it. Its presence or absence is a
+        # scope question settled elsewhere; what matters here is that the
+        # completion answer is not overwritten by the work status.
+        check("project 'alpha': failed" not in joined,
+              "and the goal's failure is not reported as the completion state")
+
+
+async def test_an_explicit_work_question_keeps_work_authoritative():
+    check.section("a work question is answered by the work record")
+    async with boot(default_reply="Sure.") as nova:
+        await project(nova, "alpha")
+        await contract(nova, "alpha", PASSED)
+        await goal(nova, "alpha", "add the adder", outcome="failed")
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="alpha", confidence=0.99)
+
+        seen: list[str] = []
+
+        def cap(prompt: str) -> str:
+            seen.append(prompt)
+            return "Sure."
+
+        nova.llm.when(lambda _p: True, cap, label="cap")
+        nova.llm.rules.insert(0, nova.llm.rules.pop())
+
+        await nova.brain.chat("What failed?", conversation_id=str(uuid4()))
+        joined = chr(10).join(seen)
+        check("goal 'add the adder' (alpha): failed" in joined,
+              f"the failed goal is in the grounding "
+              f"({'found' if 'add the adder' in joined else joined[:60]!r})")
+        check("project 'alpha': complete" in joined,
+              "alongside the completion record, so neither is lost")
+
+
 async def main() -> None:
     await test_goal_success_with_no_contract()
     await test_goal_failure_with_acceptance_complete()
@@ -277,6 +363,9 @@ async def main() -> None:
     await test_neither_axis_crosses_projects()
     await test_a_correction_does_not_leave_a_stale_answer()
     await test_the_api_and_events_do_not_confuse_the_two_words()
+    await test_agreement_adds_no_second_sentence()
+    await test_an_explicit_completion_question_keeps_completion_authoritative()
+    await test_an_explicit_work_question_keeps_work_authoritative()
     check.finish()
 
 
