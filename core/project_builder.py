@@ -1769,6 +1769,34 @@ class ProjectBuilder:
         if verdict.state == "passing":
             parts.append("The checks that ran all pass, but final acceptance "
                          "is still outstanding.")
+        # THE OTHER AXIS. Completion is about whether the artifact satisfies
+        # the agreed criteria. The goal/task system is about whether the
+        # planned WORK ran. They are independent -- measured: a project whose
+        # criteria are demonstrated while its goal and every task failed --
+        # and this sentence used to report only the first, so
+        #
+        #     "Project alpha: complete."
+        #
+        # was the whole answer to "what's the status of alpha?" for a project
+        # whose work plan had failed outright. Neither axis may speak for the
+        # other, so when they disagree, both are said.
+        try:
+            goals = await self._memory.list_goals(project_name=slug, limit=5)
+        except Exception:  # noqa: BLE001
+            goals = []
+        failed_goals = [g for g in goals if str(g.get("status")) == "failed"]
+        live_goals = [g for g in goals
+                      if str(g.get("status")) in ("active", "blocked")]
+        if failed_goals:
+            titles = "; ".join(str(g.get("title") or "untitled")
+                               for g in failed_goals[:3])
+            parts.append(f"Note that the planned work did not all succeed: "
+                         f"{len(failed_goals)} goal(s) failed ({titles}).")
+        elif live_goals:
+            titles = "; ".join(str(g.get("title") or "untitled")
+                               for g in live_goals[:3])
+            parts.append(f"There is still planned work outstanding: {titles}.")
+
         if verdict.legacy_note:
             parts.append(verdict.legacy_note)
         if summary and summary != "(pending)":
