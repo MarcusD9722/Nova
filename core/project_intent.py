@@ -851,7 +851,8 @@ def defers_a_change(text: str) -> bool:
 #: complaining." must keep failing, and it does, because what is left of
 #: it is not an instruction either.
 _CORRECTION_OPENER_RE = re.compile(
-    r"^(?:no|nope|nah|not\s+that)\s*[,.;:-]+\s*",
+    r"^(?:no|nope|nah|not\s+that|sorry|oops|my\s+mistake|scratch\s+that)"
+    r"\s*[,.;:-]+\s*",
     re.IGNORECASE,
 )
 
