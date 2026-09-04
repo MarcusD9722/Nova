@@ -48,11 +48,15 @@ BUILDER = "core/project_builder.py"
 
 #: (id, description, file, old, new, suites)
 MUTANTS: list[tuple] = [
-    ("M201", "a task is claimable on a generation its goal has moved past",
+    # Killed by the pause/resume regression the survival prompted. The
+    # observed effect is STARVATION, not a stale hand-out: `_CLAIM_UPDATE`
+    # fences the write independently, so removing the SELECT half wedges
+    # the candidate query on a row the UPDATE always refuses.
+    ("M201", "the claim query offers rows the write will always refuse",
      SQLITE,
      "\"AND g.status='active' AND t.generation = g.generation \"",
      "\"AND g.status='active' \"",
-     [JOURNEYS, GENERATED]),
+     [HANDOFF, JOURNEYS, GENERATED]),
 
     ("M202", "a row that already ended can be written again", SQLITE,
      '''                if row is None or str(row[0]) != "running":''',
@@ -112,10 +116,20 @@ MUTANTS: list[tuple] = [
      "    def _recover_from_audit(self) -> None:\n        return",
      [RESTART]),
 
-    ("M212", "evidence is filed without the task that produced it", SQLITE,
-     '''                 verdict, detail, error, task_id,''',
-     '''                 verdict, detail, error, None,''',
-     [JOURNEYS, GENERATED, RESTART]),
+    # M212 WITHDRAWN as EQUIVALENT, and the investigation is the finding.
+    # `record_acceptance_evidence` takes a task_id, `Evidence` carries one,
+    # and NOTHING ever sets it: production's only evidence writer
+    # (`ProjectBuilder._validate_criteria`) calls `record_verdict` without a
+    # task, and nothing in `derive_state`, the events or the projections reads
+    # the field. Replacing an always-None value with None cannot change any
+    # observable behaviour, so no state assertion can kill this mutant and one
+    # that appeared to would be asserting something else. The dead provenance
+    # is recorded in the Stage 15 report rather than wired up: filling it in
+    # would be inventing the task -> evidence pipeline that does not exist.
+    # ("M212", "evidence is filed without the task that produced it", SQLITE,
+    #  "                 verdict, detail, error, task_id,",
+    #  "                 verdict, detail, error, None,",
+    #  [JOURNEYS, GENERATED, RESTART]),
 ]
 
 

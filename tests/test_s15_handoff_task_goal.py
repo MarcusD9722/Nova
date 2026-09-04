@@ -280,6 +280,98 @@ async def test_the_same_truth_is_read_back_by_a_new_reader():
               f"with the same error ({row.get('last_error')!r})")
 
 
+async def test_a_resume_does_not_rerun_the_previous_runs_queue():
+    """A resumed goal is a NEW run; last run's queued work is not part of it.
+
+    FOUND BY MUTATION (M201), and the mechanism is not the one I expected --
+    which is the reason to write it down.
+
+    Deleting `AND t.generation = g.generation` from `_CLAIM_SELECT` was noticed
+    by no suite in this stage. PAUSE then RESUME is the one transition that
+    leaves a goal ACTIVE on a NEW generation with the previous run's tasks
+    still queued underneath it, so it is the only place that condition does any
+    work at all (a cancelled goal's tasks are already excluded by
+    `g.status='active'`).
+
+    What the deletion actually causes, measured rather than assumed: NOT the
+    old work re-running. `_CLAIM_UPDATE` carries its OWN generation fence
+    (`g.generation = tasks.generation`), so a stale row is refused at the write
+    even when the SELECT offers it. The two halves are a matched pair -- the
+    UPDATE is what makes a stale hand-out impossible, and the SELECT's
+    condition is what stops the queue STARVING on rows the UPDATE will always
+    refuse. Without it the candidate query returns the same wedged row for all
+    eight claim attempts and `claim_next_task` gives up, so the resumed goal
+    makes no progress at all and its own `__decide__` task is never reached.
+
+    Hence both halves are asserted below: nothing from the old run is handed
+    out, AND the new run's own work does run.
+    """
+    check.section("I27 a resume opens a new run and does not inherit the old")
+    with _tmp() as td:
+        mem = await fresh(Path(td))
+        g = await a_goal(mem, "alpha", "alpha work")
+        left_over = [str(await mem.enqueue_goal_task(
+            goal_id=g, project_name="alpha", tool_name=f"demo.step{i}"))
+            for i in range(3)]
+        gen0 = await gen_of(mem, g)
+
+        # LIVENESS FIRST: this work genuinely is runnable on its own run.
+        c = await mem.claim_next_goal_task()
+        check(c is not None and str(c["goal_id"]) == str(g)
+              and int(c["generation"]) == gen0,
+              f"the queued work is claimable while the run is live "
+              f"(gen {(c or {}).get('generation')})")
+        await mem.complete_goal_task(task_id=str(c["task_id"]), status="done",
+                                     result={"ok": True},
+                                     expected_generation=int(c["generation"]))
+
+        await mem.update_goal_status(goal_id=g, status="paused")
+        check(await mem.claim_next_goal_task() is None,
+              "nothing of a paused goal is claimable")
+
+        await mem.resume_goal(goal_id=g)
+        gen1 = await gen_of(mem, g)
+        goals = await mem.list_goals(limit=50)
+        status = str(next(x["status"] for x in goals
+                          if str(x["goal_id"]) == str(g)))
+        check(status == "active" and gen1 == gen0 + 1,
+              f"the resume opens a NEW run, and leaves the goal active "
+              f"(paused/{gen0} -> {status}/{gen1})")
+
+        rows = await mem.list_goal_tasks(goal_id=str(g))
+        stale = [r for r in rows
+                 if str(r["task_id"]) in left_over
+                 and str(r["status"]) == "queued"
+                 and int(r["generation"]) == gen0]
+        check(len(stale) >= 1,
+              f"the previous run's queued work is still on disk at its own "
+              f"generation ({len(stale)} row(s) at gen {gen0})")
+
+        # THE POINT: none of it may be handed out on the new run.
+        claimed = []
+        for _ in range(10):
+            c = await mem.claim_next_goal_task()
+            if c is None:
+                break
+            claimed.append(c)
+            await mem.complete_goal_task(
+                task_id=str(c["task_id"]), status="done", result={"ok": True},
+                expected_generation=int(c["generation"]))
+        stale_ids = {str(r["task_id"]) for r in stale}
+        rerun = [c for c in claimed if str(c["task_id"]) in stale_ids]
+        check(not rerun,
+              f"none of the old run's queued work was handed out again "
+              f"({[str(c['tool_name']) for c in rerun]})")
+        old_gen = [c for c in claimed if int(c["generation"]) != gen1]
+        check(not old_gen,
+              f"and nothing at all was claimed on the old generation "
+              f"({[(str(c['tool_name']), c['generation']) for c in old_gen]})")
+        # LIVENESS for that absence: the new run's own work DID run.
+        check(claimed,
+              f"while the resume's own work was claimed normally "
+              f"({[str(c['tool_name']) for c in claimed]})")
+
+
 async def main() -> None:
     await test_a_task_belongs_to_one_goal_and_one_project()
     await test_a_stale_generation_cannot_queue_or_finish_work()
@@ -287,6 +379,7 @@ async def main() -> None:
     await test_an_attempt_cannot_reopen_a_finished_task()
     await test_a_task_whose_goal_does_not_exist_never_runs()
     await test_the_same_truth_is_read_back_by_a_new_reader()
+    await test_a_resume_does_not_rerun_the_previous_runs_queue()
     check.finish()
 
 
