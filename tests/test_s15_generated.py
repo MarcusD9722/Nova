@@ -48,6 +48,18 @@ check = Checks()
 SEQUENCES = int(os.getenv("NOVA_S15_SEQUENCES", "1000"))
 OPS_PER_SEQUENCE = (4, 10)
 
+# The harness watchdog is a HARD process timeout, defaulting to 180s and never
+# cancelled -- right for a suite that boots servers and should never hang, and
+# far too short for this one, which does about twenty minutes of real work at
+# its default size. Measured the hard way: in a full gate run (which does not
+# set the variable) this suite was killed mid-run at 180s and reported as a
+# failure with no failing assertion anywhere.
+#
+# A suite that intends to run long declares its own budget, scaled to the size
+# actually asked for, so it still fails fast if it wedges. An explicit
+# NOVA_IT_WATCHDOG_S from the caller still wins.
+os.environ.setdefault("NOVA_IT_WATCHDOG_S", str(max(300, SEQUENCES * 3)))
+
 #: Everything this file claims to exercise. Each must be reached at least once
 #: or the run fails: an unexercised branch is an untested one, however many
 #: sequences ran.
