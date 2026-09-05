@@ -2910,6 +2910,23 @@ class SQLiteMemoryBackend:
                 "created_at": row[5], "sealed_at": row[6],
                 "seal_mode": row[7] or ""}
 
+    async def projects_with_requirements(self, *, limit: int = 50) -> list[str]:
+        """Every project that has a recorded requirement, newest activity first.
+
+        The chat layer needs this to answer a question about "the work" rather
+        than about one named project: without it, the only way to find out
+        whether anything is failing was to evaluate every directory on disk,
+        which costs a full digest per project on an ordinary turn.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT project_name, MAX(created_at) AS last_touch "
+                "FROM project_requirements GROUP BY project_name "
+                "ORDER BY last_touch DESC LIMIT ?", (int(limit),))
+            rows = await cur.fetchall()
+        return [str(r[0]) for r in rows]
+
     async def seal_requirement(self, *, project_name: str, revision: int,
                                seal_mode: str = "auto") -> bool:
         """Mark a revision's acceptance contract as agreed and whole.

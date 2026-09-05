@@ -16,7 +16,8 @@
     "dist:win:setup": "npm run backend:build && npm run build && electron-builder --win nsis",
     "dist:win:portable": "npm run backend:build && npm run build && electron-builder --win portable",
     "dist:win:all": "npm run backend:build && npm run build && electron-builder --win nsis portable",
-    "test:voice": "node scripts/test-voice.mjs"
+    "test:voice": "node scripts/test-voice.mjs",
+    "test:events": "node src/projectEvents.test.mjs"
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",

@@ -61,6 +61,7 @@ __all__ = [
     "REMOVAL_WHOLE_PROJECT",
     "REMOVAL_INSIDE_PROJECT",
     "REMOVAL_AMBIGUOUS",
+    "removal_object_tokens",
     "REMOVAL_UNSUPPORTED",
 ]
 
@@ -161,8 +162,41 @@ _DELIBERATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A TRAILING deferral clause: "..., but not yet.", "..., not yet though."
+#:
+#: `_DEFERRED_PROHIBITION_RE` needs a negated imperative ("don't change it
+#: yet"), so a bare trailing "not yet" was invisible and the sentence was
+#: treated as an ordinary authorised instruction. Measured: "Actually make
+#: the bird fall slower instead, not yet though." edited the project
+#: immediately, having been told not to.
+#:
+#: DELIBERATELY ANCHORED AT THE END. "not yet" far more often describes the
+#: WORLD than the timing of the request, and reading those as deferrals
+#: would refuse work that was actually asked for:
+#:
+#:     "The score is not showing yet, add it."    an instruction, now
+#:     "It is not done yet, keep going."          an instruction, now
+#:     "Make it slower, but not yet."             a deferral
+#:
+#: Only a clause that CLOSES the sentence is the speaker qualifying their
+#: own request.
+_TRAILING_DEFERRAL_RE = re.compile(
+    r"(?:,|;|:|-)?\s*(?:but|though|although|however)?\s*"
+    r"\bnot\s+(?:just\s+)?"
+    r"(?:yet|(?:right\s+)?now|for\s+now|at\s+the\s+moment|"
+    r"for\s+the\s+moment|for\s+the\s+time\s+being|"
+    r"until\s+later|till\s+later|until\s+then)"
+    r"(?:\s*,?\s*(?:though|however))?\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
 _VETOES = (
     ("prohibition", _PROHIBITION_RE),
+    # A deferral is not a prohibition: it wants the change, later. It gets its
+    # own name so the refusal reason says which one refused, and so the caller
+    # can turn it into a pending proposal rather than dropping it.
+    ("deferral", _TRAILING_DEFERRAL_RE),
     ("denial", _DENIAL_RE),
     ("retrospective", _RETROSPECTIVE_RE),
     ("self_target", _SELF_TARGET_RE),
@@ -700,6 +734,29 @@ def _head_and_tokens(obj: str) -> tuple[str, list[str]]:
     return (tokens[-1] if tokens else ""), tokens
 
 
+def removal_object_tokens(text: str) -> list[list[str]]:
+    """The content tokens of each thing a removal verb is acting on.
+
+    `classify_removal` answers WHAT KIND of removal this is. This answers WHAT
+    IT NAMES, which the caller needs for a question the classifier deliberately
+    cannot answer on its own: whether the named thing could be a project other
+    than the current one. The classifier is given one slug and knows nothing
+    about the rest of the machine, and that is the right shape for it -- so the
+    ambiguity check lives at the call site, which does know.
+
+    Returns one token list per removal verb found, empty lists dropped.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    out: list[list[str]] = []
+    for m in _REMOVAL_VERB_RE.finditer(raw):
+        _, tokens = _head_and_tokens(_object_of(raw, m))
+        if tokens:
+            out.append(list(tokens))
+    return out
+
+
 def classify_removal(text: str, *, slug: str = "") -> str:
     """What kind of removal this is, if any.
 
@@ -776,8 +833,28 @@ def defers_a_change(text: str) -> bool:
     it wants it not to happen. Only the first may become a pending proposal, and
     the qualifier has to modify the PROHIBITION rather than merely appear
     somewhere in the sentence.
+
+    Two shapes qualify. A negated imperative with a time qualifier ("don't
+    change anything yet"), and a trailing clause that qualifies the request the
+    speaker just made ("..., but not yet"). The second was missing, and a
+    sentence carrying it was executed immediately.
     """
-    return bool(_DEFERRED_PROHIBITION_RE.search((text or "").strip()))
+    raw = (text or "").strip()
+    return bool(_DEFERRED_PROHIBITION_RE.search(raw)
+                or _TRAILING_DEFERRAL_RE.search(raw))
+
+
+#: "No, ..." / "Nope — ..." / "Nah, ...": a correction opener. Only ever
+#: stripped inside `carries_a_proposal`, where the sentence has already
+#: been refused authorisation and the remaining question is what it
+#: proposes. It is NOT a preamble in general -- "No, I was not
+#: complaining." must keep failing, and it does, because what is left of
+#: it is not an instruction either.
+_CORRECTION_OPENER_RE = re.compile(
+    r"^(?:no|nope|nah|not\s+that|sorry|oops|my\s+mistake|scratch\s+that)"
+    r"\s*[,.;:-]+\s*",
+    re.IGNORECASE,
+)
 
 
 def carries_a_proposal(text: str) -> bool:
@@ -823,7 +900,24 @@ def carries_a_proposal(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return False
-    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw).strip()
+    # BOTH deferral forms come out before the grammar is applied. The
+    # docstring's rule is "a sentence that WOULD have authorised the change if
+    # the user had not deferred it", so any clause that does the deferring has
+    # to go -- otherwise the re-check trips over the very deferral being
+    # stripped and every deferred proposal reads as no proposal at all.
+    # BOTH deferral forms come out before the grammar is applied. The
+    # docstring's rule is "a sentence that WOULD have authorised the change if
+    # the user had not deferred it", so any clause that does the deferring has
+    # to go -- otherwise the re-check trips over the very deferral being
+    # stripped and every deferred proposal reads as no proposal at all.
+    rest = _DEFERRED_PROHIBITION_RE.sub(" ", raw)
+    rest = _TRAILING_DEFERRAL_RE.sub(" ", rest).strip().rstrip(",;-").strip()
+    # ...and so does a leading correction opener. "No, add a parallax
+    # background instead" proposes a parallax background; the grammar is
+    # anchored at the start of the sentence, so without this the "No," hides
+    # the instruction behind it and the correction is silently dropped --
+    # leaving the plan it was correcting still approvable.
+    rest = _CORRECTION_OPENER_RE.sub("", rest, count=1).strip()
     if not rest:
         return False
     return bool(authorize_project_mutation(rest, complaint=False).allowed)

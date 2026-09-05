@@ -440,22 +440,109 @@ class ProjectBuilder:
         """Projects, by the ONE definition in `core.project_names`."""
         return list_project_dirs(self._projects_dir)
 
+    #: A slug mention has to be a WHOLE token, not a run of letters inside a
+    #: longer word. `"one" in "Is it done?"` is true, and it made a project
+    #: called `one` the subject of a question that never mentioned it -- which
+    #: then outranked the current project everywhere this resolver is used:
+    #: selection, resume, status, mutation and the completion record attached
+    #: to an answer. Measured, with projects `one` and `cat` on disk:
+    #:
+    #:     "Is it done?"             -> one     (d-ONE)
+    #:     "what a catastrophe"      -> cat     (CAT-astrophe)
+    #:     "the application is slow" -> cat     (appli-CAT-ion)
+    #:     "that's a scone"          -> one     (sc-ONE)
+    #:
+    #: Lookarounds rather than , because slugs contain hyphens and  sits
+    #: in the middle of `flappy-bird`.
+    @staticmethod
+    def _mention_span(needle: str, haystack: str) -> tuple[int, int] | None:
+        """WHERE the name appears, or None. The span is what disambiguates.
+
+        Two projects can both legitimately match one message: with `cat` and
+        `cat-tracker` on disk, "open the cat tracker" matches `cat` as an exact
+        token and `cat-tracker` as a spaced phrase. Tier priority alone picked
+        `cat` -- and since a named project outranks the current one everywhere,
+        "delete the cat tracker" resolved to `cat`, a destructive command
+        aimed at the wrong project.
+
+        Length alone is not the answer either: it would break the case tier
+        priority exists for. "flappy-bird is still frozen" must resolve to
+        `flappy-bird`, not to a project called `still-frozen` whose spaced form
+        also appears -- and `still-frozen` is the longer name.
+
+        The two cases differ in whether the matches OVERLAP. `cat` sits inside
+        the span `cat tracker` occupies; `still frozen` sits somewhere else in
+        the sentence entirely. So the span decides, and tier priority still
+        decides between candidates that do not overlap.
+        """
+        if not needle:
+            return None
+        m = re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])",
+                      haystack)
+        return (m.start(), m.end()) if m else None
+
+    @classmethod
+    def _mentions_token(cls, needle: str, haystack: str) -> bool:
+        return cls._mention_span(needle, haystack) is not None
+
+    @staticmethod
+    def _drop_covered(cands: list[tuple[str, tuple[int, int]]]
+                      ) -> list[str]:
+        """Remove any name whose mention sits INSIDE another name's mention."""
+        keep: list[str] = []
+        for slug, (lo, hi) in cands:
+            covered = any(
+                other != slug and o_lo <= lo and hi <= o_hi
+                and (o_hi - o_lo) > (hi - lo)
+                for other, (o_lo, o_hi) in cands)
+            if not covered:
+                keep.append(slug)
+        return keep
+
+    #: The compact form of every run of up to four consecutive WORDS in the
+    #: text. Compacting the whole string instead ("flappy bird" -> the entire
+    #: message with separators stripped) destroys the boundaries the exact and
+    #: spaced paths were just taught to respect, and lets a slug match inside a
+    #: longer word all over again:
+    #:
+    #:     "unflappybirds everywhere" -> flappy-bird
+    #:     "the notepads are cheap"   -> note-pad
+    #:     "repackaged goods"         -> pack-age
+    #:
+    #: Joining word RUNS keeps both directions working -- "flappy bird" and
+    #: "flappybird" both produce "flappybird" -- while "notepads" produces
+    #: "notepads" and matches nothing. Four words because the caller only
+    #: reaches this path for slugs of at most four parts.
+    @staticmethod
+    def _compact_windows(text: str, max_words: int = 4) -> set[str]:
+        words = re.findall(r"[a-z0-9]+", text)
+        out: set[str] = set()
+        for i in range(len(words)):
+            joined = ""
+            for j in range(i, min(i + max_words, len(words))):
+                joined += words[j]
+                out.add(joined)
+        return out
+
     def known_slug_in_text(self, text: str) -> str | None:
         lowered = (text or "").lower()
-        compact = re.sub(r"[^a-z0-9]", "", lowered)
-        exact_slug: list[str] = []
-        spaced_slug: list[str] = []
+        compact = self._compact_windows(lowered)
+        exact_slug: list[tuple[str, tuple[int, int]]] = []
+        spaced_slug: list[tuple[str, tuple[int, int]]] = []
         compact_only: list[str] = []
         for s in self.list_projects():
             part_count = len([p for p in s.split("-") if p])
-            if s in lowered:
-                exact_slug.append(s)
+            span = self._mention_span(s, lowered)
+            if span is not None:
+                exact_slug.append((s, span))
                 continue
             # Very long slugs (many hyphen-separated words) are often just
             # sentence-like artifacts from earlier routing mistakes. Avoid
             # treating those as a spaced phrase match inside normal prose.
-            if part_count <= 6 and s.replace("-", " ") in lowered:
-                spaced_slug.append(s)
+            spaced = (self._mention_span(s.replace("-", " "), lowered)
+                      if part_count <= 6 else None)
+            if spaced is not None:
+                spaced_slug.append((s, spaced))
                 continue
             # Slugs are single mashed-together words ("flappybird") but users
             # naturally type them with spaces ("flappy bird") — compare with
@@ -463,6 +550,8 @@ class ProjectBuilder:
             # minimum length so short slugs don't match unrelated text.
             s_compact = s.replace("-", "")
             if part_count <= 4 and len(s_compact) >= 5 and s_compact in compact:
+                # `compact` is a SET of word-run compactions, so this is an
+                # equality test against whole words, not a substring scan.
                 compact_only.append(s)
         # Priority order:
         # 1) Exact hyphenated slug mention typed by the user (strongest signal)
@@ -470,10 +559,17 @@ class ProjectBuilder:
         # 3) Compact fuzzy match ("flappybird")
         # This prevents complaint text from outranking an explicitly named
         # project, e.g. "flappy-bird is still frozen...".
-        if exact_slug:
-            return max(exact_slug, key=len)
-        if spaced_slug:
-            return max(spaced_slug, key=len)
+        # A name that appears INSIDE another name's mention loses to it,
+        # whichever tier each matched in: "the cat tracker" is one mention, not
+        # two. Candidates that matched somewhere else in the sentence are
+        # untouched, so tier priority still settles those.
+        surviving = self._drop_covered(exact_slug + spaced_slug)
+        exact = [s for s, _ in exact_slug if s in surviving]
+        spaced = [s for s, _ in spaced_slug if s in surviving]
+        if exact:
+            return max(exact, key=len)
+        if spaced:
+            return max(spaced, key=len)
         # Longest compact match still wins among fuzzy-only candidates.
         return max(compact_only, key=len) if compact_only else None
 
@@ -1673,6 +1769,34 @@ class ProjectBuilder:
         if verdict.state == "passing":
             parts.append("The checks that ran all pass, but final acceptance "
                          "is still outstanding.")
+        # THE OTHER AXIS. Completion is about whether the artifact satisfies
+        # the agreed criteria. The goal/task system is about whether the
+        # planned WORK ran. They are independent -- measured: a project whose
+        # criteria are demonstrated while its goal and every task failed --
+        # and this sentence used to report only the first, so
+        #
+        #     "Project alpha: complete."
+        #
+        # was the whole answer to "what's the status of alpha?" for a project
+        # whose work plan had failed outright. Neither axis may speak for the
+        # other, so when they disagree, both are said.
+        try:
+            goals = await self._memory.list_goals(project_name=slug, limit=5)
+        except Exception:  # noqa: BLE001
+            goals = []
+        failed_goals = [g for g in goals if str(g.get("status")) == "failed"]
+        live_goals = [g for g in goals
+                      if str(g.get("status")) in ("active", "blocked")]
+        if failed_goals:
+            titles = "; ".join(str(g.get("title") or "untitled")
+                               for g in failed_goals[:3])
+            parts.append(f"Note that the planned work did not all succeed: "
+                         f"{len(failed_goals)} goal(s) failed ({titles}).")
+        elif live_goals:
+            titles = "; ".join(str(g.get("title") or "untitled")
+                               for g in live_goals[:3])
+            parts.append(f"There is still planned work outstanding: {titles}.")
+
         if verdict.legacy_note:
             parts.append(verdict.legacy_note)
         if summary and summary != "(pending)":

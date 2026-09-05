@@ -24,7 +24,7 @@ from core.mood import detect_mood_signal
 from core.policy._json_extract import extract_first_json_object
 from core.completion import STATES
 from core.intent import (asks_about_work, mentions_completion,
-                         is_question,
+                         is_question, refers_to_one_thing,
                          is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
@@ -32,6 +32,7 @@ from core.project_intent import (
     asks_current_project,
     classify_removal,
     REMOVAL_AMBIGUOUS,
+    REMOVAL_INSIDE_PROJECT,
     REMOVAL_UNSUPPORTED,
     REMOVAL_WHOLE_PROJECT,
     approves_without_naming_a_change,
@@ -297,6 +298,11 @@ def _format_weather_reply(city: str, payload: dict[str, Any]) -> str:
     if humidity in (None, ""):
         return f"Right now in {city}, it is {temp} degrees Fahrenheit with {description}."
     return f"Right now in {city}, it is {temp} degrees Fahrenheit with {description}. Humidity is {humidity}%."
+
+
+#: "the caller did not pass a scope", which is not the same as `None`
+#: ("every project"). Without this the default would silently mean survey.
+_UNSET = object()
 
 
 @dataclass
@@ -1171,12 +1177,44 @@ class RuntimeManager:
     def society(self) -> AgentSociety:
         return self._society
 
-    async def _completion_context(self, text: str) -> str:
-        """Completion grounding for the project this turn is about.
+    #: How many projects a GENERAL work question may describe. A question about
+    #: "the work" should not silently omit a failing project, and should not
+    #: turn one turn into a digest of every project on the machine either.
+    _COMPLETION_CONTEXT_PROJECTS = 5
 
-        The project named in the message wins; otherwise the one last worked
-        on. Named beats pointer because a person who says "is the calculator
-        done?" is asking about the calculator, whatever Nova touched last.
+    async def _work_scope(self, text: str) -> list[str] | None:
+        """Which projects this turn is about. `None` means "all of them".
+
+        THE SCOPE OF A QUESTION IS A PROPERTY OF THE QUESTION. Two context
+        builders answering the same turn cannot each decide it for themselves,
+        which is exactly what they were doing: completion described one project
+        while `describe_work_state` described every project, so "is it done?"
+        arrived at the model carrying another project's FAILED goal.
+
+          named       -> that project, and only that one
+          referential -> the current project, or NOTHING if the pointer is
+                         stale. "Is it done?" about a project that no longer
+                         exists is answered about nothing, never about
+                         whatever else happens to be lying around
+          survey      -> all of them ("how is the work going?")
+        """
+        pb = self._project_builder
+        named = pb.known_slug_in_text(text)
+        if named:
+            return [named]
+        if refers_to_one_thing(text):
+            current = await pb.last_active()
+            return [current] if current else []
+        return None
+
+    async def _completion_context(self, text: str,
+                                  scope: list[str] | None | object = _UNSET
+                                  ) -> str:
+        """Completion grounding for the projects this turn is about.
+
+        `scope` comes from `_work_scope`. It is passed in rather than
+        recomputed so that this and the goal/task summary are provably talking
+        about the same projects.
         """
         try:
             pb = self._project_builder
@@ -1189,23 +1227,64 @@ class RuntimeManager:
             if not (asks_about_work(text)
                     or (named and mentions_completion(text))):
                 return ""
-            slug = named or await pb.last_active()
-            if not slug:
+            if scope is _UNSET:
+                scope = await self._work_scope(text)
+
+            # WHICH projects this answer is allowed to be about.
+            #
+            # A named project is the whole scope: "is the calculator done?" is
+            # about the calculator. But a GENERAL question — "how is the work
+            # going?" — is not about one project, and treating it as though it
+            # were is how a failing project became invisible. Measured: two
+            # projects, one with a goal marked done and one FAILING its
+            # acceptance criteria, produced an answer prompt containing
+            #
+            #     - goal 'ship the alpha feature' (alpha): done, revision 0
+            #
+            # and nothing whatsoever about the project that was failing,
+            # because completion described only `last_active`. Nova said
+            # "Everything looks fine."
+            #
+            # `describe_work_state` already answers general work questions
+            # across EVERY project; this one answered them about one. Two
+            # context builders disagreeing about the scope of the same question
+            # is the defect — not either one on its own.
+            if scope is None:
+                # A survey. Describe the same population the goal summary
+                # describes, preferring the current project, bounded so one
+                # turn does not become a digest of the whole machine. Only
+                # projects with a recorded requirement: one indexed query,
+                # rather than digesting every directory on disk.
+                current = await pb.last_active()
+                contracted = await self._memory.projects_with_requirements(
+                    limit=self._COMPLETION_CONTEXT_PROJECTS)
+                slugs = ([current] if current else []) + [
+                    s for s in contracted if s != current]
+                slugs = slugs[:self._COMPLETION_CONTEXT_PROJECTS]
+            else:
+                slugs = list(scope)
+            if not slugs:
                 return ""
-            legacy = ""
-            try:
-                rec = await self._memory.get_latest_fact(f"project:{slug}",
-                                                         "status")
-                value = str(getattr(rec, "value", "") or "")
-                # A pre-Stage-14 status string is history. Passing it in lets
-                # the verdict say so rather than leaving the model to find a
-                # stale "complete" elsewhere and believe it.
-                if value and value not in STATES:
-                    legacy = value
-            except Exception:  # noqa: BLE001
+
+            out: list[str] = []
+            for slug in slugs:
                 legacy = ""
-            return await self._completion.describe_for_chat(slug=slug,
-                                                            legacy_status=legacy)
+                try:
+                    rec = await self._memory.get_latest_fact(f"project:{slug}",
+                                                             "status")
+                    value = str(getattr(rec, "value", "") or "")
+                    # A pre-Stage-14 status string is history. Passing it in
+                    # lets the verdict say so rather than leaving the model to
+                    # find a stale "complete" elsewhere and believe it.
+                    if value and value not in STATES:
+                        legacy = value
+                except Exception:  # noqa: BLE001
+                    legacy = ""
+                # Returns "" for a project with nothing recorded, so a project
+                # that was merely scaffolded adds no tokens.
+                out.append(await self._completion.describe_for_chat(
+                    slug=slug, legacy_status=legacy))
+            return "".join(o for o in out if o)
         except Exception as e:  # noqa: BLE001
             logger.debug("completion_context_failed", error=str(e)[:160])
             return ""
@@ -1515,6 +1594,33 @@ class RuntimeManager:
         return ("I don't have any projects yet — tell me what to build and "
                 "I'll start one.")
 
+    def _removal_names_another_project(self, text: str, slug: str) -> list[str]:
+        """Projects OTHER than `slug` whose name contains what is being removed.
+
+        A removal object counts as confusable when its tokens are a subset of
+        another project's slug tokens: "tracker" against `bug-tracker` does,
+        "login button" against `login-page` does not. Subset rather than
+        substring, so this cannot repeat the defect it is guarding against.
+        """
+        from core.project_intent import removal_object_tokens
+
+        current = {p for p in str(slug or "").split("-") if p}
+        hits: list[str] = []
+        for tokens in removal_object_tokens(text):
+            want = {w for t in tokens for w in str(t).lower().split("-") if w}
+            if not want:
+                continue
+            for other in self._project_builder.list_projects():
+                if other == slug:
+                    continue
+                if want <= {p for p in other.split("-") if p} and other not in hits:
+                    hits.append(other)
+        # A thing that is only ever a part of the CURRENT project's own name is
+        # an edit, not another project. That is Stage 13B's rule and it stays.
+        if not hits and current:
+            return []
+        return hits
+
     async def _project_prepass(self, text: str,
                                conversation_id: Any = None) -> str | None:
         """Detect project build/status/resume/improve intents and act on them."""
@@ -1614,7 +1720,8 @@ class RuntimeManager:
             # e88104c, "Don't build it yet." replaced a pending parallax
             # background and a later "Go ahead." ran those words.
             is_proposal = (reason == "no affirmative instruction"
-                           or (reason == "vetoed: prohibition"
+                           or (reason in ("vetoed: prohibition",
+                                          "vetoed: deferral")
                                and defers_a_change(t)
                                and carries_a_proposal(t)))
             if is_proposal and in_play:
@@ -1756,6 +1863,39 @@ class RuntimeManager:
                 # authoritative operation is the only thing allowed to remove a
                 # project; this pre-pass may not do it conversationally.
                 removal = classify_removal(t, slug=slug)
+
+                # A BARE COMMON WORD THAT HAPPENS TO BE A PROJECT NAME.
+                #
+                # "delete the sidebar", said while working on `blog`, with a
+                # project called `sidebar` also on disk. The name resolver finds
+                # `sidebar` (it is a real project and the word is right there),
+                # named beats pointer as it must, and the classifier -- now
+                # asked about `sidebar` rather than about `blog` -- says WHOLE
+                # PROJECT. Measured: a permission request to delete an entire
+                # project, from a sentence that most plausibly meant "take the
+                # sidebar out of my blog". Classified against `blog` the very
+                # same words are an inside-project edit.
+                #
+                # Only for a name that is ONE bare word. `bug-tracker` and
+                # "bug tracker" name an identity and go straight to the gated
+                # tool as before; `sidebar` is a common noun that a person
+                # could equally be pointing at inside the thing they are
+                # working on. And only when it is not the project already in
+                # hand -- "delete the sidebar" while ON sidebar means the
+                # project, and nothing here interferes.
+                current_slug = await pb.last_active()
+                if (removal == REMOVAL_WHOLE_PROJECT and slug
+                        and current_slug and slug != current_slug
+                        and "-" not in slug
+                        and classify_removal(t, slug=current_slug)
+                        == REMOVAL_INSIDE_PROJECT):
+                    logger.info("project_removal_bare_word_ambiguous",
+                                named=slug, current=current_slug)
+                    return (f"I'd rather ask than guess: do you mean delete "
+                            f"the whole '{slug}' project, or take the {slug} "
+                            f"out of '{current_slug}'? Tell me which and I'll "
+                            f"do it.")
+
                 if removal == REMOVAL_WHOLE_PROJECT:
                     # The authoritative operation is the only thing allowed to
                     # remove a project, and it lives behind an admin-tier
@@ -1773,6 +1913,34 @@ class RuntimeManager:
                     return (f"I want to be sure before I touch anything — do you "
                             f"mean delete the whole '{slug}' project, or remove "
                             f"something inside it? Tell me which and I'll do it.")
+
+                # AN OBJECT THAT COULD BE ANOTHER PROJECT.
+                #
+                # `classify_removal` is given one slug and knows nothing about
+                # the rest of the machine, so it reads "delete tracker" as a
+                # thing inside the current project -- correctly, by its own
+                # rule, which exists because "bird" must not mean flappy-bird.
+                # But with `cat-tracker` current and `bug-tracker` also on
+                # disk, "delete tracker" names a component of BOTH, and Nova
+                # answered "working on those improvements to cat-tracker" and
+                # started editing it. Measured: project.started fired on a
+                # project the person may well have been asking to delete.
+                #
+                # The rule the file already states two paragraphs up is the
+                # one that settles it: an uncertain destructive intent performs
+                # no side effect at all. Narrow on purpose -- it fires only
+                # when the named thing is a token-subset of some OTHER
+                # project's name, so a component of the CURRENT project's own
+                # name stays an inside-project edit and Stage 13B's rule is
+                # untouched.
+                confusable = self._removal_names_another_project(t, slug)
+                if confusable:
+                    logger.info("project_removal_confusable", slug=slug,
+                                candidates=confusable[:3])
+                    others = ", ".join(f"'{c}'" for c in confusable[:3])
+                    return (f"I'd rather ask than guess: do you mean the "
+                            f"{others} project, or something inside "
+                            f"'{slug}'? Tell me which and I'll do it.")
 
                 if pb.is_building(slug):
                     return f"I'm still working on {slug} — I'll report the moment it's done."
@@ -2240,8 +2408,24 @@ class RuntimeManager:
         # containing none of it - not the step, not the error, not the goal.
         work_context = ""
         try:
+            # ONE scope decision, shared by both builders below -- but only
+            # computed when something is actually going to use it. Resolving it
+            # eagerly cost every ordinary turn a 2.3 ms project-name scan, and
+            # cost any turn containing a pronoun ("that was funny") a
+            # last-active read at 7.8 ms p50 / 64 ms p90, for an answer nobody
+            # asked for. `_UNSET` means "nothing needed it yet"; the completion
+            # builder resolves it itself if its own gate passes.
+            _scope: Any = _UNSET
             if asks_about_work(clean_user):
-                work_context = await self._memory.describe_work_state()
+                _scope = await self._work_scope(clean_user)
+                if _scope is None:
+                    work_context = await self._memory.describe_work_state()
+                elif _scope:
+                    work_context = await self._memory.describe_work_state(
+                        project_name=_scope[0])
+                # An empty scope means the turn points at a project that is not
+                # there. Goals belonging to OTHER projects are not an answer to
+                # it, so nothing is attached.
             # A PROJECT's completion is a different question from a goal's task
             # rows, and describe_work_state cannot see it: a project with
             # acceptance criteria has no goal rows at all, so it returned "" and
@@ -2249,7 +2433,8 @@ class RuntimeManager:
             # separately, because "is the calculator ready?" is a completion
             # question and "is the kettle ready?" is not, and only the project
             # resolver can tell those apart.
-            work_context += await self._completion_context(clean_user)
+            work_context += await self._completion_context(clean_user,
+                                                           scope=_scope)
         except Exception as e:  # noqa: BLE001
             logger.debug("work_state_summary_failed", error=str(e)[:160])
 

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { PROJECT_REPORT_TYPES, completedReport, unfinishedReport } from "../projectEvents";
 
 // Bus-event side effects extracted verbatim from App.jsx (Phase 0.6 of
 // docs/ROADMAP.md) — behavior unchanged. Each block tracks its own last-seen
@@ -24,7 +25,7 @@ export default function useNovaBusEffects({ novaEvents, appendNovaMessage, speak
     const fresh = novaEvents.filter(
       (ev) =>
         (ev.seq || 0) > lastProjectEventSeqRef.current &&
-        (ev.type === "project.completed" || ev.type === "project.error")
+        PROJECT_REPORT_TYPES.includes(ev.type)
     );
     if (!fresh.length) {
       const maxSeq = Math.max(...novaEvents.map((e) => e.seq || 0));
@@ -39,40 +40,21 @@ export default function useNovaBusEffects({ novaEvents, appendNovaMessage, speak
 
     fresh.forEach((ev) => {
       const d = ev.data || {};
-      if (ev.type === "project.completed") {
-        const files = Array.isArray(d.files) && d.files.length ? d.files.join(", ") : "";
-        const suggestions =
-          Array.isArray(d.suggestions) && d.suggestions.length
-            ? `\n\nSuggested improvements:\n${d.suggestions.map((s) => `• ${s}`).join("\n")}\n\nSay "implement those improvements" and I'll do it.`
-            : "";
-        // Be honest about how sure we are. The build/run check only confirms it
-        // launches — it can't verify a visual/interactive feature actually works.
-        const status = d.status || "complete";
-        const isImprove = d.mode === "improve";
-        const note = d.test_note && !/passed/i.test(d.test_note) ? d.test_note : (d.run_note && !/passed/i.test(d.run_note) ? d.run_note : "");
-        let head;
-        if (status === "needs attention") {
-          head = `⚠️ I worked on "${d.project}" but it didn't fully check out${note ? ` — ${note}` : ""}.`;
-        } else if (status === "needs review") {
-          head = `🛠️ I updated "${d.project}"${note ? ` (${note})` : ""}. It runs, but please double-check it does what you wanted.`;
-        } else if (isImprove) {
-          // Honest framing: `summary` is written by the planner BEFORE the code
-          // is generated, so it describes what was ATTEMPTED, not a confirmed
-          // fix. The run check only proves the program starts without crashing —
-          // it cannot tell a working game loop from one frozen on frame one.
-          // Saying "Done — resolved X" here is how a silent no-op got reported
-          // as a fix four times in a row.
-          head = `🛠️ I changed "${d.project}". Attempted: ${d.summary || "see files below"}\n⚠️ I verified only that it starts without crashing — I could NOT verify the behavior you asked about. Please run it and tell me what actually happens.`;
-        } else {
-          head = `✅ Project "${d.project}" is built. ${d.summary || ""}\nGive it a try and let me know how it looks.`;
+      if (ev.type === "project.state_changed") {
+        // A build that stopped without completing. `project.completed` no
+        // longer fires for these (Stage 14 narrowed it to real completions),
+        // so without this the run ends in silence.
+        const report = unfinishedReport(ev);
+        if (report) {
+          appendNovaMessage(`nova-project-${ev.seq}`, report.text);
+          speakNotice(report.speak);
         }
-        const text =
-          head +
-          (files ? `\nFiles: ${files}` : "") +
-          (d.run ? `\nRun it with: ${d.run}` : "") +
-          suggestions;
-        appendNovaMessage(`nova-project-${ev.seq}`, text);
-        speakNotice(`I finished working on ${String(d.project || "").replace(/-/g, " ")}. Give it a try.`);
+      } else if (ev.type === "project.completed") {
+        const report = completedReport(ev);
+        if (report) {
+          appendNovaMessage(`nova-project-${ev.seq}`, report.text);
+          speakNotice(report.speak);
+        }
       } else {
         appendNovaMessage(
           `nova-project-${ev.seq}`,
