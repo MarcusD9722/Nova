@@ -3,6 +3,9 @@
 Branch `nova-p10-preflight-stage15-cross-capability`, based on `origin/main`
 `6f575ed` (Stage 14, merged and frozen).
 
+**Status: built and gated on the branch. NOT MERGED, and Stage 16 not begun.**
+This document describes a branch awaiting review, not a change on `main`.
+
 Stage 15 looks for the places where two individually correct subsystems produce
 an incorrect combined result. Nothing here was fixed on suspicion: every defect
 was reproduced first, traced to the production path that caused it, fixed at
@@ -113,6 +116,76 @@ now carries both:
 
 Additive only, and **silent when the axes agree** — a complete artifact with a
 successful goal says only that it is complete.
+
+---
+
+## 2b. Defects in my own tests and tooling — NOT Nova's
+
+Kept separate on purpose. Everything in section 2 is a defect in the product.
+Everything here is a defect in the instrument, found while pointing it at the
+product, and none of it says anything about Nova's behaviour.
+
+**H1 — five suites attributed events to the wrong step.** They read
+`BUS.recent(900)[n0:]`, but that deque has `maxlen=100`, so positional slicing
+silently stopped meaning anything past the hundredth event. Replaced with a
+subscription `Recorder`; every affected suite was re-run and no other result
+changed. The corrected instrument is the authoritative basis for the evidence
+that follows it.
+
+**H2 — a test that passed while proving nothing.** An orphan-task test queued
+work against a non-existent goal and asserted nothing was claimable. It passed
+because `enqueue_goal_task` refuses at WRITE time and returns `None`, so the
+claim-time guard it was named after never ran — and a follow-up assertion sat
+behind `if task is not None:` and was skipped every time. Split into the two
+guards that actually exist, with a liveness proof beside them.
+
+**H3 — the observer contaminated what it observed.** A TOCTOU fixture read
+completion state through the same patched `list_projects` the test was
+manipulating. Fixed with an explicit `slugs=` parameter.
+
+**H4 — `str.replace` without an assertion** silently no-op'd twice while
+reporting success. Every anchor is asserted now.
+
+**H5 — escape mangling through shell heredocs**, repeatedly: `
+` collapsing
+into real newlines inside string literals and breaking modules at import.
+Mitigated by writing patch scripts as files rather than heredocs.
+
+**H6 — a barrier keyed on a project slug deadlocked the suite** (section 3).
+
+**H7 — J14 assumed per-goal task ordering** that production does not provide,
+and counted other goals' tasks as its own (section 5).
+
+**H8 — the generator's model tracked one claimed task**, so a second claim
+silently replaced the first; and its uniform operation choice made the run
+vacuous until the coverage gate caught it (section 6).
+
+**H9 — the harness watchdog killed a legitimately long suite** in a full gate
+(section 9).
+
+One more, which is not a defect but belongs in the same column: **I predicted
+M201's mechanism wrongly** and said so rather than quietly correcting it — see
+section 7.
+
+---
+
+## 2c. Unreachable in production, and labelled as such
+
+Scenarios asked for that cannot occur, each measured rather than assumed. They
+are recorded, not simulated: a test that appeared to exercise one of these
+would be exercising something else.
+
+* **A foreground chat turn concurrent with a build parked inside its model
+  call.** One model context, calls serialised; the parked build holds the only
+  slot (section 3).
+* **The generation fence firing across a restart.** Startup writes a terminal
+  outcome first, so the row guard refuses the late result before generations
+  are ever compared (section 4).
+* **The revision fence in `current_verdict_for`.** Measured in Stage 14: no
+  rows cross a revision onto a live criterion. Kept as defence in depth and
+  labelled in the source.
+* **Evidence provenance by task.** `acceptance_evidence.task_id` is never
+  written by any production path (section 7, M212).
 
 ---
 
@@ -249,6 +322,12 @@ permission names, the axis a status line reports.
 killed / 2 survived; both survivors were investigated before anything was
 touched, and they needed opposite responses.
 
+For runtime, the campaign runs the generator at **150** sequences, not 1000 —
+enough to reach every branch its coverage gate asserts. The 1000-sequence
+figures in section 6 come from dedicated runs and from the counted gates, not
+from the mutation campaign. A mutant surviving the targeted suites is escalated
+to the full set before survival is believed.
+
 | id | mutant | outcome |
 |---|---|---|
 | M201 | the claim query offers rows the write will always refuse | KILLED (after a new regression) |
@@ -364,6 +443,28 @@ Inside **each** of the three gates:
 **Frontend.** `npm run test:events` passes (27 assertions over the project
 event projections) and `npm run build` succeeds — 40.0s, chunk-size advisories
 only, all pre-existing.
+
+### Exact-tree verification of what is proposed for merge
+
+Performed after the three gates. Every commit after the gated executable head
+`d3ed33c` is documentation-only, so this holds for the branch head as it
+stands; any later executable change would invalidate the gates and require all
+three to be re-run.
+
+| check | result |
+|---|---|
+| `core` / `backend` / `memory` / `tests` / `frontend` subtree hashes, gated head `d3ed33c` vs branch head | **identical**, all five |
+| whole-repo diff `d3ed33c..HEAD` | documentation only — this report |
+| executable files changed after the gates | **0** |
+| commits after the gated head | one, docs-only |
+| working tree, executable paths | clean (0 changes) |
+| working tree, anything else | clean apart from Marcus's own pre-existing `projects/` state |
+| local vs `origin/…stage15-cross-capability` | equal, re-verified after a fresh fetch |
+| Marcus's `projects/` deletions and `projects/.trash/` | untouched — 9 deletions still unstaged, `.trash` still untracked with 4 entries, nothing staged, restored, cleaned or committed |
+
+So the three 183/183 gates describe exactly the executable tree proposed for
+merge. Any later executable change would invalidate them and require all three
+to be re-run.
 
 **Assertion volume.** 586 `check()` call sites across the 18 Stage 15 suites;
 executed counts are higher where sites sit inside loops (the journeys alone
