@@ -7,7 +7,7 @@ Moved verbatim from backend/app.py in Phase 0.6 — behavior unchanged.
 
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from backend.state import STATE
@@ -83,9 +83,31 @@ _RESOLVE_NOTES = {
 }
 
 
+def _origin_allowed(request: Request) -> bool:
+    """Is this approval coming from somewhere Nova actually serves?
+
+    CORS stops a disallowed origin READING the response; it does not stop the
+    request from EXECUTING, and this endpoint is what turns a pending
+    destructive action into an approved one. So the Origin is checked here as
+    well. No Origin at all (curl, the CLI, a local process) passes, as does
+    every origin the CORS layer already allows — `null` included, which is
+    what Electron and a file:// harness send.
+    """
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        return True
+    from backend.app import _parse_allowed_origins
+
+    return origin in set(_parse_allowed_origins())
+
+
 @router.post("/permissions/resolve")
-async def permissions_resolve(req: PermissionResolveRequest) -> dict:
+async def permissions_resolve(req: PermissionResolveRequest,
+                              request: Request) -> dict:
     """Approve or deny a pending action that needed Marcus's confirmation."""
+    if not _origin_allowed(request):
+        raise HTTPException(status_code=403,
+                            detail="This origin may not resolve permissions.")
     if STATE.runtime is None:
         raise HTTPException(status_code=503, detail="Not ready")
     broker = STATE.runtime.permission_broker

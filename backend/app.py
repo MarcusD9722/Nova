@@ -391,6 +391,21 @@ def _api_token() -> str:
     return os.getenv("NOVA_API_TOKEN", "").strip()
 
 
+def api_exposure_note() -> str | None:
+    """What an unauthenticated port means, or None when a token is set.
+
+    The comment above has promised this warning since the middleware was
+    written and nothing ever emitted it. Kept pure so it can be asserted
+    directly rather than scraped out of startup output.
+    """
+    if _api_token():
+        return None
+    return ("No NOVA_API_TOKEN is set: every endpoint on this port answers any "
+            "local process, including POST /permissions/resolve, which APPROVES "
+            "an action that was waiting for you. Set one in .env if anything "
+            "else runs on this machine.")
+
+
 def _request_token_ok(supplied: str | None) -> bool:
     import hmac
 
@@ -425,7 +440,11 @@ def _parse_allowed_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_parse_allowed_origins(),
-    allow_credentials=True,
+    # Nova authenticates with `Authorization: Bearer` (frontend/src/lib/
+    # apiToken.js). It sets no cookies and never sends credentials mode, so
+    # credentialed CORS buys nothing — and `allow_credentials=True` beside the
+    # `null` origin Electron needs was the one combination worth not having.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1277,6 +1296,9 @@ async def _startup() -> None:
             BUS.publish("model.gpu_confirmed", {"status": llm.gpu_status.status})
             if cfg.mmproj_path is not None:
                 print(f"• Vision model loaded: {cfg.mmproj_path.name}")
+            _note = api_exposure_note()
+            if _note:
+                _bullet(f"WARNING: {_note}")
             print("• Startup complete: gpu_offload_confirmed")
         except GPUEnforcementError as e:
             logger.error("gpu_enforcement_failed", error=str(e))
