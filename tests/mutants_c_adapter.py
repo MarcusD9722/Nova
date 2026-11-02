@@ -38,7 +38,9 @@ PY = REPO / "venv" / "Scripts" / "python.exe"
 
 ADAPTER = "tests/test_computer_windows_adapter.py"
 FROZEN_P8 = "tests/test_computer_control_p8.py"
-ALL_SUITES = [ADAPTER, FROZEN_P8]
+#: The P5.2 contract pins `adapter_installed is False` on a stock boot.
+P52_CONTRACT = "tests/test_speaker_api_contract_v52.py"
+ALL_SUITES = [ADAPTER, FROZEN_P8, P52_CONTRACT]
 
 CW = "core/computer_windows.py"
 CC = "core/computer_control.py"
@@ -161,6 +163,15 @@ MUTANTS: list[tuple] = [
      '        if dry_run or not self.available:',
      '        if not self.available:',
      [ADAPTER]),
+
+    # The regression the full gate caught. Installing an adapter on a stock
+    # boot makes `adapter_installed` true at /speaker/permission-probe, which
+    # tests/test_speaker_api_contract_v52.py asserts is false. Both suites are
+    # listed because this belongs caught here, not only by the P5.2 contract.
+    ("M321", "an actuator is installed even though neither flag asked", CC,
+     '    if not (execution_enabled() or observation_enabled()):\n        return None',
+     '    if False:\n        return None',
+     [ADAPTER, P52_CONTRACT]),
 ]
 
 

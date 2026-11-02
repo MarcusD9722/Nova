@@ -928,7 +928,10 @@ class RuntimeManager:
         # Windows, so `NOVA_COMPUTER_CONTROL` is the switch it always claimed to
         # be — but it is still off by default, so a permitted action is still a
         # dry run until Marcus turns it on. Observation has its own flag,
-        # `NOVA_COMPUTER_OBSERVE`, also off (see core/computer_control.py).
+        # `NOVA_COMPUTER_OBSERVE`, also off.
+        #
+        # `default_adapter()` returns None while BOTH are off, so a stock boot
+        # constructs no actuator object at all (see core/computer_control.py).
         self._permission_broker = PermissionBroker(
             mode=os.getenv("NOVA_PERMISSION_MODE", "guarded"),
             audit_path=(memory_dir / "permission_audit.jsonl"),

@@ -181,8 +181,11 @@ API-accessible).
   (`psutil` is present in the venv but unpinned, so process names come from
   `QueryFullProcessImageNameW`). `NOVA_COMPUTER_CONTROL` is now the switch it always
   claimed to be — and **still off by default**, so nothing about a stock boot changed.
+  While both flags are off `default_adapter()` builds nothing at all, so a stock boot
+  holds no actuator object -- which is what keeps `adapter_installed: False` true at
+  `/speaker/permission-probe`. The full gate caught that; see `docs/COMPUTER_CONTROL.md`.
   Verified live: SendInput accepted 2/2 events, a capslock toggle observed through
-  `GetKeyState` and restored. See `docs/COMPUTER_CONTROL.md`.
+  `GetKeyState` and restored.
   - **Observation is gated separately** by `NOVA_COMPUTER_OBSERVE`, also off. It had to
     be: `computer.observe` is READ tier, so it is auto-allowed in *every* policy mode
     including `locked` — without its own flag, merely installing an adapter would have
@@ -197,8 +200,8 @@ API-accessible).
     CRITICAL kinds (`system_setting`, `delete`), which the adapter refuses structurally
     rather than relying on the policy mode; and forced process kill — `close_app` posts
     WM_CLOSE, which an app may refuse or answer with a save prompt.
-  - 20 mutants (`tests/mutants_c_adapter.py`) delete each guard in turn, all killed;
-    `tests/test_computer_windows_adapter.py` (148 assertions) drives a fake API so the
+  - 21 mutants (`tests/mutants_c_adapter.py`) delete each guard in turn, all killed;
+    `tests/test_computer_windows_adapter.py` (155 assertions) drives a fake API so the
     suite synthesizes no real input, with two sections against the real binding and the
     booted runtime.
   - **Fixed in passing:** `skill.run` called `act("type", target=step)` per step, and a

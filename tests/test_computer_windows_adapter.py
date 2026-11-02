@@ -50,6 +50,7 @@ from core.computer_control import (  # noqa: E402
     default_adapter,
     execution_enabled,
     observation_enabled,
+    platform_adapter,
 )
 from core.computer_windows import (  # noqa: E402
     DEFAULT_DENY_WINDOWS,
@@ -629,11 +630,11 @@ async def test_the_real_binding_and_the_real_runtime() -> None:
           f"INPUT is 40 bytes on x64 — a wrong size means SendInput silently "
           f"rejects everything ({ctypes.sizeof(INPUT)})")
 
-    real = default_adapter()
+    real = platform_adapter()
     check(real is not None and type(real).__name__ == "WindowsAdapter",
-          f"default_adapter() returns a WindowsAdapter here ({type(real).__name__})")
-    check(default_adapter("linux") is None and default_adapter("darwin") is None,
-          "and None off Windows, where ctypes.wintypes cannot even import")
+          f"platform_adapter() finds a WindowsAdapter here ({type(real).__name__})")
+    check(platform_adapter("linux") is None and platform_adapter("darwin") is None,
+          "and nothing off Windows, where ctypes.wintypes cannot even import")
 
     scr = real.observe("screen")
     check(scr["virtual"]["w"] > 0 and scr["virtual"]["h"] > 0,
@@ -644,30 +645,76 @@ async def test_the_real_binding_and_the_real_runtime() -> None:
     check(any(w.get("process") for w in wins["windows"]),
           "with process names resolved (QueryFullProcessImageNameW works)")
 
-    # The production wiring: the runtime must actually hold this adapter, or
-    # every assertion above is about a module nothing uses.
+    # `default_adapter` answers a DIFFERENT question from `platform_adapter`:
+    # not "what could this machine use" but "what should actually be
+    # installed". With both flags off the answer is nothing at all, so a stock
+    # boot holds no actuator object — nothing with bound user32 signatures or a
+    # DLL handle on a machine where Nova may neither look nor act.
+    saved = {k: os.environ.get(k) for k in ("NOVA_COMPUTER_CONTROL", "NOVA_COMPUTER_OBSERVE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        check(default_adapter() is None,
+              "with both flags off, default_adapter() installs nothing")
+        os.environ["NOVA_COMPUTER_OBSERVE"] = "1"
+        check(default_adapter() is not None,
+              "the observe flag alone is enough to want one")
+        os.environ.pop("NOVA_COMPUTER_OBSERVE")
+        os.environ["NOVA_COMPUTER_CONTROL"] = "1"
+        check(default_adapter() is not None,
+              "and so is the control flag alone")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # ── the production wiring, in both states ────────────────────────────────
+    # A stock boot. `/speaker/permission-probe` reports `adapter_installed`
+    # from this very object, and tests/test_speaker_api_contract_v52.py asserts
+    # it is False — so this has to stay None or that P5.2 contract breaks.
     async with boot(default_reply="Sure.") as nova:
         rt = nova.runtime
-        check(rt._computer._adapter is not None,
-              "the booted runtime holds a platform adapter")
+        check(rt._computer._adapter is None,
+              f"a stock boot holds NO platform adapter ({rt._computer._adapter})")
+        check(rt._computer.available is False, "so control is unavailable")
+
+        probe = await nova.http.post("/speaker/permission-probe",
+                                     json={"capability": "computer.type"})
+        body = probe.json() if probe.status_code == 200 else {}
+        check(body.get("adapter_installed") is False,
+              f"and the P5.2 permission probe still reports none "
+              f"({body.get('adapter_installed')})")
+        check(body.get("executed") is False and body.get("execution_enabled") is False,
+              "with nothing executed and execution off — the P5.2 invariant")
+
+    # With observation asked for, the runtime must ACTUALLY hold the adapter —
+    # otherwise every assertion in this file is about a module nothing uses.
+    async with boot(default_reply="Sure.",
+                    env={"NOVA_COMPUTER_OBSERVE": "1"}) as nova:
+        rt = nova.runtime
         check(type(rt._computer._adapter).__name__ == "WindowsAdapter",
-              f"and it is the Windows one ({type(rt._computer._adapter).__name__})")
+              f"asking to observe attaches the real adapter "
+              f"({type(rt._computer._adapter).__name__})")
         check(rt._computer.available is False,
-              "yet control is unavailable, because the flag is off by default")
+              "while control stays unavailable — looking is not acting")
 
         from core.tool_router import ToolCall
+
+        out = await rt._router.execute(
+            ToolCall(name="computer.observe", args={"what": "windows"}))
+        obs = out.result if isinstance(out.result, dict) else {}
+        check(obs.get("available") is True,
+              f"and the real observe tool now works ({obs.get('note') or 'ok'})")
+        check((obs.get("observation") or {}).get("count", 0) >= 1,
+              "returning real windows through the real router")
 
         out = await rt._router.execute(
             ToolCall(name="computer.act", args={"kind": "type", "target": "hello"}))
         res = out.result if isinstance(out.result, dict) else {}
         check(res.get("status") in {"approved_not_executed", "needs_confirmation"},
-              f"so the real tool is still a dry run or a prompt ({res.get('status')})")
-
-        out = await rt._router.execute(
-            ToolCall(name="computer.observe", args={"what": "windows"}))
-        obs = out.result if isinstance(out.result, dict) else {}
-        check(obs.get("available") is False,
-              f"and the real observe tool is gated too ({obs.get('status')})")
+              f"yet acting is still a dry run or a prompt ({res.get('status')})")
 
         rep = rt._capability_report()
         check(rep is not None, "the capability report still builds with an adapter attached")

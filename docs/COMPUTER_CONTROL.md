@@ -4,9 +4,11 @@ Phase 8 shipped a permission gate and, on purpose, no actuator: `ComputerControl
 ran with `adapter=None`, so a permitted action was an honest dry run. The Windows
 adapter (`core/computer_windows.py`, 2026-11-02) is that missing actuator.
 
-**A stock boot behaves exactly as it did before.** Both flags default off. The
-adapter is attached, so `NOVA_COMPUTER_CONTROL` finally means something, but
-until you set it a permitted action still returns `approved_not_executed`.
+**A stock boot behaves exactly as it did before.** Both flags default off, and
+while both are off `default_adapter()` builds nothing — the process holds no
+actuator object at all, not merely a disabled one. Set either flag and the
+adapter appears; `NOVA_COMPUTER_CONTROL` then finally means something, and until
+you set it a permitted action still returns `approved_not_executed`.
 
 ---
 
@@ -174,12 +176,26 @@ production.
 venv\Scripts\python.exe tests\mutants_c_adapter.py
 ```
 
-20 mutants delete each guard in turn — the observation gate, the deny-list, the
+21 mutants delete each guard in turn — the observation gate, the deny-list, the
 focus assertion, the bounds check, the CRITICAL refusal, the overwrite guard, the
-surrogate-pair split, the runtime wiring, `skill.run`'s dry run — and the suite
-has to notice each one. All 20 are killed by a named assertion. A guard no
-mutant can kill is a guard that is not being tested, whatever the green count
-says.
+surrogate-pair split, the runtime wiring, `skill.run`'s dry run, the conditional
+construction — and the suite has to notice each one. All 21 are killed by a
+named assertion. A guard no mutant can kill is a guard that is not being tested,
+whatever the green count says.
+
+### What the full gate caught
+
+Wiring the adapter unconditionally made `adapter_installed` true at
+`/speaker/permission-probe`, and `tests/test_speaker_api_contract_v52.py`
+asserts it is false on a stock boot. The P5.2 **invariant** was never at risk —
+voice-identified Marcus still got the same `decision` and `tier` as typed, with
+`executed` and `execution_enabled` both false. What changed was a statement of
+environmental fact, which the adapter had made obsolete.
+
+The fix went on the new code's side rather than into a frozen P5 acceptance
+suite: nothing is constructed until a flag asks for it, which restores the
+contract literally and shrinks the default surface. `M321` and C10 now both pin
+it, so it cannot drift back silently.
 
 ### What was verified live
 
@@ -194,11 +210,14 @@ guards are load-bearing in the real path, not only against the fake.
 
 ## Other platforms
 
-`default_adapter()` returns `None` off Windows, so `NOVA_COMPUTER_CONTROL` stays
+`platform_adapter()` returns `None` off Windows, so `NOVA_COMPUTER_CONTROL` stays
 a no-op there and actions remain dry runs. The import is lazy and
 platform-checked because `core/computer_windows.py` pulls in `ctypes.wintypes`,
 which raises outright on Linux and macOS — a module-level import would break
 every non-Windows boot.
+
+(`platform_adapter()` answers "what could this machine use"; `default_adapter()`
+answers "what should actually be installed", which is nothing until a flag asks.)
 
 A macOS or Linux adapter needs only the two methods in
 `core/computer_control.py`'s contract (`observe`, `execute`), either of which may

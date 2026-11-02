@@ -13,6 +13,12 @@ A Windows adapter now exists (`core/computer_windows.py`), so the flag above is
 the switch it always claimed to be rather than a no-op. The DEFAULT is
 unchanged: the flag is off, so a permitted action is still a dry run.
 
+`default_adapter()` goes further and builds NOTHING while both flags are off, so
+a stock boot holds no actuator object at all — nothing with bound user32
+signatures or a DLL handle on a machine where Nova may neither look nor act.
+That also keeps `adapter_installed: False` honest at
+`/speaker/permission-probe`, which tests/test_speaker_api_contract_v52.py pins.
+
 Observation is gated separately, by `NOVA_COMPUTER_OBSERVE`, and also defaults
 off. It has to be: `computer.observe` is READ tier and therefore auto-allowed in
 every policy mode including `locked`, so without its own gate the act of
@@ -82,8 +88,8 @@ def observation_enabled() -> bool:
     return os.getenv("NOVA_COMPUTER_OBSERVE", "0").strip().lower() in _TRUTHY
 
 
-def default_adapter(platform: str | None = None) -> Any | None:
-    """The platform adapter for this machine, or None when none fits.
+def platform_adapter(platform: str | None = None) -> Any | None:
+    """The adapter this platform COULD use, regardless of whether it is wanted.
 
     Imported lazily and per-platform: `core.computer_windows` pulls in
     `ctypes.wintypes`, which raises outright on Linux and macOS, so a
@@ -102,6 +108,25 @@ def default_adapter(platform: str | None = None) -> Any | None:
         logger.warning("computer_adapter_unavailable", platform=plat,
                        error=str(exc)[:160])
         return None
+
+
+def default_adapter(platform: str | None = None) -> Any | None:
+    """The adapter to actually INSTALL, which is none unless a flag asks.
+
+    A different question from `platform_adapter`. With neither
+    `NOVA_COMPUTER_CONTROL` nor `NOVA_COMPUTER_OBSERVE` set, no actuator object
+    is constructed at all — nothing holds bound user32 signatures or a DLL
+    handle on a machine where Nova may neither look nor act. Same conservatism
+    as the rest of Phase 8, and it keeps `adapter_installed: False` honest on a
+    default boot (`/speaker/permission-probe` reports it, and
+    tests/test_speaker_api_contract_v52.py pins it).
+
+    Either flag is enough, because observation needs an adapter to see with
+    just as much as execution needs one to act with.
+    """
+    if not (execution_enabled() or observation_enabled()):
+        return None
+    return platform_adapter(platform)
 
 
 class ComputerControl:
