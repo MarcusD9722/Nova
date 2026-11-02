@@ -165,7 +165,9 @@ CATALOG: dict[str, Setting] = dict(
         # ── Developer mode / security ───────────────────────────────────────
         _s("NOVA_DEV_MODE", "bool", "0", "Enable guarded self-editing."),
         _s("NOVA_PERMISSION_MODE", "str", "guarded", "Actuator permission policy: locked (read-only) | guarded (default; standard/admin need confirmation, critical denied) | trusted (auto-allow through standard)."),
-        _s("NOVA_COMPUTER_CONTROL", "bool", "0", "Allow computer-control actions to actually EXECUTE (still gated per-action + needs a platform adapter). OFF by default — actions are otherwise dry-run only (Phase 8)."),
+        _s("NOVA_COMPUTER_CONTROL", "bool", "0", "Allow computer-control actions to actually EXECUTE (still gated per-action by the permission broker). OFF by default — actions are otherwise dry-run only. A Windows adapter ships (core/computer_windows.py); on other platforms there is none, so this stays a no-op (Phase 8)."),
+        _s("NOVA_COMPUTER_OBSERVE", "bool", "0", "Allow Nova to actually look at this machine's windows (titles, geometry, process names — never pixels or screen content). Separate from NOVA_COMPUTER_CONTROL on purpose: computer.observe is READ tier and so auto-allowed in every policy mode, and window titles name documents, messages and accounts. OFF by default."),
+        _s("NOVA_COMPUTER_DENY_WINDOWS", "csv", "", "Foreground-window titles that refuse synthesized input (substring match, case-insensitive). Empty uses the built-in list — password managers, terminals and security dialogs; see DEFAULT_DENY_WINDOWS. Set to 'none' to disable the guard entirely, which is not advised."),
         _s("NOVA_API_TOKEN", "str", "", "Bearer token required on all endpoints when set.", secret=True),
         _s("NOVA_ADMIN_TOKEN", "str", "", "Extra token for maintenance endpoints.", secret=True),
         _s("NOVA_ALLOWED_ORIGINS", "csv", "", "CORS origins override (comma-separated)."),

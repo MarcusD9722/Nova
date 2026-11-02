@@ -89,7 +89,7 @@ from core.workers.research_worker import ResearchWorker
 from core.orchestrator.society import AgentSociety
 from core import code_intel
 from core.permissions import PermissionBroker
-from core.computer_control import ComputerControl
+from core.computer_control import ComputerControl, default_adapter
 from core.error_log import ErrorLog
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.unifier import MemoryUnifier
@@ -923,14 +923,18 @@ class RuntimeManager:
             return {"ok": True, "by_severity": scan["by_severity"], "findings": scan["findings"][:25],
                     "disclaimer": scan["disclaimer"]}
 
-        # ── Computer control (Phase 8) — permission-gated, propose-only ──────
-        # The broker is the single gate; no platform adapter ships, so actions
-        # are dry-run/unavailable by default (see core/computer_control.py).
+        # ── Computer control (Phase 8) — permission-gated ────────────────────
+        # The broker is the single gate. A platform adapter now exists on
+        # Windows, so `NOVA_COMPUTER_CONTROL` is the switch it always claimed to
+        # be — but it is still off by default, so a permitted action is still a
+        # dry run until Marcus turns it on. Observation has its own flag,
+        # `NOVA_COMPUTER_OBSERVE`, also off (see core/computer_control.py).
         self._permission_broker = PermissionBroker(
             mode=os.getenv("NOVA_PERMISSION_MODE", "guarded"),
             audit_path=(memory_dir / "permission_audit.jsonl"),
         )
-        self._computer = ComputerControl(self._permission_broker, adapter=None)
+        self._computer = ComputerControl(self._permission_broker,
+                                         adapter=default_adapter())
 
         async def _tool_computer_observe(args: dict[str, Any]) -> dict[str, Any]:
             return await self._computer.observe(str(args.get("what") or "windows"))
@@ -963,13 +967,27 @@ class RuntimeManager:
             params = args.get("params") if isinstance(args.get("params"), dict) else {}
             steps = render_steps(skill["steps"], params)
             # Every step is re-checked through the permission gate — a "learned"
-            # skill is never a bypass. With no adapter, each step is a dry run.
+            # skill is never a bypass.
+            #
+            # `dry_run=True` is load-bearing, not belt-and-braces. A step is a
+            # free-text description: `detect_repeated_workflow` builds steps
+            # from an activity log and `render_steps` only fills in
+            # {placeholders}, so a step reads like "open the browser". Typing
+            # that string is not executing the workflow, it is dumping prose
+            # into whichever window has focus — which is exactly what would
+            # have happened once a real platform adapter was wired and
+            # NOVA_COMPUTER_CONTROL was on. Running a learned skill for real
+            # needs a step -> action translator that does not exist yet, and
+            # guessing at one here would be inventing intent.
             results = []
             for step in steps:
-                results.append({"step": step, **await self._computer.act("type", target=step,
-                                                                          details={"step": step}, wait_for_confirm=False)})
+                results.append({"step": step, **await self._computer.act(
+                    "type", target=step, details={"step": step},
+                    wait_for_confirm=False, dry_run=True)})
             return {"ok": True, "skill": skill["name"], "steps_evaluated": results,
-                    "note": "Each step is permission-checked individually; nothing executed without an enabled adapter."}
+                    "note": ("Each step was permission-checked individually. Nothing was "
+                             "executed: a learned step is a description, not a keystroke "
+                             "payload, so there is nothing to synthesize yet.")}
 
         # ── Project deletion: permission-gated, recoverable by default ───────
         from core.project_manager import ProjectManager as _PM
@@ -1123,8 +1141,10 @@ class RuntimeManager:
             "actions need Marcus's explicit approval, and NOTHING executes unless computer control is enabled with a "
             "platform adapter (off by default — otherwise a dry run). args: {kind, target?, details?}")
         self._router.register("skill.run", _tool_skill_run,
-            "Run a learned workflow skill by id, substituting {params}. Every step is re-checked through the "
-            "permission gate; a learned skill is never a bypass. args: {skill_id, params?}")
+            "Evaluate a learned workflow skill by id, substituting {params}. Every step is re-checked through "
+            "the permission gate; a learned skill is never a bypass. Steps are descriptions rather than "
+            "keystrokes, so this reports the per-step permission decisions and executes nothing. "
+            "args: {skill_id, params?}")
 
         for _name, _fn, _desc in [
             ("code.index", _tool_code_index,
@@ -2833,10 +2853,11 @@ class RuntimeManager:
     def _capability_report(self):
         """The runtime's own view of what is wired up right now.
 
-        Registration is not operability: `ComputerControl` is constructed with
-        `adapter=None` because no platform adapter ships, so its tools exist
-        and permission may be granted while nothing can actually execute. That
-        is measured here and passed in, rather than inferred from a flag.
+        Registration is not operability: `ComputerControl` holds a platform
+        adapter where one exists, but `NOVA_COMPUTER_CONTROL` is off by
+        default, so its tools exist and permission may be granted while
+        nothing can actually execute. That is measured here through
+        `.available` — flag AND adapter — rather than inferred from either.
         """
         from core.capability_report import summarize_capabilities
 

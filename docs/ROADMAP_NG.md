@@ -164,7 +164,7 @@ API-accessible).
   `list` + `/experiments`.
 - No schema migration (facts-based). Backend/API only.
 
-### Phase 8 — Computer Control & Skill Learning *(✅ SHIPPED 2026-07-20)*
+### Phase 8 — Computer Control & Skill Learning *(✅ SHIPPED 2026-07-20; actuator added 2026-11-02)*
 - **Permission foundation (shipped first, on purpose)** — `core/permissions.py`: four
   tiers (read/standard/admin/critical), capability→tier registry, policy modes
   (`locked`/`guarded` [default]/`trusted`), a pure `evaluate`, and an async
@@ -173,17 +173,51 @@ API-accessible).
   Flag `NOVA_PERMISSION_MODE`. `/permissions/audit`, `/permissions/resolve`.
 - **Computer control — `core/computer_control.py`, propose-only** — every action routes
   through the broker, and even an *allowed* action is a **dry run** unless BOTH
-  `NOVA_COMPUTER_CONTROL=1` AND a platform adapter are present (neither ships). Observe
+  `NOVA_COMPUTER_CONTROL=1` AND a platform adapter are present. Observe
   honestly reports "no adapter" rather than faking sight. `computer.observe`/`computer.act`.
   **No armed autonomous actuator by default.**
+- **Windows adapter — `core/computer_windows.py` (added 2026-11-02)** — the actuator the
+  phase deliberately left out. Pure `ctypes` against user32/kernel32, so no new dependency
+  (`psutil` is present in the venv but unpinned, so process names come from
+  `QueryFullProcessImageNameW`). `NOVA_COMPUTER_CONTROL` is now the switch it always
+  claimed to be — and **still off by default**, so nothing about a stock boot changed.
+  Verified live: SendInput accepted 2/2 events, a capslock toggle observed through
+  `GetKeyState` and restored. See `docs/COMPUTER_CONTROL.md`.
+  - **Observation is gated separately** by `NOVA_COMPUTER_OBSERVE`, also off. It had to
+    be: `computer.observe` is READ tier, so it is auto-allowed in *every* policy mode
+    including `locked` — without its own flag, merely installing an adapter would have
+    turned silent window enumeration on, and window titles name documents, messages and
+    accounts. Looking and acting are separate decisions.
+  - **Three guards in front of input synthesis**, all failing closed: a deny-list on the
+    foreground window title (password managers, terminals, security dialogs — applied to
+    clicks too, since clicking "Allow" is worse than typing), an optional focus assertion
+    (`details["window"]`), and bounds plus a 2,000-char ceiling. Every executed action
+    reports which window received it.
+  - **Deliberately not implemented:** screenshots or any screen-content reading; the two
+    CRITICAL kinds (`system_setting`, `delete`), which the adapter refuses structurally
+    rather than relying on the policy mode; and forced process kill — `close_app` posts
+    WM_CLOSE, which an app may refuse or answer with a save prompt.
+  - 20 mutants (`tests/mutants_c_adapter.py`) delete each guard in turn, all killed;
+    `tests/test_computer_windows_adapter.py` (148 assertions) drives a fake API so the
+    suite synthesizes no real input, with two sections against the real binding and the
+    booted runtime.
+  - **Fixed in passing:** `skill.run` called `act("type", target=step)` per step, and a
+    learned step is a free-text description (`detect_repeated_workflow` builds them from an
+    activity log), not a keystroke payload. Harmless while no adapter existed; with one
+    wired and the flag on it would have typed prose into whatever window had focus. `act`
+    now takes an explicit `dry_run`, which `skill.run` uses, so its "nothing executed"
+    note is true by construction rather than true only while the actuator was missing.
+    Running a learned skill for real needs a step -> action translator that does not
+    exist yet.
 - **#2 Autonomous Skill Learning** — `core/skills.py`: deterministic
   `detect_repeated_workflow` (longest recurring non-overlapping subsequence) → Nova
   OFFERS to learn, never auto-learns. Learned skills are parameterized, versioned (with
   history), and branchable; running one re-checks every step through the permission gate
   (never a bypass). `skill.detect`/`learn`/`list`/`get`/`update`/`branch`/`delete`/`run`
   + `/skills`.
-- No schema migration (facts-based). **Deliberately conservative** — the whole point of
-  the phase is the gate, not the actuator.
+- No schema migration (facts-based). **Deliberately conservative** — the point of the
+  phase was the gate, and the gate is unchanged: the adapter sits behind it, off by
+  default, and refuses on its own account on top of whatever the broker decides.
 
 ### Phase 9 — Physical World *(hardware/device-gated)*
 - **#16 Smart Home Intelligence** (abstraction layer buildable now; context-aware rules;
