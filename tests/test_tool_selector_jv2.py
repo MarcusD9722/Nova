@@ -313,6 +313,42 @@ def test_context_influences_selection():
     check(len(bare.tools) > 0, "the bare follow-up still returns candidates rather than nothing")
 
 
+def test_cosine_depends_on_normalised_vectors():
+    """`_cosine` is a DOT PRODUCT, and only equals a cosine for unit vectors.
+
+    core/tools/selector.py skips normalising on purpose: memory/embeddings.py
+    returns L2-normalised vectors, so the dot product already IS the cosine,
+    and renormalising per tool per turn would be wasted work. That makes tool
+    ranking depend on an invariant owned by a module three files away, and
+    nothing near the consumer asserted it — if embeddings ever stopped
+    normalising, selection would silently mis-rank with no error anywhere.
+    """
+    from core.tools.selector import _cosine
+
+    unit = [0.6, 0.8]
+    check(abs(_cosine(unit, unit) - 1.0) < 1e-9, "unit vectors score 1.0")
+    scaled = [1.2, 1.6]  # same direction, norm 2
+    check(_cosine(scaled, scaled) > 1.0,
+          f"a non-unit vector scores ABOVE 1 — this is a dot product, not a "
+          f"cosine, which is exactly why the invariant matters "
+          f"(got {_cosine(scaled, scaled):.2f})")
+    check(abs(_cosine(unit, [0.8, -0.6])) < 1e-9,
+          "orthogonal unit vectors score 0")
+    check(_cosine([], [1.0]) == 0.0, "degenerate input scores 0, no crash")
+
+    # The invariant itself, measured at its source rather than assumed.
+    from memory import embeddings
+
+    available = embeddings.embedding_available()
+    print(f"  --   real embedder available: {available}")
+    if available:
+        v = embeddings.embed_texts(["what's the weather in Austin"])[0]
+        norm = sum(x * x for x in v) ** 0.5
+        check(abs(norm - 1.0) < 1e-3,
+              f"memory/embeddings returns unit vectors, which is what makes "
+              f"the selector's dot product a cosine (norm {norm:.4f})")
+
+
 def main():
     test_recall_is_perfect()
     test_no_tool_turns()
@@ -322,6 +358,7 @@ def main():
     test_query_embedded_once_per_turn()
     test_selection_preserves_permissions_boundary()
     test_context_influences_selection()
+    test_cosine_depends_on_normalised_vectors()
 
     print("\nRESULT:", "FAILURES" if _fail else "ALL PASS")
     sys.exit(1 if _fail else 0)

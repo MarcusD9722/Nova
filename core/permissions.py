@@ -242,11 +242,14 @@ class PermissionBroker:
         BUS.publish("permission.mode_changed", {"mode": self._mode})
 
     @staticmethod
-    def _now() -> str:
+    def _now_iso() -> str:
+        # Named for what it RETURNS. `_now()` elsewhere in this codebase means
+        # a datetime (core/runtime.py, core/agent_supervisor.py); this one has
+        # always been a string.
         return datetime.now(timezone.utc).isoformat()
 
     def _audit(self, entry: dict[str, Any]) -> None:
-        entry = {"ts": self._now(), **entry}
+        entry = {"ts": self._now_iso(), **entry}
         self._recent.append(entry)
         self._recent = self._recent[-500:]
         BUS.publish("permission.audit", {k: clip(str(v), 160) for k, v in entry.items()})
@@ -279,7 +282,7 @@ class PermissionBroker:
         self._pending[request_id] = asyncio.get_event_loop().create_future()
         self._pending_meta[request_id] = {
             "capability": capability, "tier": TIER_NAMES[tier],
-            "details": dict(details or {}), "requested_at": self._now()}
+            "details": dict(details or {}), "requested_at": self._now_iso()}
         self._audit({**base, "outcome": "pending", "request_id": request_id})
         BUS.publish("permission.requested", {"request_id": request_id, "capability": capability,
                                              "tier": TIER_NAMES[tier], "details": details or {}})

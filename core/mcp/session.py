@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import shutil
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,14 +68,32 @@ class ServerConfig:
         )
 
 
-class Transport:
+class Transport(ABC):
     """Minimal duplex JSON-RPC channel. Implemented by stdio; an HTTP/SSE
-    transport can satisfy the same three methods."""
+    transport can satisfy the same five methods.
 
+    An ABC rather than a bare class with `...` bodies, because those bodies
+    silently return None: a transport missing one method would fail somewhere
+    downstream with a confusing error instead of at construction. A
+    `typing.Protocol` would not help here — Protocol members are not abstract,
+    so an explicit subclass missing one still instantiates. (The Protocol in
+    services/tts_client.py is right for ITS case: those implementations are
+    duck-typed and never subclass it.)
+    """
+
+    @abstractmethod
     async def start(self) -> None: ...
+
+    @abstractmethod
     async def send(self, payload: dict) -> None: ...
+
+    @abstractmethod
     async def receive(self, timeout: float) -> dict | None: ...
+
+    @abstractmethod
     async def close(self) -> None: ...
+
+    @abstractmethod
     def is_alive(self) -> bool: ...
 
 
