@@ -268,6 +268,10 @@ over-long text, paragraph dumps) before replacing a template.
 
 **U5 — capabilities.**
 * `core/semantic_cache.py` — reuse a recent answer when a question *means* the same thing.
+  **Deleted 2026-11:** it shipped as a module but was never wired into the chat
+  path, and it keyed on the question embedding alone with no speaker scoping,
+  so it could not be wired without breaking P5 memory isolation. The
+  repetition problem it was reached for is handled by `core/repetition.py`.
   Strict admission: never a tool-backed turn, never time-sensitive, never short exchanges,
   high similarity bar, short TTL, and **any memory write invalidates everything**.
 * `MemoryUnifier.correct_fact` + `memory.correct` — a correction now SUPERSEDES the wrong

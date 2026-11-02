@@ -29,7 +29,9 @@ def main():
     used: set[str] = set()
     for folder in ("core", "backend", "memory", "plugins", "tools"):
         for f in (REPO / folder).rglob("*.py"):
-            if "__pycache__" in f.parts or "venv" in f.parts:
+            # `bpyenv` is a vendored Blender runtime — 2298 files that are not
+            # Nova's code and are walked on every run for nothing.
+            if ({"__pycache__", "venv", "bpyenv"} & set(f.parts)):
                 continue
             used |= set(re.findall(r'"(NOVA_[A-Z_]+)"', f.read_text(encoding="utf-8", errors="replace")))
     missing = sorted(used - set(CATALOG))
@@ -48,6 +50,19 @@ def main():
     }
     ghost = sorted(documented - set(CATALOG))
     check(not ghost, f".env.example documents only real (cataloged) vars (dead: {ghost or 'none'})")
+
+    # ── .env.example is GENERATED, so it must BE what the generator renders.
+    # The ghost check above only sees UNCOMMENTED lines, which is exactly how
+    # the file drifted ~120 settings behind the catalog while still passing:
+    # every stale entry was a comment, and nothing checked the other direction
+    # at all. One stale section even documented NOVA_SPEAKER_ID=0 while the
+    # real default was 1. Byte equality makes that class of drift impossible.
+    from tools.gen_env_example import render as render_env_example
+
+    on_disk = env_example.read_text(encoding="utf-8")
+    check(on_disk == render_env_example(),
+          "`.env.example` is exactly what tools/gen_env_example.py renders — "
+          "run that script after changing a setting")
 
     # ── Validation behaviors (pure, on a supplied environ) ──
     warnings = validate_environment({"NOVA_PROT": "9000"})

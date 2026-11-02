@@ -9,9 +9,11 @@ Live: Nova gave a capability answer, Marcus then said something entirely new —
 
 — and Nova replied with essentially her previous capability answer.
 
-The semantic response cache was ruled out first: `core/semantic_cache.py` is
-imported by no production module (only by a test), so it is not in the chat
-path, and this was not a stale cache hit. Prior assistant replies ARE in the
+The semantic response cache was ruled out first: it was imported by no
+production module (only by a test), so it was not in the chat path and this was
+not a stale cache hit. That module has since been deleted outright — it keyed
+on the question embedding alone, with no speaker scoping, so it could never be
+wired without breaking P5 memory isolation. Prior assistant replies ARE in the
 prompt for continuity, which is correct and must stay; the model simply reused
 one.
 

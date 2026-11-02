@@ -7,7 +7,7 @@ Live: Nova answered a capability question, Marcus then said something new —
 
 — and she replied with essentially the previous capability answer.
 
-Ruled out first, per the brief: `core/semantic_cache.py` is imported by no
+Ruled out first, per the brief: the semantic cache was imported by no
 production module (only by a test), so the response cache is NOT in the chat
 path and this was not a stale cache hit.
 
