@@ -435,8 +435,9 @@ class SelfImproveWorker:
         if 3 <= len(focus) <= 200:
             try:
                 await self._memory.record_interest_focus(focus)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("interest_focus_write_failed",
+                             error=str(exc)[:160])
 
     # How many reflection cycles between consolidation passes. Reflection runs
     # every ~30 min; a pattern across days doesn't change in half an hour, and

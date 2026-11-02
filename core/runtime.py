@@ -591,13 +591,16 @@ class RuntimeManager:
         # NOTE: ChatDecider and ResponseComposer used to be constructed here.
         # Phase P4 unified /chat and /chat/stream onto one pipeline and stopped
         # calling both of them; the attributes were assigned and never read
-        # again, so every boot built two unused LLM policy objects. Removing
-        # them also drops the last reference to FollowUpGeneratorLLM (its only
-        # caller was ChatDecider), leaving core/policy/chat_decider.py,
-        # core/policy/followup_generator.py and core/response_composer.py —
-        # ~590 lines — completely unreachable. They are left on disk (working
-        # and now under test) rather than deleted unilaterally; delete them
-        # when you're sure deep-mode composition won't want them back.
+        # again, so every boot built two unused LLM policy objects. That also
+        # dropped the last reference to FollowUpGeneratorLLM, whose only caller
+        # was ChatDecider.
+        #
+        # The three files it left unreachable — chat_decider.py,
+        # followup_generator.py, response_composer.py, ~590 lines — were
+        # DELETED in the 2026-11 repo cleanup. A second scan confirmed nothing
+        # imported them and that two of the three had no test at all, so the
+        # earlier note's "now under test" was true of one file only. Deep mode
+        # never did want them back; git history has them if it ever does.
         self._extractor = MemoryExtractorLLM(llm, llm_semaphore=self._llm_sem)
         self._summarizer = SummarizerLLM(llm, llm_semaphore=self._llm_sem)
         self._storyteller = StorytellerLLM(llm, llm_semaphore=self._llm_sem)
@@ -2237,8 +2240,11 @@ class RuntimeManager:
                         entity=_story_ent, attribute="state",
                         value=new_state[:2000], confidence=0.8,
                     )
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # The story continues next turn from whatever was last stored,
+                # so a dropped state write loses the thread silently.
+                logger.warning("story_state_write_failed",
+                               error=str(exc)[:160])
             yield {"type": "done", "full_text": story_reply, "tool_calls": []}
             return
 
@@ -3484,8 +3490,8 @@ class RuntimeManager:
                 if wb_trend:
                     context["wellbeing_trend"] = wb_trend
                     await self._memory.mark_wellbeing_nudged()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("wellbeing_nudge_failed", error=str(exc)[:160])
 
         # Continuity across gaps (CG1) — "catch me up" on the first turn of a
         # genuinely new conversation, if enough time has passed since the last
@@ -3961,8 +3967,9 @@ class RuntimeManager:
         try:
             await self._memory.add_lesson(msg, topic="preference")
             BUS.publish("memory.lesson_learned", {"lesson": msg[:160]})
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Marcus asked for something to change and Nova did not keep it.
+            logger.warning("lesson_write_failed", error=str(exc)[:160])
 
     async def _capture_mood(self, message: str) -> None:
         """Detect a coarse mood signal (heuristic, not an LLM call — see
@@ -3974,8 +3981,8 @@ class RuntimeManager:
         try:
             await self._memory.record_mood(label)
             BUS.publish("mood.detected", {"mood": label})
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("mood_write_failed", mood=label, error=str(exc)[:160])
 
     async def _capture_wellbeing(self) -> None:
         """Coarse usage-time signal (WB1) — no LLM call, just a clock check.
@@ -3985,5 +3992,6 @@ class RuntimeManager:
         if 0 <= hour < 5:
             try:
                 await self._memory.record_wellbeing_signal("late_night")
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("wellbeing_signal_write_failed",
+                             error=str(exc)[:160])

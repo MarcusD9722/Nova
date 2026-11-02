@@ -41,6 +41,10 @@ confidently, skip the model; otherwise ask. Best of both — no latency regressi
 common phrasing, no silent failure on the uncommon one.
 
 ### A2. Task/smalltalk routing — `core/policy/chat_decider.py`
+> **Moot since 2026-11:** `chat_decider.py` was deleted. Phase P4 stopped
+> calling it and it sat unreachable; routing now lives in `core/intent.py`
+> plus the runtime's own tool decider. Kept here as the record of what was
+> proposed, not as a live item.
 `_looks_like_task_request`, `_needs_task_clarification`, `_task_title`,
 `_smalltalk_token_budget` are all regex/heuristic. This decides whether Nova *builds
 something* vs. *chats* — a high-consequence branch driven by pattern matching.

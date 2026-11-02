@@ -5,7 +5,9 @@ from __future__ import annotations
 One place to answer "is this a question?" — previously every subsystem invented
 its own rule with different behavior:
   - core/project_builder.py QUESTION_LEAD_RE: anchored to the literal first word
-  - core/policy/chat_decider.py _TASK_REQUEST_RE/_NON_TASK_CHAT_RE: anchored at 0
+  - the old ChatDecider's _TASK_REQUEST_RE/_NON_TASK_CHAT_RE: anchored at 0
+    (that module was deleted once it became unreachable; the lesson is why
+     this file exists, so it is kept here rather than the dangling path)
 
 That anchoring is exactly how "I meant What other improvements can we make to
 the flappy-bird game?" got treated as a work request instead of a question: the

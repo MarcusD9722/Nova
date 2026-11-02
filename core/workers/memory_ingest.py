@@ -130,8 +130,9 @@ class MemoryIngestWorker:
                     await self._sq.put(SummarizeHintEvent(
                         conversation_id=ev.conversation_id, timestamp=_now(),
                         reason="periodic", identity=ev.identity))
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("summarize_hint_dropped",
+                                 conversation_id=cid, error=str(exc)[:160])
 
             await self._drain_summarize_hints(max_items=1)
 

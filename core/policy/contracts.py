@@ -115,24 +115,9 @@ class MemoryFact(_StrictModel):
         return v
 
 
-class TaskToEnqueue(_StrictModel):
-    title: str
-    details: str
-
-
 class ToolPlanItem(_StrictModel):
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
-
-
-class ConversationPolicyOutput(_StrictModel):
-    mode: Literal["smalltalk", "task", "clarify", "refuse"] = "smalltalk"
-    assistant_reply: str = ""
-    follow_up_question: str | None = None
-    should_enqueue_task: bool = False
-    task_to_enqueue: TaskToEnqueue | None = None
-    tool_plan: list[ToolPlanItem] = Field(default_factory=list)
-    memory_facts: list[MemoryFact] = Field(default_factory=list)
 
 
 class MemoryExtractorOutput(_StrictModel):
@@ -145,10 +130,6 @@ class AutonomyPlannerOutput(_StrictModel):
     tool_calls: list[ToolPlanItem] = Field(default_factory=list)
     new_tasks: list[dict[str, Any]] = Field(default_factory=list)  # {title, details, priority}
     message_to_user: str | None = None
-
-
-class FollowUpGeneratorOutput(_StrictModel):
-    follow_up_question: str = ""
 
 
 class SummarizerOutput(_StrictModel):

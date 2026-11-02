@@ -51,6 +51,8 @@ Date *arithmetic* must stay exact and deterministic. Only unusual *phrasing*
 hands a concrete date back to the deterministic math.
 
 ### A3 — `core/response_composer.py` (12) and `core/mood.py` (8)
+> **Partly moot since 2026-11:** `response_composer.py` was deleted
+> (unreachable since Phase P4). The `core/mood.py` half below still stands.
 Mood still has a fixed `MOOD_LABELS` set; U4 improved the *stress read* in the
 twin but not mood capture itself.
 

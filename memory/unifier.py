@@ -1608,11 +1608,19 @@ class MemoryUnifier:
                         try:
                             await self._sqlite.reinforce_fact(dupes[0])
                             self._search_gen += 1
-                        except Exception:
-                            pass
+                        except Exception as exc:  # noqa: BLE001
+                            # Still degrades to "already stored" — but the
+                            # re-mention did NOT resist decay, and the comment
+                            # above promises it would.
+                            logger.debug("fact_reinforce_failed", entity=entity,
+                                         attribute=attribute,
+                                         error=str(exc)[:160])
                         return UUID(dupes[0])  # already stored; nothing to write
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # The duplicate CHECK failed, so the write below may store a
+                    # second copy of a fact that is already here.
+                    logger.debug("fact_duplicate_check_failed", entity=entity,
+                                 attribute=attribute, error=str(exc)[:160])
 
             tasks = [
                 self._sqlite.add_fact(
@@ -1661,8 +1669,12 @@ class MemoryUnifier:
         if stale_ids and self._chroma is not None:
             try:
                 await self._chroma.delete_ids(stale_ids)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # The superseded rows are gone from SQLite but their vectors
+                # are not, so recall can still surface the old value.
+                logger.warning("semantic_delete_failed",
+                               where="superseded_fact", ids=len(stale_ids),
+                               error=str(exc)[:160])
 
         BUS.publish(
             "memory.write",
@@ -1987,8 +1999,10 @@ class MemoryUnifier:
             if self._chroma is not None:
                 try:
                     await self._chroma.delete_ids(ids)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("semantic_delete_failed",
+                                   where="supersede_facts", ids=len(ids),
+                                   error=str(exc)[:160])
             await self._json.append_audit({"op": "supersede", "ids": ids, "reason": reason})
             return removed
         except Exception as e:  # noqa: BLE001
@@ -2021,8 +2035,13 @@ class MemoryUnifier:
                 if self._chroma is not None:
                     try:
                         await self._chroma.delete_ids(ids)
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        # The corrected-away value is still semantically
+                        # searchable, which is the whole thing a correction
+                        # exists to stop.
+                        logger.warning("semantic_delete_failed",
+                                       where="correct_fact", ids=len(ids),
+                                       error=str(exc)[:160])
             except Exception as e:  # noqa: BLE001
                 logger.debug("correction_delete_failed", error=str(e)[:160])
 
@@ -2502,8 +2521,13 @@ class MemoryUnifier:
                 stale_ids = [f"doc:{path}#{i}" for i in range(len(chunks), prior_count)]
                 try:
                     await self._chroma.delete_ids(stale_ids)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # Orphan chunks from the file's longer previous version
+                    # stay in recall, quoting text the file no longer has.
+                    logger.warning("semantic_delete_failed",
+                                   where="document_chunks",
+                                   path=str(path)[:120], ids=len(stale_ids),
+                                   error=str(exc)[:160])
 
             await self._sqlite.replace_document_chunks(path, chunks)
 
@@ -2715,8 +2739,12 @@ class MemoryUnifier:
             if self._chroma is not None:
                 try:
                     await self._chroma.delete_ids(ids)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # A purge that only half happened is the worst outcome
+                    # here: SQLite says gone, recall says otherwise.
+                    logger.warning("semantic_delete_failed",
+                                   where="purge_facts", ids=len(ids),
+                                   error=str(exc)[:160])
 
         return {
             "entity": ent,

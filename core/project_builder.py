@@ -659,8 +659,12 @@ class ProjectBuilder:
     async def _save_fact(self, slug: str, attribute: str, value: str) -> None:
         try:
             await self._memory.add_fact(entity=f"project:{slug}", attribute=attribute, value=value[:400], confidence=0.95)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Every project fact — status, last_error, last_worked — comes
+            # through here. Silence meant a degraded memory lost all of them
+            # without a single line to find it by.
+            logger.warning("project_fact_write_failed", project=slug,
+                           attribute=attribute, error=str(exc)[:160])
 
     async def _set_last_active(self, slug: str) -> bool:
         """Store the current-project pointer. False if it did not get stored.
@@ -731,8 +735,11 @@ class ProjectBuilder:
         try:
             await self._memory.add_fact(entity="projects", attribute="last_active",
                                         value="", confidence=0.95)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # The pointer still names a project that is gone, so "it" can
+            # resolve to something deleted on the next turn.
+            logger.warning("stale_last_active_not_cleared",
+                           project=slug, error=str(exc)[:160])
         return None
 
     def _read_project_md(self, slug: str) -> str:
@@ -1075,8 +1082,11 @@ class ProjectBuilder:
                 await self._announcer.announce(slug=slug, verdict=verdict,
                                          reason=f"build failed: {str(e)[:120]}",
                                          extra={"mode": "build"})
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # NB: bound as `exc`, not `e` — `e` is the build failure and is
+                # still read on the next line. Binding `e` here would delete it.
+                logger.warning("build_failure_report_failed", project=slug,
+                               error=str(exc)[:160])
             BUS.publish("project.error", {"project": slug, "error": clip(e, 240)})
         finally:
             self._active.pop(slug, None)

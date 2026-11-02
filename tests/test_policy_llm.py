@@ -26,7 +26,6 @@ from harness import Checks, ScriptedLLM
 from core.policy._json_extract import extract_first_json_object
 from core.policy.autonomy_planner import AutonomyPlannerLLM
 from core.policy.contracts import MemoryExtractorOutput
-from core.policy.followup_generator import FollowUpGeneratorLLM
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.storyteller import is_story_request, story_system_prompt
 from core.policy.summarizer import SummarizerLLM
@@ -144,26 +143,6 @@ async def test_summarizer() -> None:
     check(out.key_facts == [{"k": "v"}] and out.open_loops == [{"o": "1"}], "optional lists round-trip")
 
 
-async def test_followup() -> None:
-    check.section("FollowUpGeneratorLLM")
-
-    m, sem = llm_returning('{"follow_up_question":"How did the fort turn out?"}')
-    out = await FollowUpGeneratorLLM(m, llm_semaphore=sem).regenerate(user_text="x", avoid=[])
-    check(out.follow_up_question.endswith("?"), "a question is returned")
-
-    m, sem = llm_returning('{"follow_up_question":"How did it go."}')
-    out = await FollowUpGeneratorLLM(m, llm_semaphore=sem).regenerate(user_text="x", avoid=[])
-    check(out.follow_up_question == "How did it go?", "a missing '?' is repaired")
-
-    m, sem = llm_returning('{"follow_up_question":"Really!!"}')
-    out = await FollowUpGeneratorLLM(m, llm_semaphore=sem).regenerate(user_text="x", avoid=[])
-    check(out.follow_up_question == "Really?", "trailing punctuation is normalized to '?'")
-
-    m, sem = llm_returning("nonsense")
-    out = await FollowUpGeneratorLLM(m, llm_semaphore=sem).regenerate(user_text="x", avoid=[])
-    check(out.follow_up_question == "", "an unparseable reply yields an empty question, no raise")
-
-
 async def test_autonomy_planner() -> None:
     check.section("AutonomyPlannerLLM")
 
@@ -239,7 +218,6 @@ async def main() -> None:
     await test_json_extract()
     await test_memory_extractor()
     await test_summarizer()
-    await test_followup()
     await test_autonomy_planner()
     await test_storyteller()
     await test_semaphore_is_respected()
