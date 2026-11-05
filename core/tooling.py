@@ -64,7 +64,7 @@ async def _kill_tree(proc: Any) -> None:
             await asyncio.wait_for(killer.wait(), timeout=10)
             return
         except Exception as e:  # noqa: BLE001
-            logger.debug("taskkill_failed", pid=pid, error=str(e)[:120])
+            logger.warning("taskkill_failed", pid=pid, error=str(e)[:120])
     with contextlib.suppress(Exception):
         proc.kill()
 
@@ -338,9 +338,21 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         topic = _slug_topic(str(args.get("topic") or args.get("attribute") or ""))
         if not fact:
             return {"ok": False, "error": "missing_fact"}
-        # "note" is a personal namespace, not a shared one — a guest saying
-        # "remember my locker code" was writing into the same bucket as Marcus.
-        entity = remap_entity_for("note", current_identity())
+
+        # AN ATTRIBUTE-SHAPED TOPIC GOES WHERE ATTRIBUTES GO (audit, M18).
+        # "remember that I live in Austin" with topic="location" was written to
+        # `note.location`, while the extractor writes the same thing to
+        # `user.location`. Only the `user` row is a singleton, so it is
+        # superseded on a move and the `note` row stays forever: after moving
+        # from Dallas to Austin, BOTH were in memory and both came back on
+        # recall. One namespace per kind of fact, so supersession can work.
+        namespace = "note"
+        if topic in MemoryUnifier._SINGLETON_USER_ATTRS:
+            namespace = "user"
+
+        # A personal namespace, not a shared one — a guest saying "remember my
+        # locker code" was writing into the same bucket as Marcus.
+        entity = remap_entity_for(namespace, current_identity())
         if entity is None:
             return {"ok": False, "error": "unverified_speaker", "saved": None,
                     "detail": ("I can't save that to memory when I'm not sure "
@@ -351,7 +363,27 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             entity=entity, attribute=topic, value=fact[:400], confidence=0.9,
             source="user", verification_status="stated",
         )
-        return {"ok": True, "saved": fact[:400], "topic": topic}
+        # A note written under the OLD routing for the same attribute would now
+        # sit beside the superseding one forever, so it is retired here. Only
+        # the speaker's own notes, and only the one attribute.
+        superseded = 0
+        if namespace == "user":
+            stale_note = remap_entity_for("note", current_identity())
+            if stale_note:
+                try:
+                    old = await memory.get_facts(entity=stale_note,
+                                                 attribute=topic, limit=25)
+                    ids = [str(f.id) for f in old if getattr(f, "id", None)]
+                    if ids:
+                        superseded = await memory.supersede_facts(
+                            old_ids=ids,
+                            reason=f"re-routed to {entity}.{topic} (audit M18)")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("stale_note_retire_failed", attribute=topic,
+                                   error=str(exc)[:160])
+        return {"ok": True, "saved": fact[:400], "topic": topic,
+                "stored_as": f"{entity}.{topic}",
+                **({"replaced_notes": superseded} if superseded else {})}
 
     async def _memory_correct(args: dict[str, Any]) -> dict[str, Any]:
         """Correct a remembered fact — scoped to whoever is actually speaking.
@@ -395,6 +427,25 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         if not attribute or not new_value:
             return {"ok": False, "error": "missing_attribute_or_value"}
         return await memory.correct_fact(entity, attribute, new_value, old_value=old_value)
+
+    async def _memory_forget(args: dict[str, Any]) -> dict[str, Any]:
+        """Delete something the speaker asks to be forgotten.
+
+        This tool did not exist (audit 2026-11-02, C4). "Please forget my locker
+        code" reached `memory.correct`, which needs a replacement value, failed
+        with `missing_attribute_or_value` — and the reply said "I've wiped that
+        locker code from my memory" anyway. The next turn recited it.
+
+        The result names what was removed, so the reply can state the truth
+        instead of asserting it.
+        """
+        what = str(args.get("what") or args.get("query") or args.get("topic")
+                   or args.get("value") or "").strip()
+        if not what:
+            return {"ok": False, "error": "missing_what",
+                    "detail": "Say which thing to forget."}
+        dry = bool(args.get("dry_run") or args.get("preview"))
+        return await memory.forget(what, dry_run=dry)
 
     async def _memory_recall(args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query") or args.get("q") or "").strip()
@@ -990,8 +1041,19 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         scanned = indexed = skipped_unchanged = failed = 0
         errors: list[str] = []
 
+        # THE CAP COUNTS WORK, NOT FILES LOOKED AT (audit, M4). It used to
+        # count every file scanned, including the ones already indexed and
+        # unchanged — so a 25-file folder with a cap of 10 indexed 10, then
+        # spent calls 2, 3 and 4 re-scanning the same first 10, skipping them
+        # as unchanged, hitting the cap and reporting "call again to continue".
+        # It never progressed past file 10, and the note said it would.
+        #
+        # `attempted` is what the cap bounds: a file that was indexed, failed,
+        # or could not be stat'ed. Skipping an unchanged file is free, so it
+        # does not consume the budget and the next call reaches new files.
+        attempted = 0
         for p in folder.rglob("*"):
-            if scanned >= max_files:
+            if attempted >= max_files:
                 break
             if not p.is_file():
                 continue
@@ -1002,11 +1064,13 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                 stat = p.stat()
             except Exception:
                 failed += 1
+                attempted += 1
                 continue
 
             if not await memory.document_needs_indexing(str(p), stat.st_mtime):
                 skipped_unchanged += 1
                 continue
+            attempted += 1
 
             suffix = p.suffix.lower()
             if suffix in _INDEX_IMAGE_SUFFIXES:
@@ -1023,7 +1087,9 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             await memory.index_document(path=str(p), excerpt=excerpt, mtime=stat.st_mtime)
             indexed += 1
 
-        more = scanned >= max_files
+        # "More remaining" means the cap stopped it mid-folder. A run that
+        # reached the end has nothing left, however many files it skipped.
+        more = attempted >= max_files
         return {
             "ok": True, "folder": str(folder), "scanned": scanned, "indexed": indexed,
             "skipped_unchanged": skipped_unchanged, "failed": failed,
@@ -1058,6 +1124,69 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             title=title, details=str(args.get("details") or title), due_at_iso=due_at.isoformat(), recurrence=recurrence,
         )
         return {"ok": True, "reminder_id": str(rid), "title": title, "due_at": due_at.isoformat(), "recurrence": recurrence}
+
+    async def _reminder_list(args: dict[str, Any]) -> dict[str, Any]:
+        """What reminders are actually set.
+
+        THERE WAS NO WAY TO ASK (audit 2026-11-02, H6). "Do I have any reminders
+        coming up?" had no tool to call, so the decision step said, correctly,
+        "I don't have access to a tool that can list your existing reminders" —
+        and that honest answer was discarded by the reply step, which invented
+        "You've got a dentist appointment coming up at 5:00 PM today" out of an
+        internal throttle timestamp. A REST endpoint existed; chat could not
+        reach it.
+
+        Times come back in Marcus's own timezone, because handing the model a
+        UTC stamp is how 17:57 became "5:00 PM".
+        """
+        refused = _owner_only("reminders", detail=(
+            "The reminders here are Marcus's, so I can't list them from this "
+            "conversation."))
+        if refused is not None:
+            return refused
+        status = str(args.get("status") or "pending").strip().lower() or "pending"
+        try:
+            limit = max(1, min(int(args.get("limit") or 20), 50))
+        except (TypeError, ValueError):
+            limit = 20
+        rows = await memory.list_reminders(status=(None if status == "all" else status),
+                                           limit=limit)
+        items = []
+        for r in rows:
+            title = str(r.get("title") or "")
+            # Nova's own bookkeeping reminders (birthday heads-ups, habit
+            # prompts, the morning briefing) are not things Marcus set.
+            if title.startswith("__nova_"):
+                continue
+            items.append({
+                "reminder_id": str(r.get("reminder_id") or ""),
+                "title": title,
+                "when": _local_stamp(r.get("due_at")),
+                "recurrence": str(r.get("recurrence") or "none"),
+                "status": str(r.get("status") or ""),
+            })
+        if not items:
+            return {"ok": True, "reminders": [], "count": 0,
+                    "note": "Nothing is scheduled. Say that plainly — do not "
+                            "describe a reminder that is not in this list."}
+        return {"ok": True, "count": len(items), "reminders": items,
+                "note": "These are the only reminders that exist."}
+
+    async def _reminder_cancel(args: dict[str, Any]) -> dict[str, Any]:
+        """Cancel one reminder by id. Reports whether it actually existed."""
+        refused = _owner_only("reminders", detail=(
+            "Those reminders are Marcus's, so I won't cancel one from here."))
+        if refused is not None:
+            return refused
+        rid = str(args.get("reminder_id") or args.get("id") or "").strip()
+        if not rid:
+            return {"ok": False, "error": "missing_reminder_id",
+                    "note": "Call reminder.list first and use the id from it."}
+        cancelled = await memory.cancel_reminder(reminder_id=rid)
+        if not cancelled:
+            return {"ok": False, "error": "no_such_reminder", "reminder_id": rid,
+                    "note": "Nothing was cancelled — there is no pending reminder with that id."}
+        return {"ok": True, "cancelled": True, "reminder_id": rid}
 
     _IMAGEGEN_PORT = int(os.getenv("NOVA_IMAGEGEN_PORT", "8801").strip() or "8801")
     _IMAGEGEN_BASE = f"http://127.0.0.1:{_IMAGEGEN_PORT}"
@@ -1300,6 +1429,7 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.remember": _memory_remember,
         "memory.recall": _memory_recall,
         "memory.correct": _memory_correct,
+        "memory.forget": _memory_forget,
         "memory.learn_lesson": _memory_learn_lesson,
         "memory.remember_person": _memory_remember_person,
         "memory.remember_event": _memory_remember_event,
@@ -1335,6 +1465,8 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "skill.delete": _skill_delete,
         "goal.create": _goal_create,
         "reminder.create": _reminder_create,
+        "reminder.list": _reminder_list,
+        "reminder.cancel": _reminder_cancel,
         "memory.index_folder": _memory_index_folder,
         "image.generate": _image_generate,
         "video.generate": _video_generate,
@@ -1350,6 +1482,7 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.rebuild_index": "Rebuild the semantic memory index from the primary store. args: {}",
         "memory.remember": "Save a fact or note to permanent long-term memory when the current speaker asks you to remember something. It is filed under whoever is speaking. args: {fact, topic?}",
         "memory.recall": "Search permanent long-term memory for previously saved facts and notes. args: {query}",
+        "memory.forget": ("DELETE something the speaker asks you to forget or stop storing (\"forget my locker code\", \"don't keep that\"). Only ever their own memory, and only facts matching every word of what they named. The result lists exactly what was removed: say THAT, and never claim a deletion the result does not show. args: {what, dry_run?}"),
         "memory.correct": ("Fix something you remembered WRONG when the current speaker corrects you ('no, her birthday is the 14th'). This SUPERSEDES the old value instead of storing a second contradictory fact. Corrections apply to the speaker's own memory; you cannot use this to change what is stored about anyone else. args: {attribute, value, entity?, old_value?}"),
         "memory.learn_lesson": ("Save a durable lesson about how the current speaker wants you to behave (a "
                                  "correction or preference) so you apply it in future replies with them. "
@@ -1451,6 +1584,8 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                            "isn't installed yet, this honestly reports that — never claim an image was made "
                            "if the tool result says ok:false."),
         "video.generate": "Not implemented yet — always returns unavailable. Offer image.generate instead.",
+        "reminder.list": ("List the reminders that ACTUALLY exist, with their times in Marcus's timezone. Call this before answering anything about upcoming reminders: there was no such tool, and the answer got invented from an internal timestamp. If the list comes back empty, say nothing is scheduled. args: {status?, limit?}"),
+        "reminder.cancel": ("Cancel one reminder by its id, from reminder.list. Reports whether a reminder actually existed; never say you cancelled one unless ok is true. args: {reminder_id}"),
         "reminder.create": ("Schedule a reminder or recurring check-in. args: {title, when, details?}. "
                             "'when' examples: '5pm', 'in 20 minutes', 'tomorrow at 9am', 'every morning at 8', "
                             "'every weekday at 7:30am', 'every monday at noon'. If the user didn't give a clear "
@@ -1497,7 +1632,19 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         "memory.timeline", "code.read", "self.read_code", "self.list_code",
         "project.status", "project.trash", "plan.status", "research.list",
         "research.findings", "experiment.list", "experiment.analyze",
+        "reminder.list",
         "agents.roster", "agent.recall", "executive.brief", "skill.detect",
+        # PLUGIN READS (audit, M2). These were absent, so the FIRST failure
+        # fenced the tool for the rest of the turn: one 404 from `web.fetch`
+        # meant a second URL was never tried, while the agent prompt told the
+        # model "if a tool failed twice, stop" — advice it could not follow
+        # because there was never a second attempt. Each of these only reads a
+        # public or read-scoped source; nothing here sends, writes or spends.
+        # `discord.send` and `email.draft_reply` are deliberately absent.
+        "web.search", "web.fetch", "weather.current", "system.time",
+        "maps.geocode", "maps.place_search", "maps.places_nearby",
+        "maps.directions", "calendar.today", "calendar.upcoming",
+        "email.recent", "discord.read",
     ):
         if _read_only in tools:
             router.set_retry_safe(_read_only, True)

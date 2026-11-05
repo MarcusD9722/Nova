@@ -78,11 +78,75 @@ _DIRS_FROM_TO_RE = re.compile(
 )
 FROM_HERE_RE = re.compile(r"\b(?:from\s+here|from\s+my\s+location|near\s+me|around\s+me)\b", re.IGNORECASE)
 _NEAREST_QUERY_RE = re.compile(r"\b(?:nearest|closest)\s+(.+?)(?:\?|$)", re.IGNORECASE)
+
+# ── NOT A PLACE (audit 2026-11-02, H2) ──────────────────────────────────────
+#
+# `\bfind\b` and `\bshow\s+me\b` matched any sentence containing those words,
+# anywhere, and this capability runs BEFORE the model gets a look. Measured on
+# real weights:
+#
+#     "Find the bug: def last_n(items, n): ..."     -> "Maps isn't set up"
+#     "Write merge_intervals ... and show me the code." -> "Maps isn't set up"
+#     "Find me a good book about Rome"              -> a place search
+#     "How do I get to the bottom of this bug?"     -> asked for a route
+#     "What's the nearest star?"                    -> asked which city
+#
+# Two guards, in the order they are cheap:
+#
+#   1. A message that is plainly about software or code is not about a place.
+#   2. "find"/"show me" need a PLACE SIGNAL — a place word, a map word, or
+#      "near me". An allowlist, because the failure of the old rule was that it
+#      recognised everything.
+
+#: Software, code and debugging context. Anything matching this is somebody's
+#: work, not somewhere to drive.
+_CODE_CONTEXT_RE = re.compile(
+    r"```|`[^`]+`"
+    r"|\b(?:def|class|import|lambda|async|await|return)\s"
+    r"|\b\w+\s*\([^)]*\)\s*:"                      # a function signature
+    r"|\b[\w-]+\.(?:py|js|jsx|ts|tsx|html|css|json|yml|yaml|md|sh|ps1|java|rs|go|c|cpp)\b"
+    r"|\b(?:the\s+)?(?:bug|bugs|traceback|stack\s*trace|exception|syntax\s+error|"
+    r"compile\s+error|regression|segfault)\b"
+    r"|\b(?:this|the|my|that)\s+(?:code|function|method|class|script|file|module|"
+    r"test|tests|repo|project|branch|commit|snippet|variable|loop|query)\b"
+    r"|\bsource\s+code\b|\bcode\s+review\b",
+    re.IGNORECASE,
+)
+
+#: Words that make a request about somewhere on a map. A place TYPE, a map verb,
+#: or a proximity phrase.
+_PLACE_SIGNAL_RE = re.compile(
+    r"\b(?:near\s+me|nearby|near\s+here|around\s+here|on\s+the\s+map|map|maps|"
+    r"directions?|address|addresses|open\s+in\s+maps|"
+    r"restaurant|restaurants|cafe|cafes|coffee|bar|bars|pub|diner|"
+    r"store|shop|shops|mall|market|supermarket|grocery|pharmacy|chemist|"
+    r"gas\s+station|petrol|charging\s+station|atm|bank|"
+    r"hospital|clinic|dentist|doctor|vet|"
+    r"airport|station|train|bus\s+stop|parking|garage|"
+    r"hotel|motel|library|museum|park|gym|school|university|"
+    r"post\s+office|police|fire\s+station|church|stadium|theater|theatre|cinema)\b",
+    re.IGNORECASE,
+)
+
+#: Place types that make "the nearest X" a map question. "The nearest star" is
+#: astronomy; "the nearest pharmacy" is navigation.
+_NEAREST_IS_A_PLACE_RE = _PLACE_SIGNAL_RE
+
+
+def looks_like_code_question(text: str) -> bool:
+    """Is this message plainly about software rather than about a place?"""
+    return bool(_CODE_CONTEXT_RE.search(text or ""))
+
+
 _PLACE_LOOKUP_PATTERNS = [
     re.compile(r"\bwhere\s+is\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
     re.compile(r"\bwhere's\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
-    re.compile(r"\bfind\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
     re.compile(r"\blocate\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
+]
+#: `find` and `show me` only count WITH a place signal in the sentence — see
+#: `extract_place_lookup_query`.
+_WEAK_PLACE_LOOKUP_PATTERNS = [
+    re.compile(r"\bfind\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
     re.compile(r"\bshow\s+me\b\s+(.+?)(?:\?|$)", re.IGNORECASE),
 ]
 _TO_DESTINATION_PATTERNS = [
@@ -156,17 +220,37 @@ def extract_directions(text: str) -> tuple[str, str, str] | None:
 
 
 def extract_nearest_query(text: str) -> str | None:
+    if looks_like_code_question(text):
+        return None
     match = _NEAREST_QUERY_RE.search(text)
     if not match:
         return None
     query = match.group(1).strip(" .,!?")
     query = re.sub(r"^(?:the|a|an)\s+", "", query, flags=re.IGNORECASE)
-    query = re.sub(r"\b(?:to\s+me|near\s+me|around\s+me|from\s+here)\b.*$", "", query, flags=re.IGNORECASE).strip(" .,!?")
-    return query or None
+    query = re.sub(r"\b(?:to\s+me|near\s+me|around\s+me|from\s+here|nearby|"
+                   r"on\s+the\s+map|in\s+maps)\b.*$", "", query,
+                   flags=re.IGNORECASE).strip(" .,!?")
+    if not query:
+        return None
+    # "the nearest star" is not a map question. What is being sought has to
+    # BE a place, or the sentence has to say it is about one
+    # (audit 2026-11-02, H2).
+    if not (_NEAREST_IS_A_PLACE_RE.search(query) or _PLACE_SIGNAL_RE.search(text)):
+        return None
+    return query
 
 
 def extract_place_lookup_query(text: str) -> str | None:
-    for pattern in _PLACE_LOOKUP_PATTERNS:
+    if looks_like_code_question(text):
+        # Software, not somewhere. "Find the bug" and "show me the code" both
+        # ended in a Maps error before the model ever saw them.
+        return None
+    patterns = list(_PLACE_LOOKUP_PATTERNS)
+    # "find" and "show me" are ordinary English verbs. They mean a map
+    # lookup only when the sentence says something about a place.
+    if _PLACE_SIGNAL_RE.search(text):
+        patterns += _WEAK_PLACE_LOOKUP_PATTERNS
+    for pattern in patterns:
         match = pattern.search(text)
         if not match:
             continue
@@ -183,12 +267,27 @@ def extract_place_lookup_query(text: str) -> str | None:
     return None
 
 
+#: Figures of speech that use "get to" without meaning a destination.
+#: "How do I get to the bottom of this bug?" asked Marcus where he was starting
+#: from (audit 2026-11-02, H2).
+_FIGURATIVE_DESTINATION_RE = re.compile(
+    r"^(?:the\s+)?(?:bottom|top|heart|root|core|end|point|gist|truth)\s+of\b"
+    r"|^(?:grips|terms)\s+with\b"
+    r"|^(?:know|knowing)\s+(?:you|him|her|them)\b",
+    re.IGNORECASE,
+)
+
+
 def extract_destination_from_here(text: str) -> str | None:
+    if looks_like_code_question(text):
+        return None
     for pattern in _TO_DESTINATION_PATTERNS:
         match = pattern.search(text)
         if match:
             destination = match.group(1).strip(" .,!?")
             if not destination or destination.lower() in _NON_DESTINATIONS:
+                return None
+            if _FIGURATIVE_DESTINATION_RE.search(destination):
                 return None
             return destination
     return None

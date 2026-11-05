@@ -60,6 +60,10 @@ _CLASSIFICATION: dict[str, str] = {
     # personal memory, speaker-scoped (P5.1/P5.1d/P5.1d.2)
     "memory.remember": "scoped", "memory.recall": "scoped",
     "memory.correct": "scoped", "memory.learn_lesson": "scoped",
+    # Added for the 2026-11-02 audit (C4): chat had no way to delete a memory,
+    # so a request to forget something got a false confirmation. Scoped like
+    # every other personal-memory tool — nobody forgets anybody else's.
+    "memory.forget": "scoped",
     "memory.remember_person": "scoped", "memory.recall_person": "scoped",
     # owner-private stores with no ownership column
     "memory.remember_event": "owner", "memory.timeline": "owner",
@@ -67,6 +71,10 @@ _CLASSIFICATION: dict[str, str] = {
     "memory.index_folder": "owner", "thoughts.note": "owner",
     "thoughts.recall": "owner", "twin.profile": "owner",
     "executive.brief": "owner", "reminder.create": "owner",
+    # Added for the 2026-11-02 audit (H6): chat had no way to ask what
+    # reminders exist, so the answer was invented. Owner-only, like
+    # reminder.create — these fire at Marcus, on his schedule.
+    "reminder.list": "owner", "reminder.cancel": "owner",
     "plan.save": "owner", "plan.status": "owner", "plan.advance": "owner",
     "goal.create": "owner", "research.track": "owner", "research.list": "owner",
     "skill.detect": "owner", "skill.learn": "owner", "skill.list": "owner",

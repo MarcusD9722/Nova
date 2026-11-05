@@ -348,6 +348,7 @@ async def check_criterion(*, path: Path, entry: str, module: str, listing: str,
             n in output for n in (rel, rel.replace("/", "\\"))):
         return INCONCLUSIVE, f"the generated check did not parse: {output[:160]}"
     if exit_zero:
-        return PASSED, ("MUTANT: exit 0 is a pass; "
+        # Ran clean, asserted nothing we can read. Silence is not proof.
+        return INCONCLUSIVE, ("the check exited 0 without stating a verdict, so "
                               f"it proves nothing: {output[-200:] or 'no output'}")
     return FAILED, f"check failed: {output[:300] or 'non-zero exit'}"

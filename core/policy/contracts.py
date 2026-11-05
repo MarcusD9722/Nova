@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -23,6 +24,57 @@ class _StrictModel(BaseModel):
 # class attribute into a ModelPrivateAttr, so `cls._ALIASES.get(...)` raises
 # and every fact gets dropped.
 _ATTRIBUTE_ALIASES = {"mom": "mother", "dad": "father"}
+
+
+#: Attributes whose value names PEOPLE, and so may name more than one. The
+#: extractor's own prompt says "lists are ok", and the model duly returns
+#: `child="Mateo|Liam"` — which was stored as a single value, so the graph had
+#: one child called "Mateo|Liam", "how old is Liam" found nothing, and the
+#: context firewall had no "Liam" to redact (audit, M11).
+#:
+#: `pet` is deliberately NOT here: its "|" separates a name from a species
+#: ("Mochi|cat"), so splitting it would invent a pet called "cat".
+MULTI_PERSON_ATTRIBUTES = frozenset({
+    "child", "sibling", "cousin", "friend",
+})
+
+#: A bare personal name: one to three capitalised words. Used only to decide
+#: whether a comma or "and" is separating NAMES rather than sitting inside one
+#: value ("Zoe Sanchez, manager" is one value, not two people).
+_BARE_NAME_RE = re.compile(r"^[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,2}$")
+
+#: What separates people in one value: a pipe, a comma, "and", or "&".
+_PEOPLE_SEPARATOR_RE = re.compile(r"\s*,\s*|\s+and\s+|\s*&\s*", re.IGNORECASE)
+
+#: An Oxford list leaves "and" attached to its last item.
+_LEADING_CONJUNCTION_RE = re.compile(r"^(?:and|&)\s+", re.IGNORECASE)
+
+
+def split_people_value(attribute: str, value: str) -> list[str]:
+    """One value naming several people -> one entry per person.
+
+    Returns a single-element list for everything else, so a caller can always
+    iterate the result. "|" always separates, because that is what the prompt
+    asks for. A comma or "and" separates only when EVERY part on its own looks
+    like a bare name, which keeps descriptive values whole.
+    """
+    raw = (value or "").strip()
+    if attribute not in MULTI_PERSON_ATTRIBUTES or not raw:
+        return [raw] if raw else []
+
+    if "|" in raw:
+        parts = [p.strip() for p in raw.split("|")]
+        return [p for p in parts if p] or [raw]
+
+    # The leading "and" of an Oxford list: "Mateo, Liam, and Ava" splits on the
+    # comma first, leaving "and Ava", which then fails the bare-name test and
+    # sent the whole list through as one value.
+    parts = [_LEADING_CONJUNCTION_RE.sub("", p).strip(" .")
+             for p in _PEOPLE_SEPARATOR_RE.split(raw)]
+    parts = [p for p in parts if p]
+    if len(parts) > 1 and all(_BARE_NAME_RE.match(p) for p in parts):
+        return parts
+    return [raw]
 
 
 class MemoryFact(_StrictModel):

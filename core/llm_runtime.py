@@ -275,6 +275,16 @@ def _vision_reason(model_path: Path | None, mmproj_path: Path | None) -> str:
     return "Current model is text-only; no mmproj is needed."
 
 
+#: Repetition penalty for PROSE. A reply that keeps re-using the same phrase
+#: reads badly, and 1.15 is what was measured as natural here.
+PROSE_REPEAT_PENALTY = 1.15
+
+#: Repetition penalty for CODE, which is repetitive BY DESIGN: `self.`,
+#: `return`, `if not`, a closing brace, the same indentation. Penalising that
+#: pushes the model off the correct token, and it was being applied to every
+#: generated source file (audit, L12). 1.0 is no penalty at all.
+CODE_REPEAT_PENALTY = 1.0
+
 class LLMRuntime:
     def __init__(self, model_path: Path | None, context_tokens: int = 8192):
         self._model_path = model_path
@@ -360,6 +370,11 @@ class LLMRuntime:
             self._usage["avg_reply_tokens"] = round(prev_avg + (reply_tokens - prev_avg) / max(n, 1), 1)
         except Exception:
             pass
+
+    @property
+    def context_tokens(self) -> int:
+        """The window a prompt has to fit inside. See core/prompt_budget.py."""
+        return int(self._context_tokens)
 
     @property
     def model_loaded(self) -> bool:
@@ -485,6 +500,7 @@ class LLMRuntime:
                 llama_kwargs["chat_format"] = picked_format
 
             llama = Llama(**llama_kwargs)
+            _install_thinking_switch(llama)
 
         combined = "".join(logs) + "\n" + buf.getvalue()
         # Generation is QUIET from here on, and that is what lets the per-call
@@ -580,6 +596,8 @@ class LLMRuntime:
             if callable(closer):
                 closer()
         except Exception as e:  # noqa: BLE001
+            # DEBUG on purpose (audit 2026-11-02, M12, which raised 56 real
+            # failures to warning): a close() on the way out, with nothing pending.
             logger.debug("vision_close_failed", error=str(e)[:160])
         del llama
         import gc
@@ -608,6 +626,7 @@ class LLMRuntime:
         temperature: float = 0.2,
         stop: list[str] | None = None,
         thinking: bool = False,
+        repeat_penalty: float | None = None,
     ) -> str:
         await self.initialize()
         if self._llama is None:
@@ -628,6 +647,8 @@ class LLMRuntime:
         # default_stop` would wrongly treat an empty list as falsy and still
         # apply the defaults, so check for None explicitly.
         stop_seq = default_stop if stop is None else stop
+        _penalty = float(PROSE_REPEAT_PENALTY if repeat_penalty is None
+                         else repeat_penalty)
         messages = _apply_no_think(messages, thinking=thinking)
 
         def _run() -> str:
@@ -642,7 +663,7 @@ class LLMRuntime:
                             stop=stop_seq,
                             top_k=40,
                             top_p=0.9,
-                            repeat_penalty=1.15,
+                            repeat_penalty=_penalty,
                         )
                         result = _extract_chat_text(out)
                         usage = (out or {}).get("usage") or {}
@@ -658,7 +679,7 @@ class LLMRuntime:
                             temperature=float(temperature),
                             top_k=40,
                             top_p=0.9,
-                            repeat_penalty=1.15,
+                            repeat_penalty=_penalty,
                             stop=stop_seq,
                         )
                         result = str(out.get("choices", [{}])[0].get("text", "")).strip()
@@ -684,6 +705,7 @@ class LLMRuntime:
         temperature: float = 0.2,
         stop: list[str] | None = None,
         thinking: bool = False,
+        repeat_penalty: float | None = None,
     ):
         """Yield response text deltas. Unchanged contract for every caller.
 
@@ -695,7 +717,7 @@ class LLMRuntime:
         # tokens nobody wanted — which is the abandoned-stream half of C2.
         inner = self.chat_stream_ex(
             messages, max_tokens=max_tokens, temperature=temperature,
-            stop=stop, thinking=thinking,
+            stop=stop, thinking=thinking, repeat_penalty=repeat_penalty,
         )
         async with contextlib.aclosing(inner):
             async for event in inner:
@@ -709,6 +731,7 @@ class LLMRuntime:
         temperature: float = 0.2,
         stop: list[str] | None = None,
         thinking: bool = False,
+        repeat_penalty: float | None = None,
     ):
         """Async generator yielding response text deltas as llama.cpp produces them.
 
@@ -726,6 +749,8 @@ class LLMRuntime:
         # See chat() above: an explicit empty list must disable stop sequences
         # entirely rather than falling back to the defaults.
         stop_seq = default_stop if stop is None else stop
+        _penalty = float(PROSE_REPEAT_PENALTY if repeat_penalty is None
+                         else repeat_penalty)
         base_messages = list(messages)
 
         def _attempt_messages(attempt: int) -> tuple[list[dict[str, Any]], int]:
@@ -793,7 +818,7 @@ class LLMRuntime:
                             stop=stop_seq,
                             top_k=40,
                             top_p=0.9,
-                            repeat_penalty=1.15,
+                            repeat_penalty=_penalty,
                             stream=True,
                         )
                         for chunk in stream:
@@ -943,7 +968,8 @@ class LLMRuntime:
                             temperature=float(temperature),
                             top_k=40,
                             top_p=0.9,
-                            repeat_penalty=1.15,
+                            # Describing an image is prose.
+                            repeat_penalty=PROSE_REPEAT_PENALTY,
                         )
                 # Intentionally do not print vision startup/prompt internals to backend logs.
                 return _strip_think(_extract_chat_text(out))
@@ -990,7 +1016,94 @@ def _strip_think(text: str) -> str:
 #: pathology it exists to prevent. A model swap MUST re-measure with
 #: tests/bench_ttft_v3c.py and select a contract per template rather than
 #: assuming this one. See docs/NOVA_DECISIONS.md D3.
+#: The marker `_apply_no_think` appends to say "render this turn with thinking
+#: OFF". It is the same text the model's own chat template emits for
+#: `enable_thinking=false`, which is why it used to be passed through as a real
+#: assistant message — see `_install_thinking_switch` for why that was wrong.
 _CLOSED_THINK_PREFILL = "<think>\n\n</think>\n\n"
+
+
+def _install_thinking_switch(llama: Any) -> bool:
+    """Make the fast path use the template's OWN thinking switch.
+
+    AUDIT 2026-11-02, M10. The fast path appended a trailing assistant message
+    containing a closed, empty think block, and the comment here said the chat
+    template renders that as the start of the assistant's turn, so the model
+    continues it. It does not. Rendered against this model's real template:
+
+        <|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n<|im_end|>\\n
+        <|im_start|>assistant\\n<think>\\n
+
+    — a COMPLETE assistant turn that said nothing, followed by a NEW turn with
+    `<think>` opened again. So thinking was never actually off, and the model
+    was shown an example of an assistant turn producing no answer. It mimicked
+    it: 4 of 22 replies came back empty, all of them after tool calls.
+
+    The template has a first-class switch for this:
+
+        {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\\n\\n</think>\\n\\n' }}
+        {%- else %}
+        {{- '<think>\\n' }}
+
+    With `enable_thinking=False` the generation prompt itself carries the
+    closed block and the model continues with the ANSWER — which is what the
+    prefill was trying to achieve, without the fabricated turn in front of it.
+
+    llama-cpp-python 0.3.23 has no `chat_template_kwargs`, but
+    `Jinja2ChatFormatter.__call__` forwards **kwargs straight into the Jinja
+    render. So the handler installed here strips the marker message and passes
+    the flag. Returns False, leaving the old behaviour in place, if the model
+    exposes no template to render — nothing here is allowed to stop a boot.
+    """
+    try:
+        from llama_cpp import llama_chat_format as lcf
+
+        template = (getattr(llama, "metadata", {}) or {}).get(
+            "tokenizer.chat_template")
+        if not template:
+            return False
+
+        def _token(ids: Any, fallback: str) -> str:
+            try:
+                tid = int(ids)
+                return llama.detokenize([tid]).decode("utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                return fallback
+
+        meta = getattr(llama, "metadata", {}) or {}
+        eos = _token(meta.get("tokenizer.ggml.eos_token_id"), "<|im_end|>")
+        bos = _token(meta.get("tokenizer.ggml.bos_token_id"), "")
+        formatter = lcf.Jinja2ChatFormatter(
+            template=template, eos_token=eos, bos_token=bos,
+            add_generation_prompt=True)
+
+        class _ThinkingAware(lcf.Jinja2ChatFormatter):
+            """Reads the marker, drops it, and sets `enable_thinking`."""
+
+            def __init__(self) -> None:  # noqa: D107
+                self.__dict__.update(formatter.__dict__)
+
+            def __call__(self, *, messages, **kwargs):  # type: ignore[override]
+                msgs = list(messages or [])
+                thinking_off = bool(
+                    msgs and msgs[-1].get("role") == "assistant"
+                    and str(msgs[-1].get("content") or "").strip()
+                    == _CLOSED_THINK_PREFILL.strip())
+                if thinking_off:
+                    msgs = msgs[:-1]
+                    kwargs["enable_thinking"] = False
+                return super().__call__(messages=msgs, **kwargs)
+
+        llama.chat_handler = lcf.chat_formatter_to_chat_completion_handler(
+            _ThinkingAware())
+        logger.info("thinking_switch_installed")
+        return True
+    except Exception as e:  # noqa: BLE001
+        # The prefill path still works as it did; it is just slower and
+        # occasionally empty. A template change must never fail a boot.
+        logger.warning("thinking_switch_unavailable", error=str(e)[:200])
+        return False
 
 
 def _apply_no_think(messages: list[dict[str, Any]], thinking: bool = False) -> list[dict[str, Any]]:
@@ -1031,8 +1144,14 @@ def _apply_no_think(messages: list[dict[str, Any]], thinking: bool = False) -> l
         return messages
 
     if os.getenv("NOVA_LLM_FAST_PREFILL", "1").strip().lower() not in {"0", "false", "no", "off"}:
-        # A trailing assistant message is rendered by the chat template as the
-        # start of the assistant's turn, so the model continues it.
+        # A MARKER, not a turn. `_install_thinking_switch` removes it and
+        # renders the prompt with the template's `enable_thinking=false`, so
+        # the generation prompt itself carries the closed think block.
+        #
+        # Without that handler this is still passed through as a real assistant
+        # message, which is what it used to be everywhere — a complete empty
+        # assistant turn followed by a fresh one with `<think>` reopened, which
+        # the model copied into empty replies (audit, M10).
         return [*messages, {"role": "assistant", "content": _CLOSED_THINK_PREFILL}]
 
     msgs = [dict(m) for m in messages]

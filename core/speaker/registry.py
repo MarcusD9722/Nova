@@ -30,6 +30,7 @@ be meaningless *confidently*, which is worse. A profile whose model no longer
 matches is reported `needs_reenrollment` and is never matched against.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -149,21 +150,44 @@ class SpeakerRegistry:
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
+        self._ready = False
+        self._ready_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def _conn(self):
+        # THE SCHEMA FIRST (audit, L10). Every method here opened its own
+        # connection and assumed the tables existed, while only `initialize()`
+        # created them — so on a fresh database any route that read before
+        # something else had initialised died with
+        # `no such table: speaker_profiles`. That was the one real 5xx in the
+        # route sweep (`DELETE /speaker/calibration`), and it was luck that the
+        # others happened to run after a write.
+        #
         # `async with self._conn() as db`, never `async with await ...` — an
         # aiosqlite Connection is both awaitable and a context manager, and
         # doing both starts its worker thread twice (learned in P4).
+        await self._ensure_schema()
         async with aiosqlite.connect(str(self._db_path)) as db:
             db.row_factory = aiosqlite.Row
             yield db
 
+    async def _ensure_schema(self) -> None:
+        """Create the tables once per instance. Cheap after the first call."""
+        if self._ready:
+            return
+        async with self._ready_lock:
+            if self._ready:
+                return
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            async with aiosqlite.connect(str(self._db_path)) as db:
+                for sql in SPEAKER_DDL:
+                    await db.execute(sql)
+                await db.commit()
+            self._ready = True
+
     async def initialize(self) -> None:
-        async with self._conn() as db:
-            for sql in SPEAKER_DDL:
-                await db.execute(sql)
-            await db.commit()
+        """Kept for callers that initialise explicitly at boot."""
+        await self._ensure_schema()
 
     async def save(self, profile: SpeakerProfile) -> str:
         if profile.centroid is None:

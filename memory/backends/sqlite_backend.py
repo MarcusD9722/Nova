@@ -976,8 +976,15 @@ class SQLiteMemoryBackend:
         "UPDATE {table} SET status='failed', outcome='unknown', "
         "last_error=?, updated_at=? WHERE status='running'")
 
-    async def cancel_pending_background_work(self) -> dict[str, int]:
+    async def cancel_pending_background_work(
+            self, *, on_startup: bool = True) -> dict[str, int]:
         """Clear background work left over from an older session.
+
+        `on_startup` says WHICH of two situations this is, because the note
+        written against a running task is a claim about reality:
+        `/autonomy/stop` called this routine and every running task was
+        recorded as "interrupted by a restart" when no restart had happened
+        (audit, L9). A stop requested by a person is a different fact.
 
         This prevents stale autonomous jobs from auto-resuming on process restart
         and repeatedly invoking the model before a user asks for new work.
@@ -991,9 +998,13 @@ class SQLiteMemoryBackend:
         await self.initialize()
         now = self._now_iso()
         interrupted_note = (
-            "interrupted by a restart while it was running. Whether its tool "
-            "completed is unknown: it was claimed and may have acted before "
-            "the process stopped.")
+            ("interrupted by a restart while it was running. Whether its tool "
+             "completed is unknown: it was claimed and may have acted before "
+             "the process stopped.") if on_startup else
+            ("stopped on request while it was running. Whether its tool "
+             "completed is unknown: it was claimed and may have acted before "
+             "the stop arrived."))
+        queued_status = "cancelled_on_startup" if on_startup else "cancelled_on_request"
         async with aiosqlite.connect(self._db_path) as db:
             totals: dict[str, int] = {}
             interrupted = 0
@@ -1001,7 +1012,7 @@ class SQLiteMemoryBackend:
                                ("goal_tasks", "tasks")):
                 cur_q = await db.execute(
                     self._STARTUP_CANCEL.format(table=table),
-                    ("cancelled_on_startup", now))
+                    (queued_status, now))
                 cur_r = await db.execute(
                     self._STARTUP_INTERRUPTED.format(table=table),
                     (interrupted_note, now))
@@ -1718,11 +1729,21 @@ class SQLiteMemoryBackend:
 
     # --- Habit & pattern learning (HP1) -----------------------------------------
 
-    async def log_tool_usage(self, tool_name: str) -> None:
+    async def log_tool_usage(self, tool_name: str,
+                             called_at_iso: str | None = None) -> None:
+        """Record one tool call. `called_at_iso` is for tests only.
+
+        A habit is "this tool, around this hour, on several distinct days", so
+        proving the clustering is right needs rows on days that have already
+        happened. Without a way to say WHEN, a test could only ever assert
+        about today, and the UTC-vs-local bug it has to catch (audit, M17) is
+        invisible within a single day.
+        """
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO tool_usage_log(tool_name, called_at) VALUES(?, ?)", (tool_name, self._now_iso())
+                "INSERT INTO tool_usage_log(tool_name, called_at) VALUES(?, ?)",
+                (tool_name, called_at_iso or self._now_iso()),
             )
             await db.commit()
 

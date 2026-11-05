@@ -14,6 +14,7 @@ testable and safe to run over any registered project.
 """
 
 import ast
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -119,18 +120,46 @@ def _read(path: Path) -> str:
 
 
 def iter_source_files(root: Path, *, max_files: int = 600):
+    """Source files under `root`, in a stable order, bounded by `max_files`.
+
+    Two fixes from the audit (M14, M15):
+
+    PRUNE WHILE WALKING. `sorted(root.rglob("*"))` materialises every path
+    under the root — all of `venv`, `node_modules` and `.git` — and THEN
+    skipped them. Measured on this repo: 24 seconds to index 600 files out of
+    5,777. `os.walk` lets a directory be dropped before anything inside it is
+    visited.
+
+    SKIP ON THE RELATIVE PATH. The old check looked at every component of the
+    ABSOLUTE path, so a project at `C:\\Users\\Marcus\\build\\myapp` matched
+    "build" and indexed ZERO files — silently, reporting a clean empty index.
+    Verified: `build`, `out`, `env`, `target` and `dist` all did it.
+    """
     count = 0
-    for p in sorted(root.rglob("*")):
-        if count >= max_files:
-            return
-        if not p.is_file():
-            continue
-        if any(part.lower() in _SKIP_DIRS for part in p.parts):
-            continue
-        if language_of(p) is None:
-            continue
-        count += 1
-        yield p
+    root = Path(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        # Prune in place: os.walk will not descend into what is removed here.
+        dirnames[:] = sorted(d for d in dirnames if d.lower() not in _SKIP_DIRS)
+        for fname in sorted(filenames):
+            if count >= max_files:
+                return
+            p = here / fname
+            if language_of(p) is None:
+                continue
+            count += 1
+            yield p
+
+
+def count_source_files(root: Path, *, limit: int = 100_000) -> int:
+    """How many source files there are, so truncation can be REPORTED.
+
+    The 600-file cap was silent: this repo has 5,777 source files, so
+    `tests/` and `services/` were never indexed and every report derived from
+    the index described a different, smaller project with no sign of it
+    (audit, M15).
+    """
+    return sum(1 for _ in iter_source_files(Path(root), max_files=limit))
 
 
 def index_project(root: str | Path, *, max_files: int = 600) -> dict[str, Any]:
@@ -153,7 +182,19 @@ def index_project(root: str | Path, *, max_files: int = 600) -> dict[str, Any]:
         rel = str(path.relative_to(root)).replace("\\", "/")
         langs[lang] = langs.get(lang, 0) + 1
         total_loc += info["loc"]
-        for sym in [c["name"] for c in info["classes"]] + [f["name"] for f in info["functions"]]:
+        # METHODS ARE SYMBOLS TOO (audit, M15). Only top-level names were
+        # indexed, so `impact_of` answered `impact: none` for EVERY method in
+        # the codebase — which reads as "nothing uses this, safe to change"
+        # for the majority of the functions that exist. Both spellings are
+        # recorded: the bare name, which is how a call site mentions it, and
+        # `Class.method`, which is how a person names it unambiguously.
+        file_symbols: list[str] = [c["name"] for c in info["classes"]]
+        file_symbols += [f["name"] for f in info["functions"]]
+        for cls in info["classes"]:
+            for method in cls.get("methods") or []:
+                file_symbols.append(str(method))
+                file_symbols.append(f"{cls['name']}.{method}")
+        for sym in file_symbols:
             symbols.setdefault(sym, [])
             if rel not in symbols[sym]:
                 symbols[sym].append(rel)
@@ -174,28 +215,63 @@ def index_project(root: str | Path, *, max_files: int = 600) -> dict[str, Any]:
     all_symbols = set(symbols)
     for f in files:
         own = {c["name"] for c in f["classes"]} | {fn["name"] for fn in f["functions"]}
+        # A file's own methods are its own, so using one is not a reference
+        # from elsewhere.
+        for cls in f["classes"]:
+            own |= {str(m) for m in (cls.get("methods") or [])}
+            own |= {f"{cls['name']}.{m}" for m in (cls.get("methods") or [])}
         f["refs"] = sorted((f.pop("_used") & all_symbols) - own)
 
     n_class = sum(len(f["classes"]) for f in files)
     n_func = sum(len(f["functions"]) for f in files)
     test_files = [f["path"] for f in files if _is_test(f["path"])]
+    # TRUNCATION IS REPORTED (audit, M15). At the cap the index describes a
+    # different, smaller project, and every report built on it inherits that
+    # without saying so — on this repo, 600 of 5,777 files, with `tests/` and
+    # `services/` entirely absent. Counted only when the cap was actually
+    # reached, so the common case costs nothing.
+    truncated = len(files) >= max_files
+    total_source = count_source_files(root) if truncated else len(files)
     return {
         "root": str(root), "exists": True,
         "files": files,
         "symbols": symbols,
         "todos": all_todos,
         "top_imports": sorted(import_counts.items(), key=lambda x: -x[1])[:20],
+        "truncated": truncated,
+        "truncation_note": (
+            f"Only {len(files)} of {total_source} source files were indexed "
+            f"(the cap is {max_files}). Anything below is about THOSE files, "
+            "not the whole project." if truncated else ""),
         "stats": {
             "files": len(files), "loc": total_loc, "classes": n_class, "functions": n_func,
             "todos": len(all_todos), "languages": langs, "test_files": len(test_files),
             "syntax_errors": sum(1 for f in files if f["syntax_error"]),
+            "truncated": truncated, "source_files_total": total_source,
         },
     }
 
 
+#: Directory names that mean "the tests live here".
+_TEST_DIRS = frozenset({"test", "tests", "__tests__", "spec", "specs", "testing"})
+
+#: A test FILE by name, across the languages this indexes.
+_TEST_FILE_RE = re.compile(
+    r"^(?:test_.*|.*_test|.*\.test|.*\.spec|.*Test|.*Tests|.*Spec)$")
+
+
 def _is_test(rel_path: str) -> bool:
-    p = rel_path.lower()
-    return "test" in Path(p).name or "/tests/" in ("/" + p) or p.startswith("tests/")
+    """Is this a test file?
+
+    `"test" in name` matched `latest.py`, `contest.py`, `fastest.ts` and
+    anything else containing those four letters, so the "test coverage" figure
+    counted production modules as tests (audit, M15). Matched on name shape
+    and on an enclosing test directory instead.
+    """
+    p = Path(rel_path.replace("\\", "/"))
+    if any(part.lower() in _TEST_DIRS for part in p.parent.parts):
+        return True
+    return bool(_TEST_FILE_RE.match(p.stem))
 
 
 def impact_of(index: dict[str, Any], name: str) -> dict[str, Any]:

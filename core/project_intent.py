@@ -100,6 +100,7 @@ _WORK_SUBJECT_RE = re.compile(
     r"level|sprite|texture|animation|physics|collision|score|"
     r"bug|crash|error|exception|traceback|stacktrace|regression|"
     r"test|tests|testing|pytest|unittest|assertion|coverage|"
+    r"verif\w+|"
     r"version|dependency|dependencies|package|"
     r"feature|endpoint|api|route|handler|"
     r"css|html|javascript|typescript|python|json|yaml|sql|"

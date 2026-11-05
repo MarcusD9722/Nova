@@ -67,7 +67,7 @@ class ResearchWorker:
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
-                logger.debug("research_cycle_error", error=str(e)[:200])
+                logger.warning("research_cycle_error", error=str(e)[:200])
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except (TimeoutError, asyncio.TimeoutError):
@@ -105,7 +105,7 @@ class ResearchWorker:
                     [{"role": "user", "content": prompt}], max_tokens=220, temperature=0.2, thinking=False
                 ) or "").strip()
         except Exception as e:  # noqa: BLE001
-            logger.debug("research_summarize_failed", error=str(e)[:160])
+            logger.warning("research_summarize_failed", error=str(e)[:160])
 
         stored = False
         if summary:

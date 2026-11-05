@@ -63,7 +63,7 @@ class Understanding:
         try:
             return (await asyncio.wait_for(_call(), timeout=self._timeout) or "").strip()
         except Exception as e:  # noqa: BLE001
-            logger.debug("understanding_call_failed", error=str(e)[:160])
+            logger.warning("understanding_call_failed", error=str(e)[:160])
             return ""
 
     async def classify(self, text: str, *, labels: Sequence[str], fallback: str,
@@ -91,6 +91,9 @@ class Understanding:
         bare = raw.strip().strip('"').strip()
         if bare in allowed:
             return bare
+        # DEBUG on purpose (audit 2026-11-02, M12, which raised 56 real
+        # failures to warning): the label allowlist refusing an unknown label is
+        # the allowlist working.
         logger.debug("understanding_label_rejected", got=raw[:80])
         return fallback
 

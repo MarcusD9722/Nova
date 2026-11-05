@@ -56,7 +56,7 @@ class Expression:
         try:
             return (await asyncio.wait_for(_call(), timeout=self._timeout) or "").strip()
         except Exception as e:  # noqa: BLE001
-            logger.debug("expression_call_failed", error=str(e)[:160])
+            logger.warning("expression_call_failed", error=str(e)[:160])
             return ""
 
     @staticmethod

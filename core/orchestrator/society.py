@@ -213,7 +213,7 @@ class AgentSociety:
                 )
             return (out or "").strip()
         except Exception as e:  # noqa: BLE001
-            logger.debug("society_call_failed", error=str(e)[:160])
+            logger.warning("society_call_failed", error=str(e)[:160])
             return ""
 
     async def deliberate(self, query: str, *, context: str = "", max_participants: int = 3) -> dict:

@@ -37,21 +37,48 @@ def read_limited_bytes(path: Path, max_bytes: int = MAX_BYTES) -> tuple[bytes, b
     return data[:max_bytes], len(data) > max_bytes
 
 
+#: UTF-16 byte-order marks. UTF-16 is only tried when one is present.
+_UTF16_BOMS = ((b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16"))
+
+
 def decode_text_bytes(data: bytes) -> str | None:
-    # utf-8-sig FIRST: it strips a BOM when present and is otherwise identical
-    # to utf-8. Ordered the other way round, plain utf-8 matched first and left
-    # the BOM in place, so every BOM'd file (the Windows default for a lot of
-    # editors) carried an invisible ﻿ into chat attachments, indexed
-    # document chunks, and the embeddings built from them.
-    for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+    """Decode a text file's bytes, or None if nothing plausible fits.
+
+    utf-8-sig FIRST: it strips a BOM when present and is otherwise identical to
+    utf-8. Ordered the other way round, plain utf-8 matched first and left the
+    BOM in place, so every BOM'd file (the Windows default for a lot of
+    editors) carried an invisible ﻿ into chat attachments, indexed document
+    chunks, and the embeddings built from them.
+
+    UTF-16 ONLY WITH A BOM (audit, M13). Bare "utf-16-le"/"utf-16-be" decode
+    almost any even-length byte string without error, so a cp1252 file with one
+    non-ASCII byte — a smart quote, an accented name, a degree sign — fell
+    through utf-8 and came out as fluent-looking CJK. Silently: no exception,
+    no warning, straight into chat and into indexed memory. A BOM is the only
+    positive evidence that a file really is UTF-16, so without one the
+    single-byte fallback is used, which is what such a file almost always is.
+    """
+    for encoding in ("utf-8-sig", "utf-8"):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
-    try:
-        return data.decode("latin-1")
-    except UnicodeDecodeError:
-        return None
+    for bom, encoding in _UTF16_BOMS:
+        if data.startswith(bom):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                break
+    # cp1252 before latin-1: it is the actual Windows default, and it maps the
+    # 0x80-0x9F range (smart quotes, em dash, euro) that latin-1 turns into
+    # control characters. Undefined bytes there fall through to latin-1, which
+    # decodes anything.
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 def extract_docx_text(path: Path, max_chars: int = MAX_CHARS) -> str:

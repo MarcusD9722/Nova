@@ -189,7 +189,20 @@ _WORK_STATUS_RE = re.compile(
     # and these put it after. Restricted to we/you so "I am done with my
     # coffee" stays a sentence about coffee.
     r"(?:we|you)(?:'re| are| have|'ve)? (?:all )?done\b|"
-    r"(?:we|you) (?:have |'ve )?finished (?:all of )?(?:it|them|everything)"
+    r"(?:we|you) (?:have |'ve )?finished (?:all of )?(?:it|them|everything)|"
+    # How people actually ask, measured on real weights. None of the shapes
+    # above matched "How's that project coming along?", so NO record was
+    # attached and the reply came out of the model's head: "It's all set up and
+    # ready to go... plus the tests are written too", about a build that had
+    # just failed and written nothing (audit 2026-11-02, C4).
+    #
+    # Attaching the record to one extra turn costs tokens. Not attaching it
+    # costs the truth.
+    r"coming along|how(?:'s| is|’s) (?:it|that|the|this) .{0,24}?going|"
+    r"how(?:'s| is|’s) (?:it|that) coming|how far along|"
+    r"any (?:progress|news|update|updates)|what(?:'s| is) the latest|"
+    r"what (?:did|have) you (?:actually )?(?:verif\w+|check\w+|test\w+|prov\w+)|"
+    r"how did (?:it|that) go|(?:is|was) (?:it|that) successful"
     r")\b", re.IGNORECASE)
 
 

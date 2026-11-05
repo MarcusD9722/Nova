@@ -5,12 +5,14 @@ from __future__ import annotations
 Moved verbatim from backend/app.py in Phase 0.6 — behavior unchanged.
 """
 
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.state import STATE
+from core.event_bus import BUS
 
 router = APIRouter()
 
@@ -29,25 +31,69 @@ async def autonomy_status() -> dict:
 
 @router.post("/autonomy/stop")
 async def autonomy_stop() -> dict:
-    """Kill switch: pause the proactive self-improvement loop and cancel any
-    queued background work. Error capture keeps running (harmless)."""
+    """Kill switch: stop everything that acts without being asked.
+
+    It used to pause only the self-improvement loop, so the goal SUPERVISOR
+    kept polling and any new goal still ran its tasks — "stop" left the part
+    that actually executes tools running (audit, L9). All three are stopped
+    here, and the result says which, because a kill switch that reports
+    success while something is still running is worse than none.
+
+    What deliberately keeps running: error capture (it only records), and
+    anything Marcus asks for directly in a turn. This stops AUTONOMY, not
+    Nova.
+    """
     if STATE.runtime is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    STATE.runtime.self_improve.set_enabled(False)
-    try:
-        if STATE.memory is not None:
-            await STATE.memory.cancel_pending_background_work()
-    except Exception:
-        pass
-    return {"enabled": False}
+    runtime = STATE.runtime
+    stopped: dict[str, Any] = {}
+
+    runtime.self_improve.set_enabled(False)
+    stopped["self_improve"] = "stopped"
+
+    # The goal supervisor is the part that claims tasks and calls tools.
+    supervisor = getattr(runtime, "_agent_supervisor", None)
+    if supervisor is not None:
+        try:
+            await supervisor.stop()
+            stopped["goal_supervisor"] = "stopped"
+        except Exception as e:  # noqa: BLE001
+            stopped["goal_supervisor"] = f"could not stop: {type(e).__name__}"
+    else:
+        stopped["goal_supervisor"] = "not running"
+
+    # Queued work, and the goals it belonged to. `on_startup=False` so a
+    # running task is recorded as stopped ON REQUEST rather than by a restart
+    # that did not happen.
+    if STATE.memory is not None:
+        try:
+            stopped["cancelled"] = await STATE.memory.cancel_pending_background_work(
+                on_startup=False)
+        except Exception as e:  # noqa: BLE001
+            stopped["cancelled"] = f"could not cancel: {type(e).__name__}"
+
+    BUS.publish("autonomy.stopped", dict(stopped))
+    return {"enabled": False, "stopped": stopped}
 
 
 @router.post("/autonomy/start")
 async def autonomy_start() -> dict:
+    """Re-enable autonomy: the loop AND the supervisor `stop` turned off."""
     if STATE.runtime is None:
         raise HTTPException(status_code=503, detail="Not ready")
-    STATE.runtime.self_improve.set_enabled(True)
-    return {"enabled": True}
+    runtime = STATE.runtime
+    runtime.self_improve.set_enabled(True)
+    started = {"self_improve": "started"}
+    supervisor = getattr(runtime, "_agent_supervisor", None)
+    if supervisor is not None:
+        try:
+            # `start()` is a no-op when the loop is already running, so this is
+            # safe to call either way.
+            supervisor.start()
+            started["goal_supervisor"] = "started"
+        except Exception as e:  # noqa: BLE001
+            started["goal_supervisor"] = f"could not start: {type(e).__name__}"
+    return {"enabled": True, "started": started}
 
 
 @router.get("/autonomy/errors")

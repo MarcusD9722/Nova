@@ -84,7 +84,7 @@ class TurnGate:
             return True
         except (TimeoutError, asyncio.TimeoutError):
             self._timeouts += 1
-            logger.debug("background_yield_timeout", what=what or "background", waited_s=limit)
+            logger.warning("background_yield_timeout", what=what or "background", waited_s=limit)
             return False
         except Exception:  # noqa: BLE001
             return False

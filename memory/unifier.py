@@ -107,6 +107,40 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_local(raw: Any) -> datetime | None:
+    """A stored timestamp as LOCAL wall-clock time, or None if unreadable.
+
+    One helper for every place that asks "what hour was that?" or "what day
+    was that?" (audit, M17). Those questions are about Marcus's clock, and the
+    answers were being read straight off UTC timestamps:
+
+      * `detect_habit` labelled the hour, so an 8am habit was reported as 2pm
+        and the morning-window merge grouped the wrong calls together;
+      * mood, wellbeing and `episodes_for_consolidation` grouped by the UTC
+        day, so everything Marcus said after 6pm belonged to tomorrow and
+        "works late on Thursdays" was derived from Friday-UTC rows.
+
+    A naive stored value is assumed UTC, which is what every writer here
+    produces.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().replace(tzinfo=None)
+
+
+def _local_day(raw: Any) -> str | None:
+    """The local calendar day of a stored timestamp, as YYYY-MM-DD."""
+    dt = _as_local(raw)
+    return dt.strftime("%Y-%m-%d") if dt is not None else None
+
+
 #: Entities whose facts never decay. Being old doesn't make your name less
 #: true, and sinking identity facts would falsely trip the CH1 low-confidence
 #: hedge. Prefix match, so "project:flappy-bird" is covered by "project:".
@@ -576,7 +610,7 @@ class MemoryUnifier:
                     {"component": "memory.semantic_index", "error": clip(e, 200), "impact": "semantic recall degraded; facts still saved"},
                 )
             else:
-                logger.debug("chroma_upsert_failed", error=str(e)[:200])
+                logger.warning("chroma_upsert_failed", error=str(e)[:200])
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -591,7 +625,7 @@ class MemoryUnifier:
             try:
                 await self._ensure_semantic_index()
             except Exception as e:  # noqa: BLE001
-                logger.debug("semantic_index_ensure_failed", error=str(e))
+                logger.warning("semantic_index_ensure_failed", error=str(e))
 
             self._initialized = True
 
@@ -851,7 +885,7 @@ class MemoryUnifier:
             for edge in extract_turn_edges(content, known, active_project):
                 await self._graph.upsert_edge(edge)
         except Exception as e:  # noqa: BLE001
-            logger.debug("graph_turn_extract_failed", error=str(e)[:160])
+            logger.warning("graph_turn_extract_failed", error=str(e)[:160])
 
         return turn_id
 
@@ -930,7 +964,7 @@ class MemoryUnifier:
             self._search_gen += 1
             return True
         except Exception as e:  # noqa: BLE001
-            logger.debug("graph_link_failed", error=str(e)[:160])
+            logger.warning("graph_link_failed", error=str(e)[:160])
             return False
 
     # ── Semantic world model (Phase 4 / #11) ─────────────────────────────────
@@ -1593,6 +1627,9 @@ class MemoryUnifier:
         v_raw = str(value).strip() if value is not None else ""
         v_norm = v_raw.lower()
         if attr_key in deny_by_attr:
+            # DEBUG on purpose, both of these (audit 2026-11-02, M12, which
+            # raised 56 real failures to warning): the denylist refusing a
+            # junk value is the denylist working, not a failure.
             if (not v_raw) or (v_norm in deny_by_attr[attr_key]) or (len(v_raw) < 2):
                 logger.debug("fact_rejected_denylist", entity=entity, attribute=attribute, value=value)
                 return uuid4()  # preserve return type while skipping write
@@ -1629,7 +1666,7 @@ class MemoryUnifier:
                     if stale_ids:
                         await self._sqlite.delete_facts_by_ids(stale_ids)
                 except Exception as e:  # noqa: BLE001
-                    logger.debug("fact_supersede_failed", entity=entity, attribute=attribute, error=str(e)[:200])
+                    logger.warning("fact_supersede_failed", entity=entity, attribute=attribute, error=str(e)[:200])
                     stale_ids = []
             else:
                 try:
@@ -1645,14 +1682,14 @@ class MemoryUnifier:
                             # Still degrades to "already stored" — but the
                             # re-mention did NOT resist decay, and the comment
                             # above promises it would.
-                            logger.debug("fact_reinforce_failed", entity=entity,
+                            logger.warning("fact_reinforce_failed", entity=entity,
                                          attribute=attribute,
                                          error=str(exc)[:160])
                         return UUID(dupes[0])  # already stored; nothing to write
                 except Exception as exc:  # noqa: BLE001
                     # The duplicate CHECK failed, so the write below may store a
                     # second copy of a fact that is already here.
-                    logger.debug("fact_duplicate_check_failed", entity=entity,
+                    logger.warning("fact_duplicate_check_failed", entity=entity,
                                  attribute=attribute, error=str(exc)[:160])
 
             tasks = [
@@ -1722,7 +1759,7 @@ class MemoryUnifier:
             if edge is not None:
                 await self._graph.upsert_edge(edge, confidence=min(0.9, confidence))
         except Exception as e:  # noqa: BLE001
-            logger.debug("graph_fact_edge_failed", error=str(e)[:160])
+            logger.warning("graph_fact_edge_failed", error=str(e)[:160])
 
         return fact_id
 
@@ -1780,7 +1817,7 @@ class MemoryUnifier:
             if edge is not None:
                 await self._graph.upsert_edge(edge, confidence=0.8)
         except Exception as e:  # noqa: BLE001
-            logger.debug("graph_person_edge_failed", error=str(e)[:160])
+            logger.warning("graph_person_edge_failed", error=str(e)[:160])
 
         return person_id
 
@@ -1834,9 +1871,14 @@ class MemoryUnifier:
     async def list_people_with_upcoming_dates(self, within_days: int = 7) -> list[dict[str, Any]]:
         """People with a birthday/anniversary landing within the next N days
         (today inclusive), soonest first. Used to surface a gentle reminder —
-        never guesses a date that wasn't actually stored."""
+        never guesses a date that wasn't actually stored.
+
+        "Today" is Marcus's today. On the UTC date a birthday became "today"
+        in the early evening of the day BEFORE here, and dropped off the list
+        in the early evening of the day itself (audit, L12).
+        """
         await self.initialize()
-        today = _now().date()
+        today = _as_local(_now()).date()
         out: list[dict[str, Any]] = []
         for row in await self._sqlite.all_people(limit=None):
             try:
@@ -2039,7 +2081,7 @@ class MemoryUnifier:
             await self._json.append_audit({"op": "supersede", "ids": ids, "reason": reason})
             return removed
         except Exception as e:  # noqa: BLE001
-            logger.debug("supersede_failed", error=str(e)[:160])
+            logger.warning("supersede_failed", error=str(e)[:160])
             return 0
 
     async def forget(self, query: str, *, limit: int = 25,
@@ -2160,7 +2202,7 @@ class MemoryUnifier:
                                        where="correct_fact", ids=len(ids),
                                        error=str(exc)[:160])
             except Exception as e:  # noqa: BLE001
-                logger.debug("correction_delete_failed", error=str(e)[:160])
+                logger.warning("correction_delete_failed", error=str(e)[:160])
 
         was = ", ".join(r.value for r in prior[:3]) if prior else ""
         await self.add_fact(
@@ -2300,9 +2342,14 @@ class MemoryUnifier:
     # --- Mood tracking (M1: emotional presence) ------------------------------
 
     async def record_mood(self, label: str, day: str | None = None) -> None:
-        """One mood reading per calendar day (singleton per day; days
-        accumulate so a trend can be read back later)."""
-        day = day or _now().strftime("%Y-%m-%d")
+        """One mood reading per LOCAL calendar day (singleton per day; days
+        accumulate so a trend can be read back later).
+
+        Marcus's day, not UTC's (audit, M17): on the UTC day every evening
+        here belongs to tomorrow, so an evening mood overwrote the next day's
+        reading before that day had happened.
+        """
+        day = day or _as_local(_now()).strftime("%Y-%m-%d")
         ent = scoped_entity("mood")
         if ent is None:
             # Whose mood? Nova doesn't know, so she records nobody's.
@@ -2332,10 +2379,15 @@ class MemoryUnifier:
     # --- Wellbeing awareness (WB1) --------------------------------------------
 
     async def record_wellbeing_signal(self, label: str, day: str | None = None) -> None:
-        """One wellbeing reading per calendar day (singleton per day; days
-        accumulate). Only meaningful signals get written — an ordinary day
-        records nothing, same discipline as record_mood."""
-        day = day or _now().strftime("%Y-%m-%d")
+        """One wellbeing reading per LOCAL calendar day (singleton per day;
+        days accumulate). Only meaningful signals get written — an ordinary day
+        records nothing, same discipline as record_mood.
+
+        "late_night" is the signal this matters most for: a late night is late
+        by Marcus's clock, and on the UTC day it was filed under tomorrow
+        (audit, M17).
+        """
+        day = day or _as_local(_now()).strftime("%Y-%m-%d")
         ent = scoped_entity("wellbeing")
         if ent is None:
             return
@@ -2385,9 +2437,10 @@ class MemoryUnifier:
 
     # --- Habit & pattern learning (HP1) ----------------------------------------
 
-    async def log_tool_usage(self, tool_name: str) -> None:
+    async def log_tool_usage(self, tool_name: str, *,
+                             called_at_iso: str | None = None) -> None:
         await self.initialize()
-        await self._sqlite.log_tool_usage(tool_name)
+        await self._sqlite.log_tool_usage(tool_name, called_at_iso=called_at_iso)
 
     async def distinct_logged_tools(self, window_days: int = 14) -> list[str]:
         await self.initialize()
@@ -2406,11 +2459,14 @@ class MemoryUnifier:
         if len(timestamps) < min_distinct_days:
             return None
 
+        # LOCAL hour and LOCAL day. Read off the UTC timestamp, an 8am habit
+        # was labelled 2pm, and the "hour window" merge grouped calls by the
+        # wrong hour-of-day, so a genuine morning pattern could be split
+        # across the day boundary and missed entirely (audit, M17).
         by_hour: dict[int, set[str]] = {}
         for ts in timestamps:
-            try:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except Exception:
+            dt = _as_local(ts)
+            if dt is None:
                 continue
             by_hour.setdefault(dt.hour, set()).add(dt.date().isoformat())
 
@@ -2758,7 +2814,13 @@ class MemoryUnifier:
             text = " ".join(str(r.get("content") or "").split())
             if len(text) < 12:
                 continue
-            by_day.setdefault(dt.strftime("%Y-%m-%d"), []).append(text[:300])
+            # Grouped by the LOCAL day, and so is the weekday below. On the UTC
+            # day everything said after 6pm here belongs to tomorrow, which is
+            # how "works late on Thursdays" came out of Friday rows (M17).
+            day = _local_day(raw)
+            if day is None:
+                continue
+            by_day.setdefault(day, []).append(text[:300])
         return [
             {"date": day, "weekday": datetime.fromisoformat(day).strftime("%A"), "messages": msgs[:20]}
             for day, msgs in sorted(by_day.items())
@@ -2950,7 +3012,7 @@ class MemoryUnifier:
                 if widened:
                     terms = list(dict.fromkeys([*terms, *widened]))[:12]
             except Exception as e:  # noqa: BLE001
-                logger.debug("query_expansion_failed", error=str(e)[:160])
+                logger.warning("query_expansion_failed", error=str(e)[:160])
 
         BUS.publish("memory.search", {"query": clip(q, 120)})
 
@@ -3011,7 +3073,7 @@ class MemoryUnifier:
             try:
                 return await self._chroma.query(q, limit=limit)
             except Exception as e:
-                logger.debug("chroma_query_failed", error=str(e))
+                logger.warning("chroma_query_failed", error=str(e))
                 return []
 
         recent, keyword_rows, chroma_hits = await asyncio.gather(
@@ -3264,7 +3326,7 @@ class MemoryUnifier:
             # slightly fresher ordering is worth. Decay is a slow signal and
             # can wait for the 120s TTL.
         except Exception as e:  # noqa: BLE001
-            logger.debug("recall_reinforce_failed", error=str(e)[:200])
+            logger.warning("recall_reinforce_failed", error=str(e)[:200])
 
         # Bound the in-process cooldown map so a long session can't grow it
         # without limit.
@@ -3426,10 +3488,12 @@ class MemoryUnifier:
         async with self._write_lock:
             await self._sqlite.bump_autonomy_task_attempt(task_id=task_id, attempts=int(attempts), run_after_iso=run_after_iso, error=error)
 
-    async def cancel_pending_background_work(self) -> dict[str, int]:
+    async def cancel_pending_background_work(
+            self, *, on_startup: bool = True) -> dict[str, int]:
         await self.initialize()
         async with self._write_lock:
-            return await self._sqlite.cancel_pending_background_work()
+            return await self._sqlite.cancel_pending_background_work(
+                on_startup=on_startup)
 
 
     # ---------------- Agentic goal/task/proposal wrappers ----------------

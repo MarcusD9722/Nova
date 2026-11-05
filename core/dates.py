@@ -42,10 +42,13 @@ def parse_date_range(text: str, now: datetime | None = None) -> tuple[datetime, 
 
     if re.search(r"\btoday\b", t):
         return _day_bounds(today)
+    # MORE SPECIFIC FIRST. "day before yesterday" contains "yesterday", so with
+    # the plain check first it was unreachable and the phrase silently meant
+    # yesterday (audit, L2). Same for "the day before yesterday".
+    if re.search(r"\bday\s+before\s+yesterday\b", t):
+        return _day_bounds(today - timedelta(days=2))
     if re.search(r"\byesterday\b", t):
         return _day_bounds(today - timedelta(days=1))
-    if re.search(r"\b(?:day before yesterday)\b", t):
-        return _day_bounds(today - timedelta(days=2))
 
     m = re.search(r"\blast\s+(mon|tues?|wed|thur?s?|fri|sat|sun)\w*\b", t) or re.search(
         r"\b(?:this\s+past|past)\s+(mon|tues?|wed|thur?s?|fri|sat|sun)\w*\b", t

@@ -27,6 +27,22 @@ import re
 from typing import Any
 from uuid import UUID, uuid4
 
+# .env BEFORE any core import. Six settings are read at module scope — the
+# agent's step budget, the story continuation cap, the artifact window, the
+# project file-token budget, the tool-candidate count and the cold-store byte
+# cap — and loading .env after those imports meant every one of them silently
+# ignored it, while .env.example went on offering them (audit, M20).
+#
+# Nothing above this line reads configuration: the truststore injection is
+# unconditional and the rest is the standard library.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+
+    _load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env",
+                 override=False)
+except ImportError:
+    pass
+
 from fastapi import (FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket,
                      WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,13 +66,6 @@ from core.voice.speech_text import has_speakable_content, to_spoken
 from memory.unifier import MemoryUnifier
 from core.brain import Brain
 from plugins.registry import PluginConfigError
-
-try:
-    from dotenv import load_dotenv as _load_dotenv
-    _load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=False)
-except ImportError:
-    pass
-
 
 logger = get_logger(__name__)
 
@@ -438,12 +447,34 @@ async def _require_api_token(request, call_next):  # noqa: ANN001
 
 
 def _parse_allowed_origins() -> list[str]:
+    """Which origins the browser is told it may read responses from.
+
+    `null` is Electron's: a `file://` page sends `Origin: null`. It is also
+    what a sandboxed iframe on ANY website sends, and what a local .html file
+    sends — so allowing it unconditionally meant such a page could read
+    `/api/maps/key`, `/memory/recent` and `/memory/search`, and POST to `/chat`
+    and `/plugins/execute` (audit, H12).
+
+    The token is the real boundary, and `start_nova.ps1` now mints one and
+    passes it to Electron, so the dangerous combination is specifically
+    "`null` allowed AND no token". That combination is refused here: with no
+    token, `null` is dropped and a `file://` page gets nothing. An explicit
+    NOVA_ALLOWED_ORIGINS is the operator's own decision and is honoured as
+    given.
+    """
     raw = os.getenv("NOVA_ALLOWED_ORIGINS", "").strip()
-    if not raw:
-        # Local dev (Vite) + Electron (file:// uses Origin: null)
-        return ["http://localhost:5173", "http://127.0.0.1:5173", "null"]
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return parts or ["null"]
+    if raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return parts or ["null"]
+    origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    if _api_token():
+        # Authenticated Electron. Reaching anything still needs the token.
+        origins.append("null")
+    else:
+        logger.warning("null_origin_disallowed",
+                       reason="no NOVA_API_TOKEN, so file:// pages are not "
+                              "granted CORS access")
+    return origins
 
 
 app.add_middleware(
@@ -942,6 +973,12 @@ async def _tts_bytes(text: str, voice_path: Path, reason: str = "reply",
 
     if _should_cache_tts_phrase(text, reason):
         STATE.tts_phrase_cache[cache_key] = audio
+        # BOUNDED (audit, L12). `tts_cache` has been capped since Phase 0.6;
+        # this one grew without limit, and the entries are raw WAV bytes — a
+        # long-running process cached every repeated phrase it ever spoke.
+        # Oldest-inserted first, same rule as its sibling.
+        while len(STATE.tts_phrase_cache) > _TTS_CACHE_MAX:
+            STATE.tts_phrase_cache.pop(next(iter(STATE.tts_phrase_cache)), None)
     return audio
 
 
@@ -1393,7 +1430,7 @@ async def _startup() -> None:
 
         log_environment_validation()
     except Exception as e:  # noqa: BLE001
-        logger.debug("config_validation_failed", error=str(e)[:200])
+        logger.warning("config_validation_failed", error=str(e)[:200])
 
     if not _api_token():
         logger.warning(
@@ -1436,6 +1473,20 @@ async def _shutdown() -> None:
             await STATE.brain.stop()
         except Exception:
             pass
+    # MCP child processes. `McpManager.close()` existed and had NO caller, so
+    # every configured server was left running after Nova exited — an orphaned
+    # child per server, per run (audit, L4). The startup task is cancelled
+    # first in case shutdown arrives while servers are still connecting.
+    if STATE.mcp_task is not None and not STATE.mcp_task.done():
+        STATE.mcp_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await STATE.mcp_task
+    if STATE.mcp is not None:
+        try:
+            await STATE.mcp.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mcp_close_failed", error=str(exc)[:160])
+        STATE.mcp = None
     if STATE.tts_voice_cache_dir is not None:
         await asyncio.to_thread(shutil.rmtree, STATE.tts_voice_cache_dir, ignore_errors=True)
 
@@ -1592,7 +1643,7 @@ async def _resolve_turn_identity(voice_turn_id: str | None,
         if svc is not None and getattr(match, "profile_id", None):
             profile = await svc.registry.get(match.profile_id)
     except Exception as e:  # noqa: BLE001
-        logger.debug("speaker_profile_lookup_failed", error=str(e)[:160])
+        logger.warning("speaker_profile_lookup_failed", error=str(e)[:160])
     return TurnIdentity.from_match(match, profile=profile)
 
 
@@ -1764,7 +1815,7 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                     # interrupted. That is a normal barge-in, not an error.
                     continue
                 except Exception as e:  # noqa: BLE001
-                    logger.debug("tts_sentence_failed", error=str(e))
+                    logger.warning("tts_sentence_failed", error=str(e))
                     await audio_q.put({"error": str(e)})
             await audio_q.put(None)
 
@@ -1828,6 +1879,15 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
                     tool_calls_result = ev.get("tool_calls") or []
         except Exception as e:  # noqa: BLE001
             logger.error("chat_stream_failed", error=str(e))
+            # ON THE BUS, not only in the log. This is the worst failure a turn
+            # can have and it was invisible to everything that watches for
+            # trouble: the error log, self-improvement, the UI's error handling.
+            # `errors.json` showed zero context-window failures BY
+            # CONSTRUCTION, which is why the overflow could brick a
+            # conversation unnoticed (audit 2026-11-02, M12).
+            BUS.publish("system.error", {"component": "chat.stream",
+                                         "error": _event_clip(e, 300),
+                                         "sent_any_token": bool(sent_any_token)})
             # Always signal the crash so the frontend can distinguish a mid-stream
             # failure from a clean finish (previously both looked like `done`).
             yield _sse("error", {"message": "The reply was interrupted by an internal error.", "where": "stream"})

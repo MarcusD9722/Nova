@@ -451,7 +451,14 @@ class ArtifactStore:
 # ── Capturing tool results as artifacts ──────────────────────────────────────
 
 #: Keys tools actually use for an ordered result list, in preference order.
-_LIST_KEYS = ("results", "places", "items", "matches", "hits", "routes", "entries")
+#: Keys whose value is "the list the user is about to point at", so "the
+#: second one" can resolve. `emails`, `events`, `messages` and `reminders`
+#: were missing, which is exactly the set of tools where a follow-up is most
+#: natural — "reply to the second one" could not resolve after email.recent
+#: (audit, L7).
+_LIST_KEYS = ("results", "places", "items", "matches", "hits", "routes",
+              "entries", "emails", "events", "messages", "reminders",
+              "symbols", "findings", "files")
 
 #: How long a given tool's output stays true. Tools not listed here get SESSION,
 #: which is the conservative middle: reusable within the conversation, not
@@ -460,22 +467,35 @@ _TOOL_FRESHNESS: dict[str, str] = {
     "web.search": FRESH_SLOW,
     "web.fetch": FRESH_SLOW,
     "weather.current": FRESH_SHORT,
-    "weather.forecast": FRESH_SHORT,
+    # `weather.forecast` was here too, and is not a registered tool (L7).
     "maps.directions": FRESH_REALTIME,
     "maps.places_nearby": FRESH_SLOW,
     "maps.place_search": FRESH_SLOW,
     "maps.geocode": FRESH_STATIC,
-    "time.now": FRESH_NO_CACHE,
-    "gmail.list": FRESH_SHORT,
-    "calendar.list": FRESH_SHORT,
+    # THE NAMES THE ROUTER ACTUALLY HAS (audit, L7). `time.now`, `gmail.list`
+    # and `calendar.list` do not exist — the registered tools are
+    # `system.time`, `email.recent` and `calendar.today`/`calendar.upcoming`
+    # — so every one of these entries was dead and those tools silently took
+    # the FRESH_SESSION default: a clock reading and an inbox listing were
+    # reusable for the whole conversation.
+    "system.time": FRESH_NO_CACHE,
+    "email.recent": FRESH_SHORT,
+    "calendar.today": FRESH_SHORT,
+    "calendar.upcoming": FRESH_SHORT,
+    "discord.read": FRESH_SHORT,
+    "reminder.list": FRESH_SHORT,
 }
 
 #: Tools whose output is text Nova did not write and did not verify. Anything
 #: reaching Nova from outside is data, never instructions — see
 #: core/context_firewall.py.
 _EXTERNAL_TOOLS = frozenset({
-    "web.search", "web.fetch", "gmail.list", "gmail.read", "discord.read",
+    # Same correction as the freshness table above (audit, L7): `gmail.list`
+    # and `gmail.read` are not registered tools, so mail arriving from outside
+    # was being trusted as a tool result rather than framed as external data.
+    "web.search", "web.fetch", "email.recent", "discord.read",
     "maps.places_nearby", "maps.place_search", "memory.index_folder",
+    "mcp",  # every MCP capability is namespaced `mcp:<server>:<tool>`
 })
 
 

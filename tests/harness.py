@@ -203,7 +203,7 @@ class ScriptedLLM:
 
     async def chat(self, messages: list[dict[str, Any]], max_tokens: int = 512,
                    temperature: float = 0.2, stop: list[str] | None = None,
-                   thinking: bool = False) -> str:
+                   thinking: bool = False, repeat_penalty: float | None = None) -> str:
         prompt = self._flatten(messages)
         async with self._tracked():
             self.prompts.append(prompt)
@@ -211,7 +211,8 @@ class ScriptedLLM:
 
     async def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 512,
                           temperature: float = 0.2, stop: list[str] | None = None,
-                          thinking: bool = False):
+                          thinking: bool = False,
+                          repeat_penalty: float | None = None):
         prompt = self._flatten(messages)
         async with self._tracked():
             self.prompts.append(prompt)

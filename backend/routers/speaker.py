@@ -21,6 +21,7 @@ when `NOVA_API_TOKEN` is configured.
 """
 
 import asyncio
+import os
 import shutil
 import subprocess
 import tempfile
@@ -150,6 +151,22 @@ async def enroll(
     if role not in _ENROLLABLE_ROLES:
         raise HTTPException(status_code=422, detail=(
             f"role must be one of {list(_ENROLLABLE_ROLES)}; got {role!r}"))
+    # OWNER IS NOT A ROLE A REQUEST MAY ASK FOR (audit, H12). The stated rule
+    # is that a role never comes from the request, and this is the one route
+    # where it did — a multipart POST needs no CORS preflight, so a page that
+    # could reach this port could enrol a voice AS MARCUS, which is the
+    # identity every owner-scoped tool trusts.
+    #
+    # It is still settable, deliberately: `NOVA_ALLOW_OWNER_ENROLLMENT=1` is
+    # how the calibration harness enrols him, and that is a decision made at
+    # the machine, not in a request body.
+    if role == "owner" and os.getenv(
+            "NOVA_ALLOW_OWNER_ENROLLMENT", "").strip().lower() not in {
+                "1", "true", "yes", "on"}:
+        raise HTTPException(status_code=403, detail=(
+            "Enrolling the owner is not something a request may ask for. Set "
+            "NOVA_ALLOW_OWNER_ENROLLMENT=1 in the backend's own environment "
+            "and restart, or enrol as a guest and change the role locally."))
 
     samples: list[tuple[Any, int]] = []
     for f in files:

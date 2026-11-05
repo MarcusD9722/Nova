@@ -60,7 +60,7 @@ class AutonomyPlannerLLM:
         try:
             out = AutonomyPlannerOutput.model_validate(obj)
         except Exception as e:  # noqa: BLE001
-            logger.debug("autonomy_planner_invalid", error=str(e), raw=raw[:400])
+            logger.warning("autonomy_planner_invalid", error=str(e), raw=raw[:400])
             return AutonomyPlannerOutput(action="idle", reason="planner_invalid", tool_calls=[], new_tasks=[], message_to_user=None)
 
         # guard: strip tools not in registry

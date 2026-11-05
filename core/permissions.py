@@ -21,6 +21,8 @@ Design:
 """
 
 import asyncio
+import contextlib
+import os
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,6 +213,8 @@ class PermissionBroker:
             lines = blob.decode("utf-8", errors="replace").splitlines()
             lines = lines[-self._RECOVER_TAIL:]
         except OSError as e:  # noqa: BLE001
+            # DEBUG on purpose (audit 2026-11-02, M12, which raised 56 real
+            # failures to warning): there is no audit file yet on a first run.
             logger.debug("permission_audit_read_failed", error=str(e)[:160])
             return
 
@@ -281,8 +285,48 @@ class PermissionBroker:
                 self._audit_path.parent.mkdir(parents=True, exist_ok=True)
                 with self._audit_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self._trim_audit_file()
             except Exception as e:  # noqa: BLE001
-                logger.debug("permission_audit_write_failed", error=str(e)[:160])
+                logger.warning("permission_audit_write_failed", error=str(e)[:160])
+
+    #: How many audit lines to keep on disk. The file held EVERYTHING, forever,
+    #: in plaintext — including the `details` of every request, which is the
+    #: path a tool was asked to read or the command it was asked to run — and
+    #: `purge` did not touch it (audit, L12). An audit trail that grows without
+    #: limit becomes the largest unmanaged copy of what Nova has been asked to
+    #: do. Overridable, and a retention of 0 means keep everything, which is a
+    #: choice an operator can now make deliberately.
+    _AUDIT_MAX_LINES = int(os.getenv("NOVA_PERMISSION_AUDIT_MAX_LINES",
+                                     "20000").strip() or "20000")
+
+    #: Checked every N writes rather than on each one: the trim reads the file.
+    _AUDIT_TRIM_EVERY = 200
+
+    def _trim_audit_file(self) -> None:
+        """Keep the newest `_AUDIT_MAX_LINES` entries, oldest dropped first."""
+        if self._audit_path is None or self._AUDIT_MAX_LINES <= 0:
+            return
+        self._audit_writes = getattr(self, "_audit_writes", 0) + 1
+        if self._audit_writes % self._AUDIT_TRIM_EVERY:
+            return
+        try:
+            lines = self._audit_path.read_text(encoding="utf-8",
+                                               errors="replace").splitlines()
+        except OSError:
+            return
+        if len(lines) <= self._AUDIT_MAX_LINES:
+            return
+        keep = lines[-self._AUDIT_MAX_LINES:]
+        tmp = self._audit_path.with_suffix(self._audit_path.suffix + ".tmp")
+        try:
+            tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            tmp.replace(self._audit_path)
+            logger.info("permission_audit_trimmed", dropped=len(lines) - len(keep),
+                        kept=len(keep))
+        except OSError as e:
+            logger.warning("permission_audit_trim_failed", error=str(e)[:160])
+            with contextlib.suppress(OSError):
+                tmp.unlink()
 
     async def request(self, capability: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         """Ask to perform a capability. Returns {decision, request_id?}:

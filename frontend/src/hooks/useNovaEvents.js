@@ -24,11 +24,14 @@ export default function useNovaEvents({ enabled = true } = {}) {
   const [activity, setActivity] = useState({
     thinking: false,
     tool: null, // active tool name
-    memory: null, // "read" | "write" | "search"
+    memory: null, // "read" | "write" | "forgotten" | "corrected"
     vision: false,
     web: false,
     ttsGenerating: false,
     lastError: null,
+    // Something is degraded but the turn did not fail — a backend
+    // `system.warning`, or the cloud daily token cap (audit, L5).
+    lastWarning: null,
   });
 
   const wsRef = useRef(null);
@@ -65,7 +68,13 @@ export default function useNovaEvents({ enabled = true } = {}) {
         flash("tool", String(data.tool || "tool"));
         flash("lastError", `${data.tool || "tool"}: ${data.error || "failed"}`);
       } else if (type === "memory.write") flash("memory", "write");
-      else if (type === "memory.search" || type === "memory.read") flash("memory", "read");
+      // `memory.read` was listened for and is published by nothing, while
+      // `memory.corrected`, `memory.forgotten` and `memory.superseded` ARE
+      // published and were listened for by nothing (audit, L5). Checked
+      // against the publishers rather than guessed.
+      else if (type === "memory.search") flash("memory", "read");
+      else if (type === "memory.forgotten") flash("memory", "forgotten");
+      else if (type === "memory.corrected" || type === "memory.superseded") flash("memory", "corrected");
       else if (type === "vision.analysis_start") hold("vision", true);
       else if (type === "vision.analysis_done" || type === "vision.error") hold("vision", false);
       else if (type === "web.search_start" || type === "web.fetch_start") hold("web", true);
@@ -77,6 +86,11 @@ export default function useNovaEvents({ enabled = true } = {}) {
       else if (type === "project.progress") hold("tool", `project:${data.project || "build"} (${data.stage || "working"})`);
       else if (type === "project.completed" || type === "project.error") flash("tool", `project:${data.project || "build"}`);
       else if (type === "model.error" || type === "system.error") flash("lastError", String(data.error || type));
+      // `system.warning` had no handler at all (audit, L5). It is shown as a
+      // warning rather than an error, so a degraded component is visible
+      // without claiming the turn failed.
+      else if (type === "system.warning") flash("lastWarning", String(data.error || data.component || type));
+      else if (type === "cloud.capped") flash("lastWarning", `cloud daily token cap reached (${data.tokens || "?"})`);
     },
     [flash, hold]
   );

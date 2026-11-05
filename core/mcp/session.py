@@ -16,10 +16,12 @@ how to say honestly.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,6 +105,35 @@ class StdioTransport(Transport):
     def __init__(self, cfg: ServerConfig) -> None:
         self._cfg = cfg
         self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task | None = None
+        #: The last few stderr lines, for diagnosing a server that will not
+        #: talk. Bounded: a chatty server must not become a memory leak.
+        self._stderr_tail: deque[str] = deque(maxlen=20)
+
+    async def _drain_stderr(self) -> None:
+        """Keep the child's stderr pipe empty for as long as it runs."""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self._stderr_tail.append(text[:400])
+                    logger.debug("mcp_server_stderr", server=self._cfg.server_id,
+                                 line=text[:200])
+        except (asyncio.CancelledError, asyncio.IncompleteReadError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug("mcp_stderr_drain_ended", server=self._cfg.server_id,
+                         error=str(e)[:120])
+
+    def stderr_tail(self) -> list[str]:
+        """What the server last complained about, for an error message."""
+        return list(self._stderr_tail)
 
     async def start(self) -> None:
         exe = shutil.which(self._cfg.command) or self._cfg.command
@@ -128,6 +159,13 @@ class StdioTransport(Transport):
         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as e:
             raise McpError(f"cannot start MCP server {self._cfg.server_id!r}: "
                            f"{type(e).__name__}: {e}") from e
+        # DRAIN STDERR. It is a PIPE and nothing ever read it, so a server that
+        # logs to stderr filled the 64 KB pipe buffer and then BLOCKED on its
+        # next write — forever, with Nova waiting on a stdout frame that could
+        # never come (audit, L4). The drain runs for the life of the process,
+        # keeps only the last few lines, and surfaces them in the logs where a
+        # failing server is actually diagnosable.
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def send(self, payload: dict) -> None:
         if self._proc is None or self._proc.stdin is None:
@@ -162,6 +200,11 @@ class StdioTransport(Transport):
 
     async def close(self) -> None:
         proc, self._proc = self._proc, None
+        task, self._stderr_task = self._stderr_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         if proc is None:
             return
         try:

@@ -407,7 +407,7 @@ class EpisodicIngestWorker:
             except Exception as e:  # noqa: BLE001
                 # Reinforcement is bookkeeping; losing it must not fail a write
                 # that already succeeded.
-                logger.debug("episodic_reinforce_failed", error=str(e)[:160])
+                logger.warning("episodic_reinforce_failed", error=str(e)[:160])
 
     def status(self) -> dict[str, Any]:
         return {**self.stats, "queue_depth": self._q.qsize(),

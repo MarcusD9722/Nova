@@ -68,20 +68,37 @@ _ASKS_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Words that can sit between the possessive and the date word without being
+#: part of either: "our WEDDING anniversary", "my NEXT birthday", "our 10TH
+#: anniversary". Without this the possessive did not match at all and the
+#: question fell through to the model instead of the stored answer (audit, L8).
+_DATE_MODIFIER = (r"(?:next|last|this|upcoming|coming|wedding|marriage|big|"
+                  r"first|second|third|\d{1,3}(?:st|nd|rd|th)?)")
+
 #: A possessive subject: "my", "Leslie's", "Mateo and Liam's".
 _POSSESSIVE_RE = re.compile(
-    r"\b(?P<who>my|your|his|her|their|"
-    r"(?:[A-Z][\w'-]+(?:\s+and\s+[A-Z][\w'-]+)*))\s*(?:'s|s'|')?\s+" + _DATE_WORD,
+    r"\b(?P<who>my|our|ours|your|his|her|their|"
+    r"(?:[A-Z][\w'-]+(?:\s+and\s+[A-Z][\w'-]+)*))\s*(?:'s|s'|')?\s+"
+    rf"(?:{_DATE_MODIFIER}\s+){{0,2}}" + _DATE_WORD,
     re.IGNORECASE,
 )
 
-_SELF_WORDS = {"my", "mine", "i", "me"}
+#: Words that mean the SPEAKER. "our" belongs here: an anniversary is shared by
+#: definition and is stored under the speaker, so "When's our anniversary?" was
+#: taking "our" for somebody's NAME and answering "I don't have our on file"
+#: (audit, L8).
+_SELF_WORDS = {"my", "mine", "i", "me", "our", "ours", "we", "us"}
 
 #: Words that look like a capitalised name but are not one.
 _NOT_A_NAME = {
     "when", "what", "which", "who", "the", "a", "an", "and", "or", "is", "are",
     "was", "were", "do", "does", "did", "tell", "me", "please", "nova", "hey",
     "so", "also", "both", "everyone", "their", "there",
+    # The pattern is case-insensitive, so a lowercase word also matches its
+    # capitalised-name branch: "our wedding anniversary" produced a person
+    # called "wedding" (audit, L8).
+    "wedding", "work", "marriage", "next", "last", "this", "that", "upcoming",
+    "first", "second", "third", "big", "our", "ours", "we", "us",
 }
 
 

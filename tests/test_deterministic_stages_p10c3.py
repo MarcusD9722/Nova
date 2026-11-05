@@ -1996,6 +1996,21 @@ async def test_production_retry_classification():
             # that finding are deliberately NOT here — reminder.cancel changes
             # a reminder's status and memory.forget deletes.
             "reminder.list",
+            # Added for audit 2026-11-02 M2. Each was checked in its plugin
+            # source, not taken from its name: web.search/web.fetch and
+            # weather.current issue GETs; system.time reads the clock;
+            # maps.* call the Google Maps read endpoints; calendar.* use
+            # _list_events on a calendar.readonly scope; email.recent lists
+            # via gmail.readonly; discord.read GETs channel messages.
+            #
+            # Their write-capable siblings are deliberately absent:
+            # email.draft_reply POSTs a draft and discord.send posts a
+            # message. Repeating a read costs a request; repeating either of
+            # those is a second draft or a second message.
+            "web.search", "web.fetch", "weather.current", "system.time",
+            "maps.geocode", "maps.place_search", "maps.places_nearby",
+            "maps.directions", "calendar.today", "calendar.upcoming",
+            "email.recent", "discord.read",
         }
         declared = sorted(n for n in read_only if n in names and router.is_retry_safe(n))
         check(len(declared) >= 12,

@@ -82,9 +82,14 @@ class StorytellerLLM:
         try:
             async with self._sem:
                 out = await self._llm.chat(
-                    [{"role": "user", "content": prompt}], max_tokens=400, temperature=0.2, thinking=True
+                    # thinking=False (audit, M9): at 400 tokens the think
+                    # block consumed the whole budget and the JSON state
+                    # never arrived — finish=length 3 of 3, so story
+                    # continuity was silently dead on this model.
+                    [{"role": "user", "content": prompt}], max_tokens=400,
+                    temperature=0.2, thinking=False
                 )
             return (out or "").strip()[:1600]
         except Exception as e:  # noqa: BLE001
-            logger.debug("story_state_update_failed", error=str(e))
+            logger.warning("story_state_update_failed", error=str(e))
             return prior_state

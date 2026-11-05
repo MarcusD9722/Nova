@@ -109,6 +109,8 @@ class ErrorLog:
                 for e in data[-self._max :]:
                     self._entries.append(e)
         except Exception as e:  # noqa: BLE001
+            # DEBUG on purpose (audit 2026-11-02, M12, which raised 56 real
+            # failures to warning): there is no error log yet on a first run.
             logger.debug("error_log_load_failed", error=str(e)[:200])
 
     def _persist(self) -> None:
@@ -116,7 +118,7 @@ class ErrorLog:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._path.write_text(json.dumps(list(self._entries), ensure_ascii=False), encoding="utf-8")
         except Exception as e:  # noqa: BLE001
-            logger.debug("error_log_persist_failed", error=str(e)[:200])
+            logger.warning("error_log_persist_failed", error=str(e)[:200])
 
     # ── signature (for recurrence grouping) ──────────────────────────────────
 

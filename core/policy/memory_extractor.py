@@ -5,7 +5,8 @@ import json
 from core.llm_runtime import LLMRuntime
 from core.logging_setup import get_logger
 from core.policy._json_extract import extract_first_json_object
-from core.policy.contracts import MemoryExtractorOutput, MemoryFact
+from core.policy.contracts import (MemoryExtractorOutput, MemoryFact,
+                                   split_people_value)
 
 
 logger = get_logger(__name__)
@@ -83,12 +84,33 @@ class MemoryExtractorLLM:
         # anyway, validation drops that one fact here and keeps the rest.
         kept: list[MemoryFact] = []
         dropped = 0
+        split = 0
         for item in raw_facts:
             try:
-                kept.append(MemoryFact.model_validate(item))
+                fact = MemoryFact.model_validate(item)
             except Exception as e:  # noqa: BLE001
                 dropped += 1
+                # DEBUG on purpose (audit 2026-11-02, M12, which raised 56 real
+                # failures to warning): an expected small-model slip, and the INFO
+                # `memory_extractor_partial` line below reports the count.
                 logger.debug("memory_extractor_fact_dropped", error=str(e)[:200], item=str(item)[:200])
+                continue
+            # ONE PERSON PER FACT. The prompt invites lists, and the model
+            # obliges with child="Mateo|Liam" — which was stored verbatim, so
+            # the graph held one child named "Mateo|Liam", nothing could answer
+            # a question about Liam, and the context firewall had no "Liam" to
+            # redact (audit, M11). `pet` is excluded there: its "|" separates a
+            # name from a species.
+            names = split_people_value(fact.attribute, fact.value)
+            if len(names) > 1:
+                split += 1
+                for name in names:
+                    kept.append(fact.model_copy(update={"value": name}))
+            else:
+                kept.append(fact)
         if dropped:
             logger.info("memory_extractor_partial", kept=len(kept), dropped=dropped)
+        if split:
+            logger.info("memory_extractor_split_people", values=split,
+                        facts=len(kept))
         return MemoryExtractorOutput(facts=kept)

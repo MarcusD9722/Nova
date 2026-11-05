@@ -26,6 +26,7 @@ Non-negotiables baked in here:
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 import httpx
@@ -168,6 +169,41 @@ class CloudRuntime:
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._capped = False
+        # ON DISK (audit, L3). The cap lived in memory only, so a restart --
+        # including the one a runaway loop provokes -- reset the day's spend to
+        # zero, and the ceiling could be crossed once per restart. A plain
+        # JSON file holding one day's counters.
+        self._spend_path = Path(
+            os.getenv("NOVA_CLOUD_SPEND_PATH", "").strip()
+            or Path(__file__).resolve().parents[1] / "memory_data" / "cloud_spend.json")
+        self._load_spend()
+
+    def _load_spend(self) -> None:
+        """Read today's counters back. A missing or unreadable file is zero."""
+        try:
+            raw = json.loads(self._spend_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if str(raw.get("day") or "") != self._day:
+            return          # yesterday's numbers; the day has rolled
+        try:
+            self._prompt_tokens = int(raw.get("prompt_tokens") or 0)
+            self._completion_tokens = int(raw.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        self._capped = self._over_cap()
+        if self._capped:
+            logger.warning("cloud_cap_restored_as_reached",
+                           tokens=self._prompt_tokens + self._completion_tokens)
+
+    def _save_spend(self) -> None:
+        try:
+            self._spend_path.parent.mkdir(parents=True, exist_ok=True)
+            self._spend_path.write_text(json.dumps({
+                "day": self._day, "prompt_tokens": self._prompt_tokens,
+                "completion_tokens": self._completion_tokens}), encoding="utf-8")
+        except OSError as e:
+            logger.warning("cloud_spend_persist_failed", error=str(e)[:160])
 
     def _roll_day(self) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -176,6 +212,7 @@ class CloudRuntime:
             self._prompt_tokens = 0
             self._completion_tokens = 0
             self._capped = False
+            self._save_spend()
 
     @property
     def _daily_cap(self) -> int:
@@ -197,12 +234,37 @@ class CloudRuntime:
         # openai: prompt_tokens/completion_tokens · anthropic: input_tokens/output_tokens
         self._prompt_tokens += int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
         self._completion_tokens += int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        self._save_spend()
+        self._note_if_capped()
+
+    def _note_if_capped(self, *, estimated: bool = False) -> None:
         if self._over_cap() and not self._capped:
             self._capped = True
             logger.warning("cloud_daily_cap_reached", cap=self._daily_cap,
+                           estimated=estimated,
                            tokens=self._prompt_tokens + self._completion_tokens)
-            BUS.publish("cloud.capped", {"cap": self._daily_cap,
-                                         "tokens": self._prompt_tokens + self._completion_tokens})
+            BUS.publish("cloud.capped", {
+                "cap": self._daily_cap, "estimated": estimated,
+                "tokens": self._prompt_tokens + self._completion_tokens})
+
+    def _record_stream_usage(self, *, prompt_chars: int, reply_chars: int) -> None:
+        """Count a STREAMED call, which reports no usage block.
+
+        Streams were entirely uncounted (audit, L3): a day spent streaming
+        moved the counter not at all, under a cap that therefore never fired.
+        SSE carries no token counts, so these are estimated from characters at
+        the same ratio core/prompt_budget.py uses. An estimate that is counted
+        is worth more than an exact number that is not, and both the log line
+        and the bus event say which it is.
+        """
+        self._roll_day()
+        est_prompt = max(1, int(prompt_chars / 3.4))
+        est_reply = max(1, int(reply_chars / 3.4))
+        self._prompt_tokens += est_prompt
+        self._completion_tokens += est_reply
+        self._save_spend()
+        logger.info("cloud_stream_usage_estimated", prompt=est_prompt, reply=est_reply)
+        self._note_if_capped(estimated=True)
 
     def estimated_cost_usd(self) -> float:
         """Rough spend estimate from configurable per-1M-token rates. Clearly an
@@ -369,20 +431,36 @@ class CloudRuntime:
                     self._calls += 1
                     BUS.publish("cloud.call", {"provider": self.provider, "model": self.model,
                                                "firewall": scrub.summary(), "stream": True})
-                    async for line in resp.aiter_lines():
-                        line = (line or "").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        chunk = line[5:].strip()
-                        if chunk == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(chunk)
-                        except Exception:
-                            continue
-                        delta = adapter.parse_delta(obj)
-                        if delta:
-                            yield delta
+                    reply_chars = 0
+                    try:
+                        async for line in resp.aiter_lines():
+                            line = (line or "").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if chunk == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(chunk)
+                            except Exception:
+                                continue
+                            # Some providers DO send a usage block on the final
+                            # SSE frame. Prefer it over the estimate.
+                            if isinstance(obj, dict) and obj.get("usage"):
+                                self._record_usage(obj)
+                                reply_chars = 0
+                            delta = adapter.parse_delta(obj)
+                            if delta:
+                                reply_chars += len(delta)
+                                yield delta
+                    finally:
+                        # In a `finally` so an ABANDONED stream still counts
+                        # what it spent before the caller walked away.
+                        if reply_chars:
+                            self._record_stream_usage(
+                                prompt_chars=sum(len(str(m.get("content") or ""))
+                                                 for m in safe),
+                                reply_chars=reply_chars)
         except Exception as e:  # noqa: BLE001
             yield await self._fallback_chat(f"{type(e).__name__}: {e}"[:200], messages, **kw)
 

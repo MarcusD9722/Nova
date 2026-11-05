@@ -28,9 +28,38 @@ _BRIEFING_TITLE = "__nova_morning_briefing__"
 # are handled specially instead of firing stale as if they're happening now.
 _MISSED_GRACE = timedelta(minutes=30)
 
+#: Marker for a reminder whose wording depends on WHEN IT FIRES. The rest of
+#: the details is "<YYYY-MM-DD>|<name>|<label>", rendered by
+#: `_render_dated_details` at fire time. A heads-up created three days early
+#: used to carry the sentence "in 3 day(s)" it was written with, and still said
+#: that on the day itself (audit, M5).
+_DATED_DETAILS = "__nova_dated__:"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _local_wall_clock(dt: datetime) -> datetime:
+    """The same instant as a NAIVE local wall-clock time.
+
+    Calendar arithmetic has to happen here, not in UTC: "every day at 8am"
+    means the wall clock reads 8, and adding 24 hours of absolute time across
+    a DST boundary makes it read 7 — permanently, because the next advance
+    starts from the wrong answer (audit, M6). Measured on 1 November 2026.
+    """
+    aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    return aware.astimezone().replace(tzinfo=None)
+
+
+def _local_to_utc(naive_local: datetime) -> datetime:
+    """A naive local wall-clock time back as aware UTC.
+
+    `astimezone` on a naive datetime assumes local time and picks up whichever
+    UTC offset is in force on THAT date, which is exactly what makes the
+    wall clock stay put across a DST change.
+    """
+    return naive_local.astimezone(timezone.utc)
 
 
 class ReminderWorker:
@@ -86,7 +115,7 @@ class ReminderWorker:
         try:
             await self._ensure_morning_briefing()
         except Exception as e:  # noqa: BLE001
-            logger.debug("morning_briefing_setup_failed", error=str(e))
+            logger.warning("morning_briefing_setup_failed", error=str(e))
         while not self._stop.is_set():
             try:
                 await self._tick()
@@ -99,13 +128,13 @@ class ReminderWorker:
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
-                logger.debug("birthday_check_failed", error=str(e)[:200])
+                logger.warning("birthday_check_failed", error=str(e)[:200])
             try:
                 await self._check_habits()
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
-                logger.debug("habit_check_failed", error=str(e)[:200])
+                logger.warning("habit_check_failed", error=str(e)[:200])
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except (TimeoutError, asyncio.TimeoutError):
@@ -151,7 +180,9 @@ class ReminderWorker:
         anniversary landing within the next 3 days (MR1). Idempotent — a
         title keyed by name+date means a re-scan (or a restart) never creates
         a duplicate for the same occurrence."""
-        today_str = _now().strftime("%Y-%m-%d")
+        # The LOCAL day, so "once per day" means once per Marcus's day. In UTC
+        # the scan date rolls over in the early evening here.
+        today_str = _local_wall_clock(_now()).strftime("%Y-%m-%d")
         if self._last_birthday_scan_date == today_str:
             return
         self._last_birthday_scan_date = today_str
@@ -166,13 +197,21 @@ class ReminderWorker:
             if title in existing_titles:
                 continue
             try:
-                due = datetime.fromisoformat(occurrence).replace(hour=9, minute=0, second=0, microsecond=0)
+                # 9 AM where MARCUS is. A naive datetime was stored and read
+                # back as UTC, so every birthday heads-up fired at 3 AM local
+                # (audit, M5).
+                due = _local_to_utc(
+                    datetime.fromisoformat(occurrence).replace(
+                        hour=9, minute=0, second=0, microsecond=0))
             except Exception:
                 continue
             label = "birthday" if "birthday" in entry["label"] or entry["label"] == "bday" else entry["label"]
-            details = f"{entry['name']}'s {label} is today." if entry["days_until"] == 0 else (
-                f"{entry['name']}'s {label} is in {entry['days_until']} day(s) ({occurrence})."
-            )
+            # The WORDS are left to fire time. "in 3 day(s)" was computed here,
+            # at creation, and stored — so a heads-up created three days early
+            # still said "in 3 days" when it fired on the day itself (audit,
+            # M5). `_DATED_DETAILS` is rendered in `_tick` against the date in
+            # the reminder, which is the only place that knows what day it is.
+            details = f"{_DATED_DETAILS}{occurrence}|{entry['name']}|{label}"
             await self._memory.create_reminder(title=title, details=details, due_at_iso=due.isoformat(), recurrence="none")
 
     async def _ensure_morning_briefing(self) -> None:
@@ -227,19 +266,33 @@ class ReminderWorker:
                         await self._memory.complete_reminder(reminder_id=reminder_id)
                     continue
                 # One-shot reminder/timer missed while offline: collect for a
-                # single consolidated catch-up (below); mark it done. Internal
-                # bookkeeping reminders (__nova_*) aren't surfaced to Marcus.
-                if not title.startswith("__nova_"):
-                    missed_oneshots.append(str(r.get("details") or title))
+                # single consolidated catch-up (below); mark it done.
+                #
+                # The `__nova_` filter is about Nova's own bookkeeping, and it
+                # was swallowing the birthday and anniversary heads-ups too —
+                # every one of them is titled `__nova_birthday_<name>_<date>__`,
+                # so a birthday missed across an offline gap was marked done
+                # and never mentioned (audit, M5). What makes a reminder
+                # internal is that it carries no message for Marcus, not the
+                # shape of its title.
+                detail = self._render_dated_details(
+                    str(r.get("details") or ""), now)
+                if detail and (not title.startswith("__nova_")
+                               or str(r.get("details") or "").startswith(_DATED_DETAILS)):
+                    missed_oneshots.append(detail or title)
                 await self._memory.complete_reminder(reminder_id=reminder_id)
                 continue
 
             # ── On time (within grace): fire normally ──
             try:
-                message = await self._compose_briefing() if is_briefing else (str(r.get("details") or title))
+                message = (await self._compose_briefing() if is_briefing else
+                           self._render_dated_details(
+                               str(r.get("details") or title), now))
             except Exception as e:  # noqa: BLE001
-                logger.debug("briefing_compose_failed", error=str(e))
-                message = "Good morning!" if is_briefing else (str(r.get("details") or title))
+                logger.warning("briefing_compose_failed", error=str(e))
+                message = ("Good morning!" if is_briefing else
+                           self._render_dated_details(
+                               str(r.get("details") or title), now))
 
             BUS.publish(
                 "reminder.due",
@@ -270,23 +323,60 @@ class ReminderWorker:
             )
 
     @staticmethod
+    def _render_dated_details(details: str, now: datetime) -> str:
+        """Turn a `__nova_dated__:` payload into the sentence to say NOW.
+
+        "<name>'s birthday is today" / "is tomorrow" / "is in N days", decided
+        against the local date at fire time rather than at creation time.
+        Anything that is not such a payload comes back unchanged.
+        """
+        if not details.startswith(_DATED_DETAILS):
+            return details
+        body = details[len(_DATED_DETAILS):]
+        parts = body.split("|")
+        if len(parts) < 3:
+            return body
+        occurrence, name, label = parts[0], parts[1], parts[2]
+        try:
+            target = datetime.fromisoformat(occurrence).date()
+        except ValueError:
+            return f"{name}'s {label} is coming up ({occurrence})."
+        days = (target - _local_wall_clock(now).date()).days
+        if days == 0:
+            return f"{name}'s {label} is today."
+        if days == 1:
+            return f"{name}'s {label} is tomorrow ({occurrence})."
+        if days < 0:
+            return f"{name}'s {label} was on {occurrence}."
+        return f"{name}'s {label} is in {days} day(s) ({occurrence})."
+
+    @staticmethod
     def _advance(due_at_iso: str, recurrence: str) -> datetime:
+        """The next occurrence, keeping the LOCAL wall-clock time fixed.
+
+        This added 24 hours in UTC, so at the DST change on 1 November 2026 a
+        daily 8am reminder became 7am and stayed there — and the morning
+        briefing with it (audit, M6). The step is taken on the local wall clock
+        and converted back, so the offset in force on the new date is the one
+        that applies.
+        """
         try:
             due = datetime.fromisoformat(due_at_iso)
         except Exception:
             due = _now()
         if due.tzinfo is None:
             due = due.replace(tzinfo=timezone.utc)
-        if recurrence == "daily":
-            return due + timedelta(days=1)
-        if recurrence == "weekday":
-            nxt = due + timedelta(days=1)
-            while nxt.weekday() >= 5:
-                nxt += timedelta(days=1)
-            return nxt
+
+        local = _local_wall_clock(due)
         if recurrence == "weekly":
-            return due + timedelta(days=7)
-        return due + timedelta(days=1)
+            local += timedelta(days=7)
+        elif recurrence == "weekday":
+            local += timedelta(days=1)
+            while local.weekday() >= 5:
+                local += timedelta(days=1)
+        else:  # daily, and the catch-all the old code used
+            local += timedelta(days=1)
+        return _local_to_utc(local)
 
     @classmethod
     def _next_future_occurrence(cls, due_at: datetime, recurrence: str, now: datetime) -> datetime:

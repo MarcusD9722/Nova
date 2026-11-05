@@ -153,11 +153,30 @@ async def _async_checks():
     check(sum(1 for r in res if not r["ok"]) == 1,
           f"a side-effecting failing tool is not re-run at all (got {len(res)})")
 
-    # step budget caps a model that never says respond
+    # step budget caps a model that never says respond. DISTINCT calls: an
+    # identical successful call is now stopped sooner by the repeat guard
+    # below, which would reach 1 round and hide whether the budget works.
     calls.clear()
-    ex = executor_with(['{"action": "tool", "tool": "weather.current", "args": {}}'] * 20)
+    ex = executor_with([
+        '{"action": "tool", "tool": "weather.current", "args": {"city": "Austin"}}',
+        '{"action": "tool", "tool": "weather.current", "args": {"city": "Dallas"}}',
+        '{"action": "tool", "tool": "weather.current", "args": {"city": "Houston"}}',
+        '{"action": "tool", "tool": "weather.current", "args": {"city": "El Paso"}}',
+        '{"action": "tool", "tool": "weather.current", "args": {"city": "Waco"}}',
+    ])
     res = await ex.run(agent=Agent(name="chat", step_budget=3), user_text="loop", grounding="{}")
     check(len(res) == 3, f"step budget caps the loop (got {len(res)})")
+
+    # …and the SAME successful call is not made twice (audit 2026-11-02, M8).
+    # `memory.recall` with one query ran six times in a measured turn: six
+    # generations of the decide step, each shown an observation it ignored.
+    calls.clear()
+    ex = executor_with(['{"action": "tool", "tool": "weather.current", "args": {"city": "Austin"}}'] * 20)
+    res = await ex.run(agent=Agent(name="chat", step_budget=6), user_text="loop", grounding="{}")
+    check(len(res) == 1,
+          f"an identical successful call stops the loop (got {len(res)})")
+    check(sum(1 for c in calls if c[0] == "weather.current") == 1,
+          f"and the tool really ran once ({calls})")
 
     # the decision prompt still contains the load-bearing rules (verbatim move)
     llm = _ScriptedLLM(['{"action": "respond"}'])

@@ -1099,6 +1099,18 @@ class ProjectBuilder:
     async def _llm_file(self, prompt: str) -> str:
         # Writing/rewriting an actual source file — the `coder` role.
         runtime, sem = self._handle("coder")
+        kwargs: dict[str, Any] = {}
+        try:
+            # NO REPETITION PENALTY FOR CODE (audit, L12). The 1.15 that makes
+            # prose read well was being applied to every generated source
+            # file, and code repeats by design — `self.`, `return`, `if not`,
+            # the same indentation on every line of a block. Penalising that
+            # pushes the model off the correct token.
+            from core.llm_runtime import CODE_REPEAT_PENALTY
+
+            kwargs["repeat_penalty"] = CODE_REPEAT_PENALTY
+        except ImportError:
+            pass        # a runtime without the parameter keeps its default
         async with sem:
             raw = await runtime.chat(
                 [{"role": "user", "content": prompt}],
@@ -1106,6 +1118,7 @@ class ProjectBuilder:
                 temperature=0.2,
                 stop=[],
                 thinking=True,
+                **kwargs,
             )
         raw = (raw or "").strip()
         # Take the LARGEST fenced block, not the first: models often quote the

@@ -11,7 +11,8 @@ a milestone whose target date has passed while still open is flagged `at_risk`.
 The chat model composes the plan (vision → milestones → items) and persists it via
 the plan.* tools; this module is the deterministic engine — building, rolling
 forward, and scoring progress — so all of it is testable without a model.
-(Named goal_planner to avoid the existing intent-router core/planner.py.)
+(Named goal_planner to avoid what was then core/planner.py, an unused
+intent router removed in the 2026-11-02 audit cleanup.)
 """
 
 from datetime import date, datetime, timedelta

@@ -34,6 +34,7 @@ export default function ChatPanel({
   onSendMessage,
   onFileUpload,
   onStop,
+  onNewConversation,
   isAssistantThinking = false, // removed onRetry
 }) {
   // Refs & state
@@ -523,6 +524,22 @@ export default function ChatPanel({
             title="Stop generating"
           >
             Stop
+          </GlassButton>
+        )}
+
+        {/* There was no way to start a fresh conversation. The id lived in
+            localStorage with a 7-day TTL, so one conversation that grew past
+            the model's context window stayed broken across restarts with
+            nothing a person could do about it (audit 2026-11-02, H3). */}
+        {!isStreaming && onNewConversation && (
+          <GlassButton
+            type="button"
+            variant="ghost"
+            onClick={() => onNewConversation?.()}
+            className="nova-chat-new-button"
+            title="Start a new conversation (keeps everything she remembers)"
+          >
+            New
           </GlassButton>
         )}
 

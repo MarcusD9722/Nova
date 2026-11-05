@@ -60,9 +60,12 @@ CORE_TOOLS = ("memory.remember", "memory.recall")
 #: here, because a wrong deterministic hit skips the semantic stage entirely.
 _RULES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     (re.compile(r'\b(what(?:\'s| is)? the )?(time|clock)\b.*\?|\bwhat time is it\b', re.I),
-     ("time.now",)),
+     # `system.time` is the registered name. `time.now` never existed, so this
+     # rule selected nothing at all (audit, L7).
+     ("system.time",)),
     (re.compile(r'\b(weather|forecast|temperature|rain|snow|jacket|umbrella)\b', re.I),
-     ("weather.current", "weather.forecast")),
+     # There is no `weather.forecast` tool either.
+     ("weather.current",)),
     (re.compile(r'\bset (?:a |an )?(timer|alarm|reminder)\b|\bremind me\b', re.I),
      ("reminder.create",)),
     (re.compile(r'\b(remember|note) that\b|\bdon\'t forget\b', re.I),
@@ -375,7 +378,7 @@ class ToolSelector:
                                          scores=dict(ranked[:12]),
                                          reason="LLM router broke a tie")
                 except Exception as e:  # noqa: BLE001
-                    logger.debug("tool_router_llm_failed", error=str(e)[:160])
+                    logger.warning("tool_router_llm_failed", error=str(e)[:160])
             picked = self._finalise([n for n, _ in ranked[: self.max_candidates]], known)
             return Selection(tools=picked, stage="widened", scores=dict(ranked[:12]),
                              reason=f"{len(contenders)} tools scored within the margin")

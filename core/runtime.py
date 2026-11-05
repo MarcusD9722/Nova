@@ -16,7 +16,6 @@ from core.conversation_state import ConversationStateStore
 from core.event_bus import BUS
 from core.events import EpisodicPersistEvent, MemoryIngestEvent, SummarizeHintEvent
 from core.logging_setup import get_logger
-from core.planner import Planner
 from core.policy.autonomy_planner import AutonomyPlannerLLM
 from core.policy.memory_extractor import MemoryExtractorLLM
 from core.policy.summarizer import SummarizerLLM
@@ -664,7 +663,13 @@ class RuntimeManager:
             "NOVA_TOOL_SELECTOR", "1"
         ).strip().lower() not in {"0", "false", "no", "off"} else None
         self._tool_loop = ToolLoopExecutor(
-            models=self._models, tool_router=router, selector=self._tool_selector
+            models=self._models, tool_router=router, selector=self._tool_selector,
+            # The skill learner's INPUT. `log_activity` had no production
+            # caller, so `skill.detect` always read an empty log and answered
+            # "no repeated workflow detected yet" however often Marcus
+            # repeated one (audit, M7). Owner-scoped inside `_log_activity`:
+            # a guest's tool calls are not Marcus's workflow.
+            activity_log=self._log_activity,
         )
         # Live-turn context (JV2). Working context is what is happening now;
         # artifacts are the concrete things turns produced. Both are hot, bounded
@@ -779,7 +784,10 @@ class RuntimeManager:
         self._summarizer = SummarizerLLM(llm, llm_semaphore=self._llm_sem)
         self._storyteller = StorytellerLLM(llm, llm_semaphore=self._llm_sem)
         self._autonomy_planner = AutonomyPlannerLLM(llm, llm_semaphore=self._llm_sem)
-        self._planner = Planner()
+        # `core.planner.Planner` used to be constructed here and never
+        # called — a regex that recognised "create project X" and nothing
+        # downstream that asked it anything (audit, L12). Deep mode's
+        # `self._deep.plan` is the planner that runs.
 
         # Queues
         self._memory_ingest_q: asyncio.Queue[MemoryIngestEvent] = asyncio.Queue(maxsize=200)
@@ -952,6 +960,8 @@ class RuntimeManager:
             dev_mode=dev_mode,
             error_log=self._error_log,
             state_store=self._state_store,
+            # Gives `prune_episodes` the caller it never had (audit, L12).
+            episodes=self._episodes,
         )
 
         # Real user-facing scheduling ("remind me at 5pm") + a spoken morning
@@ -1044,13 +1054,22 @@ class RuntimeManager:
             cand = self._projects_dir / name
             return cand if cand.is_dir() else None
 
-        def _get_index(root: Path) -> dict[str, Any]:
+        async def _get_index(root: Path) -> dict[str, Any]:
+            """The structural index, built OFF the event loop.
+
+            `index_project` walks a filesystem and parses every file it finds.
+            Called synchronously here it blocked the loop for 24 seconds on
+            this repo, which freezes token streaming, the voice WebSocket and
+            barge-in for the whole time — Nova stops responding and cannot be
+            interrupted (audit, M14). The walk itself is ~11x faster now, and
+            it still belongs in a thread.
+            """
             import time as _t
             key = str(root)
             cached = self._code_index_cache.get(key)
             if cached and (_t.monotonic() - cached[0]) < 120:
                 return cached[1]
-            idx = code_intel.index_project(root)
+            idx = await asyncio.to_thread(code_intel.index_project, root)
             self._code_index_cache[key] = (_t.monotonic(), idx)
             return idx
 
@@ -1058,18 +1077,23 @@ class RuntimeManager:
             root = _resolve_project_root(str(args.get("project") or ""))
             if root is None:
                 return {"ok": False, "error": "unknown_project", "note": "Register it first with self.register_project, or use 'self' for Nova's own code."}
-            idx = _get_index(root)
+            idx = await _get_index(root)
             if not idx.get("exists"):
                 return {"ok": False, "error": "not_a_directory", "path": str(root)}
-            return {"ok": True, "project": str(root), "architecture": code_intel.architecture_summary(idx),
-                    "health": code_intel.health_score(idx)}
+            return {"ok": True, "project": str(root),
+                    "architecture": code_intel.architecture_summary(idx),
+                    "health": code_intel.health_score(idx),
+                    # Say when the index is only part of the project, so no
+                    # report built on it reads as the whole thing (M15).
+                    **({"truncated": idx["truncation_note"]}
+                       if idx.get("truncated") else {})}
 
         async def _tool_code_symbols(args: dict[str, Any]) -> dict[str, Any]:
             root = _resolve_project_root(str(args.get("project") or ""))
             if root is None:
                 return {"ok": False, "error": "unknown_project"}
             q = str(args.get("query") or args.get("name") or "").strip().lower()
-            idx = _get_index(root)
+            idx = await _get_index(root)
             hits = [{"symbol": s, "files": locs} for s, locs in idx.get("symbols", {}).items()
                     if not q or q in s.lower()]
             hits.sort(key=lambda h: h["symbol"].lower())
@@ -1082,13 +1106,16 @@ class RuntimeManager:
             symbol = str(args.get("symbol") or args.get("name") or "").strip()
             if not symbol:
                 return {"ok": False, "error": "missing_symbol"}
-            return {"ok": True, **code_intel.impact_of(_get_index(root), symbol)}
+            idx = await _get_index(root)
+            return {"ok": True, **code_intel.impact_of(idx, symbol),
+                    **({"caveat": idx["truncation_note"]}
+                       if idx.get("truncated") else {})}
 
         async def _tool_code_health(args: dict[str, Any]) -> dict[str, Any]:
             root = _resolve_project_root(str(args.get("project") or ""))
             if root is None:
                 return {"ok": False, "error": "unknown_project"}
-            idx = _get_index(root)
+            idx = await _get_index(root)
             debt = code_intel.tech_debt(idx)
             return {"ok": True, "health": code_intel.health_score(idx),
                     "debt_summary": debt["by_severity"], "top_debt": debt["items"][:12]}
@@ -1097,7 +1124,7 @@ class RuntimeManager:
             root = _resolve_project_root(str(args.get("project") or ""))
             if root is None:
                 return {"ok": False, "error": "unknown_project"}
-            scan = code_intel.security_scan(root)
+            scan = await asyncio.to_thread(code_intel.security_scan, root)
             return {"ok": True, "by_severity": scan["by_severity"], "findings": scan["findings"][:25],
                     "disclaimer": scan["disclaimer"]}
 
@@ -1266,7 +1293,7 @@ class RuntimeManager:
                 # false, so this surfaces as a non-fatal cleanup warning — and
                 # `ProjectBuilder.last_active()` verifies existence anyway, so a
                 # stale pointer can never be handed back as the current project.
-                logger.debug("last_active_clear_failed", error=str(e)[:160])
+                logger.warning("last_active_clear_failed", error=str(e)[:160])
                 cleanup_warning = ("The project was moved to trash, but I could "
                                    "not update which project is active.")
 
@@ -1496,7 +1523,7 @@ class RuntimeManager:
                     slug=slug, legacy_status=legacy))
             return "".join(o for o in out if o)
         except Exception as e:  # noqa: BLE001
-            logger.debug("completion_context_failed", error=str(e)[:160])
+            logger.warning("completion_context_failed", error=str(e)[:160])
             return ""
 
     @property
@@ -1612,6 +1639,28 @@ class RuntimeManager:
         except Exception as e:  # noqa: BLE001
             self._episodic_stats["failures"] += 1
             logger.warning("episodic_promotion_failed", error=str(e)[:200])
+
+    async def _refresh_active_project(self, work_ctx: Any, user_text: str) -> None:
+        """Keep `active_project` pointing at the project this turn is about.
+
+        It had NO writer (audit, L6), while four places read it: the grounding
+        line, episode promotion, selection promotion and the graph's turn
+        edges. So every episode was stored with `project=None` and none could
+        ever be recalled by the project it belonged to.
+
+        A project named IN the message wins — "how's flappy-bird going" is
+        about flappy-bird whatever the pointer says. Otherwise the builder's
+        `last_active`, which is the same answer "what are we working on?"
+        gives. Best-effort: a missing pointer is not worth failing a turn
+        over, and the cost is the behaviour that was there before.
+        """
+        try:
+            named = self._project_builder.known_slug_in_text(user_text)
+            slug = named or await self._project_builder.last_active()
+            if slug and work_ctx.active_project != slug:
+                work_ctx.active_project = str(slug)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("active_project_refresh_failed", error=str(exc)[:160])
 
     def _note_selection(self, referenced, conversation_id, turn_id: str,
                         user_text: str) -> None:
@@ -2601,7 +2650,11 @@ class RuntimeManager:
                 yield ev
             if not story_reply:
                 async with self._llm_sem:
-                    retry = await self._llm.chat(messages, max_tokens=story_budget, temperature=0.7, thinking=True)
+                    # Same reason as the stream above (audit, M9): the first
+                    # attempt produced nothing, and repeating it with the
+                    # budget going to reasoning produces nothing again.
+                    retry = await self._llm.chat(messages, max_tokens=story_budget,
+                                                 temperature=0.7, thinking=False)
                 story_reply = (retry or "").strip()
                 if story_reply:
                     yield {"type": "token", "text": story_reply}
@@ -2634,6 +2687,14 @@ class RuntimeManager:
         # wrong recall costs milliseconds. See memory/recall_gate.py.
         work_ctx = self._working.get(str(conversation_id))
         work_ctx.record_user(clean_user)
+        # THE ACTIVE PROJECT, WRITTEN (audit, L6). `active_project` was read in
+        # four places — the grounding line, episode promotion, selection
+        # promotion and the graph's turn edges — and set by nobody, so every
+        # episode was stored with `project=None` and no episode could ever be
+        # recalled by the project it belonged to. The authoritative pointer is
+        # the builder's `last_active`, which is what "the project we are
+        # working on" means everywhere else.
+        await self._refresh_active_project(work_ctx, clean_user)
         active_items = self._artifacts.active_items(str(conversation_id))
 
         # A positional reference ("the second one") is resolved here,
@@ -2724,7 +2785,7 @@ class RuntimeManager:
                     tool_catalog=self._tool_loop.tool_catalog(self._chat_agent),
                 )
             except Exception as e:  # noqa: BLE001
-                logger.debug("deep_plan_failed", error=str(e)[:160])
+                logger.warning("deep_plan_failed", error=str(e)[:160])
             if deep_plan:
                 loop_agent = Agent(
                     name="chat-deep", step_budget=self._chat_agent.step_budget,
@@ -2821,7 +2882,7 @@ class RuntimeManager:
             work_context += await self._completion_context(clean_user,
                                                            scope=_scope)
         except Exception as e:  # noqa: BLE001
-            logger.debug("work_state_summary_failed", error=str(e)[:160])
+            logger.warning("work_state_summary_failed", error=str(e)[:160])
 
         artifact_context = ""
         current_set = self._artifacts.latest_result_set(str(conversation_id))
@@ -2988,7 +3049,7 @@ class RuntimeManager:
                     user_text=clean_user, plan=deep_plan, draft=draft, tool_results=tool_results
                 )
             except Exception as e:  # noqa: BLE001
-                logger.debug("deep_critique_failed", error=str(e)[:160])
+                logger.warning("deep_critique_failed", error=str(e)[:160])
             reply = draft
             if verdict == "revise" and notes:
                 BUS.publish("agent.stage", {"stage": "revise", "notes": notes[:160]})
@@ -3000,11 +3061,27 @@ class RuntimeManager:
                         "ONLY the corrected message.")},
                 ]
                 async with chat_model.semaphore:
+                    # thinking=False (audit, M19). The critic correctly said
+                    # the draft had ignored a failed tool; the revision then
+                    # spent its entire budget inside <think> and came back
+                    # empty — finish=length 3 of 3 — so the UNREVISED draft was
+                    # sent and the objection vanished without a word. The whole
+                    # point of deep mode is that the objection is acted on.
                     revised = await chat_model.runtime.chat(
-                        revise_msgs, max_tokens=reply_budget, temperature=0.4, thinking=True
+                        revise_msgs, max_tokens=reply_budget, temperature=0.4,
+                        thinking=False
                     )
                 if (revised or "").strip():
                     reply = revised.strip()
+                else:
+                    # A revision that produced nothing is not an approval.
+                    # Say what the reviewer objected to rather than sending
+                    # the draft as if it had passed.
+                    logger.warning("deep_revise_empty", notes=notes[:160])
+                    reply = (f"{draft}\n\n(I tried to revise this and the "
+                             f"revision came back empty, so this is the "
+                             f"unrevised draft. What my own review flagged: "
+                             f"{notes.strip()})").strip()
             if not reply:
                 reply = "Sorry — I came up empty on that one."
             yield {"type": "token", "text": reply}
@@ -3450,8 +3527,13 @@ class RuntimeManager:
             piece: list[str] = []
             reason = "stop"
             async with self._llm_sem:
+                # thinking=False (audit, M9). A story does not need a plan the
+                # reader never sees, and with it on the model spent the whole
+                # 1,200-token budget inside <think>: 47 seconds to the first
+                # WORD of a story asked for as "very short", and the segment
+                # then arrived truncated.
                 async for ev in model.chat_stream_ex(
-                    convo, max_tokens=budget, temperature=0.7, thinking=True
+                    convo, max_tokens=budget, temperature=0.7, thinking=False
                 ):
                     if ev.get("type") == "token":
                         piece.append(ev["text"])
@@ -3931,7 +4013,7 @@ class RuntimeManager:
                     context["wellbeing_trend"] = wb_trend
                     await self._memory.mark_wellbeing_nudged()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("wellbeing_nudge_failed", error=str(exc)[:160])
+            logger.warning("wellbeing_nudge_failed", error=str(exc)[:160])
 
         # Continuity across gaps (CG1) — "catch me up" on the first turn of a
         # genuinely new conversation, if enough time has passed since the last
@@ -4177,6 +4259,9 @@ class RuntimeManager:
             # Named Rex", "July St" and "Called" alongside Mateo and Liam, and
             # all five went into the grounding context on every single turn.
             if not RuntimeManager._looks_like_person_name(p):
+                # DEBUG on purpose (audit 2026-11-02, M12, which raised 56 real
+                # failures to warning): the name validator refusing a non-name is the
+                # validator working.
                 logger.debug("name_list_rejected", candidate=p[:60])
                 continue
             # Capitalize each segment, not just the first letter of the word:
@@ -4289,7 +4374,7 @@ class RuntimeManager:
                             age=said.age, derived=said.birth_year is not None,
                             scope=scope.store)
         except Exception as e:  # noqa: BLE001
-            logger.debug("age_capture_failed", error=str(e)[:160])
+            logger.warning("age_capture_failed", error=str(e)[:160])
 
         user_name = _extract_user_name(msg)
         if user_name:
@@ -4401,12 +4486,30 @@ class RuntimeManager:
         re.compile(r"\bi (?:prefer|'d rather|would rather|really like|like it when|don't like it when|hate it when)\b", re.IGNORECASE),
         re.compile(r"^\s*(?:please\s+)?(?:always|never)\b", re.IGNORECASE),
         re.compile(r"\b(?:make sure (?:to|you)|remember to|be sure to)\b", re.IGNORECASE),
-        re.compile(r"^\s*(?:please\s+)?(?:stop|don'?t)\b", re.IGNORECASE),
+        # "stop"/"don't" must be about NOVA's behaviour, not about anything
+        # the sentence happens to be about. A bare `^(stop|don't)` captured
+        # "Don't forget the milk" as a durable lesson, which is a large part of
+        # why lessons were 136 of 271 stored facts — half of all memory
+        # (audit, L13). A directive to Nova names her or addresses her:
+        # "don't do that", "stop apologising", "don't call me that".
+        re.compile(r"^\s*(?:please\s+)?(?:stop|don'?t)\s+"
+                   r"(?:(?:do|say|call|tell|ask|use|add|mention|repeat|"
+                   r"assume|guess|apologi[sz]e|interrupt|explain|remind|"
+                   r"start|keep|bother|worry|forget)\b|that\b|it\b|this\b|"
+                   r"me\b|\w+ing\b)", re.IGNORECASE),
         re.compile(r"^\s*no,?\s+(?:that'?s|thats|it'?s)\s+(?:wrong|not right|incorrect)\b", re.IGNORECASE),
         re.compile(r"\bi (?:told|asked) you (?:to|not to)\b", re.IGNORECASE),
     ]
     # Questions and build/status requests shouldn't be mistaken for lessons.
     _LESSON_SKIP = re.compile(r"\?\s*$|^\s*(?:what|why|how|when|who|which|can you|could you|make (?:a|me|an)|build|create)\b", re.IGNORECASE)
+
+    #: A directive whose object is a THING IN THE WORLD, not Nova's behaviour.
+    #: "Don't forget the milk" is a reminder; "don't forget to be brief" is a
+    #: lesson. Checked after the patterns, so it only ever removes.
+    _LESSON_NOT_ABOUT_NOVA = re.compile(
+        r"^\s*(?:please\s+)?don'?t\s+forget\s+(?:the|my|our|about\s+the)\b|"
+        r"^\s*(?:please\s+)?stop\s+(?:by|at|for|and\s+get)\b",
+        re.IGNORECASE)
 
     async def _capture_lessons(self, message: str) -> None:
         """Detect an explicit correction/preference and store it as a durable
@@ -4416,6 +4519,8 @@ class RuntimeManager:
             return
         if self._LESSON_SKIP.search(msg):
             return
+        if self._LESSON_NOT_ABOUT_NOVA.search(msg):
+            return
         if not any(p.search(msg) for p in self._LESSON_PATTERNS):
             return
         try:
@@ -4424,6 +4529,28 @@ class RuntimeManager:
         except Exception as exc:  # noqa: BLE001
             # Marcus asked for something to change and Nova did not keep it.
             logger.warning("lesson_write_failed", error=str(exc)[:160])
+
+    async def _log_activity(self, step: str) -> None:
+        """Record one completed tool call as a step in the activity log.
+
+        The INPUT to Phase 8's skill learning, which had none:
+        `MemoryUnifier.log_activity` existed, `detect_learnable_workflow` read
+        it, and nothing in production ever wrote to it — so `skill.detect`
+        answered "no repeated workflow detected yet" no matter how many times
+        Marcus repeated one (audit, M7).
+
+        OWNER ONLY. A learned skill is Marcus's workflow, and `skill.detect`
+        and `skill.learn` are both owner-scoped; a guest's tool calls must not
+        join the sequence those read, or a stranger's three calls become a
+        workflow attributed to him.
+        """
+        if not current_identity().is_owner:
+            return
+        try:
+            await self._memory.log_activity(step)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("activity_log_write_failed", step=step[:60],
+                           error=str(exc)[:160])
 
     async def _capture_mood(self, message: str) -> None:
         """Detect a coarse mood signal (heuristic, not an LLM call — see
@@ -4436,7 +4563,7 @@ class RuntimeManager:
             await self._memory.record_mood(label)
             BUS.publish("mood.detected", {"mood": label})
         except Exception as exc:  # noqa: BLE001
-            logger.debug("mood_write_failed", mood=label, error=str(exc)[:160])
+            logger.warning("mood_write_failed", mood=label, error=str(exc)[:160])
 
     async def _capture_wellbeing(self) -> None:
         """Coarse usage-time signal (WB1) — no LLM call, just a clock check.
@@ -4447,5 +4574,5 @@ class RuntimeManager:
             try:
                 await self._memory.record_wellbeing_signal("late_night")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("wellbeing_signal_write_failed",
+                logger.warning("wellbeing_signal_write_failed",
                              error=str(exc)[:160])

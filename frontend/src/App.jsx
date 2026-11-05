@@ -207,6 +207,27 @@ export default function App() {
       if (conversationId) window.localStorage.setItem(CONV_STORAGE_KEY, String(conversationId));
     } catch {}
   }, [conversationId]);
+
+  // Start a fresh conversation. The ONLY way out of a conversation that has
+  // grown past the model's context window — before this, the id persisted in
+  // localStorage for 7 days and a broken conversation stayed broken across
+  // restarts (audit 2026-11-02, H3). Memory is untouched: this clears the
+  // thread, not what she knows.
+  const startNewConversation = () => {
+    try {
+      streamCtlRef.current?.abort?.();
+    } catch {}
+    streamCtlRef.current = null;
+    try {
+      window.localStorage.removeItem(CONV_STORAGE_KEY);
+    } catch {}
+    setConversationId(null);
+    conversationIdRef.current = null;
+    setMessages([]);
+    setThinking(false);
+    clearTtsQueue();
+    showSystemMessage("Started a new conversation. Everything she remembers is still there.");
+  };
   const [thinking, setThinking] = useState(false);
   // U8: current project-build stage ("writing: main.py"), or "" when idle.
   const [buildProgress, setBuildProgress] = useState("");
@@ -2090,6 +2111,7 @@ export default function App() {
                   messages={messages}
                   onSendMessage={sendMessage}
                   onStop={stopStream}
+                  onNewConversation={startNewConversation}
                   isAssistantThinking={thinking}
                 />
               </Suspense>

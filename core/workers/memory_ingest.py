@@ -131,6 +131,9 @@ class MemoryIngestWorker:
                         conversation_id=ev.conversation_id, timestamp=_now(),
                         reason="periodic", identity=ev.identity))
                 except Exception as exc:  # noqa: BLE001
+                    # DEBUG on purpose (audit 2026-11-02, M12, which raised 56
+                    # real failures to warning): a malformed hint is ignored
+                    # and no work is lost.
                     logger.debug("summarize_hint_dropped",
                                  conversation_id=cid, error=str(exc)[:160])
 
@@ -261,7 +264,7 @@ class MemoryIngestWorker:
         except Exception as e:  # noqa: BLE001
             # Best-effort by design, but say so: a silent return here is how
             # this whole feature looked "working" while doing nothing.
-            logger.debug("reconcile_judge_failed", error=str(e)[:160])
+            logger.warning("reconcile_judge_failed", error=str(e)[:160])
             return
         obj = extract_first_json_object(raw or "") or {}
         verdicts = obj.get("verdicts") if isinstance(obj, dict) else None
@@ -345,7 +348,7 @@ class MemoryIngestWorker:
                 with active_turn(hint.identity or TurnIdentity.typed()):
                     await self._summarize_one(hint)
             except Exception as e:  # noqa: BLE001
-                logger.debug("summarize_failed", error=str(e))
+                logger.warning("summarize_failed", error=str(e))
             finally:
                 with contextlib.suppress(Exception):
                     self._sq.task_done()

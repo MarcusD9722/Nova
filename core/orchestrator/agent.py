@@ -10,8 +10,9 @@ default chat path behaves identically while the loop becomes reusable (deep
 mode's Executor stage in 2.3 reuses it).
 """
 
+import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from core.logging_setup import get_logger
 from core.orchestrator.model_router import ModelRouter
@@ -22,6 +23,23 @@ if TYPE_CHECKING:  # selection is optional; never imported at runtime from here
     from core.tools.selector import ToolSelector
 
 logger = get_logger(__name__)
+
+
+def _canonical_args(args: Any) -> str:
+    """A stable text form of a tool's arguments, for comparing two calls.
+
+    Key order and whitespace must not make two identical calls look different:
+    `{"query": "locker code"}` and `{ "query" : "locker code" }` are the same
+    request. Falls back to repr for anything unserialisable, which still
+    compares equal to itself.
+    """
+    if not isinstance(args, dict):
+        return repr(args)
+    try:
+        return json.dumps(args, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(sorted(args.items(), key=lambda kv: str(kv[0])))
 
 # Tools the free agent loop never calls directly: code.write is gated behind
 # the project builder (sandboxed writes), the other two are internal/setup.
@@ -47,9 +65,16 @@ class ToolLoopExecutor:
     """Runs an Agent's reason→act→observe loop and returns the observations."""
 
     def __init__(self, *, models: ModelRouter, tool_router: ToolRouter,
-                 selector: "ToolSelector | None" = None) -> None:
+                 selector: "ToolSelector | None" = None,
+                 activity_log: "Callable[[str], Awaitable[None]] | None" = None) -> None:
         self._models = models
         self._router = tool_router
+        #: Where a completed tool call is recorded as one coarse step, for the
+        #: skill learner. `MemoryUnifier.log_activity` had NO production caller
+        #: at all, so `detect_learnable_workflow` read an empty log, and Phase
+        #: 8's skill learning could never trigger for any amount of repeated
+        #: work (audit, M7). Optional so a test executor needs no memory.
+        self._activity_log = activity_log
         #: Optional preselection stage (core/tools/selector.py). Without it the
         #: agent sees every allowed tool on every step — the pre-V2 behaviour,
         #: which remains the fallback whenever selection is unavailable.
@@ -118,9 +143,18 @@ class ToolLoopExecutor:
             "what you remember about a topic, check memory.recall first.\n"
             "- To inspect or improve your OWN code, use self.read_code / self.list_code, and self.propose_change "
             "to suggest an edit. Proposals are NOT applied automatically — Marcus reviews and approves them.\n"
-            "- Each observation above is real; trust it. Don't repeat a call that already succeeded.\n"
+            "- Each observation above is real; trust it. Don't repeat a call that already succeeded "
+            "with the same arguments — the result is already above, and asking again stops the loop.\n"
             "- If a tool failed twice, stop and respond — explain what failed.\n"
-            "- When the observations already answer the user, respond."
+            "- When the observations already answer the user, respond.\n"
+            # THE ANSWER IS NOT WRITTEN HERE (audit, M8). This step decides one
+            # thing: another tool, or enough. Models were composing the whole
+            # reply into the JSON, which is parsed for two keys and discarded —
+            # paying for the full answer twice, and time to first token is 94%
+            # to 99% of a turn.
+            "- Do NOT write the answer or any prose for the user. A later step writes the reply and "
+            'it never sees this JSON. {"action": "respond"} is the whole output when you are ready; '
+            "anything else you write here is thrown away."
             + (f"\n{agent.extra_instructions}" if agent.extra_instructions else "")
         )
         handle = self._models.for_role(agent.model_role)
@@ -172,13 +206,20 @@ class ToolLoopExecutor:
         # Tools this turn may no longer call, and why. A refusal is not a
         # transient failure to be worked around: it is an answer.
         fenced: dict[str, str] = {}
+        # Calls already made this turn, as (tool, canonical args). The prompt
+        # says "Don't repeat a call that already succeeded" and nothing
+        # enforced it, so `memory.recall` with the SAME query ran six times in
+        # one turn — six full decide generations, each shown an observation it
+        # then ignored (audit, M8). A repeat means the loop is not converging,
+        # so the right move is to stop and answer with what is already there.
+        seen_calls: set[tuple[str, str]] = set()
         for _ in range(agent.step_budget):
             try:
                 decision = await self.decide(
                     agent=agent, user_text=user_text, grounding=grounding, tool_results=tool_results
                 )
             except Exception as e:  # noqa: BLE001
-                logger.debug("tool_decider_failed", error=str(e))
+                logger.warning("tool_decider_failed", error=str(e))
                 decision = None
             if decision is None:
                 break
@@ -204,6 +245,23 @@ class ToolLoopExecutor:
                             reason=fenced[decision["tool"]])
                 break
 
+            # THE SAME SUCCESSFUL CALL TWICE. Not a retry — the observation is
+            # already in the prompt the model just read, so running it again
+            # produces an identical observation and the next decision is the
+            # same decision. Measured at six rounds of `memory.recall` with one
+            # query: six generations of the most expensive step in the turn
+            # (audit, M8).
+            #
+            # SUCCEEDED calls only. A failure is a different situation: a
+            # retry-safe tool gets its second attempt under the two-strike rule
+            # above, and taking that away would be a regression dressed up as
+            # an optimisation.
+            signature = (decision["tool"], _canonical_args(decision["args"]))
+            if signature in seen_calls:
+                logger.info("tool_repeat_stopped", tool=decision["tool"],
+                            rounds=len(tool_results))
+                break
+
             call = ToolCall(name=decision["tool"], args=decision["args"])
             # No timeout here on purpose. The router holds the authoritative
             # budget per tool; a number typed at this generic call site cannot
@@ -215,6 +273,19 @@ class ToolLoopExecutor:
             # the answer (memory/artifacts.py::capture_tool_result).
             tool_results.append({"tool": call.name, "args": call.args, "ok": res.ok,
                                  "result": res.result, "error": res.error})
+            # ONE COARSE STEP PER SUCCESSFUL CALL (audit, M7). The tool name
+            # only: the skill learner looks for a repeated SEQUENCE of steps,
+            # and arguments differ every time ("rename this file") which would
+            # make every run look unique. A failed call is not part of a
+            # workflow worth learning.
+            if res.ok:
+                seen_calls.add(signature)
+            if res.ok and self._activity_log is not None:
+                try:
+                    await self._activity_log(call.name)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("activity_log_failed", tool=call.name,
+                                   error=str(e)[:160])
             if not res.ok:
                 failure_counts[call.name] = failure_counts.get(call.name, 0) + 1
                 why = self._fence_reason(call.name, res)

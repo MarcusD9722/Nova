@@ -70,8 +70,15 @@ class SelfImproveWorker:
         error_log: ErrorLog,
         state_store,
         interval_s: float | None = None,
+        episodes=None,
     ) -> None:
         self._memory = memory
+        # The episodic store, for pruning. `prune_episodes` existed, was
+        # careful (old, unimportant, never-revisited, non-protected kinds
+        # only) and was called by NOTHING, so the episode table only ever grew
+        # (audit, L12). Optional: a worker built without one simply does not
+        # prune.
+        self._episodes = episodes
         self._llm = llm
         self._sem = llm_semaphore
         self._dev = dev_mode
@@ -137,7 +144,7 @@ class SelfImproveWorker:
             active_goals = len([g for g in await self._memory.list_goals(limit=200)
                                 if str(g.get("status") or "") == "active"])
         except Exception as e:  # noqa: BLE001
-            logger.debug("internal_state_counts_failed", error=str(e)[:160])
+            logger.warning("internal_state_counts_failed", error=str(e)[:160])
         state = derive_internal_state(InternalStateInputs(
             snapshot=self._metrics.snapshot(),
             queued_tasks=queued,
@@ -175,7 +182,7 @@ class SelfImproveWorker:
                 except Exception:
                     continue
         except Exception as e:  # noqa: BLE001
-            logger.debug("benchmark_read_failed", error=str(e)[:160])
+            logger.warning("benchmark_read_failed", error=str(e)[:160])
         report = compute_benchmark_report(snaps)
         report["enabled"] = True
         return report
@@ -228,7 +235,7 @@ class SelfImproveWorker:
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
-                logger.debug("self_improve_cycle_error", error=str(e)[:200])
+                logger.warning("self_improve_cycle_error", error=str(e)[:200])
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except (TimeoutError, asyncio.TimeoutError):
@@ -256,7 +263,7 @@ class SelfImproveWorker:
         try:
             await self._memory.consolidate_lessons()
         except Exception as e:  # noqa: BLE001
-            logger.debug("lesson_consolidation_failed", error=str(e)[:160])
+            logger.warning("lesson_consolidation_failed", error=str(e)[:160])
 
         # 3a) Episodic -> semantic consolidation. Runs occasionally, not every
         # cycle: it reads a month of episodes, and a pattern across days does
@@ -266,7 +273,11 @@ class SelfImproveWorker:
             try:
                 await self._consolidate_episodes()
             except Exception as e:  # noqa: BLE001
-                logger.debug("episode_consolidation_failed", error=str(e)[:160])
+                logger.warning("episode_consolidation_failed", error=str(e)[:160])
+            # 3a-ii) Prune AFTER consolidating, never before: consolidation is
+            # what turns an old episode into a lasting belief, so pruning first
+            # would discard the evidence before it had been read (audit, L12).
+            await self._prune_episodes()
 
         # 3b) Knowledge-graph association discovery (Phase 4 / #8) — infer
         # low-confidence links between nodes that share several neighbors.
@@ -277,7 +288,7 @@ class SelfImproveWorker:
                 BUS.publish("memory.graph_discovery", {"discovered": found["discovered"]})
                 logger.info("graph_associations_discovered", count=found["discovered"])
         except Exception as e:  # noqa: BLE001
-            logger.debug("graph_discovery_failed", error=str(e)[:160])
+            logger.warning("graph_discovery_failed", error=str(e)[:160])
 
         # 4) Self-eval (Phase 2.5) — once per UTC day, snapshot the metrics
         # into a durable fact and announce it on the bus.
@@ -318,9 +329,9 @@ class SelfImproveWorker:
                             except Exception:
                                 pass
                 except Exception as e:  # noqa: BLE001
-                    logger.debug("benchmark_check_failed", error=str(e)[:160])
+                    logger.warning("benchmark_check_failed", error=str(e)[:160])
         except Exception as e:  # noqa: BLE001
-            logger.debug("self_eval_failed", error=str(e)[:160])
+            logger.warning("self_eval_failed", error=str(e)[:160])
 
     # ── self-correction (error -> diagnose -> propose) ───────────────────────
 
@@ -436,13 +447,31 @@ class SelfImproveWorker:
             try:
                 await self._memory.record_interest_focus(focus)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("interest_focus_write_failed",
+                logger.warning("interest_focus_write_failed",
                              error=str(exc)[:160])
 
     # How many reflection cycles between consolidation passes. Reflection runs
     # every ~30 min; a pattern across days doesn't change in half an hour, and
     # this reads a month of episodes rather than the last 30 turns.
     _CONSOLIDATE_EVERY = 8
+
+    async def _prune_episodes(self) -> None:
+        """Drop old, unimportant, never-revisited episodes.
+
+        The store's own rule decides what may go — nothing that is a decision,
+        a project event or a stated preference, nothing recent, nothing
+        important, nothing revisited. This just gives it a caller.
+        """
+        if self._episodes is None:
+            return
+        try:
+            removed = await self._episodes.prune_episodes()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("episode_prune_failed", error=str(e)[:160])
+            return
+        if removed:
+            logger.info("episodes_pruned", removed=removed)
+            BUS.publish("memory.episodes_pruned", {"removed": removed})
 
     async def _consolidate_episodes(self) -> None:
         """Form generalizations about Marcus from many separate days.
@@ -455,7 +484,7 @@ class SelfImproveWorker:
         try:
             episodes = await self._memory.episodes_for_consolidation(days=30, max_turns=400)
         except Exception as e:  # noqa: BLE001
-            logger.debug("consolidation_episodes_failed", error=str(e)[:160])
+            logger.warning("consolidation_episodes_failed", error=str(e)[:160])
             return
         # Below this there is no pattern to find, only noise to hallucinate from.
         if len(episodes) < 4:
@@ -502,7 +531,11 @@ class SelfImproveWorker:
             # day it was never shown is exactly the fabrication this guards.
             dates = [str(d).strip() for d in (ob.get("dates") or []) if str(d).strip() in known_dates]
             if len(dates) < 2:
-                logger.debug("consolidation_rejected_unsupported", topic=str(ob.get("topic"))[:40],
+                # DEBUG on purpose (audit 2026-11-02, M12, which raised 56
+                # real failures to warning): an unsupported generalization
+                # being refused IS the point of the check.
+                logger.debug("consolidation_rejected_unsupported",
+                             topic=str(ob.get("topic"))[:40],
                              cited=len(ob.get("dates") or []), verified=len(dates))
                 continue
             try:
