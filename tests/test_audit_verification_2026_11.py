@@ -201,6 +201,38 @@ async def test_cannot_check_anywhere_is_not_a_pass() -> None:
           f"a script that prints CANNOT_CHECK and exits 0 is NOT a pass "
           f"({verdict}: {detail[:70]!r})")
 
+    # …and the OTHER side of that line, which nothing here used to assert:
+    # reading the word anywhere in the reply is only safe because a code fence
+    # overrides it. A model that writes a real check AND gives it a
+    # can't-decide branch of its own mentions the word inside working Python,
+    # and a refusal is read from prose, never from a script. Found by mutation
+    # testing: deleting the fence exemption broke no check in this file, so
+    # every generated check with a CANNOT_CHECK branch could have been thrown
+    # away unrun and nothing would have said so.
+    with_branch = (
+        "Here is the check.\n\n"
+        "```python\n"
+        "import main\n"
+        "try:\n"
+        "    r = main.add(2, 3)\n"
+        "except Exception as e:\n"
+        "    print('CANNOT_CHECK: could not call it:', e)\n"
+        "    raise SystemExit(0)\n"
+        "assert r == 5, f'got {r}'\n"
+        "print('PASS: it adds')\n"
+        "```\n")
+    verdict, detail = await check_criterion(
+        path=project, entry="main.py", module="main", listing="main.py",
+        code="def add(a, b): return a + b",
+        criterion={"text": "it adds two numbers", "origin_quote": "adds"},
+        request="a calculator that adds",
+        ask_file=_reply(with_branch), declare_scaffold=lambda paths: None)
+    check(verdict == PASSED,
+          f"a real check that MENTIONS CANNOT_CHECK is run, not discarded "
+          f"({verdict}: {detail[:70]!r})")
+    check("no runnable check could be written" not in detail,
+          f"the fence is what tells a check from a refusal ({detail[:80]!r})")
+
 
 async def test_a_silent_exit_zero_is_weaker_evidence() -> None:
     """A printed CANNOT_CHECK is the false pass; a bare assert is not.

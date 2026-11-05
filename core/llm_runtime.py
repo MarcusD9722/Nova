@@ -649,13 +649,71 @@ class LLMRuntime:
         stop_seq = default_stop if stop is None else stop
         _penalty = float(PROSE_REPEAT_PENALTY if repeat_penalty is None
                          else repeat_penalty)
-        messages = _apply_no_think(messages, thinking=thinking)
+        base_messages = list(messages)
 
-        def _run() -> str:
+        def _attempt(attempt: int) -> tuple[list[dict[str, Any]], int, bool]:
+            """Messages, budget and whether reasoning is on, for attempt N.
+            ESCALATES rather than repeats.
+
+            A `thinking=True` call that comes back empty did not come back empty
+            by chance: on this model it means the budget was spent inside
+            `<think>` and the answer never started. Measured on real weights, a
+            story at the audit's 1200-token budget:
+
+                attempt 1  22s  finish=length  0 visible words
+                attempt 2  22s  finish=length  0 visible words
+                attempt 3  22s  finish=length  0 visible words
+                -> 65.9s of silence, then the caller's apology
+
+            The same prompts at 2400 tokens produced 137 and 336 words. So the
+            budget is what fails, and repeating it identically buys nothing but
+            the wait. This is the policy `ProjectBuilder._llm_json` already uses
+            for the same failure (audit, H15): double the budget for a thought
+            that was merely long, then stop paying for reasoning altogether —
+            a model that cannot stop deliberating cannot be out-budgeted, and
+            the fast contract measures 0/18 empty.
+
+            A `thinking=False` call escalates differently, and keeps TWO cheap
+            tries first: a fast attempt costs ~36 ms, its failure really is
+            stochastic (the model occasionally opens a second block on top of
+            the prefilled one), and most such turns succeed on a second cheap
+            try — escalating immediately put a 19.7 s P90 back on turns as
+            simple as "Good morning". Only a turn that has failed the cheap
+            contract TWICE has earned the full reasoning budget. That is the
+            chain `chat_stream_ex` has always used; `chat()` had no escalation
+            at all, so a turn the streaming path would have rescued came back
+            empty here.
+            """
+            if attempt == 0:
+                return (_apply_no_think(base_messages, thinking=thinking),
+                        int(max_tokens), bool(thinking))
+            if not thinking:  # the cheap chain, above
+                if attempt == 1:
+                    return (_apply_no_think(base_messages, thinking=False),
+                            int(max_tokens), False)
+                return (_apply_no_think(base_messages, thinking=True),
+                        int(max_tokens), True)
+            if attempt == 1:
+                return (_apply_no_think(base_messages, thinking=True),
+                        int(max_tokens) * 2, True)
+            return (_apply_no_think(base_messages, thinking=False),
+                    int(max_tokens), False)
+
+        # The parameters deliberately SHADOW `messages` and `max_tokens`: the
+        # body below is per-attempt work and must never read the call's values
+        # instead of this attempt's.
+        def _run(messages: list[dict[str, Any]], max_tokens: int) -> str:
+            # Stays False in the raw-completion fallback below: that path
+            # bypasses the chat handler, so nothing pre-opens a <think> block.
+            opened_think = False
             with _hold(self._llama_lock, self._lock_wait_s, "chat"):
                 with _quiet_generation():
                     # Prefer chat-completions for modern instruct models.
                     if hasattr(self._llama, "create_chat_completion"):
+                        # This path goes through the chat handler, which with
+                        # thinking on has already written `<think>` into the
+                        # generation prompt. Read it BEFORE generating.
+                        opened_think = _prompt_opens_think(self._llama, messages)
                         out = self._llama.create_chat_completion(
                             messages=messages,
                             max_tokens=int(max_tokens),
@@ -683,7 +741,7 @@ class LLMRuntime:
                             stop=stop_seq,
                         )
                         result = str(out.get("choices", [{}])[0].get("text", "")).strip()
-            return _strip_think(result)
+            return _strip_think(result, opened_think)
 
         # Occasionally the reasoning model burns its whole generation on an
         # unclosed <think> block and nothing visible ever comes out. That's
@@ -691,11 +749,20 @@ class LLMRuntime:
         # safe to silently retry a few times before giving up.
         result = ""
         for attempt in range(3):
-            result = await asyncio.to_thread(_run)
+            attempt_messages, attempt_budget, _thinking_on = _attempt(attempt)
+            result = await asyncio.to_thread(
+                _run, attempt_messages, attempt_budget)
             if result:
                 break
             if attempt < 2:
-                logger.debug("llm_chat_empty_retry", attempt=attempt + 1)
+                # WHAT the next attempt changes, not just that there is one:
+                # three log lines that say "retry" and nothing else is how a
+                # 56-second silence looks like one slow call.
+                _next = _attempt(attempt + 1)
+                logger.debug("llm_chat_empty_retry", attempt=attempt + 1,
+                             spent_budget=attempt_budget,
+                             spent_thinking=_thinking_on,
+                             next_budget=_next[1], next_thinking=_next[2])
         return result
 
     async def chat_stream(
@@ -777,7 +844,21 @@ class LLMRuntime:
             """
             if attempt == 0:
                 return _apply_no_think(base_messages, thinking=thinking), int(max_tokens)
-            if attempt == 1 and not thinking:
+            if thinking:
+                # The caller asked for reasoning and got nothing visible, which
+                # on this model means the budget went inside <think>. Both
+                # attempts below used to fall through to the branch at the end
+                # of this function and repeat the failed attempt verbatim:
+                # measured, 3 x 1200 tokens = 65.9s of silence on every story.
+                # Double it once for a thought that was merely long, then stop
+                # paying for reasoning. Same policy as `chat()` above and as
+                # `ProjectBuilder._llm_json` (audit, H15).
+                if attempt == 1:
+                    return (_apply_no_think(base_messages, thinking=True),
+                            int(max_tokens) * 2)
+                return (_apply_no_think(base_messages, thinking=False),
+                        int(max_tokens))
+            if attempt == 1:
                 # Retry the CHEAP path once before paying for reasoning.
                 #
                 # Fast attempts cost ~130ms, so a second one is nearly free,
@@ -866,7 +947,8 @@ class LLMRuntime:
             producer = asyncio.create_task(
                 asyncio.to_thread(_produce, queue, attempt_messages, attempt_budget, cancel)
             )
-            think_filter = _ThinkStreamFilter()
+            think_filter = _ThinkStreamFilter(
+                in_think=_prompt_opens_think(self._llama, attempt_messages))
             produced_any = False
             finish_reason = ""
             try:
@@ -989,7 +1071,7 @@ _THINK_BLOCK_RE = re.compile(r"(?is)<think>.*?</think>")
 _THINK_UNCLOSED_RE = re.compile(r"(?is)<think>.*$")
 
 
-def _strip_think(text: str) -> str:
+def _strip_think(text: str, started_in_think: bool = False) -> str:
     """Remove Qwen3-style <think>...</think> reasoning blocks from a full reply.
 
     Reasoning models (e.g. Qwen3.5) emit their chain-of-thought inline as
@@ -998,6 +1080,18 @@ def _strip_think(text: str) -> str:
     generation got cut off mid-thought (no closing tag) by dropping everything
     from the unclosed <think> onward.
     """
+    if started_in_think:
+        # The generation prompt opened the block, so the reply begins inside it
+        # and carries only a CLOSING tag. Neither regex below matches that —
+        # `_THINK_BLOCK_RE` needs both tags and `_THINK_UNCLOSED_RE` needs the
+        # opening one — so without this the reasoning was returned verbatim.
+        idx = text.find(_THINK_CLOSE)
+        if idx != -1:
+            text = text[idx + len(_THINK_CLOSE):]
+        elif _THINK_OPEN not in text:
+            # Cut off mid-thought: all of it was reasoning, none of it an
+            # answer. Same call as `_ThinkStreamFilter.flush` makes.
+            return ""
     if "<think>" not in text and "</think>" not in text:
         return text.strip()
     cleaned = _THINK_BLOCK_RE.sub("", text)
@@ -1062,14 +1156,47 @@ def _install_thinking_switch(llama: Any) -> bool:
         template = (getattr(llama, "metadata", {}) or {}).get(
             "tokenizer.chat_template")
         if not template:
+            # SAY SO. Without the handler the fast path silently reverts to
+            # passing the marker through as a real assistant turn, which is the
+            # measured 8.2s-median, occasionally-empty behaviour this replaced.
+            # A boot that quietly loses that is a boot nobody can diagnose.
+            logger.warning("thinking_switch_no_template",
+                           detail="model exposes no chat template; the fast "
+                                  "reasoning contract falls back to the "
+                                  "prefill marker")
             return False
 
         def _token(ids: Any, fallback: str) -> str:
+            """A special token's TEXT, or the fallback literal.
+
+            `detokenize([id])` returns EMPTY BYTES for a control token. That is
+            llama.cpp's normal behaviour — control tokens are not rendered as
+            text unless asked for — and it does not raise, so the first version
+            of this, which only guarded against an exception, handed
+            `eos_token=""` to `Jinja2ChatFormatter`. The formatter puts its eos
+            into the stop list, and an EMPTY STOP SEQUENCE matches at position
+            0: every generation ended after one token with no text at all.
+            Nova was mute on every chat call, and the M10 unit test did not see
+            it because the rendered PROMPT was correct — only the stop list was
+            wrong, and nothing generated anything to notice.
+
+            `special=True` renders it properly. The fallback stays for a
+            llama-cpp without that parameter, and an empty or blank result is
+            now treated as a failure to resolve, never as the token.
+            """
             try:
                 tid = int(ids)
-                return llama.detokenize([tid]).decode("utf-8", errors="ignore")
-            except Exception:  # noqa: BLE001
+            except (TypeError, ValueError):
                 return fallback
+            for kwargs in ({"special": True}, {}):
+                try:
+                    text = llama.detokenize([tid], **kwargs).decode(
+                        "utf-8", errors="ignore")
+                except Exception:  # noqa: BLE001
+                    continue
+                if text.strip():
+                    return text
+            return fallback
 
         meta = getattr(llama, "metadata", {}) or {}
         eos = _token(meta.get("tokenizer.ggml.eos_token_id"), "<|im_end|>")
@@ -1097,6 +1224,12 @@ def _install_thinking_switch(llama: Any) -> bool:
 
         llama.chat_handler = lcf.chat_formatter_to_chat_completion_handler(
             _ThinkingAware())
+        # REMEMBER that this template writes the opening <think> into the
+        # GENERATION PROMPT when thinking is on. The model therefore starts
+        # inside the block and never emits the tag, which a filter waiting for
+        # one cannot know. See `_prompt_opens_think`.
+        with contextlib.suppress(Exception):
+            llama._nova_prompt_opens_think = True
         logger.info("thinking_switch_installed")
         return True
     except Exception as e:  # noqa: BLE001
@@ -1104,6 +1237,31 @@ def _install_thinking_switch(llama: Any) -> bool:
         # occasionally empty. A template change must never fail a boot.
         logger.warning("thinking_switch_unavailable", error=str(e)[:200])
         return False
+
+
+def _prompt_opens_think(llama: Any, messages: list[dict[str, Any]]) -> bool:
+    """Does the generation prompt already OPEN a `<think>` block?
+
+    True only with the template-driven handler installed (M10), and only when
+    thinking is on. The template emits `<think>\n` for the generation prompt
+    unless `enable_thinking=false`, which the handler sets exactly when the
+    fast-path marker is the last message. So this reads the marker — the same
+    condition the handler uses — and the two cannot drift apart.
+
+    It matters because the model then starts INSIDE the block and never emits
+    the opening tag. A stream filter that waits for one hands the entire chain
+    of thought to the reader: measured, a story asked for with thinking on
+    began "Thinking Process: 1. **Analyze the Request:**" instead of a story.
+    """
+    if not getattr(llama, "_nova_prompt_opens_think", False):
+        return False
+    msgs = messages or []
+    marker = bool(
+        msgs and isinstance(msgs[-1], dict)
+        and msgs[-1].get("role") == "assistant"
+        and str(msgs[-1].get("content") or "").strip()
+        == _CLOSED_THINK_PREFILL.strip())
+    return not marker
 
 
 def _apply_no_think(messages: list[dict[str, Any]], thinking: bool = False) -> list[dict[str, Any]]:
@@ -1169,9 +1327,11 @@ class _ThinkStreamFilter:
     enough text to detect a boundary before releasing it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, in_think: bool = False) -> None:
+        # `in_think=True` when the GENERATION PROMPT already opened the block,
+        # so the first token is reasoning and no opening tag will ever arrive.
         self._buf = ""
-        self._in_think = False
+        self._in_think = bool(in_think)
 
     def feed(self, token: str) -> str:
         self._buf += token

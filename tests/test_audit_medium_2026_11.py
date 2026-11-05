@@ -317,6 +317,104 @@ def test_the_fast_path_uses_the_templates_own_switch() -> None:
           "the fix produces one")
 
 
+def test_the_eos_token_survives_detokenisation() -> None:
+    """A control token detokenizes to b'' — and an empty stop halts everything.
+
+    Found by a LIVE RUN, after the M10 fix was committed and the test above was
+    green. That test renders the template with a HARDCODED
+    `eos_token="<|im_end|>"`, so it never touched the one line that resolves
+    that token from model metadata — and that line is where the bug was.
+
+    `detokenize([eos_id])` returns EMPTY BYTES for a control token. That is
+    llama.cpp's normal behaviour, not an error, and it does not raise, so a
+    guard that only caught exceptions handed `eos_token=""` to
+    `Jinja2ChatFormatter`. The formatter puts its eos into the stop list, and
+    an EMPTY STOP SEQUENCE matches at position 0: one token generated, no text,
+    on every single call. Nova was mute on every chat request while all 195
+    suites were green, because every one of them substitutes `ScriptedLLM`.
+
+    So this asserts the stop list the switch actually produces — once against a
+    fake that detokenizes the way llama.cpp really does, and once against the
+    real model's metadata, which `vocab_only=True` reads with no VRAM.
+    """
+    check.section("M10: the eos the switch resolves is not an empty string")
+    from core import llm_runtime
+
+    try:
+        from llama_cpp import Llama, llama_chat_format as lcf
+    except ImportError:
+        check(False, "llama_cpp is not importable here")
+        return
+
+    TEMPLATE = (
+        "{%- for m in messages %}<|im_start|>{{ m['role'] }}\n"
+        "{{ m['content'] }}<|im_end|>\n{%- endfor %}"
+        "{%- if add_generation_prompt %}<|im_start|>assistant\n"
+        "{%- if enable_thinking is defined and enable_thinking is false %}"
+        "{{- '<think>\n\n</think>\n\n' }}{%- else %}{{- '<think>\n' }}"
+        "{%- endif %}{%- endif %}"
+    )
+
+    class FakeLlama:
+        """`detokenize` exactly as llama.cpp does it for a control token."""
+
+        metadata = {"tokenizer.chat_template": TEMPLATE,
+                    "tokenizer.ggml.eos_token_id": "248046"}
+        chat_handler = None
+
+        def detokenize(self, tokens, prev_tokens=None, special=False):
+            return b"<|im_end|>" if special else b""
+
+    captured: dict = {}
+    real_wrap = lcf.chat_formatter_to_chat_completion_handler
+
+    def _spy(formatter):
+        # The handler the switch installs is a COMPLETION handler, so the only
+        # way to see the stop list without generating anything is to catch the
+        # formatter on its way in.
+        captured["formatter"] = formatter
+        return real_wrap(formatter)
+
+    def _install(llama_obj) -> bool:
+        captured.clear()
+        lcf.chat_formatter_to_chat_completion_handler = _spy
+        try:
+            return llm_runtime._install_thinking_switch(llama_obj)
+        finally:
+            lcf.chat_formatter_to_chat_completion_handler = real_wrap
+
+    def _stops(label: str) -> list[str]:
+        fmt = captured.get("formatter")
+        if fmt is None:
+            check(False, f"{label}: the formatter never reached the handler")
+            return []
+        return list(fmt(messages=[{"role": "user", "content": "hi"}]).stop or [])
+
+    check(_install(FakeLlama()), "the switch installs on a control-token vocab")
+    stops = _stops("fake")
+    check("" not in stops,
+          f"no EMPTY stop sequence — it would match at position 0 and end "
+          f"every generation after one token ({stops!r})")
+    check(any("im_end" in s for s in stops),
+          f"the real end token is what stops it ({stops!r})")
+
+    # The same thing against the real model, which is where it was found.
+    gguf = REPO / "model" / "Qwen3.5-9B-Q6_K.gguf"
+    if not gguf.exists():
+        check(False, f"the model file is not here, so the real vocab cannot "
+                     f"be checked ({gguf.name})")
+        return
+    real_llm = Llama(model_path=str(gguf), vocab_only=True, verbose=False)
+    eos_id = (real_llm.metadata or {}).get("tokenizer.ggml.eos_token_id")
+    check(real_llm.detokenize([int(eos_id)]) == b"",
+          "this model's eos really does detokenize to nothing, which is the "
+          "condition that caused it")
+    check(_install(real_llm), "the switch installs on the real model")
+    stops = _stops("real")
+    check("" not in stops,
+          f"and its stop list is not an empty string either ({stops!r})")
+
+
 # ── M15: the code index answers correctly ───────────────────────────────────
 
 def test_the_code_index_tells_the_truth() -> None:
@@ -617,6 +715,7 @@ async def main() -> None:
     test_a_daily_reminder_keeps_its_hour_across_dst()
     test_a_birthday_heads_up_says_what_is_true_now()
     test_the_fast_path_uses_the_templates_own_switch()
+    test_the_eos_token_survives_detokenisation()
     test_the_code_index_tells_the_truth()
     test_dotenv_is_loaded_before_the_core_imports()
     test_real_failures_log_above_debug()

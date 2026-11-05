@@ -55,7 +55,21 @@ class DeepPipeline:
                 [{"role": "user", "content": prompt}], max_tokens=400, temperature=0.2, thinking=True
             )
         plan = (raw or "").strip()
-        if not plan or plan.upper().startswith("DIRECT"):
+        if not plan:
+            # NOT the same as DIRECT, though both return "". DIRECT is the
+            # planner judging that no plan is needed; this is the planner
+            # saying nothing at all, which on this model means the budget was
+            # spent inside <think> (audit follow-up). `chat()` escalates now,
+            # so reaching here means even the reasoning-off attempt came back
+            # empty -- deep mode continues unplanned either way, and the only
+            # way to know which happened is this line.
+            logger.warning("deep_plan_empty", budget=400,
+                           detail="planner returned nothing after escalation; "
+                                  "deep mode proceeds without a plan")
+            return ""
+        if plan.upper().startswith("DIRECT"):
+            logger.info("deep_plan_direct",
+                        detail="planner judged the request trivial")
             return ""
         return plan
 
@@ -94,5 +108,16 @@ class DeepPipeline:
         if verdict == "revise":
             return "revise", str(obj.get("notes") or "").strip()[:600]
         # Anything not an explicit, parseable "revise" is treated as approve —
-        # deep mode must never block a reply on a flaky critic parse.
+        # deep mode must never block a reply on a flaky critic parse. That
+        # stays. But an approval the critic never actually gave is not the same
+        # event as one it did, and pre-escalation the critic returned nothing
+        # on every deep turn and rubber-stamped every draft in silence
+        # (audit follow-up). The draft still ships; it no longer ships
+        # unrecorded.
+        if verdict != "approve":
+            logger.warning("deep_critique_unparsed",
+                           raw_empty=not (raw or "").strip(),
+                           verdict=verdict or None,
+                           detail="critic gave no parseable verdict; the draft "
+                                  "is approved by default and NOT reviewed")
         return "approve", ""
