@@ -456,24 +456,37 @@ def _parse_allowed_origins() -> list[str]:
     and `/plugins/execute` (audit, H12).
 
     The token is the real boundary, and `start_nova.ps1` now mints one and
-    passes it to Electron, so the dangerous combination is specifically
-    "`null` allowed AND no token". That combination is refused here: with no
-    token, `null` is dropped and a `file://` page gets nothing. An explicit
-    NOVA_ALLOWED_ORIGINS is the operator's own decision and is honoured as
-    given.
+    passes it to Electron (see C1), so an unauthenticated page cannot read
+    anything whatever its origin says.
+
+    DROPPING `null` BY DEFAULT WAS TRIED AND REVERTED. It breaks the thing the
+    whole permission system rests on: `/permissions/resolve` checks the request
+    origin against this list, so with no token Electron could no longer approve
+    anything — a silent failure of the approval path, which is worse than the
+    exposure it closed. `NOVA_DROP_NULL_ORIGIN=1` is the opt-in for a setup
+    that does not need `file://`, and the audit's own fix shape — an Electron
+    custom scheme, and then drop `null` for good — is the real answer and is
+    more than a CORS list change.
     """
     raw = os.getenv("NOVA_ALLOWED_ORIGINS", "").strip()
     if raw:
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         return parts or ["null"]
     origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
-    if _api_token():
-        # Authenticated Electron. Reaching anything still needs the token.
-        origins.append("null")
-    else:
-        logger.warning("null_origin_disallowed",
-                       reason="no NOVA_API_TOKEN, so file:// pages are not "
-                              "granted CORS access")
+    if os.getenv("NOVA_DROP_NULL_ORIGIN", "").strip().lower() in {
+            "1", "true", "yes", "on"}:
+        logger.warning("null_origin_dropped",
+                       reason="NOVA_DROP_NULL_ORIGIN is set; file:// pages, "
+                              "including Electron, get no CORS access")
+        return origins
+    if not _api_token():
+        # The H12 combination, left working but said out loud.
+        logger.warning(
+            "null_origin_without_token",
+            reason="`Origin: null` is allowed and no NOVA_API_TOKEN is set, so "
+                   "a sandboxed iframe or local .html file can reach this port. "
+                   "Launch through start_nova.ps1, which mints one.")
+    origins.append("null")
     return origins
 
 

@@ -28,7 +28,12 @@ def check(cond, label):
 # A registry shaped like Nova's real one: 49 tools in core/tooling.py plus
 # plugins. Descriptions are abbreviated but keep the vocabulary that matters.
 TOOLS = {
-    "time.now": "Get the current date and time.",
+    # THE REAL NAMES (audit 2026-11-02, L7). This catalogue is synthetic, but
+    # it was synthetic with names the router does not have — `time.now`,
+    # `gmail.list`, `calendar.list` — so a deterministic rule that named the
+    # real tool could not match anything here, and the test measured the
+    # selector against a catalogue Nova has never had.
+    "system.time": "Get the current date and time.",
     "weather.current": "Current weather conditions for a city or location.",
     "weather.forecast": "Weather forecast for the coming days at a location.",
     "maps.directions": "Driving directions, distance and travel time between two places.",
@@ -53,9 +58,9 @@ TOOLS = {
     "image.generate": "Generate an image from a text description.",
     "video.generate": "Generate a short video from a text description.",
     "discord.send": "Send a message to a Discord channel.",
-    "gmail.list": "List recent emails from Gmail.",
+    "email.recent": "List recent emails from Gmail.",
     "gmail.send": "Send an email through Gmail.",
-    "calendar.list": "List upcoming calendar events.",
+    "calendar.upcoming": "List upcoming calendar events.",
     "calendar.create": "Create a calendar event.",
     "thoughts.note": "Record a private thought or observation.",
     "thoughts.recall": "Recall previously recorded thoughts.",
@@ -85,7 +90,7 @@ DATASET = [
     ("tell me a joke", (), "no tool: social"),
     ("thanks, that's perfect", (), "no tool: acknowledgement"),
 
-    ("what time is it", ("time.now",), "deterministic: time"),
+    ("what time is it", ("system.time",), "deterministic: time"),
     ("what's the weather tomorrow", ("weather.forecast", "weather.current"), "weather"),
     ("do I need a jacket today", ("weather.current", "weather.forecast"), "weather, implied"),
     ("will it snow at Hunter this weekend", ("weather.forecast", "weather.current"), "weather, place"),
@@ -116,12 +121,17 @@ DATASET = [
      ("self.read_code", "self.list_code"), "self code"),
     ("generate an image of a snowy mountain", ("image.generate",), "image"),
     ("send a message to the Discord channel", ("discord.send",), "discord"),
-    ("what's on my calendar tomorrow", ("calendar.list",), "calendar"),
-    ("any new emails", ("gmail.list",), "email"),
+    ("what's on my calendar tomorrow", ("calendar.upcoming",), "calendar"),
+    ("any new emails", ("email.recent",), "email"),
     ("what's on my screen right now", ("vision.look_at_screen",), "vision"),
 
+    # `weather.current` accepted here too (audit 2026-11-02, L7): the
+    # deterministic weather rule used to name `weather.forecast`, which is not
+    # a tool this codebase has — the synthetic catalogue above is the only
+    # place it exists. The real answer to a forecast question is Nova's
+    # current-conditions tool, or nothing.
     ("check the weather and the traffic for tomorrow morning",
-     ("weather.forecast", "maps.directions"), "multi-tool"),
+     ("weather.forecast", "weather.current", "maps.directions"), "multi-tool"),
 ]
 
 
@@ -208,7 +218,7 @@ def test_deterministic_stage_is_free():
     sel = build_selector()
     result = sel.select("what time is it", TOOLS)
     check(result.stage == "deterministic", f"time routes deterministically (got {result.stage})")
-    check("time.now" in result.tools, "and picks the right tool")
+    check("system.time" in result.tools, "and picks the right tool")
     check(result.elapsed_ms < 15, f"in well under a millisecond of work ({result.elapsed_ms}ms)")
 
 

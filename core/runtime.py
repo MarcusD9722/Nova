@@ -35,6 +35,7 @@ from core.project_intent import (
     classify_removal,
     REMOVAL_AMBIGUOUS,
     REMOVAL_INSIDE_PROJECT,
+    REMOVAL_NONE,
     REMOVAL_UNSUPPORTED,
     REMOVAL_WHOLE_PROJECT,
     approves_without_naming_a_change,
@@ -1640,6 +1641,35 @@ class RuntimeManager:
             self._episodic_stats["failures"] += 1
             logger.warning("episodic_promotion_failed", error=str(e)[:200])
 
+    def _conversation_is_about(self, conv: str, slug: str | None) -> bool:
+        """Has THIS conversation been working on `slug`?
+
+        The evidence a borrowed `last_active` pointer does not provide. A
+        conversation that named the project, or that Nova has already recorded
+        as working on it, is one where "make the pipe gap wider" is about the
+        project. A conversation that merely inherited the pointer is not — that
+        is the C3 case, where a sentence from someone's private life became an
+        executable plan.
+
+        Bounded to the last few turns: a project mentioned once, twenty turns
+        ago, is not what this conversation is about any more.
+        """
+        if not conv or not slug:
+            return False
+        ctx = self._working.peek(str(conv))
+        if ctx is None:
+            return False
+        if str(getattr(ctx, "active_project", "") or "") == str(slug):
+            return True
+        recent = list(getattr(ctx, "user_turns", []) or [])[-6:]
+        for turn in recent:
+            try:
+                if self._project_builder.known_slug_in_text(str(turn)) == slug:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
     async def _refresh_active_project(self, work_ctx: Any, user_text: str) -> None:
         """Keep `active_project` pointing at the project this turn is about.
 
@@ -1943,6 +1973,23 @@ class RuntimeManager:
         pb = self._project_builder
         conv = str(conversation_id or "")
 
+        # A project NAMED here is what this conversation is about, recorded
+        # before any branch can return. The pre-pass answers and returns for
+        # most project turns, so the main path — where the working context is
+        # built — never runs on them, and the next turn had no way to know
+        # this conversation had been working on anything. That is the evidence
+        # `_conversation_is_about` needs to tell a deferred change to a project
+        # from a sentence out of someone's private life (audit C3, and the
+        # deferral feature it would otherwise break).
+        if conv:
+            named_here = pb.known_slug_in_text(t)
+            if named_here:
+                try:
+                    self._working.get(conv).active_project = str(named_here)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("active_project_note_failed",
+                                   error=str(exc)[:160])
+
         # Plain questions ("what improvements could we make to X?", "is X a
         # good game?", "what should we add next?") are asking Nova to DISCUSS,
         # not to act. Computed up front so every branch below treats questions
@@ -2087,7 +2134,23 @@ class RuntimeManager:
             # later "go ahead" runs these exact words as instructions, so a
             # sentence from someone's private life must never become one
             # (audit, C3 — same borrowed-pointer root as the improve path).
-            if is_proposal and in_play and references_project_work(t):
+            #
+            # WHERE THE C3 GATE BELONGS, and where it does not. Requiring work
+            # vocabulary HERE was tried and reverted: "Add a parallax
+            # background, but don't change anything yet" names no project and
+            # uses no work words — no word list distinguishes a game's own
+            # domain from private life — so the whole deferral feature went
+            # silent and every "okay, do it" found nothing to consume.
+            #
+            # Storing a plan performs nothing. What makes it executable is an
+            # explicit approval, a second deliberate turn in the same
+            # conversation, and both of C3's reproductions were SINGLE
+            # sentences that executed immediately. So the gate lives on the
+            # immediate-execution path, where the harm was measured, and
+            # `is_proposal` — which applies the authorisation grammar to
+            # whatever is left after the deferral clause — is what guards this
+            # one.
+            if is_proposal and in_play:
                 self._pending_plan.setdefault(conv, {})[in_play] = t
                 self._bound_pending_plans()
 
@@ -2165,7 +2228,20 @@ class RuntimeManager:
             # reports, and "where did we leave off" names no project by nature.
             if _asks_status:
                 slug = await pb.last_active()
-            elif may_mutate and references_project_work(t):
+            elif classify_removal(t) != REMOVAL_NONE:
+                # A REMOVAL REQUEST RESOLVES A TARGET WITHOUT THE WORK GATE,
+                # because what it reaches is a question or an explanation, not
+                # an edit: "do you mean the 'tracker' project, or something
+                # inside 'flappy-bird'?", or "I have no way to archive a
+                # project". Gating it meant "delete tracker" fell through to
+                # the model, which answered "Sure." — the one answer a
+                # destructive request must never get (the C3 gate, applied one
+                # branch too wide). Nothing below this deletes anything
+                # without `may_mutate` and the permission broker.
+                slug = await pb.last_active()
+            elif may_mutate and (references_project_work(t)
+                                 or self._conversation_is_about(
+                                     conv, await pb.last_active())):
                 # BOTH halves, and this is the second one (audit, C3). An
                 # affirmative instruction was enough on its own to borrow the
                 # last-active project as a target, and that pointer is durable
@@ -2174,6 +2250,14 @@ class RuntimeManager:
                 # rewrote its acceptance contract. An instruction that says
                 # nothing about software is now conversation, which is where it
                 # belongs.
+                #
+                # The second way to qualify is the CONVERSATION. "Make the pipe
+                # gap 20% larger" names no project and uses no work vocabulary,
+                # but in a conversation that just opened flappy-bird it is
+                # plainly about flappy-bird — requiring work words alone meant
+                # every concrete instruction about a game's own domain was
+                # treated as private life. The pointer still has to have been
+                # earned HERE, which is what keeps the C3 case out.
                 #
                 # …but only when the message did not NAME a different project.
                 # Measured with flappy-bird open: "Let's work on the calculator
@@ -2948,6 +3032,13 @@ class RuntimeManager:
         # next turn rebuilt the same oversized prompt. Every message after that,
         # including "Hello?", answered "Sorry — I hit an internal error", for
         # good, across restarts.
+        # A runtime that does not report its window gets the documented
+        # default. Reading `self._llm.context_tokens` unconditionally made the
+        # budget depend on an attribute every test double has to know about,
+        # and a double without it crashed the whole turn.
+        _context_window = int(getattr(self._llm, "context_tokens", 0)
+                              or os.getenv("NOVA_CONTEXT_TOKENS", "8192").strip()
+                              or "8192")
         _blocks, _trimmed = _fit_prompt([
             _Block("episodic", episodic_context, _DROP),
             _Block("artifacts", artifact_context, _DROP),
@@ -2960,7 +3051,7 @@ class RuntimeManager:
             _Block("grounding", grounding_text),
             _Block("work", work_context),
             _Block("user", clean_user),
-        ], context_tokens=self._llm.context_tokens,
+        ], context_tokens=_context_window,
             reply_tokens=int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536"))
         _by = {b.name: b.text for b in _blocks}
         episodic_context = _by["episodic"]
@@ -2973,7 +3064,7 @@ class RuntimeManager:
             # Visible, because a trimmed prompt is a reply with less to go on.
             # The old behaviour was no log and no reply at all.
             logger.info("prompt_trimmed", actions=", ".join(_trimmed),
-                        context_tokens=self._llm.context_tokens)
+                        context_tokens=_context_window)
             BUS.publish("chat.prompt_trimmed", {"actions": _trimmed})
 
         system_prompt = (

@@ -38,6 +38,12 @@ sys.path.insert(0, str(REPO / "tests"))
 
 os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 os.environ.setdefault("NOVA_REPO_ROOT", str(REPO))
+# This suite drives the OPERATOR path — enrolling Marcus himself through
+# POST /speaker/enroll, which is what the calibration harness does. Since
+# audit 2026-11-02 H12 that needs saying out loud at the machine: `role` is
+# not something a request may choose, because a multipart POST needs no CORS
+# preflight, so a page that could reach this port could enrol a voice AS him.
+os.environ.setdefault("NOVA_ALLOW_OWNER_ENROLLMENT", "1")
 
 import numpy as np  # noqa: E402
 

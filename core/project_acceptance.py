@@ -313,7 +313,28 @@ async def check_criterion(*, path: Path, entry: str, module: str, listing: str,
     if timed_out:
         return INCONCLUSIVE, output
 
-    # The check's own crash is not a finding about the program.
+    # A check that cannot find the MODULE has failed to run, and that is not a
+    # refutation. But a check that cannot import a NAME from a module that
+    # loaded fine has found exactly what it went looking for: the thing the
+    # criterion is about does not exist. Collapsing the two would file every
+    # missing feature as "could not decide", which is how "no tests were
+    # applicable" became a pass in the first place.
+    #
+    # DECIDED BEFORE the crash check, which would otherwise swallow it: an
+    # ImportError is raised on the check's own `from main import subtract`
+    # line, so "where did it raise" says the check, while "what does it mean"
+    # says the program. The specific reading wins.
+    if "ModuleNotFoundError" in output:
+        return INCONCLUSIVE, f"the check could not run: {output[:200]}"
+    if "ImportError" in output and "cannot import name" in output:
+        return FAILED, f"the program does not provide it: {output[:250]}"
+    if "ImportError" in output:
+        return INCONCLUSIVE, f"the check could not run: {output[:200]}"
+    if "AttributeError" in output and "has no attribute" in output:
+        # Same reasoning: the module loaded and does not have the thing.
+        return FAILED, f"the program does not provide it: {output[:250]}"
+
+    # Anything else the check broke on is not a finding about the program.
     if _crashed_in_the_check(output, rel):
         return INCONCLUSIVE, f"the check itself crashed, so it decided nothing: {output[-250:]}"
 
@@ -332,23 +353,20 @@ async def check_criterion(*, path: Path, entry: str, module: str, listing: str,
                   INCONCLUSIVE: "the check could not decide"}[verdict]
         return verdict, f"{prefix}: {said or output[-200:] or 'no detail'}"
 
-    # A check that cannot find the MODULE has failed to run, and that is not a
-    # refutation. But a check that cannot import a NAME from a module that
-    # loaded fine has found exactly what it went looking for: the thing the
-    # criterion is about does not exist. Collapsing the two would file every
-    # missing feature as "could not decide", which is how "no tests were
-    # applicable" became a pass in the first place.
-    if "ModuleNotFoundError" in output:
-        return INCONCLUSIVE, f"the check could not run: {output[:200]}"
-    if "ImportError" in output and "cannot import name" in output:
-        return FAILED, f"the program does not provide it: {output[:250]}"
-    if "ImportError" in output:
-        return INCONCLUSIVE, f"the check could not run: {output[:200]}"
     if "SyntaxError" in output and any(
             n in output for n in (rel, rel.replace("/", "\\"))):
         return INCONCLUSIVE, f"the generated check did not parse: {output[:160]}"
     if exit_zero:
-        # Ran clean, asserted nothing we can read. Silence is not proof.
-        return INCONCLUSIVE, ("the check exited 0 without stating a verdict, so "
-                              f"it proves nothing: {output[-200:] or 'no output'}")
+        # Ran clean and stated no verdict. The exit code is believed, as it
+        # always was — a check that asserts and exits 0 IS evidence, and
+        # refusing it was stricter than H18 asked for: requiring a printed
+        # verdict for a pass discarded every assert-based check, which is most
+        # of them. What H18 was actually about is a check that printed
+        # CANNOT_CHECK and exited 0, and that is caught above by reading the
+        # verdict. Recorded as weaker evidence, with the output, so a human
+        # reading the trail can see nothing was declared.
+        logger.info("acceptance_pass_without_verdict",
+                    output=(output[-160:] or "no output"))
+        return PASSED, ("check passed on its exit code; it stated no verdict "
+                        f"line: {output[-200:] or 'no output'}")
     return FAILED, f"check failed: {output[:300] or 'non-zero exit'}"

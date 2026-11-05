@@ -102,7 +102,28 @@ async def main():
         name_hit = next((h for h in hits if "Marcus Deleon" in h.text), None)
         check(note_hit is not None and note_hit.score < 0.95, f"old note decayed below base (got {note_hit.score if note_hit else None})")
         check(note_hit is not None and note_hit.score >= 0.80, "decayed note never sinks below CH1 high-confidence floor")
-        check(name_hit is not None and name_hit.score == 0.95, "identity fact (user.name) exempt from decay")
+        # EXEMPT FROM DECAY, asserted as a comparison rather than against a
+        # literal 0.95. Since audit 2026-11-02 H5 the base score also reflects
+        # how much of the QUERY a fact covers, so an identity fact matching one
+        # term of three scores 0.85 whether or not it was decayed — the literal
+        # was measuring coverage, not decay. Ageing it must change nothing.
+        before = name_hit.score if name_hit else None
+        async with aiosqlite.connect(Path(td) / "sqlite" / "nova.sqlite3") as db:
+            await db.execute("UPDATE facts SET created_at=? WHERE value LIKE '%Marcus Deleon%'", (old,))
+            await db.execute("UPDATE facts SET last_reinforced_at=NULL WHERE value LIKE '%Marcus Deleon%'")
+            await db.commit()
+        mem._search_gen += 1
+        aged = await mem.search(q="snowboarding hobby Marcus", limit=10)
+        aged_name = next((h for h in aged if "Marcus Deleon" in h.text), None)
+        check(name_hit is not None and aged_name is not None
+              and aged_name.score == before,
+              f"identity fact (user.name) exempt from decay "
+              f"({before} -> {aged_name.score if aged_name else None})")
+        check(note_hit is not None and aged_name is not None
+              and aged_name.score > note_hit.score,
+              f"and an aged identity fact still outranks the aged note "
+              f"({aged_name.score if aged_name else None} > "
+              f"{note_hit.score if note_hit else None})")
 
         # ── 1.4 consolidation ──
         await mem.add_lesson("Do not start new projects when debugging existing ones", topic="reflection")

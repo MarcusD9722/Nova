@@ -118,6 +118,41 @@ CATALOG: dict[str, Setting] = dict(
         _s("NOVA_TTS_SPEED", "float", "1.0", "Base TTS speed multiplier."),
         _s("NOVA_TTS_MOOD_PACING", "bool", "1", "Subtle mood-based speech pacing (WS-H)."),
         _s("NOVA_TTS_CACHE_MAX", "int", "64", "Max cached TTS clips."),
+        # ── Added by the 2026-11-02 audit fixes ──────────────────────────────
+        _s("NOVA_LLM_WARMUP", "bool", "1",
+           "Burn the model's first inference at boot. On this card llama-cpp "
+           "JIT-compiles its kernels on first use (~15.7s cold, ~0.3s warm), "
+           "and a turn's 12s timeout fired mid-compile: 4 of 4 dead boots "
+           "(audit C2)."),
+        _s("NOVA_LLM_LOCK_WAIT_S", "float", "300",
+           "How long a generation waits for the model lock before raising "
+           "GPUEnforcementError. The lock is what serialises llama.cpp; a "
+           "semaphore cannot, because the work runs in a thread cancellation "
+           "cannot reach (audit C2)."),
+        _s("NOVA_PERMISSION_AUDIT_MAX_LINES", "int", "20000",
+           "Lines kept in the permission audit file. It used to grow forever "
+           "in plaintext and purge did not touch it (audit L12). 0 keeps "
+           "everything."),
+        _s("NOVA_PROJECT_HTML_CHECK", "bool", "1",
+           "Run the headless browser smoke test on HTML projects. They were "
+           "never executed at all (audit H19)."),
+        _s("NOVA_HTML_SMOKE_TIMEOUT_S", "float", "30",
+           "Time limit for one HTML project's smoke test."),
+        _s("NOVA_HTML_SMOKE_TICKS", "int", "60",
+           "Animation/timer ticks to drive an HTML project for, with arrow "
+           "keys dispatched on each."),
+        _s("NOVA_CLOUD_SPEND_PATH", "path", "",
+           "Where the day's cloud token spend is kept. The cap lived in "
+           "memory, so a restart reset it (audit L3). Defaults to "
+           "memory_data/cloud_spend.json."),
+        _s("NOVA_ALLOW_OWNER_ENROLLMENT", "bool", "0",
+           "Allow POST /speaker/enroll to enrol role=owner. Off by default: a "
+           "multipart POST needs no CORS preflight, so a page that could "
+           "reach this port could enrol a voice AS Marcus (audit H12)."),
+        _s("NOVA_DROP_NULL_ORIGIN", "bool", "0",
+           "Refuse `Origin: null` entirely. Off by default because Electron's "
+           "file:// pages send it and /permissions/resolve checks the origin, "
+           "so dropping it disables the approval path (audit H12)."),
         _s("NOVA_FFMPEG_PATH", "path", "", "Explicit ffmpeg path if not on PATH."),
         _s("NOVA_STT_MODEL", "str", "openai/whisper-base", "Transformers STT fallback model."),
         _s("NOVA_STT_MODEL_SIZE", "str", "base", "faster-whisper model size. Measured: base 73ms mean vs small 106ms on this GPU (tests/bench_stt_v3.py)."),

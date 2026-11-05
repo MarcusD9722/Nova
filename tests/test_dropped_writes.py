@@ -138,7 +138,10 @@ async def test_a_dropped_reinforcement_is_recorded() -> None:
         check(str(again) == str(first),
               f"the duplicate still resolves to the stored fact "
               f"({str(again)[:8]} vs {str(first)[:8]})")
-        check(rec.saw("fact_reinforce_failed", level="debug"),
+        # WARNING, not debug, since audit 2026-11-02 M12: production runs at
+        # INFO, so a lost reinforcement logged at debug was invisible — and a
+        # lost write is the exact thing this suite exists to make visible.
+        check(rec.saw("fact_reinforce_failed", level="warning"),
               f"and the dropped reinforcement is recorded ({rec.names()})")
 
 

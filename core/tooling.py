@@ -220,7 +220,19 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     #: Plugin tools that reach OUT of this machine on Marcus's behalf, and so
     #: need his approval rather than only his data scope. Sending a message as
     #: someone is not something to do unasked (audit 2026-11-02, H10).
-    _BROKERED_PLUGINS = {"discord.send": "discord.send"}
+    #: Plugins the broker decides before anything leaves the box.
+    #:
+    #: EMPTY, deliberately. `discord.send` was put here during the audit fixes
+    #: and taken back out: in the default `guarded` mode a STANDARD capability
+    #: needs a click, so every Discord message Nova sent would wait for one —
+    #: a change to what Marcus built, which no finding asked for. What the
+    #: findings DID ask for is covered without it: the tool stays owner-scoped
+    #: (`data_scope="owner_private"`), and `AgentSupervisor._NEVER_UNATTENDED`
+    #: keeps it away from the unattended planner, which is M1.
+    #:
+    #: The machinery below is kept because it is the right shape for anything
+    #: that should ask first; it just has nothing in it today.
+    _BROKERED_PLUGINS: dict[str, str] = {}
 
     def _broker_guarded(name: str, capability: str, fn: Any) -> Any:
         """Wrap a plugin so the broker decides before anything leaves the box."""

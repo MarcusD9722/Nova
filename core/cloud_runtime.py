@@ -368,7 +368,15 @@ class CloudRuntime:
     # ── LLMRuntime-compatible surface ──
     async def chat(self, messages: list[dict[str, Any]], max_tokens: int = 512,
                    temperature: float = 0.2, stop: list[str] | None = None,
-                   thinking: bool = False) -> str:
+                   thinking: bool = False,
+                   repeat_penalty: float | None = None) -> str:
+        # `repeat_penalty` is accepted and IGNORED. It is a llama.cpp sampler
+        # setting; the hosted providers have their own penalty parameters with
+        # different scales, and silently mapping 1.0 onto one of them would be
+        # a guess. Accepting it keeps this a drop-in replacement for
+        # `LLMRuntime` — the interface the whole codebase calls (audit L12
+        # added the parameter, and a coder-role call that landed here raised
+        # TypeError on every attempt).
         kw = {"max_tokens": max_tokens, "temperature": temperature, "stop": stop, "thinking": thinking}
         if not self.available:
             if self._over_cap():
@@ -405,7 +413,9 @@ class CloudRuntime:
 
     async def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 512,
                           temperature: float = 0.2, stop: list[str] | None = None,
-                          thinking: bool = False) -> AsyncIterator[str]:
+                          thinking: bool = False,
+                          repeat_penalty: float | None = None) -> AsyncIterator[str]:
+        # Accepted and ignored, same as `chat` above.
         kw = {"max_tokens": max_tokens, "temperature": temperature, "stop": stop, "thinking": thinking}
         if not self.available:
             text = await self._fallback_chat("cloud not configured", messages, **kw)

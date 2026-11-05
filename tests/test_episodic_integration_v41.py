@@ -295,8 +295,18 @@ async def test_mcp_provenance_survives():
     from core.mcp.session import ServerConfig
 
     class AllowBroker:
+        # The shape PermissionBroker.request ACTUALLY returns. This used to
+        # say `{"allowed": True}`, a key the broker has never had — the same
+        # fake-shaped double that let H13 hide, where every real MCP call was
+        # denied in every mode while the tests stayed green (audit
+        # 2026-11-02, H13).
+        mode = "trusted"
+
         async def request(self, capability, details=None):
-            return {"allowed": True}
+            return {"decision": "allowed"}
+
+        def pending(self):
+            return []
 
     async with boot() as nova:
         # The manager writes into the RUNTIME's artifact store, which is what

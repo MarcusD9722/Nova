@@ -202,8 +202,16 @@ async def test_cannot_check_anywhere_is_not_a_pass() -> None:
           f"({verdict}: {detail[:70]!r})")
 
 
-async def test_a_silent_exit_zero_proves_nothing() -> None:
-    check.section("H18: exit 0 with no verdict is not a pass")
+async def test_a_silent_exit_zero_is_weaker_evidence() -> None:
+    """A printed CANNOT_CHECK is the false pass; a bare assert is not.
+
+    Requiring a declared verdict for a PASS was tried and reverted: it
+    discards every assert-based check, which is most of them, and H18's actual
+    false pass was a script that PRINTED CANNOT_CHECK and exited 0. So the
+    exit code is still believed when nothing was declared, and the detail says
+    so.
+    """
+    check.section("H18: exit 0 with no verdict is believed, but recorded as such")
     project = Path(tempfile.mkdtemp(prefix="nova-h18b-")) / "proj"
     project.mkdir(parents=True)
     (project / "main.py").write_text("x = 1\n", encoding="utf-8")
@@ -219,8 +227,10 @@ async def test_a_silent_exit_zero_proves_nothing() -> None:
         code="x = 1", criterion={"text": "it works", "origin_quote": "works"},
         request="make it work", ask_file=_reply(script),
         declare_scaffold=lambda paths: None)
-    check(verdict == INCONCLUSIVE,
-          f"silence is not proof ({verdict}: {detail[:80]!r})")
+    check(verdict == PASSED,
+          f"a clean exit is still evidence ({verdict}: {detail[:60]!r})")
+    check("stated no verdict" in detail,
+          f"but the trail says nothing was declared ({detail[:80]!r})")
 
     # …and a check that states PASS is believed.
     ok = "```python\nimport main\nprint('PASS: main imports and x is', main.x)\n```"
@@ -535,7 +545,7 @@ async def main() -> None:
     test_a_checks_own_crash_is_not_evidence()
     await test_a_crashing_check_reaches_the_verdict_as_inconclusive()
     await test_cannot_check_anywhere_is_not_a_pass()
-    await test_a_silent_exit_zero_proves_nothing()
+    await test_a_silent_exit_zero_is_weaker_evidence()
     await test_a_check_cannot_disturb_the_project()
     test_inline_scripts_are_found()
     await test_a_broken_page_is_reported_not_announced()
