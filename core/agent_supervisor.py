@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+from core.gpu import GPU_SEM
 from core.logging_setup import get_logger
 from core.policy._json_extract import extract_first_json_object
 from core.tool_router import ToolCall, ToolRouter
@@ -132,6 +133,38 @@ class AgentSupervisor:
         except Exception as e:  # noqa: BLE001
             logger.warning("agent_stale_discard_failed", error=str(e)[:160])
 
+    #: Tools this loop is never offered. It runs UNATTENDED, on a timer, with
+    #: nobody watching the step it picks — so the things whose mistakes cannot be
+    #: taken back are not on its menu at all (audit 2026-11-02, M1). Deleting a
+    #: project and purging the trash have a human-facing path; sending a message
+    #: as Marcus and writing source have one too. Every one of them was being
+    #: offered here, with an empty description, to a model asked to guess.
+    #:
+    #: Not a substitute for the PermissionBroker, which still gates each of
+    #: these. It is the earlier question: should an unsupervised planner even be
+    #: thinking about them.
+    _NEVER_UNATTENDED = frozenset({
+        "project.delete", "project.purge", "project.restore", "project.scaffold",
+        "code.write", "shell.exec", "discord.send", "computer.act",
+        "memory.rebuild_index", "memory.purge", "memory.forget",
+        "self.apply_change", "self.register_project",
+    })
+
+    def _offerable_tools(self) -> dict[str, str]:
+        """What the unattended planner may choose from, with real descriptions."""
+        described = dict(self._tool_descriptions)
+        out: dict[str, str] = {}
+        for name in self._router.list_tools():
+            if name in self._NEVER_UNATTENDED:
+                continue
+            desc = (described.get(name) or "").strip()
+            if not desc:
+                # No description means the model would be guessing at the
+                # arguments. Leaving it out is the honest answer.
+                continue
+            out[name] = desc
+        return out
+
     async def _decide_next(self, *, goal_id: str, project_name: str) -> dict[str, Any]:
         """
         Ask the LLM for the next step.
@@ -141,7 +174,7 @@ class AgentSupervisor:
         - {"type":"final","message":"..."}
         - {"type":"question","message":"..."}  # needs user input; pauses goal
         """
-        tools_list = "\n".join([f"- {n}: {self._tool_descriptions.get(n, '')}" for n in self._router.list_tools()])
+        tools_list = "\n".join(f"- {n}: {d}" for n, d in self._offerable_tools().items())
         recent_tasks = await self._memory.list_goal_tasks(goal_id=goal_id, limit=12)
         # Compact history for the model
         history_lines: list[str] = []
@@ -183,13 +216,20 @@ Rules:
 
 Return JSON only.
 """
-        raw = await self._llm.chat(
-            [{"role": "user", "content": prompt}],
-            max_tokens=768,  # background reasoning + the JSON decision
-            temperature=0.2,
-            stop=["\n\nUser:", "\n\nAssistant:"],
-            thinking=True,
-        )
+        # THE GPU PERMIT. This call took none — the only model call site in the
+        # codebase that didn't — so a background goal could start a generation
+        # beside a live turn's (audit 2026-11-02, C2, path e). With autonomy on
+        # by default in start_nova.ps1, that is a real pairing, not a theoretical
+        # one. The lock inside LLMRuntime now makes the overlap survivable; the
+        # permit is what keeps it from being attempted.
+        async with GPU_SEM:
+            raw = await self._llm.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=768,  # background reasoning + the JSON decision
+                temperature=0.2,
+                stop=["\n\nUser:", "\n\nAssistant:"],
+                thinking=True,
+            )
         # Reuse the balanced-brace extractor (handles nested braces / trailing
         # prose) instead of a greedy `\{.*\}` that breaks on either.
         data = extract_first_json_object((raw or "").strip())

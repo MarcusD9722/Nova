@@ -22,6 +22,7 @@ State model:
 - All writes are confined to projects_dir (slug-sanitized, no traversal).
 """
 
+import ast
 import asyncio
 import os
 import re
@@ -279,6 +280,36 @@ def slugify(name: str) -> str:
     is called, and two independent implementations of that had already drifted.
     """
     return canonical_project_slug(name)
+
+
+#: pytest's one-line summary: "3 passed in 0.12s", "1 failed, 10 passed in …",
+#: "no tests ran in 0.01s".
+_PYTEST_COUNT_RE = re.compile(r"\b(\d+)\s+(passed|failed|error|errors|xpassed|xfailed)\b")
+
+
+def _collected_count(output: str) -> int:
+    """How many tests pytest actually ran. 0 means nothing was proven.
+
+    Parsed from the summary rather than trusted from the exit code, because exit
+    0 is also what an empty run produces — the whole of H17.
+    """
+    if "no tests ran" in (output or "").lower():
+        return 0
+    return sum(int(m.group(1)) for m in _PYTEST_COUNT_RE.finditer(output or ""))
+
+
+def _module_level_asserts(path: Path) -> int:
+    """How many `assert` statements run at import time.
+
+    A file of top-level asserts proves something when it exits 0, even though
+    pytest collects no tests from it. Counted structurally rather than by
+    grepping for the word, so a string containing "assert" is not evidence.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return 0
+    return sum(1 for node in tree.body if isinstance(node, ast.Assert))
 
 
 def _now_str() -> str:
@@ -1396,8 +1427,16 @@ class ProjectBuilder:
             "Rules:\n"
             f"- Import the REAL names defined above (e.g. `from {module} import ...`).\n"
             "- Test pure logic only: never open a window, sleep, play audio, or read input.\n"
-            "- Use plain `assert` statements and the standard library only.\n"
-            f"- The file must run as `python {test_name}` and exit non-zero if any check fails.\n"
+            # SAY HOW IT WILL BE RUN. The old instruction was "must run as
+            # `python <file>` and exit non-zero if a check fails", and what came
+            # back was pytest-style — classes under `unittest.main()`, or bare
+            # test functions with no main block — which exits 0 having run
+            # nothing. The runner uses pytest now, so ask for pytest
+            # (audit 2026-11-02, H17).
+            "- Write top-level functions named `test_...` that use plain `assert`. "
+            "No classes, no `unittest`, no `if __name__ == \"__main__\"` block.\n"
+            f"- The file is run with `pytest {test_name}`, which is installed. "
+            "Every check must live inside a `test_...` function so it actually runs.\n"
             "- If nothing can be tested without a live GUI or network, reply with EXACTLY: NO_TESTS\n"
             "Reply with ONLY the test file content in one fenced code block (or the bare word NO_TESTS)."
         )
@@ -1473,27 +1512,70 @@ class ProjectBuilder:
         return f"Logic tests inconclusive (code left unchanged; a test may be wrong): {tail[:150]}"
 
     @staticmethod
-    def _run_test_file(project_dir: Path, test_file: str, timeout_s: float = 20.0) -> str | None:
-        """Run a generated test file. None = passed (exit 0); a string is the failure output."""
+    def _run_test_file(project_dir: Path, test_file: str, timeout_s: float = 60.0) -> str | None:
+        """Run a generated test file. None = tests RAN and passed.
+
+        "EXIT 0" IS NOT "THE TESTS PASSED" (audit 2026-11-02, H17). This ran
+        `python test_main.py` and read exit 0 as success, while the model writes
+        pytest-style files:
+
+          * a file of `class TestX:` with `unittest.main()` at the bottom prints
+            "Ran 0 tests ... OK" and exits 0;
+          * a file of bare `def test_*()` functions and no main block defines
+            them and exits 0.
+
+        Both reported "Logic tests passed" having executed NOTHING, and that is
+        how a real bug shipped: todo-cli's own generated test catches its
+        inverted sort under pytest, and the fix loop written for exactly that
+        never fired.
+
+        So: run pytest, and require that it actually collected something. A file
+        that collects nothing falls back to a direct run (module-level asserts
+        are a legitimate shape) but can only ever report INCONCLUSIVE — never a
+        pass, because nothing proved anything.
+        """
         import subprocess
         import sys
 
-        try:
-            proc = subprocess.run(
-                [sys.executable, test_file],
-                cwd=str(project_dir),
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                stdin=subprocess.DEVNULL,
-            )
-        except subprocess.TimeoutExpired:
-            return "Test run timed out (possible infinite loop or blocking call)."
-        except Exception as e:  # noqa: BLE001
-            return str(e)[:400]
-        if proc.returncode != 0:
-            return (proc.stderr or proc.stdout or f"exit code {proc.returncode}").strip()[-1500:]
-        return None
+        def _run(args: list[str]) -> tuple[int, str]:
+            try:
+                proc = subprocess.run(
+                    args, cwd=str(project_dir), capture_output=True, text=True,
+                    timeout=timeout_s, stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                return -9, "Test run timed out (possible infinite loop or blocking call)."
+            except Exception as e:  # noqa: BLE001
+                return -1, str(e)[:400]
+            return proc.returncode, ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+
+        code, out = _run([sys.executable, "-m", "pytest", test_file, "-q",
+                          "-p", "no:cacheprovider"])
+        if code == -9 or code == -1:
+            return out
+        # pytest's own exit codes: 0 all passed, 1 some failed, 2 interrupted,
+        # 3 internal error, 4 usage error, 5 nothing collected.
+        if code == 0 and _collected_count(out) > 0:
+            return None
+        if code == 1:
+            return out[-1500:] or "a generated test failed"
+        if code in (2, 3, 4) and "No module named pytest" not in out:
+            return (f"pytest could not run the generated tests (exit {code}):\n"
+                    f"{out[-900:]}")
+
+        # Nothing collected, or pytest is unavailable. Run the file directly:
+        # that executes module-level asserts, which is a real way to write a
+        # check even though pytest cannot see it as a test.
+        direct_code, direct_out = _run([sys.executable, test_file])
+        if direct_code != 0:
+            return (direct_out or f"exit code {direct_code}").strip()[-1500:]
+        if _module_level_asserts(project_dir / test_file) > 0:
+            # Real checks, really executed, all passed. The shape is unusual;
+            # the evidence is not.
+            return None
+        return ("No test actually executed. pytest collected nothing from "
+                f"{test_file} and running it directly asserted nothing, so this "
+                "says nothing about whether the code works.")
 
     @staticmethod
     def _run_check(project_dir: Path, entry: str, timeout_s: float = 8.0) -> str | None:

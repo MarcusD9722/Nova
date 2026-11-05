@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from core.file_extract import ATTACHMENT_HEADER
 from core.logging_setup import get_logger
 from core.llm_runtime import LLMRuntime
 from core.runtime import RuntimeManager
@@ -16,11 +17,29 @@ from memory.unifier import MemoryUnifier
 logger = get_logger(__name__)
 
 
-def _sanitize_user_text(text: str) -> str:
-    """Remove known UI artifacts and collapse whitespace."""
-    if not text:
+#: A pasted transcript, as opposed to a line that merely begins with a word and
+#: a colon. `user: admin` in a docker-compose file is not a transcript, and
+#: treating it as one replaced the whole message with the word "admin"
+#: (audit 2026-11-02, H1).
+_ROLE_LINE_RE = re.compile(r"^(user|assistant|nova|marcus)\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def _sanitize_prose(text: str) -> str:
+    """Clean what the USER typed. Never touches attachment contents.
+
+    Two things this deliberately no longer does:
+
+    * **It does not flatten whitespace.** `re.sub(r"\\s+", " ", t)` put pasted
+      code and every attached file on one line, indentation and all, before the
+      model ever saw it. Runs of spaces and blank lines are tidied; newlines
+      survive.
+    * **It does not trim on a single role-prefixed line.** A transcript needs at
+      least two of them, which is what a real paste looks like, so one stray
+      `user:` can no longer delete the question around it.
+    """
+    t = (text or "").strip()
+    if not t:
         return ""
-    t = text.strip()
 
     # Strip common test tags
     t = re.sub(r"#e2e\b", "", t, flags=re.IGNORECASE)
@@ -29,18 +48,40 @@ def _sanitize_user_text(text: str) -> str:
     # Remove UI/editor artifacts
     t = re.sub(r"\blast edited by\s+Nova\b", "", t, flags=re.IGNORECASE)
 
-    # If the user pasted a transcript, keep only the last user line.
+    # A pasted conversation: keep the last thing the user said in it.
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    if any(ln.lower().startswith("assistant:") or ln.lower().startswith("user:") for ln in lines):
+    role_lines = [ln for ln in lines if _ROLE_LINE_RE.match(ln)]
+    if len(role_lines) >= 2:
         last_user = ""
         for ln in lines:
-            if ln.lower().startswith("user:"):
-                last_user = ln.split(":", 1)[1].strip()
+            m = _ROLE_LINE_RE.match(ln)
+            if m and m.group(1).lower() in ("user", "marcus"):
+                last_user = m.group(2).strip()
         if last_user:
             t = last_user
 
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    # Tidy, don't flatten: horizontal runs collapse, line structure stays.
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r" *\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Clean the user's own words and leave their files alone.
+
+    The attachment block is passed through verbatim. It is DATA — a file the
+    user asked about — and rewriting it changed what Nova was asked to look at:
+    a compose file containing `user: admin` arrived at the model as the single
+    word "admin", with the question gone, and the request still returned 200.
+    """
+    if not text:
+        return ""
+    marker = "\n\n" + ATTACHMENT_HEADER
+    head, sep, tail = text.partition(marker)
+    if not sep:
+        return _sanitize_prose(text)
+    return (_sanitize_prose(head) + sep + tail).strip()
 
 
 @dataclass

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -153,7 +154,32 @@ _NOT_A_NAME = {
     "august", "september", "october", "november", "december",
     "st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "ln", "lane",
     "blvd", "boulevard", "ct", "court", "way", "rings", "circle", "cir",
+    # Weekdays. "Leslie said she'd call me Monday." stored the user's name as
+    # "Monday" — and `_replace_user_name_fact` PURGED the real one first
+    # (audit 2026-11-02, H4).
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "weekend", "week", "month", "year", "morning", "afternoon", "evening", "night",
+    "later", "soon", "sometime", "back", "asap", "uber", "lyft", "taxi",
+    # Verbs that showed up as captured "names" once a connective was optional:
+    # "My kids love pizza" -> child "Love Pizza".
+    "love", "loves", "loved", "hate", "hates", "think", "thinks", "thought",
+    "play", "plays", "played", "eat", "eats", "enjoy", "enjoys", "prefer",
+    "prefers", "know", "knows", "live", "lives", "work", "works", "crazy",
+    "pizza", "dinosaurs", "soccer", "dinner", "lunch", "breakfast",
 }
+
+#: Reporting verbs. If one of these comes before "call me X", the subject of the
+#: sentence is somebody else and X is not what to call the speaker.
+_REPORTED_SPEECH_RE = re.compile(
+    r"\b(?:said|says|saying|told|tells|asked|asks|mentioned|mentions|wants?|"
+    r"wanted|thinks?|thought|promised|texted|emailed|called)\b",
+    re.IGNORECASE,
+)
+
+#: A name statement that is being REFUSED or merely asked about.
+_NAME_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|never|stop|quit|isn'?t|not)\b", re.IGNORECASE)
 
 # Durable-profile attributes surfaced in grounding, most-useful first — the
 # list is walked in this order and truncated, so put what matters early.
@@ -186,9 +212,24 @@ _NAME_QUERY_RE = re.compile(
     r"\b(?:do\s+you\s+know\s+my\s+name|what\s+is\s+my\s+name|who\s+am\s+i)\b",
     re.IGNORECASE,
 )
+#: Self-identification. The lead-in is case-INSENSITIVE and the captured name
+#: is not — same scoped `(?i:...)` trick the family patterns use.
+#:
+#: The lead-in used to be case-sensitive too, so "My name is Marcus." (a capital
+#: M, i.e. how anyone actually types it) matched nothing and stored NOTHING,
+#: while "my name is marcus" would have stored "Marcus". Measured: his own name
+#: was never captured by this path at all (audit 2026-11-02, H4).
 _NAME_STATEMENT_PATTERNS = [
-    re.compile(r"\bmy\s+name\s+is\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b"),
-    re.compile(r"\bcall\s+me\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b"),
+    re.compile(r"(?i:\bmy\s+name\s+is)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b"),
+    # "call me X" only where the speaker is the one doing the asking: the start
+    # of a clause, optionally behind a politeness or "you can". Without that,
+    # "Leslie said she'd call me Monday." renamed him Monday.
+    # …and "call me X <time>" is a request to telephone, not a nickname:
+    # "call me Marc later", "call me Dave tomorrow".
+    re.compile(r"(?i:(?:^|[.!?;]\s*|,\s*)(?:please\s+|just\s+|you\s+can\s+|you\s+may\s+)*"
+               r"call\s+me)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b"
+               r"(?!\s+(?:later|tomorrow|tonight|today|back|soon|then|when|after|"
+               r"at|on|in|before|around|about)\b)"),
 ]
 
 
@@ -242,13 +283,35 @@ def _looks_like_self_history_query(text: str) -> bool:
     return bool(_SELF_HISTORY_RE.search(text or ""))
 
 
+def plausible_person_name(raw: str) -> bool:
+    """Could this fragment plausibly be somebody's name?
+
+    ONE definition, shared by the name path and the family/friend lists. It is
+    deliberately strict: these values feed the grounding block that goes into
+    EVERY later turn, so a false positive is read by the model forever, while a
+    false negative only means the name gets said again.
+    """
+    words = [w for w in re.split(r"\s+", (raw or "").strip()) if w]
+    if not (1 <= len(words) <= 3) or len(" ".join(words)) > 40:
+        return False
+    if any(w.lower() in _NOT_A_NAME for w in words):
+        return False
+    return all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", w) for w in words)
+
+
 def _extract_user_name(text: str) -> str | None:
     raw = (text or "").strip()
     if not raw:
         return None
+    # A question or a refusal is not somebody telling you their name.
+    if "?" in raw or _NAME_NEGATION_RE.search(raw):
+        return None
     for pattern in _NAME_STATEMENT_PATTERNS:
         match = pattern.search(raw)
         if not match:
+            continue
+        # "<someone> said … call me X": the subject is not the speaker.
+        if _REPORTED_SPEECH_RE.search(raw[:match.start()]):
             continue
         candidate = re.sub(r"\s+", " ", match.group(1).strip(" .,!?:;\t\n"))
         if not candidate:
@@ -257,6 +320,10 @@ def _extract_user_name(text: str) -> str | None:
         if not words or len(words) > 4:
             continue
         if any(word.lower() in {"nova", "sorry", "actually", "no"} for word in words):
+            continue
+        # The shared validator, which is where weekdays, months, prepositions
+        # and the rest of the false positives are refused.
+        if not plausible_person_name(candidate):
             continue
         return " ".join(word[:1].upper() + word[1:] for word in words)
     return None
@@ -755,7 +822,11 @@ class RuntimeManager:
             memory=self._memory,
             llm=self._llm,
             router=self._router,
-            tool_descriptions={name: "" for name in self._router.list_tools()},
+            # The ROUTER's real descriptions. This passed `{name: ""}`, so the
+            # unattended loop's prompt listed 82 tools with no description and
+            # no argument shape and the model had to guess (audit, M1). The
+            # supervisor narrows the list itself — see `_offerable_tools`.
+            tool_descriptions=dict(self._router.describe_tools()),
             cfg=SupervisorConfig(tick_seconds=agent_tick),
         )
 
@@ -2968,32 +3039,39 @@ class RuntimeManager:
             held: list[str] = []
             releasing = not guard_on
             async with chat_model.semaphore:
-                async for token in chat_model.runtime.chat_stream(
+                # `aclosing`, because the abandon paths below RETURN out of this
+                # loop. Without it the model stream was merely left suspended:
+                # its worker thread went on decoding a reply nobody would read,
+                # holding the model while the next turn started (audit, C2).
+                stream = chat_model.runtime.chat_stream(
                     msgs, max_tokens=budget, temperature=0.4, thinking=False
-                ):
-                    collected.append(token)
-                    if releasing:
-                        yield {"type": "token", "text": token}
-                        continue
-                    held.append(token)
-                    if sum(len(x) for x in held) >= self._REPEAT_PROBE_CHARS:
-                        probe = "".join(held)
-                        if is_near_duplicate(
-                            probe, [p[:len(probe)] for p in previous_replies]
-                        ):
+                )
+                async with contextlib.aclosing(stream):
+                    async for token in stream:
+                        collected.append(token)
+                        if releasing:
+                            yield {"type": "token", "text": token}
+                            continue
+                        held.append(token)
+                        if sum(len(x) for x in held) >= self._REPEAT_PROBE_CHARS:
+                            probe = "".join(held)
+                            if is_near_duplicate(
+                                probe, [p[:len(probe)] for p in previous_replies]
+                            ):
+                                yield {"type": "_abandoned", "text": "".join(collected)}
+                                return
+                            releasing = True
+                            yield {"type": "token", "text": probe}
+                            held = []
+                    # Anything still held means the probe never cleared, so
+                    # NOTHING has been emitted yet and abandoning here is still
+                    # invisible.
+                    if held:
+                        tail = "".join(held)
+                        if is_near_duplicate(tail, previous_replies):
                             yield {"type": "_abandoned", "text": "".join(collected)}
                             return
-                        releasing = True
-                        yield {"type": "token", "text": probe}
-                        held = []
-                # Anything still held means the probe never cleared, so NOTHING
-                # has been emitted yet and abandoning here is still invisible.
-                if held:
-                    tail = "".join(held)
-                    if is_near_duplicate(tail, previous_replies):
-                        yield {"type": "_abandoned", "text": "".join(collected)}
-                        return
-                    yield {"type": "token", "text": tail}
+                        yield {"type": "token", "text": tail}
             yield {"type": "_complete", "text": "".join(collected)}
 
         async def _run(msgs):
@@ -3759,18 +3837,9 @@ class RuntimeManager:
 
     @staticmethod
     def _looks_like_person_name(raw: str) -> bool:
-        """Could this fragment plausibly be somebody's name?
-
-        Deliberately strict: these lists feed the grounding context that goes
-        into EVERY turn, so a false positive is read by the model forever,
-        while a false negative just means Marcus says the name again.
-        """
-        words = [w for w in re.split(r"\s+", (raw or "").strip()) if w]
-        if not (1 <= len(words) <= 3) or len(" ".join(words)) > 40:
-            return False
-        if any(w.lower() in _NOT_A_NAME for w in words):
-            return False
-        return all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", w) for w in words)
+        """See `plausible_person_name` — one definition, module level, so the
+        name path and these lists cannot disagree about what a name is."""
+        return plausible_person_name(raw)
 
     @staticmethod
     def _split_name_list(text: str) -> list[str]:
@@ -3912,8 +3981,14 @@ class RuntimeManager:
         if user_name:
             await self._replace_user_name_fact(user_name)
 
-        # Location
-        m_loc = re.search(r"\bi\s+live\s+in\s+([A-Za-z][A-Za-z0-9 _\-]{2,60})\b", msg, flags=re.IGNORECASE)
+        # Location. The capture STOPS at the first connective: it used to run
+        # greedily to the end of the sentence, so "I live in Austin with my wife
+        # and two kids" was stored as a location of
+        # "Austin with my wife and two kids" (audit 2026-11-02, H4).
+        m_loc = re.search(
+            r"\bi\s+live\s+in\s+([A-Za-z][A-Za-z0-9 .'\-]{1,58}?)"
+            r"(?=\s*(?:[,.;!?]|$)|\s+(?:with|and|but|where|since|for|near|because|so)\b)",
+            msg, flags=re.IGNORECASE)
         if m_loc:
             loc = m_loc.group(1).strip(" .!?\t\n")
             if loc:
@@ -3956,9 +4031,17 @@ class RuntimeManager:
                 if name:
                     await self._memory.add_fact(entity=target, attribute=attr, value=name, confidence=0.9)
 
-        # Children list
+        # Children list.
+        #
+        # THE CONNECTIVE IS REQUIRED. It used to be optional — `(?:\s+(?:named|
+        # are|:))?` — so any sentence about his kids donated its tail as names:
+        # "My kids love pizza" stored a child called "Love Pizza", "My daughter
+        # loves dinosaurs" stored "Loves Dinosaurs" (audit 2026-11-02, H4).
+        # Introducing names needs a word that introduces them.
         m_kids = re.search(
-            r"\b(?:i\s+have|my)\s+(?:two\s+|three\s+|four\s+|\d+\s+)?(sons|son|daughters|daughter|kids|children)\b(?:\s+(?:named|are|:))?\s+(.+)$",
+            r"\b(?:i\s+have|my)\s+(?:two\s+|three\s+|four\s+|\d+\s+)?"
+            r"(sons|son|daughters|daughter|kids|children)\b"
+            r"\s*(?:,\s*|\s+(?:named|are|is|called)\s+|\s*:\s*)(.+)$",
             msg,
             flags=re.IGNORECASE,
         )
@@ -3973,10 +4056,13 @@ class RuntimeManager:
                 await self._memory.add_fact(entity=target, attribute="children_type", value="daughters", confidence=0.7)
 
         # Siblings / cousins / friends lists (simple)
+        # Same required connective, for the same reason: "My friends think I'm
+        # crazy" stored a friend called "Think I'M Crazy".
+        _INTRO = r"\s*(?:,\s*|\s+(?:are|is|named|called)\s+|\s*:\s*)"
         list_patterns = [
-            (r"\bmy\s+(?:siblings|brothers|sisters)\b(?:\s+(?:are|:|named))?\s+(.+)$", "sibling", 0.85),
-            (r"\bmy\s+cousins?\b(?:\s+(?:are|:|named))?\s+(.+)$", "cousin", 0.85),
-            (r"\bmy\s+friends?\b(?:\s+(?:are|:|named))?\s+(.+)$", "friend", 0.8),
+            (rf"\bmy\s+(?:siblings|brothers|sisters)\b{_INTRO}(.+)$", "sibling", 0.85),
+            (rf"\bmy\s+cousins?\b{_INTRO}(.+)$", "cousin", 0.85),
+            (rf"\bmy\s+friends?\b{_INTRO}(.+)$", "friend", 0.8),
         ]
         for pat, attr, conf in list_patterns:
             mm = re.search(pat, msg, flags=re.IGNORECASE)

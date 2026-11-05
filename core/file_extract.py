@@ -21,6 +21,15 @@ TEXT_SUFFIXES = {
 MAX_BYTES = 200_000
 MAX_CHARS = 12_000
 
+#: The line that separates what the USER typed from the contents of the files
+#: they attached. Defined here, in the module that owns attachment extraction,
+#: because two places need to agree on it: `backend/app.py` writes it, and
+#: `core/brain.py` has to know where the user's prose stops before it starts
+#: rewriting whitespace and role prefixes. Guessing the boundary is how a
+#: compose file containing `user: admin` became the entire user message
+#: (audit 2026-11-02, H1).
+ATTACHMENT_HEADER = "Attached file context:"
+
 
 def read_limited_bytes(path: Path, max_bytes: int = MAX_BYTES) -> tuple[bytes, bool]:
     with path.open("rb") as fh:

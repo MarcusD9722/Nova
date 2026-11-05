@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,24 @@ logger = get_logger(__name__)
 #: cannot drift into the state where cancellation beats the process's own
 #: timeout and nothing kills it.
 _SHELL_MAX_TIMEOUT_S = 120.0
+
+
+def _local_stamp(created_at: Any) -> str:
+    """A stored UTC timestamp, shown in Marcus's own time.
+
+    The model was handed raw UTC and read it as wall-clock time — which is how
+    a bookkeeping stamp of 17:57 became "your dentist appointment at 5:00 PM"
+    (audit 2026-11-02, H6/H7). Anything unparseable is passed through rather
+    than guessed at.
+    """
+    raw = str(created_at or "")
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return raw[:16].replace("T", " ")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 async def _kill_tree(proc: Any) -> None:
@@ -410,11 +428,20 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
                                "can't look back through our conversations.")}
         if rng:
             since, until = rng
+            # LOCAL BOUNDS, UTC COMPARISON. `parse_date_range` works in local
+            # wall-clock time, which is right — "yesterday" means Marcus's
+            # yesterday — but `turns.created_at` is UTC and the two were compared
+            # as strings. At UTC-6 that asked for the wrong 24 hours: "what did
+            # we talk about yesterday" found the morning and afternoon, MISSED
+            # everything after 6pm, and wrongly included the previous evening
+            # (audit 2026-11-02, H7).
+            since_utc = since.astimezone(timezone.utc)
+            until_utc = until.astimezone(timezone.utc)
             rows = await memory.recall_conversation(
-                since_iso=since.isoformat(), until_iso=until.isoformat(), limit=40
+                since_iso=since_utc.isoformat(), until_iso=until_utc.isoformat(), limit=80
             )
             rows.reverse()  # chronological reads better than newest-first
-            lines = [f"{r['speaker']} ({r['created_at'][:16].replace('T', ' ')}): {r['content']}" for r in rows]
+            lines = [f"{r['speaker']} ({_local_stamp(r['created_at'])}): {r['content']}" for r in rows]
             return {
                 "ok": True,
                 "when": f"{since.date()} to {until.date()}",

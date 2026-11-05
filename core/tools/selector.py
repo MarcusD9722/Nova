@@ -384,8 +384,22 @@ class ToolSelector:
         return Selection(tools=picked, stage="semantic", scores=dict(ranked[:12]),
                          reason=f"top score {top:.3f}")
 
+    #: How much grounding may ride along with the question. bge-small truncates
+    #: at 512 tokens, and grounding alone is ~640 on an empty profile — larger
+    #: with real memory — so the QUESTION was being cut off entirely and
+    #: selection ranked tools against Nova's context with no idea what had been
+    #: asked. Measured with real embeddings: the right tool was offered 10 times
+    #: out of 11 on the bare query and 2 out of 11 as shipped
+    #: (audit 2026-11-02, H11).
+    _CONTEXT_CHARS = 600
+
     def _score(self, query: str, descriptions: dict[str, str], *, context: str) -> dict[str, float]:
-        text = f"{context}\n{query}".strip() if context else query
+        # THE QUESTION FIRST, and bounded context after it. The question is what
+        # the selection is about; grounding is a hint. Order matters because the
+        # embedder truncates, and whatever falls off the end is simply not read.
+        q = (query or "").strip()
+        ctx = (context or "").strip()[: self._CONTEXT_CHARS]
+        text = f"{q}\n{ctx}".strip() if ctx else q
         self.cache.sync(descriptions)
         qvec = self.cache.embed_query(text)
         self._has_embeddings = qvec is not None

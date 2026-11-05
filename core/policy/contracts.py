@@ -132,7 +132,38 @@ class AutonomyPlannerOutput(_StrictModel):
     message_to_user: str | None = None
 
 
+def _as_notes(v: Any) -> Any:
+    """Accept what a model actually writes for a list of short notes.
+
+    THE BUG THIS FIXES (audit 2026-11-02, H9). `key_facts` and `open_loops` were
+    declared `list[dict]`, the prompt asked only for `null|[]` with no item
+    shape, and the model obliged with a list of STRINGS. Validation failed, the
+    failure was logged at debug — below the production log level — and the
+    worker dropped the whole summary. The real database after 1,762 turns and
+    110 conversations: 3 rolling summaries and ZERO dated digests.
+
+    Strings become `{"text": ...}` so downstream shapes stay uniform; a dict
+    passes through; anything else is dropped rather than guessed at.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for item in v:
+        if isinstance(item, dict):
+            out.append(item)
+        elif isinstance(item, str) and item.strip():
+            out.append({"text": item.strip()})
+    return out
+
+
 class SummarizerOutput(_StrictModel):
     summary: str = ""
     key_facts: list[dict[str, Any]] | None = None
     open_loops: list[dict[str, Any]] | None = None
+
+    @field_validator("key_facts", "open_loops", mode="before")
+    @classmethod
+    def _coerce_notes(cls, v: Any) -> Any:
+        return _as_notes(v)

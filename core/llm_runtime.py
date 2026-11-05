@@ -5,6 +5,8 @@ import contextlib
 import io
 import os
 import re
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +15,54 @@ from core.logging_setup import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def _perf_logging() -> bool:
+    return (os.getenv("NOVA_LLM_PERF_LOG", "0").strip() or "0").lower() in {"1", "true", "yes", "on"}
+
+
+@contextlib.contextmanager
+def _quiet_generation():
+    """Keep a generation from writing to the console, WITHOUT touching globals.
+
+    Every model call used to run inside `contextlib.redirect_stdout(StringIO())`
+    to swallow llama.cpp's per-call timing lines. `sys.stdout` is
+    process-global, so for the length of a generation anything printed by any
+    other thread went into that StringIO and was lost, and two overlapping
+    redirects restored it out of order and left stdout pointing at a dead
+    object — every later print gone (audit 2026-11-02, M21). This suite's own
+    concurrency test lost its output to exactly that.
+
+    The lines are suppressed at the source instead: the model is loaded with
+    `verbose=False` unless NOVA_LLM_PERF_LOG asks for them, in which case they
+    are wanted and go to the console like any other log. So there is nothing
+    left to redirect, and this stays a context manager only so the call sites
+    read the same either way.
+    """
+    yield
+
+
+@contextlib.contextmanager
+def _hold(lock: threading.Lock, timeout_s: float, what: str):
+    """Own the model, or fail honestly. Runs on the WORKER thread.
+
+    The point of acquiring here rather than in the coroutine is that this cannot
+    be cancelled away: a caller that gives up, times out or is superseded does
+    not release the model early, because the model was never theirs to release —
+    the thread doing the work holds it (audit 2026-11-02, C2).
+
+    The timeout exists only so a leaked worker cannot starve the thread pool
+    forever. Reaching it means something is genuinely stuck, which is worth an
+    exception rather than a hang.
+    """
+    if not lock.acquire(timeout=timeout_s):
+        raise GPUEnforcementError(
+            f"the model was still busy after {timeout_s:.0f}s, so this {what} "
+            f"call was dropped rather than run alongside it")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 @dataclass(frozen=True)
@@ -246,6 +296,33 @@ class LLMRuntime:
                 self._chat_format = "llama-3"
         self._llama: Any | None = None
         self._vision_llama: Any | None = None
+        # ── THE CHOKEPOINT (audit 2026-11-02, C2) ────────────────────────────
+        #
+        # `core/gpu.py`'s semaphore was the only thing serialising the model,
+        # and it cannot do the job: the work runs in `asyncio.to_thread`, which
+        # CANNOT be cancelled, so any timeout or early exit releases the permit
+        # while the worker thread is still inside `Llama`. The next caller then
+        # walks in and llama.cpp aborts the whole process —
+        # `ggml-cuda.cu:102 CUDA error`, exit 127, no traceback.
+        #
+        # Measured: closing a reply stream partway through killed Nova 7 times
+        # out of 7. The Stop button, sending while she is replying, and voice
+        # barge-in all do exactly that.
+        #
+        # A threading.Lock acquired INSIDE the worker and held across the whole
+        # llama call is the one guard cancellation cannot step around: a second
+        # thread blocks here instead of entering the model. The semaphore stays
+        # — it keeps callers from queueing up in the first place — but it is no
+        # longer what makes this safe.
+        self._llama_lock = threading.Lock()
+        #: How long a queued generation waits for the model before giving up.
+        #: Generous: this is "wait your turn", and the only thing it protects
+        #: against is a leaked thread holding the lock forever and starving the
+        #: thread pool. An honest failure beats a hung assistant.
+        self._lock_wait_s = float(os.getenv("NOVA_LLM_LOCK_WAIT_S", "300") or 300)
+        #: Vision requests queued or in flight — see `vision_analyze`.
+        self._vision_pending = 0
+        self._warmed = False
         self._gpu_status = GpuStatus(required=bool(model_path), active=False, status="model_missing" if not model_path else "not_loaded")
         self._init_lock = asyncio.Lock()
         # Rolling token usage for the UI (updated by chat/chat_stream).
@@ -316,6 +393,42 @@ class LLMRuntime:
             self._gpu_status = GpuStatus(required=True, active=True, status="gpu_offload_confirmed")
             logger.info("llm_loaded", model=str(self._model_path), n_ctx=self._context_tokens)
 
+    async def warm_up(self) -> float:
+        """Burn the first inference at BOOT, where nothing is waiting on it.
+
+        The build of llama-cpp-python in this venv ships no `sm_120` kernels, so
+        on an RTX 5080 they are JIT-compiled on first use and cached by the
+        driver. That takes ~15.7s cold and ~0.3s warm — and the first thing a
+        turn does is a model call with a 12s timeout around it, so a cold cache
+        meant the timeout fired mid-compile, released the GPU permit, and the
+        next call entered the model beside a thread that was still in it: 4
+        aborted boots out of 4 (audit 2026-11-02, C2).
+
+        Doing it here means the compile happens once, with no deadline, before
+        anyone can be let down by it. Anything that empties the driver's cache —
+        a driver update, cache eviction — is absorbed the same way.
+
+        Returns the seconds it took; 0.0 when there is nothing to warm.
+        """
+        if self._warmed or self._model_path is None:
+            return 0.0
+        self._warmed = True
+        import time as _time
+
+        t0 = _time.perf_counter()
+        try:
+            await self.initialize()
+            await self.chat([{"role": "user", "content": "ok"}],
+                            max_tokens=4, temperature=0.0)
+        except Exception as e:  # noqa: BLE001
+            # A failed warm-up is not a failed boot: the next real call will
+            # report whatever is wrong. Saying so is the point.
+            logger.warning("llm_warmup_failed", error=str(e)[:200])
+            return 0.0
+        took = _time.perf_counter() - t0
+        logger.info("llm_warmed", seconds=round(took, 2))
+        return took
+
     def _load_llama_text_only(self) -> tuple[Any, str]:
         if self._model_path is None:
             raise RuntimeError("Model path is None")
@@ -326,7 +439,12 @@ class LLMRuntime:
         from llama_cpp import Llama  # type: ignore
 
         buf = io.StringIO()
-        logs: list[str] = []
+        # BOUNDED. The callback installed below lives for the life of the
+        # process — llama.cpp keeps calling it on every generation — and it used
+        # to append into a plain list captured by this closure, so every log
+        # line llama ever emitted was retained forever (audit, M21 neighbourhood).
+        # Only the load-time lines are ever read, and there are a few dozen.
+        logs: deque[str] = deque(maxlen=400)
 
         # Try to capture llama.cpp logs via callback if available.
         log_cb_set: Callable[..., Any] | None = None
@@ -369,15 +487,30 @@ class LLMRuntime:
             llama = Llama(**llama_kwargs)
 
         combined = "".join(logs) + "\n" + buf.getvalue()
+        # Generation is QUIET from here on, and that is what lets the per-call
+        # `redirect_stdout` go away. `verbose=True` is needed above — the
+        # GPU-offload confirmation is only in those load logs — but keeping it on
+        # meant every generation printed timings, which is why each call wrapped
+        # itself in a redirect of the process-global stdout. That swallowed
+        # anything ANOTHER thread printed during the window, and restored out of
+        # order under concurrency (audit, M21). Nothing to suppress, nothing to
+        # redirect.
+        if not _perf_logging():
+            with contextlib.suppress(Exception):
+                llama.verbose = False
         return llama, combined
 
 
     @staticmethod
     def _emit_perf_lines(log_text: str) -> None:
-        verbose_perf = (os.getenv("NOVA_LLM_PERF_LOG", "0").strip() or "0").lower() in {"1", "true", "yes", "on"}
-        if not verbose_perf:
-            return
-        if not log_text:
+        """Print llama's own timing lines out of a captured log.
+
+        No longer called per generation: with NOVA_LLM_PERF_LOG off the model is
+        loaded quiet, and with it on llama prints these itself. Kept because the
+        LOAD path still captures a log, and a caller that wants to surface the
+        timings from it should use this rather than inventing a second filter.
+        """
+        if not _perf_logging() or not log_text:
             return
         keep_prefixes = ("Llama.generate:", "llama_perf_context_print:")
         seen: set[str] = set()
@@ -430,6 +563,30 @@ class LLMRuntime:
             self._vision_llama = await asyncio.to_thread(self._load_vision_llama)
         return self._vision_llama
 
+    def _free_vision_llama(self) -> None:
+        """Give the VRAM back.
+
+        `_load_vision_llama` loads the SAME weights a second time with a vision
+        projector attached, and nothing ever unloaded it. On the 16 GB card that
+        took usage from 11.5 GB to 15.9 GB and left it there, so every later
+        chat turn ran at 55-108s instead of 4-5s, until a restart. Measured 3
+        times out of 3 (audit 2026-11-02, H21).
+        """
+        llama, self._vision_llama = self._vision_llama, None
+        if llama is None:
+            return
+        try:
+            closer = getattr(llama, "close", None)
+            if callable(closer):
+                closer()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("vision_close_failed", error=str(e)[:160])
+        del llama
+        import gc
+
+        gc.collect()
+        logger.info("vision_model_unloaded")
+
     async def generate(
         self,
         prompt: str,
@@ -474,38 +631,37 @@ class LLMRuntime:
         messages = _apply_no_think(messages, thinking=thinking)
 
         def _run() -> str:
-            sink = io.StringIO()
-            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                # Prefer chat-completions for modern instruct models.
-                if hasattr(self._llama, "create_chat_completion"):
-                    out = self._llama.create_chat_completion(
-                        messages=messages,
-                        max_tokens=int(max_tokens),
-                        temperature=float(temperature),
-                        stop=stop_seq,
-                        top_k=40,
-                        top_p=0.9,
-                        repeat_penalty=1.15,
-                    )
-                    result = _extract_chat_text(out)
-                    usage = (out or {}).get("usage") or {}
-                    self._record_usage(
-                        prompt_tokens=usage.get("prompt_tokens"),
-                        reply_tokens=int(usage.get("completion_tokens") or 0),
-                    )
-                else:
-                    # Fallback: raw completion
-                    out = self._llama(
-                        "\n".join([m.get("content", "") for m in messages if isinstance(m.get("content"), str)]),
-                        max_tokens=int(max_tokens),
-                        temperature=float(temperature),
-                        top_k=40,
-                        top_p=0.9,
-                        repeat_penalty=1.15,
-                        stop=stop_seq,
-                    )
-                    result = str(out.get("choices", [{}])[0].get("text", "")).strip()
-            self._emit_perf_lines(sink.getvalue())
+            with _hold(self._llama_lock, self._lock_wait_s, "chat"):
+                with _quiet_generation():
+                    # Prefer chat-completions for modern instruct models.
+                    if hasattr(self._llama, "create_chat_completion"):
+                        out = self._llama.create_chat_completion(
+                            messages=messages,
+                            max_tokens=int(max_tokens),
+                            temperature=float(temperature),
+                            stop=stop_seq,
+                            top_k=40,
+                            top_p=0.9,
+                            repeat_penalty=1.15,
+                        )
+                        result = _extract_chat_text(out)
+                        usage = (out or {}).get("usage") or {}
+                        self._record_usage(
+                            prompt_tokens=usage.get("prompt_tokens"),
+                            reply_tokens=int(usage.get("completion_tokens") or 0),
+                        )
+                    else:
+                        # Fallback: raw completion
+                        out = self._llama(
+                            "\n".join([m.get("content", "") for m in messages if isinstance(m.get("content"), str)]),
+                            max_tokens=int(max_tokens),
+                            temperature=float(temperature),
+                            top_k=40,
+                            top_p=0.9,
+                            repeat_penalty=1.15,
+                            stop=stop_seq,
+                        )
+                        result = str(out.get("choices", [{}])[0].get("text", "")).strip()
             return _strip_think(result)
 
         # Occasionally the reasoning model burns its whole generation on an
@@ -533,12 +689,18 @@ class LLMRuntime:
 
         Callers that need to know WHY generation ended use `chat_stream_ex`.
         """
-        async for event in self.chat_stream_ex(
+        # `aclosing` so that closing THIS generator deterministically closes the
+        # one underneath. Without it the inner generator waited for garbage
+        # collection, and until it was collected its worker thread kept decoding
+        # tokens nobody wanted — which is the abandoned-stream half of C2.
+        inner = self.chat_stream_ex(
             messages, max_tokens=max_tokens, temperature=temperature,
             stop=stop, thinking=thinking,
-        ):
-            if event.get("type") == "token":
-                yield event["text"]
+        )
+        async with contextlib.aclosing(inner):
+            async for event in inner:
+                if event.get("type") == "token":
+                    yield event["text"]
 
     async def chat_stream_ex(
         self,
@@ -615,35 +777,49 @@ class LLMRuntime:
 
         loop = asyncio.get_running_loop()
 
-        def _produce(q: asyncio.Queue, messages: list[dict[str, Any]], max_tokens: int) -> None:
-            sink = io.StringIO()
+        def _produce(q: asyncio.Queue, messages: list[dict[str, Any]], max_tokens: int,
+                     cancel: threading.Event) -> None:
             reply_tokens = 0
             try:
-                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                    stream = self._llama.create_chat_completion(
-                        messages=messages,
-                        max_tokens=int(max_tokens),
-                        temperature=float(temperature),
-                        stop=stop_seq,
-                        top_k=40,
-                        top_p=0.9,
-                        repeat_penalty=1.15,
-                        stream=True,
-                    )
-                    for chunk in stream:
-                        try:
-                            choice = (chunk.get("choices") or [{}])[0]
-                            delta = choice.get("delta") or {}
-                            token = delta.get("content")
-                            reason = choice.get("finish_reason")
-                            if reason:
-                                loop.call_soon_threadsafe(
-                                    q.put_nowait, _FinishReason(str(reason)))
-                        except Exception:
-                            token = None
-                        if token:
-                            reply_tokens += 1
-                            loop.call_soon_threadsafe(q.put_nowait, token)
+                # Held across the WHOLE stream, including iteration: each
+                # `next(stream)` is a decode step inside llama.cpp, so the model
+                # is in use until the loop ends (audit, C2).
+                with _hold(self._llama_lock, self._lock_wait_s, "chat_stream"):
+                    with _quiet_generation():
+                        stream = self._llama.create_chat_completion(
+                            messages=messages,
+                            max_tokens=int(max_tokens),
+                            temperature=float(temperature),
+                            stop=stop_seq,
+                            top_k=40,
+                            top_p=0.9,
+                            repeat_penalty=1.15,
+                            stream=True,
+                        )
+                        for chunk in stream:
+                            # Nobody is reading any more: the turn was abandoned,
+                            # the Stop button was pressed, or a new message
+                            # superseded this one. Stop decoding rather than
+                            # finishing a reply that will be thrown away — and,
+                            # more importantly, release the model promptly so the
+                            # next turn is not waiting on dead work.
+                            if cancel.is_set():
+                                with contextlib.suppress(Exception):
+                                    stream.close()
+                                break
+                            try:
+                                choice = (chunk.get("choices") or [{}])[0]
+                                delta = choice.get("delta") or {}
+                                token = delta.get("content")
+                                reason = choice.get("finish_reason")
+                                if reason:
+                                    loop.call_soon_threadsafe(
+                                        q.put_nowait, _FinishReason(str(reason)))
+                            except Exception:
+                                token = None
+                            if token:
+                                reply_tokens += 1
+                                loop.call_soon_threadsafe(q.put_nowait, token)
                 loop.call_soon_threadsafe(q.put_nowait, None)
             except Exception as e:  # noqa: BLE001
                 loop.call_soon_threadsafe(q.put_nowait, e)
@@ -652,7 +828,6 @@ class LLMRuntime:
                     # Each stream delta is one token; prompt size isn't reported
                     # by the streaming API, so leave the last known value.
                     self._record_usage(prompt_tokens=None, reply_tokens=reply_tokens)
-                self._emit_perf_lines(sink.getvalue())
 
         # Occasionally the reasoning model burns its whole generation on an
         # unclosed <think> block and nothing visible ever comes out. Nothing
@@ -662,8 +837,9 @@ class LLMRuntime:
         for attempt in range(3):
             attempt_messages, attempt_budget = _attempt_messages(attempt)
             queue: asyncio.Queue[str | None | Exception] = asyncio.Queue(maxsize=512)
+            cancel = threading.Event()
             producer = asyncio.create_task(
-                asyncio.to_thread(_produce, queue, attempt_messages, attempt_budget)
+                asyncio.to_thread(_produce, queue, attempt_messages, attempt_budget, cancel)
             )
             think_filter = _ThinkStreamFilter()
             produced_any = False
@@ -690,7 +866,14 @@ class LLMRuntime:
                     produced_any = True
                     yield {"type": "token", "text": tail}
             finally:
-                await producer
+                # Tell the worker to stop BEFORE waiting for it. This block runs
+                # on a normal finish, on `aclose()`, and on GeneratorExit — which
+                # is the abandoned-stream case: the consumer stopped reading and
+                # the model would otherwise decode to the end of its budget
+                # while nobody wanted the words.
+                cancel.set()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(producer)
             if produced_any:
                 # A caller cannot otherwise tell "the model finished" from "the
                 # model ran out of budget mid-sentence" — which is exactly how a
@@ -740,23 +923,38 @@ class LLMRuntime:
             }
         ]
 
-        llama = await self._ensure_vision_llama()
+        # Two things this counter does. It lets a burst of image questions share
+        # one load, and it tells the end of this call whether anybody else still
+        # needs the vision model — which is what makes freeing it safe.
+        self._vision_pending += 1
+        try:
+            llama = await self._ensure_vision_llama()
 
-        def _run_vision() -> str:
-            sink = io.StringIO()
-            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                out = llama.create_chat_completion(
-                    messages=messages,
-                    max_tokens=int(max_tokens),
-                    temperature=float(temperature),
-                    top_k=40,
-                    top_p=0.9,
-                    repeat_penalty=1.15,
-                )
-            # Intentionally do not print vision startup/prompt internals to backend logs.
-            return _strip_think(_extract_chat_text(out))
+            def _run_vision() -> str:
+                # Same lock as chat. Two llama.cpp contexts in one process are
+                # two uncoordinated CUDA consumers, which is the arrangement
+                # core/gpu.py exists because of — and vision took no permit at
+                # all (audit, C2/H21).
+                with _hold(self._llama_lock, self._lock_wait_s, "vision"):
+                    with _quiet_generation():
+                        out = llama.create_chat_completion(
+                            messages=messages,
+                            max_tokens=int(max_tokens),
+                            temperature=float(temperature),
+                            top_k=40,
+                            top_p=0.9,
+                            repeat_penalty=1.15,
+                        )
+                # Intentionally do not print vision startup/prompt internals to backend logs.
+                return _strip_think(_extract_chat_text(out))
 
-        return await asyncio.to_thread(_run_vision)
+            return await asyncio.to_thread(_run_vision)
+        finally:
+            self._vision_pending -= 1
+            if self._vision_pending <= 0:
+                # Last one out frees the VRAM. A reload costs ~20s on the next
+                # image; keeping it loaded cost 20x on every chat turn forever.
+                await asyncio.to_thread(self._free_vision_llama)
 
 
 _THINK_OPEN = "<think>"

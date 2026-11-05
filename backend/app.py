@@ -38,6 +38,7 @@ from core.file_extract import extract_excerpt as _extract_attachment_excerpt
 from core.file_extract import TEXT_SUFFIXES as _ATTACHMENT_TEXT_SUFFIXES
 from core.file_extract import MAX_BYTES as _ATTACHMENT_MAX_BYTES
 from core.file_extract import MAX_CHARS as _ATTACHMENT_MAX_CHARS
+from core.file_extract import ATTACHMENT_HEADER as _ATTACHMENT_HEADER
 from core.gpu_telemetry import get_gpu_telemetry
 from core.llm_runtime import GPUEnforcementError, LLMRuntime
 from core.logging_setup import get_logger, setup_logging
@@ -134,7 +135,7 @@ def _compose_chat_message(cfg: "RuntimeConfig", message: str | None, attachments
     if not attachment_context:
         return clean_message
 
-    return f"{clean_message}\n\nAttached file context:\n{attachment_context}"
+    return f"{clean_message}\n\n{_ATTACHMENT_HEADER}\n{attachment_context}"
 
 
 
@@ -1362,6 +1363,22 @@ async def _startup() -> None:
             STATE.mcp = mgr
 
         STATE.mcp_task = asyncio.create_task(_start_mcp())
+
+    # Burn the model's first inference HERE, while nothing is waiting on it.
+    #
+    # On this card llama-cpp JIT-compiles its kernels on first use (~15.7s cold,
+    # ~0.3s warm). The first thing a turn does is a model call wrapped in a 12s
+    # timeout, so a cold driver cache meant the timeout fired mid-compile, the
+    # GPU permit was released while the worker was still inside llama, and the
+    # next call entered beside it: 4 dead boots out of 4 (audit, C2). The lock
+    # in LLMRuntime makes that survivable; warming makes it not happen.
+    if (os.getenv("NOVA_LLM_WARMUP", "1").strip() or "1").lower() not in {"0", "false", "no", "off"}:
+        try:
+            took = await llm.warm_up()
+            if took:
+                _bullet(f"Model warm: first inference took {took:.1f}s")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("llm_warmup_error", error=str(e)[:200])
 
     if (os.getenv("NOVA_TTS_PREWARM", "0").strip() or "0").lower() not in {"0", "false", "no", "off"}:
         # Load + warm XTTS in the background so Nova can speak immediately.
