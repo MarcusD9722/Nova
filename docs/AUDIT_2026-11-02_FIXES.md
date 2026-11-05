@@ -347,6 +347,33 @@ one that logs the empty case as a `DIRECT`, one that records it at `debug`
 where nobody looks, one that flags every approval so the flag means nothing,
 and one that lets the critic block a reply.
 
+### The other three callers, and what actually predicts this
+
+Deep mode was found by asking which *other* code paths ask for reasoning, so
+the rest were checked too rather than assumed. There are four in production:
+
+| caller | budget | verdict |
+|---|---|---|
+| `DeepPipeline.plan` / `.critique` | 400 | **was broken** — empty 6/6, fixed above |
+| `ToolLoopExecutor.decide` | 900 | **fine** — measured 5/5 correct, 1.4–4.9 s, zero retries |
+| deep reply in `core/runtime.py` | 1536 | sound: an empty draft is caught (`"Sorry — I came up empty on that one."`), and the revision step already passes `thinking=False` for this exact failure (audit, M19) |
+| `ProjectBuilder._llm_json` | varies | sound: already escalates (audit, H15) |
+
+`decide` is the useful one, because it **refutes the obvious explanation**. The
+measured failures were 400 (empty 6/6), 1024 (1 of 3) and 1200 (3 of 3), which
+invites the rule "under ~1200 tokens with reasoning on, expect nothing" — and
+900 would sit well inside that. It does not fail. It returns a correct tool
+choice in 1.4–4.9 s and never once hit a retry.
+
+So the budget number alone predicts nothing. What overflows is **how much
+deliberation the task provokes, measured against the budget it was given**. A
+tool decision emits about 30 tokens of JSON and needs little weighing, so 900
+is roomy. A critique must hold a draft, a plan and real tool results in mind
+before judging, and 400 is not enough to finish thinking, let alone answer. A
+story must carry a plot. That is also why the escalation is the right shape:
+it does not guess which tasks are hard, it lets a task that could not finish
+thinking say so by returning nothing, and only then pays for more.
+
 **What this says about the test suite.** Every suite substitutes `ScriptedLLM`;
 not one asks the real model for a sentence. A fix that changes how the prompt is
 *built* changes what the output *looks like*, and the output-side code has no way
