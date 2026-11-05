@@ -17,6 +17,7 @@ If a future change makes an MCP call that skips any of those, that is a bug no
 matter how much faster it is.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -199,14 +200,49 @@ class McpManager:
                 details={"server": cap.server_id, "tool": cap.remote_name,
                          "destructive": cap.destructive, "read_only": cap.read_only},
             )
+        except asyncio.CancelledError:
+            # The turn above was abandoned. Not a denial: say nothing about a
+            # decision nobody made, and let the cancellation through.
+            raise
         except Exception as e:  # noqa: BLE001
             return f"permission check failed for {cap.cap_id}: {type(e).__name__}: {e}"
-        if isinstance(verdict, dict) and verdict.get("allowed"):
+
+        # PermissionBroker.request returns {"decision": allowed | denied |
+        # needs_confirmation}. This asked for `verdict["allowed"]`, a key the
+        # broker has never returned, so EVERY call was denied in every mode —
+        # read-only tools included — and every needs_confirmation request was
+        # left pending, approvable minutes later by a click (audit, H13). The
+        # test that covered it passed because its fake broker returned the
+        # made-up shape. Same three-way handling as `_gate` in core/tooling.py.
+        decision = verdict.get("decision") if isinstance(verdict, dict) else None
+        if decision == "allowed":
             return None
-        reason = ""
-        if isinstance(verdict, dict):
-            reason = str(verdict.get("reason") or verdict.get("decision") or "")
-        return f"permission denied for {cap.cap_id}" + (f": {reason}" if reason else "")
+        if decision == "denied":
+            reason = str(verdict.get("reason") or "") if isinstance(verdict, dict) else ""
+            return (f"permission denied for {cap.cap_id}"
+                    + (f": {reason}" if reason else ""))
+        if decision == "needs_confirmation":
+            request_id = str(verdict.get("request_id") or "")
+            if not request_id:
+                return (f"permission for {cap.cap_id} needs confirmation but the "
+                        "broker returned no request to confirm")
+            # Wait on the broker's own approval window. Not waiting is what
+            # left requests pending: the call was refused here while the
+            # request stayed live and resolvable long after this caller was
+            # gone.
+            if await self._permissions.await_decision(request_id):
+                return None
+            outcome = ""
+            settled = getattr(self._permissions, "settled_as", None)
+            if callable(settled):
+                outcome = str(settled(request_id) or "")
+            return (f"you did not approve {cap.cap_id}"
+                    + (f" ({outcome})" if outcome else " (declined or timed out)")
+                    + " — nothing was sent to the server")
+        # An unrecognised shape is not permission. Fail closed and name it, so
+        # a broker change cannot quietly turn into an allow.
+        return (f"permission check for {cap.cap_id} returned an unrecognised "
+                f"verdict ({decision!r}); refusing")
 
     def _normalise_result(self, raw: dict) -> tuple[str, bool, bool]:
         """MCP results are a content-block list. Flatten to bounded text."""

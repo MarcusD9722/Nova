@@ -39,13 +39,18 @@ def cfg(server_id, mode="normal", **kw):
         env={"NOVA_FAKE_MCP_MODE": mode}, **kw)
 
 
+# These fakes return the shape PermissionBroker.request ACTUALLY returns:
+# {"decision": allowed | denied | needs_confirmation}. They used to return
+# {"allowed": bool}, a key the broker has never had, which is why this file
+# stayed green while every real MCP call was denied in every mode (audit
+# 2026-11-02, H13). tests/test_audit_mcp_2026_11.py drives the real broker.
 class AllowBroker:
     def __init__(self):
         self.asked = []
 
     async def request(self, capability, details=None):
         self.asked.append((capability, details or {}))
-        return {"allowed": True}
+        return {"decision": "allowed"}
 
 
 class DenyBroker:
@@ -54,7 +59,7 @@ class DenyBroker:
 
     async def request(self, capability, details=None):
         self.asked.append((capability, details or {}))
-        return {"allowed": False, "reason": "denied by policy"}
+        return {"decision": "denied", "reason": "denied by policy"}
 
 
 # ── sanitising ───────────────────────────────────────────────────────────────

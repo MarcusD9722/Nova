@@ -139,14 +139,35 @@ async def test_case_invariance_end_to_end():
 async def test_ambiguous_names_ask_rather_than_guess():
     check.section("A: genuinely ambiguous boundaries FAIL CLOSED")
 
+    # PREPOSITIONS stay ambiguous. "Man with a Plan" and "Python for
+    # Beginners" are real titles and no word list can tell them apart from
+    # "Serpent with a dark theme", so Nova asks and quoting settles it.
     for text in ("create a project called Serpent with a dark theme",
                  "create a project called Man with a Plan",
                  "create a project called Python for Beginners",
                  "create a project called apps using ai",
-                 "create a project called Serpent that tracks spending"):
+                 # Added for audit 2026-11-02 H16: "as" was missing from the
+                 # ambiguous set, so this became `serpent-as-a-single-html-file`.
+                 "create a project called Serpent as a single HTML file"):
         got = _name(text)
         check(got == NEEDS_NAME,
               f"{text!r} -> asks for clarification ({got!r})")
+
+    # A RELATIVE CLAUSE is different, and this assertion changed with audit
+    # 2026-11-02 H16. "called Serpent that tracks spending" used to ask for a
+    # name — the finding reported the same grammar ("a script called
+    # word-counter that counts words in a text file") as a defect, because
+    # asking what to call a project the user has just named reads as broken,
+    # and the reply to that question did nothing anyway. A title containing a
+    # relative clause is rare, and quoting still states one exactly.
+    for text, want in (
+        ("create a project called Serpent that tracks spending", "Serpent"),
+        ("create a project called Ledger which tracks spending", "Ledger"),
+        ('create a project called "The Engine That Could"',
+         "The Engine That Could"),
+    ):
+        got = _name(text)
+        check(got == want, f"{text!r} -> {got!r} (want {want!r})")
 
     # Quoting removes the ambiguity, and is honoured exactly.
     for text, want in (

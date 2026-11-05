@@ -48,6 +48,11 @@ from core.project_intent import (
     qualified_project_name,
 )
 from core.gpu import GPU_SEM
+from core.prompt_budget import DROP as _DROP
+from core.prompt_budget import TRIM_OLDEST as _TRIM_OLDEST
+from core.prompt_budget import TRIM_TAIL as _TRIM_TAIL
+from core.prompt_budget import Block as _Block
+from core.prompt_budget import fit as _fit_prompt
 from core.turn_gate import GATE
 from core.capabilities.navigation import Navigation, extract_directions
 from core.project_builder import (
@@ -61,6 +66,8 @@ from core.project_builder import (
     NEEDS_NAME,
     RESUME_WORDS_RE,
     STATUS_WORDS_RE,
+    asks_project_status,
+    plausible_project_name,
 )
 from core.orchestrator.agent import Agent, ToolLoopExecutor
 from core.tools.selector import ToolSelector
@@ -112,8 +119,15 @@ def _now() -> datetime:
 
 # ── Tool-assist helpers ──────────────────────────────────────────────────────
 
+#: Asking for the clock. The loose forms must END there — "what's the time" and
+#: "tell me the time" were matching inside "What's the time complexity of
+#: quicksort?" and "Tell me the time you were most proud", and Nova answered
+#: both with the time of day (audit 2026-11-02, H2).
 _TIME_QUERY_RE = re.compile(
-    r"\b(?:what\s+time\s+is\s+it|what(?:'s|\s+is)\s+the\s+time|current\s+time|tell\s+me\s+the\s+time)\b",
+    r"\bwhat\s+time\s+is\s+it\b"
+    r"|\bcurrent\s+time\b"
+    r"|\b(?:what(?:'s|\s+is)\s+the\s+time|tell\s+me\s+the\s+time)"
+    r"(?=\s*[,.!?]*\s*$|\s+(?:now|right\s+now|again|there|please)\b)",
     re.IGNORECASE,
 )
 _DATE_QUERY_RE = re.compile(
@@ -121,10 +135,51 @@ _DATE_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Trailing words that are not part of a city name. "What's the weather in
+#: Austin right now?" sent OpenWeather a city called "Austin right now" and got
+#: a 404 back — twice, in the real error log (audit 2026-11-02, H2).
+_WEATHER_TAIL = (r"today|tonight|tomorrow|this\s+\w+|right\s+now|now|currently|"
+                 r"please|at\s+the\s+moment|outside|later|again")
 _WEATHER_CITY_RE = re.compile(
-    r'\bweather\b[^.!?]{0,60}?\b(?:in|for|at)\b\s*([A-Za-z][A-Za-z\s]{1,28}?)(?:\?|$|\s+(?:today|tonight|tomorrow|this\b))',
+    r"\bweather\b[^.!?]{0,60}?\b(?:in|for|at)\b\s*"
+    r"([A-Za-z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}?)"
+    rf"(?=\s*[?.,!]|\s*$|\s+(?:{_WEATHER_TAIL})\b)",
     re.IGNORECASE,
 )
+#: Adjectives that make "<word> weather" a remark, not a place. "Bad weather is
+#: the worst" looked up the weather for a city called "Bad".
+_WEATHER_ADJECTIVES = {
+    "bad", "good", "great", "nice", "lovely", "awful", "terrible", "horrible",
+    "cold", "hot", "warm", "cool", "wet", "dry", "rough", "perfect", "beautiful",
+    "miserable", "crazy", "weird", "strange", "typical", "british", "english",
+    "this", "that", "the", "some", "such", "any",
+}
+#: Is this message actually ASKING about the weather? The branch used to fire on
+#: the mere presence of the word, so "Is the weather app in my project any good?"
+#: looked up a city called "my project any good".
+_WEATHER_REQUEST_RE = re.compile(
+    r"\b(?:what(?:'s|\s+is|\s+was)?|how(?:'s|\s+is)?|is\s+it|will\s+it|any|"
+    r"check|look\s+up|tell\s+me|give\s+me|show\s+me|do\s+i\s+need)\b"
+    r"[^.!?]{0,40}\b(?:weather|forecast|temperature|rain|snow|humidity|wind)\b"
+    r"|\b(?:weather|forecast|temperature)\b[^.!?]{0,30}\b(?:in|for|at|like|today|"
+    r"tonight|tomorrow|outside|right\s+now)\b",
+    re.IGNORECASE,
+)
+#: …and these say the sentence is about something that merely HAS weather in its
+#: name, rather than about the weather.
+_WEATHER_NOT_ABOUT_RE = re.compile(
+    r"\b(?:app|application|widget|api|website|site|page|code|project|module|"
+    r"plugin|tool|script|channel|icon|dashboard)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_about_weather(text: str) -> bool:
+    """Is this a request for the weather, or a sentence that mentions it?"""
+    t = text or ""
+    return bool(_WEATHER_REQUEST_RE.search(t)) and not _WEATHER_NOT_ABOUT_RE.search(t)
+
+
 _WEATHER_CITY_LEAD_RE = re.compile(
     r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+weather\b',
 )
@@ -168,6 +223,45 @@ _NOT_A_NAME = {
     "prefers", "know", "knows", "live", "lives", "work", "works", "crazy",
     "pizza", "dinosaurs", "soccer", "dinner", "lunch", "breakfast",
 }
+
+#: A reply claiming the work is finished, working or verified. Used to catch a
+#: claim the authoritative record contradicts — see `_false_completion_notice`.
+#: Deliberately about COMPLETION, not about progress: "I'm still working on it"
+#: is honest and must not be corrected.
+_CLAIMS_DONE_RE = re.compile(
+    r"\b(?:it(?:'s| is)? (?:all )?(?:done|ready|finished|complete|working|set up)|"
+    r"all (?:set|done|ready|good|working)|ready to (?:go|use|try|ship)|"
+    r"(?:i(?:'ve| have)? )?finished (?:it|that|them|everything|the)|"
+    r"(?:i(?:'ve| have)? )?(?:already )?(?:built|implemented|added|updated|fixed|"
+    r"written|wrote) (?:it|that|them|the|those)|"
+    r"tests? (?:are|is|were|all) (?:written|passing|green|done)|"
+    r"(?:everything|it all) (?:works|passed|checks out)|"
+    r"(?:verified|confirmed) (?:it|that|everything)|"
+    r"(?:the|that|this) (?:script|app|game|code|project|file) is (?:built|ready|done|working)|"
+    r"you can (?:use|try|run) it now)\b",
+    re.IGNORECASE,
+)
+
+#: A negation just before the claim turns it into its opposite: "I haven't built
+#: that yet" is honest and must never be corrected.
+_NEGATED_CLAIM_RE = re.compile(
+    r"\b(?:not|isn'?t|aren'?t|wasn'?t|weren'?t|haven'?t|hasn'?t|hadn'?t|don'?t|"
+    r"doesn'?t|didn'?t|won'?t|can'?t|cannot|never|nothing|no)\b[^.!?]{0,24}$",
+    re.IGNORECASE,
+)
+
+
+def _claims_completion(reply: str) -> bool:
+    """Does this reply assert the work is finished, working or verified?"""
+    for m in _CLAIMS_DONE_RE.finditer(reply or ""):
+        before = (reply or "")[:m.start()]
+        # Only the current clause counts, so "I didn't finish. It's ready now."
+        # is read as the claim it ends with.
+        clause = re.split(r"[.!?;]", before)[-1]
+        if _NEGATED_CLAIM_RE.search(clause):
+            continue
+        return True
+    return False
 
 #: Reporting verbs. If one of these comes before "call me X", the subject of the
 #: sentence is somebody else and X is not what to call the speaker.
@@ -236,10 +330,15 @@ _NAME_STATEMENT_PATTERNS = [
 def _extract_weather_city(text: str) -> str | None:
     m = _WEATHER_CITY_RE.search(text)
     if m:
-        return m.group(1).strip().rstrip(" ,.")
+        city = m.group(1).strip().rstrip(" ,.")
+        if city and city.split()[0].lower() not in _WEATHER_ADJECTIVES:
+            return city
     m = _WEATHER_CITY_LEAD_RE.search(text)
     if m:
-        return m.group(1).strip()
+        lead = m.group(1).strip()
+        # "<Adjective> weather" is a remark about the sky, not a city.
+        if lead and lead.split()[0].lower() not in _WEATHER_ADJECTIVES:
+            return lead
     return None
 
 
@@ -585,6 +684,12 @@ class RuntimeManager:
         # A plan belongs to the project it was described for, and nothing else
         # can consume it.
         self._pending_plan: dict[str, dict[str, str]] = {}
+        # A build that was requested WITHOUT a name, per conversation:
+        # {conversation_id: brief}. Nova asks "what should I call it?" and
+        # nothing remembered that she had asked, so the answer ("word-counter")
+        # was ordinary chat and the model improvised "I'm spinning up the
+        # word-counter project now" while nothing started (audit, H16 + C4).
+        self._pending_project_name: dict[str, str] = {}
         # Episodic memory (V3 P4.1). The WARM tier of the same hot/warm/cold
         # structure: the artifact store below stays hot and unchanged, and what
         # it produces is promoted here. Same SQLite file as facts — deliberately
@@ -1685,6 +1790,60 @@ class RuntimeManager:
         while len(self._pending_plan) > self._PENDING_PLAN_CONVERSATIONS:
             self._pending_plan.pop(next(iter(self._pending_plan)), None)
 
+    def _bound_pending_project_names(self) -> None:
+        while len(self._pending_project_name) > self._PENDING_PLAN_CONVERSATIONS:
+            self._pending_project_name.pop(
+                next(iter(self._pending_project_name)), None)
+
+    #: A reply that withdraws the build instead of naming it.
+    _DECLINE_NAME_RE = re.compile(
+        r"^(?:no|nope|nah|never\s*mind|nevermind|forget\s+it|don'?t\s+bother|"
+        r"cancel(?:\s+it)?|not\s+now|maybe\s+later|skip\s+it)\b[.!]*$",
+        re.IGNORECASE)
+
+    #: "call it X", "let's call it X", "name it X", "X please", "the name is X".
+    _NAME_ANSWER_RES = (
+        re.compile(r"^(?:(?:let'?s\s+|we\s+(?:can|could|should)\s+|you\s+can\s+)?"
+                   r"(?:call|name)\s+it\s+)[\"']?(?P<name>.+?)[\"']?[.!]*$",
+                   re.IGNORECASE),
+        re.compile(r"^(?:the\s+)?name\s+(?:is|should\s+be|would\s+be)\s+"
+                   r"[\"']?(?P<name>.+?)[\"']?[.!]*$", re.IGNORECASE),
+        re.compile(r"^(?:how\s+about|what\s+about|maybe|perhaps|try)\s+"
+                   r"[\"']?(?P<name>.+?)[\"']?[.!?]*$", re.IGNORECASE),
+        re.compile(r"^[\"'](?P<name>[^\"']{1,60})[\"'][.!]*$"),
+    )
+
+    def _name_from_answer(self, text: str) -> str | None:
+        """Read a project name out of an answer to "what should I call it?".
+
+        Returns the name, "" when the build is being withdrawn, or None when
+        this message is not an answer at all — in which case the caller drops
+        the pending build rather than naming a project after an unrelated
+        sentence.
+        """
+        t = (text or "").strip()
+        if not t or len(t) > 120:
+            return None
+        if self._DECLINE_NAME_RE.match(t):
+            return ""
+        candidate = ""
+        for rx in self._NAME_ANSWER_RES:
+            m = rx.match(t)
+            if m:
+                candidate = m.group("name").strip().strip("\"'")
+                break
+        else:
+            # A bare reply: "word-counter", "Serpent", "Budget Buddy".
+            # Deliberately short — a sentence is a new request, not a name, and
+            # this is the one place a name is taken from an unmarked message.
+            if len(t.split()) <= 4 and not t.endswith("?"):
+                candidate = t.rstrip(".!").strip()
+        if not candidate:
+            return None
+        # The name still has to look like one. `plausible_project_name` keeps
+        # "that sounds good", "go ahead" and "python" from becoming projects.
+        return candidate if plausible_project_name(candidate) else None
+
     def _no_such_project(self, wanted: str) -> str:
         """One honest answer for "you named a project I do not have".
 
@@ -1752,6 +1911,10 @@ class RuntimeManager:
         # "improve" is NOT authority; an affirmative instruction is.
         is_complaint = bool(CONTINUATION_COMPLAINT_RE.search(t))
         may_mutate = authorize_project_mutation(t, complaint=is_complaint)
+        # Does this message ask where the work stands? The natural phrasings
+        # ("coming along", "is it done?") need the message to be about the work
+        # at all, or small talk would get a build report.
+        _asks_status = asks_project_status(t, references_work=references_project_work(t))
 
         # WHO is speaking. Every other write path was scoped in P5.1d; this one
         # was missed, so an unrecognised voice could start or improve a project
@@ -1761,6 +1924,39 @@ class RuntimeManager:
         # is his. One choke point, because every branch below reads this verdict.
         if may_mutate.allowed and not current_identity().is_owner:
             may_mutate = MutationVerdict(False, "vetoed: not Marcus")
+
+        # THE ANSWER TO "WHAT SHOULD I CALL IT?". Checked before every other
+        # branch, because the answer is usually a bare name ("word-counter")
+        # that matches nothing else here and would otherwise be plain chat.
+        # Nova asked the question one turn ago; the brief is kept so the build
+        # starts from what was originally requested, not from the one word.
+        if conv and conv in self._pending_project_name:
+            answered = self._name_from_answer(t)
+            if answered is not None:
+                brief = self._pending_project_name.pop(conv)
+                if answered == "":
+                    return ("No problem — I've dropped that build. Say the word "
+                            "when you want to start it.")
+                if not current_identity().is_owner:
+                    # Identity, not authority: the request was authorised one
+                    # turn ago, and a bare name is not an instruction, so
+                    # `may_mutate` is the wrong question to ask here. What
+                    # matters is whose projects folder this would write to.
+                    return ("That project would be Marcus's, so I can't start "
+                            "it from this conversation.")
+                res = await pb.start(name=answered, brief=brief)
+                if res.get("started"):
+                    return (f"Starting project \"{res['project']}\" in the "
+                            "projects folder. I'm planning and building it now "
+                            "— I'll report here when it's finished.")
+                if res.get("reason") == "already building":
+                    return (f"I'm already building {res['project']} — I'll "
+                            "report when it's done.")
+                return (f"I couldn't start that: {res.get('reason', 'unknown')}.")
+            # Not a name. Whatever this message is, the question has gone
+            # unanswered; drop the pending build rather than hold it open and
+            # attach a name from some later, unrelated sentence.
+            self._pending_project_name.pop(conv, None)
 
         # "implement those suggestions" (uses last active project when unnamed)
         if IMPLEMENT_SUGG_RE.search(t) and may_mutate:
@@ -1918,7 +2114,7 @@ class RuntimeManager:
             # acquires a mutation target, so it is gated by the same
             # authorisation. Reading STATUS is exempt: `status_text()` only
             # reports, and "where did we leave off" names no project by nature.
-            if STATUS_WORDS_RE.search(t):
+            if _asks_status:
                 slug = await pb.last_active()
             elif may_mutate and references_project_work(t):
                 # BOTH halves, and this is the second one (audit, C3). An
@@ -1954,7 +2150,11 @@ class RuntimeManager:
                         f"can delete it (it goes to the trash and can be "
                         f"restored), or leave it exactly where it is. Which "
                         f"would you like?")
-            if STATUS_WORDS_RE.search(t):
+            if _asks_status:
+                # ANSWERED FROM THE RECORD, not by the model. `status_text`
+                # renders the acceptance table and the real state; the model
+                # answering this question said "It's all set up and ready to go"
+                # about a build that had failed (audit 2026-11-02, C4).
                 return await pb.status_text(slug)
             if RESUME_WORDS_RE.search(t) and may_mutate:
                 if pb.is_building(slug):
@@ -2130,9 +2330,25 @@ class RuntimeManager:
             req = ProjectBuilder.extract_start_request(t)
             if req is not None:
                 name, brief = req
+                # STARTING a project writes a directory, a PROJECT.md and
+                # memory facts under Marcus's projects folder. Every other
+                # project write path was scoped to the owner in P5.1d and
+                # again for H10; this one had no identity check at all, so an
+                # unrecognised or guest voice could scaffold a project. Found
+                # while fixing H16.
+                if not current_identity().is_owner:
+                    return ("Projects here are Marcus's, so I can't start one "
+                            "from this conversation.")
                 if name == NEEDS_NAME:
                     # A build was clearly requested but no name was given. Ask
-                    # instead of inventing a name from the sentence.
+                    # instead of inventing a name from the sentence — and
+                    # REMEMBER that the question was asked, so the answer
+                    # starts the build. Without this the next turn was ordinary
+                    # chat: the model replied "I'm spinning up the word-counter
+                    # project now" and nothing ran (audit, H16).
+                    if conv:
+                        self._pending_project_name[conv] = brief
+                        self._bound_pending_project_names()
                     return "Happy to build that for you. What should I call the project?"
                 res = await pb.start(name=name, brief=brief)
                 if res.get("started"):
@@ -2234,6 +2450,45 @@ class RuntimeManager:
                 }.get(outcome, "it was not approved, so nothing changed")
                 lines.append(f"I didn't {what}; {why}.")
             return " ".join(lines)
+
+        def _false_completion_notice(reply: str, record: str) -> str:
+            """Correct a reply that claims finished work the record contradicts.
+
+            Measured on real weights (audit 2026-11-02, C4): asked "Is it done?
+            What did you actually verify?" about a project whose authoritative
+            state was `failing` with three named failing criteria — and with
+            that record IN the prompt, under an instruction to trust it over
+            anything she remembered — the reply was "I'm wrapping up those
+            safety nets", describing work that was not running and never
+            mentioning a single failure.
+
+            So the instruction is not the mechanism. The record is composed into
+            the reply here, from the derived state, whatever the model wrote.
+            Nothing is removed: the correction is prepended, so a reply that was
+            right reads as agreement and one that was wrong is answered.
+
+            Empty unless BOTH a completion claim and a contradicting record are
+            present, so an ordinary turn and an honest reply are untouched.
+            """
+            if not reply or not record:
+                return ""
+            state = ""
+            for line in record.splitlines():
+                m = re.search(r"- project '([^']+)': (\w+)", line)
+                if m:
+                    slug, state = m.group(1), m.group(2)
+                    break
+            if state in ("", "complete", "completed"):
+                return ""
+            if not _claims_completion(reply):
+                return ""
+            said = {
+                "failing": f"{slug} is not done — it has failing criteria",
+                "scaffolded": f"{slug} has files but nothing has been demonstrated yet",
+                "idea": f"{slug} has not been built yet",
+                "building": f"{slug} is still being built",
+            }.get(state, f"{slug} is {state}, not complete")
+            return f"To be accurate: {said}."
 
         async def _finish(reply: str, tool_calls: list[dict[str, Any]], mode: str = "chat") -> None:
             # Working context sees every reply, including the ones that return
@@ -2624,6 +2879,42 @@ class RuntimeManager:
             "can't fully test, say you added it and ask him to try it, rather than declaring it done.\n\n"
         ) if _ident.is_owner else _guest_persona(_ident)
 
+        # ── MAKE IT FIT (audit 2026-11-02, H3) ──────────────────────────────
+        #
+        # Nothing bounded this. Past n_ctx llama.cpp refused the whole prompt —
+        # "Requested tokens (13433) exceed context window of 8192" — and since
+        # the failure landed before `_finish`, the state never scrolled and the
+        # next turn rebuilt the same oversized prompt. Every message after that,
+        # including "Hello?", answered "Sorry — I hit an internal error", for
+        # good, across restarts.
+        _blocks, _trimmed = _fit_prompt([
+            _Block("episodic", episodic_context, _DROP),
+            _Block("artifacts", artifact_context, _DROP),
+            _Block("memory", stable_mem, _TRIM_TAIL),
+            _Block("summary", conversation_summary, _TRIM_TAIL),
+            _Block("recent_chat", recent_chat, _TRIM_OLDEST),
+            _Block("tools", tools_context, _TRIM_TAIL),
+            # Never trimmed: who she is, who she is talking to, and the message.
+            _Block("persona", _persona),
+            _Block("grounding", grounding_text),
+            _Block("work", work_context),
+            _Block("user", clean_user),
+        ], context_tokens=self._llm.context_tokens,
+            reply_tokens=int(os.getenv("NOVA_MAX_TOKENS", "1536").strip() or "1536"))
+        _by = {b.name: b.text for b in _blocks}
+        episodic_context = _by["episodic"]
+        artifact_context = _by["artifacts"]
+        stable_mem = _by["memory"]
+        conversation_summary = _by["summary"]
+        recent_chat = _by["recent_chat"]
+        tools_context = _by["tools"]
+        if _trimmed:
+            # Visible, because a trimmed prompt is a reply with less to go on.
+            # The old behaviour was no log and no reply at all.
+            logger.info("prompt_trimmed", actions=", ".join(_trimmed),
+                        context_tokens=self._llm.context_tokens)
+            BUS.publish("chat.prompt_trimmed", {"actions": _trimmed})
+
         system_prompt = (
             _persona
             + (f"Who you're talking to: {grounding_text}\n" if grounding_text else "")
@@ -2717,7 +3008,9 @@ class RuntimeManager:
             if not reply:
                 reply = "Sorry — I came up empty on that one."
             yield {"type": "token", "text": reply}
-            notice = _unapproved_notice(tool_results)
+            notice = " ".join(x for x in (
+                _false_completion_notice(reply, work_context),
+                _unapproved_notice(tool_results)) if x).strip()
             if notice:
                 reply = f"{notice} {reply}".strip()
                 yield {"type": "token", "text": " " + notice}
@@ -2814,7 +3107,9 @@ class RuntimeManager:
         if not reply:
             reply = "Sorry — I came up empty on that one."
         # Stated first, because it is the part that is true.
-        notice = _unapproved_notice(tool_results)
+        notice = " ".join(x for x in (
+            _false_completion_notice(reply, work_context),
+            _unapproved_notice(tool_results)) if x).strip()
         if notice:
             reply = f"{notice} {reply}".strip()
             yield {"type": "token", "text": " " + notice}
@@ -3269,7 +3564,11 @@ class RuntimeManager:
         if _looks_like_time_query(text):
             return _format_clock_reply(text), [], "smalltalk"
 
-        if "weather" in text.lower():
+        # ASKING about the weather, not merely containing the word. The old
+        # test was `"weather" in text.lower()`, so "Is the weather app in my
+        # project any good?" became a lookup for a city called "my project
+        # any good" (audit 2026-11-02, H2).
+        if asks_about_weather(text):
             city = _extract_weather_city(text) or await self._llm_slot("weather", text)
             if city:
                 call = ToolCall(name="weather.current", args={"city": city, "units": "imperial"})
@@ -3566,6 +3865,15 @@ class RuntimeManager:
         # reminder-worker's proactive nudge, so if it comes up naturally in
         # conversation she already has it, without re-announcing every turn.
         async def _load_upcoming_dates() -> list[dict[str, Any]] | None:
+            # OWNER ONLY (audit 2026-11-02, H8). This block is Marcus's social
+            # calendar, and it was built for every speaker: an unrecognised
+            # voice's prompt contained "Leslie's birthday is in 2 day(s)".
+            # P5.2's step-9 canaries covered facts, lessons, thoughts, episodes
+            # and the summary — not people's dates, reminders or goals — so the
+            # "zero private canaries reach an unknown speaker" claim was true
+            # only of the things it checked.
+            if not personal_ok:
+                return None
             try:
                 upcoming = await self._memory.list_people_with_upcoming_dates(within_days=3)
                 if not upcoming:
@@ -3649,12 +3957,18 @@ class RuntimeManager:
         # gated recommendations (looming deadline, focus window, take a break),
         # throttled so the same nudge never repeats. These are opportunities to be
         # helpful if they fit naturally, NOT a script to recite.
-        try:
-            exec_recs = await self._memory.executive_recommendations(throttle=True)
-            if exec_recs:
-                context["executive_recommendations"] = [r["message"] for r in exec_recs[:2]]
-        except Exception:
-            pass
+        # Owner only, for the same reason (audit, H8): every one of these is
+        # synthesised from his reminders, goals, habits and twin profile, and
+        # the message text quotes them — "'call the dentist' is overdue".
+        # Throttling also writes a `surfaced:` fact, so an ungated call let a
+        # guest's turn mark HIS nudge as already seen.
+        if personal_ok:
+            try:
+                exec_recs = await self._memory.executive_recommendations(throttle=True)
+                if exec_recs:
+                    context["executive_recommendations"] = [r["message"] for r in exec_recs[:2]]
+            except Exception:
+                pass
 
         # Internal operational state (#12) — advisory operating hints derived
         # from live telemetry (uncertainty / workload / energy / confidence).

@@ -49,21 +49,70 @@ _CODE_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9+\-_.]*)\n(.*?)```", re.DOTALL)
 _MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 
 
-def _python_stack_note() -> str:
-    """Tell the planner which graphics stack actually exists on this machine.
+#: Packages a small generated project might reasonably reach for. Probed, not
+#: assumed: the note names what is importable RIGHT HERE and nothing else.
+#: Order is the order they are listed in, so the sentence reads the same way
+#: every time.
+_CANDIDATE_PACKAGES = (
+    "pygame", "numpy", "pandas", "matplotlib", "requests", "httpx",
+    "flask", "fastapi", "PIL", "rich", "pydantic", "bs4", "pytest",
+)
 
-    pygame is not part of Nova's environment; planning a pygame game would
-    just fail the run check with ModuleNotFoundError. tkinter ships with the
-    standard library and is verified present.
+#: Printed names, where the import name is not what a person would write.
+_PACKAGE_LABELS = {"PIL": "pillow (PIL)", "bs4": "beautifulsoup4 (bs4)"}
+
+
+def _installed_packages() -> list[str]:
+    """Which of `_CANDIDATE_PACKAGES` can actually be imported."""
+    import importlib.util
+
+    found = []
+    for name in _CANDIDATE_PACKAGES:
+        try:
+            if importlib.util.find_spec(name) is not None:
+                found.append(name)
+        except (ImportError, ValueError):
+            # A broken or namespace-shadowed install is not something to plan
+            # around. Treat it as absent.
+            continue
+    return found
+
+
+def _python_stack_note() -> str:
+    """Tell the planner what this machine actually has.
+
+    This used to say "ONLY the standard library ... third-party packages are
+    NOT installed" whatever was installed. pytest is installed, and the test
+    runner now REQUIRES pytest-style tests, so the planner was being told the
+    opposite of the truth and, with thinking on, looped on the contradiction —
+    138 mentions of pytest in 25k characters, then finish=length (audit, H15).
+
+    tkinter is checked separately: it ships with the standard library but is a
+    genuinely optional build component on some Pythons.
     """
     import importlib.util
 
-    if importlib.util.find_spec("pygame") is not None:
-        return "use python (pygame is installed and allowed for graphical games)"
-    return (
-        "use python with ONLY the standard library — tkinter for graphical games; "
-        "pygame and other third-party packages are NOT installed"
-    )
+    available = _installed_packages()
+    tk = importlib.util.find_spec("tkinter") is not None
+    has_pytest = "pytest" in available
+    libs = [_PACKAGE_LABELS.get(n, n) for n in available if n != "pytest"]
+
+    parts = ["use python"]
+    if libs:
+        parts.append("these third-party packages ARE installed and may be imported: "
+                     + ", ".join(libs))
+    else:
+        parts.append("no third-party runtime packages are installed, so use the "
+                     "standard library")
+    parts.append("tkinter is available for graphical programs" if tk
+                 else "tkinter is NOT available, so no desktop GUI")
+    if "pygame" not in available:
+        parts.append("pygame is NOT installed")
+    parts.append("tests are run with pytest, so write pytest-style tests"
+                 if has_pytest else
+                 "pytest is NOT installed, so tests must run under unittest")
+    parts.append("do not import anything not named here, it will fail at runtime")
+    return "; ".join(parts)
 
 PROJECT_VERBS = r"(?:make|create|build|code|write|develop|start|begin)"
 PROJECT_OBJECTS = (
@@ -134,7 +183,108 @@ def _looks_like_a_title(name: str) -> bool:
     """Is this capture a project NAME, or the rest of the sentence?"""
     first = (name or "").strip().split()
     return bool(first) and first[0].lower() not in _NOT_A_NAME_LEAD
+
+
+#: Replies that are an acknowledgement, not a name. Nova asks "what should I
+#: call the project?" and the answer arrives bare, so the only thing standing
+#: between "sounds good" and a project directory called `sounds-good` is this
+#: list plus `_looks_like_a_title`.
+_NOT_A_PROJECT_NAME = frozenset("""
+    yes yeah yep yup sure ok okay okey fine good great cool nice perfect
+    please thanks thank cheers alright right correct exactly indeed absolutely
+    whatever anything something idk dunno hmm hm uh um well
+    go ahead start begin proceed continue do it done
+    sounds looks seems works fair
+    project app game script tool program site website thing one it that this
+""".split())
+
+#: Determiners that can open a real title ("My Budget", "The Last Stand") and
+#: so must not count as content when deciding whether a reply is all filler.
+_LEADING_DETERMINERS = frozenset({"a", "an", "the", "my", "our", "your", "its"})
+
+#: Replies that hand the choice back instead of making it. "whatever you
+#: think" would otherwise pass the all-filler test — "you" and "think" are
+#: content words — and create a project directory called `whatever-you-think`.
+_DEFERS_CHOICE_RE = re.compile(
+    r"^(?:(?:you|u)\s+(?:decide|choose|pick|name|call)|"
+    r"(?:it'?s\s+)?up\s+to\s+you|your\s+(?:call|choice|pick)|surprise\s+me|"
+    r"(?:i\s+)?(?:don'?t|do\s+not)\s+(?:mind|care|know)|doesn'?t\s+matter|"
+    r"(?:whatever|anything|something|any\s*thing)\b|"
+    r"(?:no|not\s+a)\s+(?:idea|clue|preference))",
+    re.IGNORECASE)
+
+
+def plausible_project_name(name: str) -> bool:
+    """Could this be what the person wants the project called?
+
+    Used where a name arrives with no "called X" marker to vouch for it — the
+    answer to Nova's own "what should I call it?". A false positive here
+    creates a real directory with a nonsense name and a memory entry to match,
+    so this is deliberately narrow.
+
+    Not `_looks_like_a_title`: that rejects a leading pronoun or possessive
+    because mid-sentence it opens a clause, while a DIRECT answer may perfectly
+    well be "My Personal Finance Dashboard 2026". What cannot open an answer is
+    a conjunction, preposition or relativiser, which is a continuation of some
+    other sentence.
+    """
+    t = (name or "").strip().strip("\"'")
+    if not t or len(t) > 60 or t.endswith("?"):
+        return False
+    words = t.split()
+    if len(words) > 5:
+        return False
+    if not re.match(r"[A-Za-z0-9]", t):
+        return False
+    if _DEFERS_CHOICE_RE.match(t):
+        return False
+    lowered = [w.lower().strip(".,;:!?\"'") for w in words]
+    if lowered[0] in (_AMBIGUOUS_CONTINUATIONS | _CLAUSE_CONNECTIVES
+                      | _ACTION_CONNECTIVES):
+        return False
+    # "sounds good", "go ahead", "the game", "that one" — nothing but filler
+    # once a leading determiner is set aside.
+    content = [w for w in lowered if w not in _LEADING_DETERMINERS]
+    if not content or all(w in _NOT_A_PROJECT_NAME for w in content):
+        return False
+    return bool(canonical_project_slug(t))
 STATUS_WORDS_RE = re.compile(r"\b(?:where (?:did|do) we leave off|left off|leave off|status|progress|where were we)\b", re.IGNORECASE)
+
+#: How people ACTUALLY ask (audit 2026-11-02, C4). "How's that project coming
+#: along?" matched none of the words above, so the authoritative record was
+#: never consulted and the answer came from the model — which said "It's all set
+#: up and ready to go... plus the tests are written too" about a build that had
+#: just failed and written nothing.
+#:
+#: These are broader and more ambiguous ("is it done?" could be about dinner), so
+#: `_project_prepass` requires the message to reference the project or the work
+#: before treating one as a status question. See `asks_project_status`.
+STATUS_PHRASES_RE = re.compile(
+    r"\b(?:"
+    r"coming along|how(?:'s| is|’s) (?:it|that|the|this) .{0,24}?going|"
+    r"how(?:'s| is|’s) (?:it|that) coming|how far along|how(?:'s| is) that going|"
+    r"any (?:progress|news|update|updates)|what(?:'s| is) the latest|"
+    r"(?:is|are) (?:it|that|this|they) (?:done|finished|ready|working)|"
+    r"did (?:you|it) (?:finish|work|build|succeed)|"
+    r"what (?:did|have) you (?:actually )?(?:verif\w+|check\w+|test\w+|prov\w+|do(?:ne)?)|"
+    r"how did (?:it|that) go|"
+    r"(?:is|was) (?:it|that) successful"
+    r")\b", re.IGNORECASE)
+
+
+def asks_project_status(text: str, *, references_work: bool) -> bool:
+    """Is this a question about where the work stands?
+
+    The narrow words ("status", "progress", "where did we leave off") are
+    unambiguous on their own. The natural phrasings are not — "how's it going?"
+    is usually small talk — so those need the message to be about the work.
+    Answering small talk with a build report would be the same over-claiming
+    error in the opposite direction.
+    """
+    raw = text or ""
+    if STATUS_WORDS_RE.search(raw):
+        return True
+    return bool(references_work and STATUS_PHRASES_RE.search(raw))
 RESUME_WORDS_RE = re.compile(r"\b(?:continue|resume|keep (?:working|going)|finish)\b", re.IGNORECASE)
 # Inflection-aware: plain \b(?:improve)\b never matched "improvements"/"improving".
 IMPROVE_WORDS_RE = re.compile(r"\b(?:improv\w*|enhanc\w*|upgrad\w*|polish\w*|refactor\w*|fix\w*|extend\w*)\b", re.IGNORECASE)
@@ -214,12 +364,27 @@ _ACTION_VERBS = frozenset("""
     put puts set sets give gives let lets have has send sends
 """.split())
 
+#: Relative pronouns. After an explicit "called X", these open a clause ABOUT
+#: the thing rather than more of its name: "called word-counter that counts
+#: words in a text file" is a name plus a requirement, and asking "what should
+#: I call the project?" there is answering a question nobody asked (audit,
+#: H16). Unmarked, they stay as unprovable as anything else — "a project that
+#: tracks spending" never said a title started.
+#:
+#: Kept narrow on purpose. A preposition is genuinely ambiguous ("Man with a
+#: Plan", "Python for Beginners" are real titles), so those still ask; a title
+#: containing a relative clause is rare, and quoting states it exactly.
+_RELATIVISERS = frozenset({"that", "which", "who", "whom", "whose"})
+
 #: Tokens after which a title boundary cannot be proven either way.
+#:
+#: "as" was missing, which is how "a game called Serpent as a single HTML file"
+#: became the project `serpent-as-a-single-html-file` (audit, H16). It asks now.
 _AMBIGUOUS_CONTINUATIONS = frozenset({
-    "with", "without", "using", "that", "which", "who", "whom", "whose",
-    "for", "from", "in", "on", "at", "about", "to", "by", "into", "over",
-    "under", "when", "while", "if", "unless", "until", "so", "because",
-})
+    "with", "without", "using", "for", "from", "in", "on", "at", "about",
+    "to", "by", "into", "over", "under", "when", "while", "if", "unless",
+    "until", "so", "because", "as", "like",
+}) | _RELATIVISERS
 
 #: Connectives that can introduce a first-person requirement clause. Broader than
 #: `_ACTION_CONNECTIVES` because "but I want it simple" and "so I can run it
@@ -234,11 +399,23 @@ _SUBJECT_PRONOUNS = frozenset({"i", "we", "you", "it", "they", "he", "she",
 NAME_AMBIGUOUS = "__NOVA_PROJECT_NAME_AMBIGUOUS__"
 
 
-def resolve_name_boundary(name: str) -> str:
+def resolve_name_boundary(name: str, *, marked: bool = False) -> str:
     """Where the title ends. Returns the name, or NAME_AMBIGUOUS to ask.
 
     Case-insensitive by construction: every comparison lowercases first, so the
     same words produce the same answer however they were capitalised.
+
+    `marked` says the words came after an explicit "called X" / "named X",
+    which changes what a RELATIVE CLAUSE means. Unmarked, nothing has said a
+    title starts here, so "a project that tracks spending" is unprovable and
+    Nova asks. Marked, the speaker has named the thing and is now describing
+    it, so "called word-counter that counts words in a text file" is a name
+    plus a requirement — it used to be answered with "What should I call the
+    project?" when the name was right there in the sentence (audit, H16).
+
+    This applies to relative pronouns ONLY. A preposition stays ambiguous
+    either way, because "Man with a Plan" and "Python for Beginners" are real
+    titles and no word list can tell them from "Serpent with a dark theme".
     """
     words = (name or "").split()
     if len(words) <= 1:
@@ -260,7 +437,12 @@ def resolve_name_boundary(name: str) -> str:
         if low in _CLAUSE_CONNECTIVES and nxt in _SUBJECT_PRONOUNS:
             return " ".join(words[:i]).strip()
 
-        # (4) anything else that could open a requirement is unprovable.
+        # (4a) a relative clause after an explicitly marked name describes the
+        # thing; the title ended at the pronoun.
+        if marked and low in _RELATIVISERS:
+            return " ".join(words[:i]).strip()
+
+        # (4b) anything else that could open a requirement is unprovable.
         if low in _AMBIGUOUS_CONTINUATIONS:
             return NAME_AMBIGUOUS
 
@@ -659,13 +841,21 @@ class ProjectBuilder:
         m = NAME_RE.search(t)
         if m:
             raw = m.group(1).strip()
-            # An unquoted capture that ran into the regex's own length limit is a
-            # PREFIX, not a name. Fail closed rather than name a project after a
-            # truncated fragment.
-            if len(raw) >= _MAX_RAW_NAME:
-                return NEEDS_NAME, t
-            name = resolve_name_boundary(raw)
+            # MARKED: "called X" / "named X" states that X is the title, so a
+            # trailing clause is cut off rather than making the whole thing
+            # unprovable. "called word-counter that counts words" is a name
+            # plus a requirement, not a question to ask back (audit, H16).
+            name = resolve_name_boundary(raw, marked=True)
             if name == NAME_AMBIGUOUS or not name:
+                return NEEDS_NAME, t
+            # An unquoted capture that ran into the regex's own length limit is
+            # a PREFIX, not a name — UNLESS the boundary fell inside it, in
+            # which case everything the limit cut off was being discarded
+            # anyway. Checking the limit first is what made "a script called
+            # word-counter that counts words in a text file" ask for a name:
+            # the capture stopped at exactly 40 characters, while the title
+            # ended at "that", twelve characters in.
+            if len(raw) >= _MAX_RAW_NAME and name == raw:
                 return NEEDS_NAME, t
             return name, t
         m2 = PROJECT_NAME_RE.search(t)
@@ -678,7 +868,8 @@ class ProjectBuilder:
                 quoted = bool(re.search(r"[\"']" + re.escape(name) + r"[\"']", t))
                 if quoted:
                     return name, t
-                resolved = resolve_name_boundary(name)
+                resolved = resolve_name_boundary(name,
+                                                 marked=bool(m2.group("marker")))
                 if (resolved != NAME_AMBIGUOUS and resolved
                         and _looks_like_a_title(resolved)):
                     return resolved, t
@@ -868,22 +1059,41 @@ class ProjectBuilder:
     # ── LLM helpers ──────────────────────────────────────────────────────────
 
     async def _llm_json(self, prompt: str, max_tokens: int = 900) -> dict[str, Any] | None:
-        # Planning benefits from native reasoning — thinking happens in the
-        # background and is stripped before JSON extraction. One retry covers
-        # the occasional run where reasoning eats the whole token budget and
-        # the JSON arrives truncated.
+        """Ask the planner for one JSON object.
+
+        Planning benefits from native reasoning, but reasoning can also eat the
+        entire budget: with thinking on, a contradictory prompt produced 25k
+        characters of deliberation and hit finish=length on every attempt, even
+        at 5,000 tokens, and the real errors.json carries seven "generation came
+        back empty" entries (audit, H15).
+
+        So the attempts ESCALATE instead of repeating:
+          1. thinking on, the caller's budget.
+          2. thinking on, double the budget, for a think that was merely long.
+          3. thinking OFF. A model that cannot stop deliberating cannot be
+             out-budgeted, and the JSON shape here does not need a think.
+        Each attempt is logged with what it got back, because "it returned
+        nothing" three times with no record of why is how H15 stayed invisible.
+        """
         runtime, sem = self._handle("planner")
-        for _ in range(2):
+        attempts = ((max_tokens, True), (max_tokens * 2, True), (max_tokens, False))
+        for n, (budget, thinking) in enumerate(attempts, start=1):
             async with sem:
                 raw = await runtime.chat(
                     [{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
+                    max_tokens=budget,
                     temperature=0.15,
-                    thinking=True,
+                    thinking=thinking,
                 )
             obj = extract_first_json_object(raw or "")
             if obj:
+                if n > 1:
+                    logger.info("planner_json_recovered", attempt=n,
+                                budget=budget, thinking=thinking)
                 return obj
+            logger.warning("planner_json_failed", attempt=n, budget=budget,
+                           thinking=thinking, chars=len(raw or ""),
+                           tail=(raw or "")[-160:])
         return None
 
     async def _llm_file(self, prompt: str) -> str:
@@ -1047,6 +1257,13 @@ class ProjectBuilder:
             #     launch check can't (inverted collision, wrong scoring, etc.).
             test_note = await self._generate_and_run_tests(slug, path, written, summary)
 
+            # 4c) HTML projects. Both steps above return None without a .py
+            #     file, and they returned it SILENTLY — so a 359-line browser
+            #     game was reported as a "Complete playable snake game... Use
+            #     arrow keys or WASD" with nothing having executed it, and with
+            #     neither arrow keys nor WASD working (audit, H19).
+            html_note = await self._smoke_test_html(slug, path, written)
+
             # 5) Suggestions
             BUS.publish("project.progress", {"project": slug, "stage": "reviewing"})
             sugg_obj = await self._llm_json(
@@ -1072,6 +1289,8 @@ class ProjectBuilder:
                 build_log.append(run_note)
             if test_note:
                 build_log.append(test_note)
+            if html_note:
+                build_log.append(html_note)
 
             # Prove the criteria, one at a time. `run_note` and `test_note` are
             # DIAGNOSTIC: a program that starts proves that a program starts,
@@ -1098,6 +1317,7 @@ class ProjectBuilder:
                        "run": clip(run, 120), "suggestions": suggestions,
                        "run_note": clip(run_note or "", 200),
                        "test_note": clip(test_note or "", 200),
+                       "html_note": clip(html_note or "", 200),
                        "contract": verdict.seal_mode, "mode": "build"})
             logger.info("project_build_finished", project=slug,
                         files=len(written), state=verdict.state)
@@ -1122,6 +1342,69 @@ class ProjectBuilder:
         finally:
             self._active.pop(slug, None)
 
+    async def _contract_basis(self, slug: str) -> tuple[int | None, str]:
+        """(revision to carry from, its request text).
+
+        Normally the current revision. But a revision can exist with NO
+        criteria — `record_request` creates one before `carry_forward` runs,
+        so a failed carry left one behind — and carrying forward from THAT
+        silently drops the whole contract, which is how the second improve of
+        any contracted project "succeeded" with zero criteria (audit, H20).
+        So an empty current revision is stepped over, back to the last one that
+        actually holds a contract.
+        """
+        req = await self._memory.current_requirement(project_name=slug)
+        if req is None:
+            return None, ""
+        current = int(req["revision"])
+        for rev in range(current, 0, -1):
+            rows = await self._memory.list_acceptance_criteria(
+                project_name=slug, revision=rev)
+            if rows:
+                if rev != current:
+                    logger.warning("contract_basis_stepped_back", project=slug,
+                                   current=current, basis=rev,
+                                   reason="the current revision holds no criteria")
+                text = await self._request_text_at(slug, rev)
+                return rev, text
+        return current, str(req.get("request_text") or "")
+
+    async def _request_text_at(self, slug: str, revision: int) -> str:
+        """The words recorded for ONE revision.
+
+        Not the current one's: carrying a contract forward from an earlier
+        revision has to combine THAT revision's words, or the new requirement
+        text would be built from a request nobody is carrying.
+        """
+        row = await self._memory.requirement_at(project_name=slug,
+                                                revision=int(revision))
+        if row is not None:
+            return str(row.get("request_text") or "")
+        req = await self._memory.current_requirement(project_name=slug)
+        return str((req or {}).get("request_text") or "")
+
+    @staticmethod
+    def combined_request(previous: str, instruction: str) -> str:
+        """The words the NEW revision is made of: what still stands, plus this.
+
+        An improvement adds to what was asked; the original request is still
+        in force. Recording the instruction ALONE is what broke H20: the
+        planner decided which criteria carried by checking them against the
+        previous request plus the instruction, while `carry_forward` then
+        checked them against the instruction alone — so every criterion from
+        the original request failed with "not a span of the request at
+        revision 2", and the first improve of any contracted project failed.
+
+        One definition, used by both, so they cannot disagree again.
+        """
+        prev = (previous or "").strip()
+        instr = (instruction or "").strip()
+        if not prev:
+            return instr
+        if not instr:
+            return prev
+        return f"{prev} {instr}"
+
     async def _plan_contract_change(self, slug: str, request: str,
                                     prev_rev: int | None
                                     ) -> tuple[dict[str, str], list[str]]:
@@ -1140,12 +1423,10 @@ class ProjectBuilder:
             project_name=slug, revision=prev_rev)
         if not old:
             return {}, []
-        # An improvement usually ADDS to what was asked, so the previous
-        # request is still in force. The new revision's text is the old
-        # request plus the new instruction; criteria that still quote it
-        # carry, and only the rest need a decision.
-        prev = await self._memory.current_requirement(project_name=slug)
-        combined = f"{(prev or {}).get('request_text', '')} {request}".strip()
+        # Checked against the SAME text `_establish_contract` is about to
+        # record for the new revision — see `combined_request`.
+        combined = self.combined_request(
+            await self._request_text_at(slug, prev_rev), request)
         reanchor: dict[str, str] = {}
         drop: list[str] = []
         for c in old:
@@ -1169,13 +1450,38 @@ class ProjectBuilder:
         """
         from core.project_acceptance import coverage_gaps, derive_criteria
 
-        rev = await self._completion.record_request(slug=slug,
-                                                    request_text=request)
+        # THE RECORDED TEXT. For a revision that follows another, it is the
+        # previous request plus this instruction — the same string
+        # `_plan_contract_change` judged the carried criteria against. Record
+        # the instruction alone and every criterion from the original request
+        # stops being a span of its own requirement (audit, H20).
+        recorded = request
         if previous_revision is not None:
-            await self._completion.carry_forward(
-                slug=slug, from_revision=previous_revision, to_revision=rev,
-                drop_criterion_ids=drop or [], reanchor=reanchor or {},
-                drop_reason="superseded by a later request")
+            recorded = self.combined_request(
+                await self._request_text_at(slug, previous_revision), request)
+
+        rev = await self._completion.record_request(slug=slug,
+                                                    request_text=recorded)
+        if previous_revision is not None:
+            try:
+                await self._completion.carry_forward(
+                    slug=slug, from_revision=previous_revision, to_revision=rev,
+                    drop_criterion_ids=drop or [], reanchor=reanchor or {},
+                    drop_reason="superseded by a later request")
+            except ValueError:
+                # A criterion could not be carried and was not dropped on
+                # purpose. The revision now exists with no contract, and
+                # letting that stand is how the contract disappeared on the
+                # NEXT improve. Say so loudly and refuse — `_contract_basis`
+                # will step back over this revision if anyone tries again.
+                logger.warning("contract_carry_forward_failed", project=slug,
+                               from_revision=previous_revision, to_revision=rev,
+                               dropped=len(drop or []))
+                BUS.publish("project.error",
+                            {"project": slug, "mode": "contract",
+                             "error": "a requirement could not be carried "
+                                      "forward, so nothing was changed"})
+                raise
 
         BUS.publish("project.progress",
                     {"project": slug, "stage": "acceptance_criteria"})
@@ -1190,8 +1496,12 @@ class ProjectBuilder:
 
         existing = await self._memory.list_acceptance_criteria(
             project_name=slug, revision=rev)
-        gaps = coverage_gaps(request, [{"origin_quote": c["origin_quote"]}
-                                       for c in existing])
+        # Coverage is judged against the RECORDED words, which for a follow-up
+        # revision include the original request. The carried criteria cover
+        # that half and the new ones cover the instruction, so a contract seals
+        # only when the whole of what is in force is accounted for.
+        gaps = coverage_gaps(recorded, [{"origin_quote": c["origin_quote"]}
+                                        for c in existing])
         if existing and not gaps:
             await self._completion.seal_contract(slug=slug, revision=rev,
                                                  seal_mode="auto")
@@ -1389,6 +1699,73 @@ class ProjectBuilder:
             return False  # a patch that breaks the syntax is worse than none
         target.write_text(patched, encoding="utf-8")
         return True
+
+    async def _smoke_test_html(self, slug: str, path: Path,
+                               written: list[str]) -> str | None:
+        """Run an HTML project headlessly, and fix it once if it is broken.
+
+        AUDIT H19. Neither the run check nor the logic tests look at a project
+        with no `.py` file, and they said nothing about it — so `serpent` was
+        announced as a "Complete playable snake game" having never been
+        executed, with a reversal guard that rejected every turn and WASD
+        controls that did not exist.
+
+        Returns the note for the build log, which is honest about what was
+        established: that the page RUNS is not that the game is right.
+        """
+        if os.getenv("NOVA_PROJECT_HTML_CHECK", "1").strip().lower() in {
+                "0", "false", "no", "off"}:
+            return None
+        pages = [f for f in written if f.lower().endswith((".html", ".htm"))]
+        if not pages:
+            return None
+        from core.project_html_check import smoke_test_html
+
+        # The entry page: index.html if there is one, else the first.
+        page = next((f for f in pages if Path(f).name.lower().startswith("index")),
+                    pages[0])
+        target = path / page
+
+        BUS.publish("project.progress",
+                    {"project": slug, "stage": "html_smoke", "file": page})
+        result = await smoke_test_html(target)
+        if result.passed or not result.ran:
+            # Passing, or nothing ran and the note says so.
+            return f"{result.note()} ({page})"
+
+        logger.info("html_smoke_failed", project=slug, page=page,
+                    errors=result.errors[:2])
+
+        # It ran and it is broken. ONE repair round, with the real error.
+        BUS.publish("project.progress",
+                    {"project": slug, "stage": "repairing", "file": page})
+        before = target.read_text(encoding="utf-8", errors="replace")
+        fixed = await self._llm_file(
+            "This single-page HTML program fails when run headlessly.\n"
+            "The errors, from a stub DOM that dispatches arrow keys and ticks "
+            "requestAnimationFrame:\n"
+            + "\n".join(f"- {e}" for e in (result.errors
+                                           or ["it never drew anything"])[:4])
+            + f"\n\nFix the CAUSE and return the COMPLETE corrected file "
+              f"`{page}`.\nKeep every working feature. Do not add a build step, "
+              "a framework, or anything loaded from the network.\n\n"
+              f"```html\n{before[:9000]}\n```\n"
+              "Reply with ONLY the corrected file in one fenced code block.")
+        if self._looks_like_failed_generation(fixed):
+            return (f"{result.note()} ({page}) The repair attempt came back "
+                    "empty, so the file is unchanged.")
+
+        target.write_text(fixed, encoding="utf-8")
+        after = await smoke_test_html(target)
+        if after.passed:
+            return (f"{after.note()} ({page}) It failed the first time and was "
+                    f"repaired: {result.errors[:1] or ['it never drew anything']}")
+        # The fix did not fix it. Leave the project as it STARTED rather than
+        # as a second broken version — the same invariant
+        # `_generate_and_run_tests` keeps for Python.
+        target.write_text(before, encoding="utf-8")
+        return (f"{result.note()} ({page}) A repair was attempted and did not "
+                "help, so the file was restored unchanged.")
 
     async def _generate_and_run_tests(self, slug: str, path: Path, written: list[str], summary: str) -> str | None:
         """Generate headless logic tests for the built code, run them, and fix
@@ -1684,8 +2061,11 @@ class ProjectBuilder:
             # Recording it here invalidates evidence gathered for the previous
             # one, which is exactly what "the requirements changed" means -
             # and it happens BEFORE any file is touched.
-            prev = await self._memory.current_requirement(project_name=slug)
-            prev_rev = int(prev["revision"]) if prev else None
+            # The revision to build on is the last one that HOLDS a contract,
+            # not simply the newest: a revision left behind with no criteria
+            # would otherwise carry nothing forward and erase the contract
+            # without anyone saying so (audit, H20).
+            prev_rev, _prev_text = await self._contract_basis(slug)
             reanchor, drop = await self._plan_contract_change(
                 slug, instructions, prev_rev)
             await self._establish_contract(slug, instructions,
@@ -1772,6 +2152,8 @@ class ProjectBuilder:
             code_candidates = [str(p.relative_to(path)).replace("\\", "/") for p in sorted(path.rglob("*.py"))]
             run_note = await self._verify_and_fix_runtime(slug, path, code_candidates)
             test_note = await self._generate_and_run_tests(slug, path, code_candidates, summary)
+            # Same gap on the improve path (audit, H19).
+            html_note = await self._smoke_test_html(slug, path, code_candidates)
             old_brief = re.search(r"## Brief\n(.*?)\n\n", project_md, re.DOTALL)
 
             # WHAT ACTUALLY HAPPENED, not what was planned. `summary` is the
@@ -1789,6 +2171,8 @@ class ProjectBuilder:
                 improve_log.append(run_note)
             if test_note:
                 improve_log.append(test_note)
+            if html_note:
+                improve_log.append(html_note)
 
             await self._validate_criteria(slug, instructions, changed,
                                           run_note=run_note)
@@ -1811,6 +2195,7 @@ class ProjectBuilder:
                        "not_changed": fail_reasons[:5], "mode": "improve",
                        "run_note": clip(run_note or "", 200),
                        "test_note": clip(test_note or "", 200),
+                       "html_note": clip(html_note or "", 200),
                        "contract": verdict.seal_mode})
         except Exception as e:  # noqa: BLE001
             logger.warning("project_improve_failed", project=slug, error=str(e)[:300])

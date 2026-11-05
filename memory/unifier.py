@@ -50,6 +50,39 @@ _STOP_WORDS = frozenset(
 )
 
 
+#: Entities that exist for Nova's own bookkeeping. They are facts in the table
+#: and they are NOT things she remembers about Marcus, so they have no business
+#: in "Things you remember" — a live prompt carried
+#: `FACT executive surfaced:upcoming:call the dentist = 2026-11-02T17:57:17`
+#: and the reply invented "your dentist appointment at 5:00 PM today", reading a
+#: UTC throttle stamp as a time of day (audit 2026-11-02, H6).
+#:
+#: Each of these has a real reader that fetches it directly: the executive
+#: layer, the session gap check, self-evaluation, the skill learner, the
+#: specialist roster. None of them goes through search.
+_BOOKKEEPING_ENTITIES = frozenset({
+    "executive", "session", "self_eval", "activity", "experiment",
+    "research_checked", "interest_focus", "mood", "wellbeing",
+})
+_BOOKKEEPING_PREFIXES = ("agent:", "agentmem:", "exptrials:", "plan:")
+
+
+def _is_bookkeeping_entity(entity: Any) -> bool:
+    e = str(entity or "").strip().lower()
+    if not e:
+        return False
+    return e in _BOOKKEEPING_ENTITIES or e.startswith(_BOOKKEEPING_PREFIXES)
+
+
+def _term_coverage(terms: list[str], text: str) -> float:
+    """What fraction of the question's words this row actually contains."""
+    wanted = [t for t in terms if t]
+    if not wanted:
+        return 1.0
+    low = (text or "").lower()
+    return sum(1 for t in wanted if t in low) / len(wanted)
+
+
 def _content_words(text: str) -> set[str]:
     """Substantive words in a fact, for cheap same-subject detection."""
     return {
@@ -2009,6 +2042,90 @@ class MemoryUnifier:
             logger.debug("supersede_failed", error=str(e)[:160])
             return 0
 
+    async def forget(self, query: str, *, limit: int = 25,
+                     dry_run: bool = False) -> dict[str, Any]:
+        """Delete what the speaker asks to be forgotten, and say what went.
+
+        THERE WAS NO WAY TO DO THIS (audit 2026-11-02, C4). Asked "Please forget
+        my locker code, I don't want you storing that", Nova called
+        `memory.correct` — which needs a replacement value and errored
+        `missing_attribute_or_value` — and then replied "I've wiped that locker
+        code from my memory". The next turn she recited it. A person's explicit
+        request to delete something is the worst possible place for a false
+        confirmation, and chat had no delete at all: `/memory/purge` needs an
+        admin token the UI does not have.
+
+        Deliberately strict, because deleting is not undoable from here:
+
+          * scoped to the speaker — nobody forgets anybody else's memory;
+          * a candidate must match EVERY meaningful word of the request, so
+            "forget my locker code" cannot take out everything about codes;
+          * bookkeeping rows are not candidates;
+          * capped, and the removed values are returned so the reply can state
+            what actually went rather than assert that something did.
+
+        `dry_run=True` answers the same question without deleting.
+        """
+        await self.initialize()
+        own = _read_scope_entity()
+        if own is None:
+            return {"ok": False, "error": "unverified_speaker",
+                    "detail": ("I'm not sure who I'm speaking with, so I won't "
+                               "delete anything from memory.")}
+        terms = [t for t in re.findall(r"[a-z0-9']+", (query or "").lower())
+                 if len(t) >= 3 and t not in _STOP_WORDS]
+        if not terms:
+            return {"ok": False, "error": "too_vague",
+                    "detail": ("Tell me which thing to forget — I won't delete "
+                               "memories on a guess.")}
+
+        from core.turn_identity import OWNER_ENTITY, may_read_entity
+
+        seen: dict[str, dict[str, Any]] = {}
+        for term in terms[:8]:
+            for row in await self._sqlite.search_facts(term, limit=200):
+                seen[str(row["id"])] = row
+        hits: list[dict[str, Any]] = []
+        for row in seen.values():
+            entity = str(row.get("entity") or "")
+            if _is_bookkeeping_entity(entity):
+                continue
+            # Only the speaker's own memory. The owner keeps legacy semantics
+            # (everything personal is his); a guest reaches only their own root.
+            if own != OWNER_ENTITY and not may_read_entity(entity):
+                continue
+            blob = f"{entity} {row.get('attribute')} {row.get('value')}".lower()
+            if all(t in blob for t in terms):
+                hits.append(row)
+        hits.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        hits = hits[:limit]
+        items = [{"entity": str(r.get("entity")), "attribute": str(r.get("attribute")),
+                  "value": str(r.get("value"))[:160]} for r in hits]
+        if not hits:
+            return {"ok": True, "deleted": 0, "items": [],
+                    "detail": "I couldn't find anything stored that matches that."}
+        if dry_run:
+            return {"ok": True, "deleted": 0, "would_delete": len(items), "items": items,
+                    "dry_run": True}
+
+        ids = [str(r["id"]) for r in hits]
+        removed = await self._sqlite.delete_facts_by_ids(ids)
+        self._search_gen += 1
+        if self._chroma is not None:
+            try:
+                await self._chroma.delete_ids(ids)
+            except Exception as exc:  # noqa: BLE001
+                # Gone from SQLite, still in the semantic index: recall could
+                # surface what was just deleted. Say so rather than hide it.
+                logger.warning("semantic_delete_failed", where="forget",
+                               ids=len(ids), error=str(exc)[:160])
+        await self._json.append_audit({"op": "forget", "query": (query or "")[:200],
+                                       "ids": ids, "items": items})
+        BUS.publish("memory.forgotten", {"count": removed,
+                                         "query": clip(query, 120)})
+        logger.info("memory_forgotten", count=removed, terms=",".join(terms[:4]))
+        return {"ok": True, "deleted": removed, "items": items}
+
     async def correct_fact(self, entity: str, attribute: str, new_value: str,
                            *, old_value: str | None = None) -> dict[str, Any]:
         """Conversational correction (U5): "no, Leslie's birthday is the 14th".
@@ -2471,7 +2588,11 @@ class MemoryUnifier:
         """
         await self.initialize()
         async with self._write_lock:
-            changed = await self._sqlite.set_reminder_status(reminder_id=reminder_id, status="cancelled")
+            # Only a PENDING reminder can be cancelled. Cancelling one twice
+            # used to answer True both times, so Nova reported a cancellation
+            # that had already happened as if it had just happened.
+            changed = await self._sqlite.set_reminder_status(
+                reminder_id=reminder_id, status="cancelled", only_if="pending")
         if changed:
             BUS.publish("reminder.cancelled", {"reminder_id": reminder_id})
         return changed
@@ -2767,6 +2888,19 @@ class MemoryUnifier:
         q_norm = q.lower().replace("’", "'")
         raw_terms = [t for t in re.findall(r"[a-z0-9']+", q_norm) if len(t) >= 3]
 
+        # STOP WORDS OUT (audit 2026-11-02, H5). The keyword tier LIKE-matches
+        # each term against entity, attribute and value, so searching for "the"
+        # matched 119 of the 271 facts in the real database — `for` 77, `you` 66,
+        # `and` 62 — every one of them scored a flat 0.95, above any semantic
+        # hit. Measured: "What was the code for my locker?" did not find the
+        # locker fact in the top ten; all ten slots were "the" matches.
+        #
+        # If a question is ONLY filler ("who are you?"), the original terms are
+        # kept: a broad search is better than no search.
+        meaningful = [t for t in raw_terms if t not in _STOP_WORDS]
+        if meaningful:
+            raw_terms = meaningful
+
         # Strip possessive suffixes (e.g. "mom's" -> "mom")
         terms: list[str] = []
         for t in raw_terms:
@@ -2938,8 +3072,16 @@ class MemoryUnifier:
         # here always claimed, though the code only ever decayed "note".
         # Salience and recall count slow the decay; see _staleness_factor.
         for row in fact_rows:
+            if _is_bookkeeping_entity(row.get("entity")):
+                # Internal rows are not things she remembers (audit, H6).
+                continue
             text = f"FACT {row['entity']} {row['attribute']} = {row['value']}"
-            base = 0.95
+            # COVERAGE, not a constant. Every keyword hit scored a flat 0.95, so
+            # a fact matching one filler word ranked level with one matching the
+            # whole question, and ordering among lexical hits was insertion
+            # order (audit, H5). Scaled to stay at or above the 0.80 the
+            # confidence hedge reads, so a full match behaves exactly as before.
+            base = 0.80 + 0.15 * _term_coverage(terms, text)
             if not _is_undecayed(row.get("entity")):
                 base *= _staleness_factor(
                     row.get("created_at"),
@@ -3542,6 +3684,12 @@ class MemoryUnifier:
     async def current_requirement(self, *, project_name: str) -> dict[str, Any] | None:
         await self.initialize()
         return await self._sqlite.current_requirement(project_name=project_name)
+
+    async def requirement_at(self, *, project_name: str,
+                             revision: int) -> dict[str, Any] | None:
+        await self.initialize()
+        return await self._sqlite.requirement_at(project_name=project_name,
+                                                 revision=int(revision))
 
     async def projects_with_requirements(self, *, limit: int = 50) -> list[str]:
         await self.initialize()

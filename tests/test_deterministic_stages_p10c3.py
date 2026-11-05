@@ -1991,6 +1991,11 @@ async def test_production_retry_classification():
             "research.list", "research.findings", "experiment.list",
             "experiment.analyze", "agents.roster", "agent.recall",
             "executive.brief", "skill.detect",
+            # Added for audit 2026-11-02 H6, and agreed read-only here: it
+            # calls list_reminders and formats the rows. Its two siblings from
+            # that finding are deliberately NOT here — reminder.cancel changes
+            # a reminder's status and memory.forget deletes.
+            "reminder.list",
         }
         declared = sorted(n for n in read_only if n in names and router.is_retry_safe(n))
         check(len(declared) >= 12,

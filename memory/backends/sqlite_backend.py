@@ -1577,15 +1577,25 @@ class SQLiteMemoryBackend:
             )
             await db.commit()
 
-    async def set_reminder_status(self, *, reminder_id: str, status: str) -> bool:
-        """True if a reminder actually changed status; False if there is none."""
+    async def set_reminder_status(self, *, reminder_id: str, status: str,
+                                  only_if: str | None = None) -> bool:
+        """True if a reminder actually changed status; False if there is none.
+
+        `only_if` fences the change to a current status. Without it, cancelling
+        an already-cancelled reminder matched its row and answered True, so
+        "cancelled" was reported twice for one cancellation — the same shape as
+        every other claim about something that did not happen
+        (audit 2026-11-02, C4 neighbourhood).
+        """
         await self.initialize()
         now = self._now_iso()
+        sql = "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?"
+        params: list[Any] = [status, now, reminder_id]
+        if only_if is not None:
+            sql += " AND status=?"
+            params.append(only_if)
         async with aiosqlite.connect(self._db_path) as db:
-            cur = await db.execute(
-                "UPDATE reminders SET status=?, updated_at=? WHERE reminder_id=?",
-                (status, now, reminder_id),
-            )
+            cur = await db.execute(sql, tuple(params))
             await db.commit()
             return cur.rowcount == 1
 
@@ -2902,6 +2912,30 @@ class SQLiteMemoryBackend:
                 "created_at, sealed_at, seal_mode "
                 "FROM project_requirements WHERE project_name=? "
                 "ORDER BY revision DESC LIMIT 1", (project_name,))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"project_name": row[0], "revision": int(row[1]),
+                "request_text": row[2], "source": row[3], "note": row[4],
+                "created_at": row[5], "sealed_at": row[6],
+                "seal_mode": row[7] or ""}
+
+    async def requirement_at(self, *, project_name: str,
+                             revision: int) -> dict[str, Any] | None:
+        """One specific recorded revision, or None.
+
+        `current_requirement` answers only for the newest. A caller that needs
+        the words of an EARLIER revision — carrying a contract forward from the
+        last revision that holds one (audit, H20) — was otherwise left guessing
+        with the current text, which is a different request.
+        """
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT project_name, revision, request_text, source, note, "
+                "created_at, sealed_at, seal_mode "
+                "FROM project_requirements WHERE project_name=? AND revision=?",
+                (project_name, int(revision)))
             row = await cur.fetchone()
         if row is None:
             return None
