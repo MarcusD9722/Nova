@@ -193,10 +193,59 @@ async def dev_inspect(req: DevInspectRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+def _require_local_origin(request: Request) -> None:
+    """Refuse a dev-mode write from an origin Nova does not serve.
+
+    Same rule as `/permissions/resolve`, for the same reason: CORS stops a
+    disallowed origin READING a response, not the request from EXECUTING. These
+    endpoints write to Nova's own source tree.
+    """
+    if not _origin_allowed(request):
+        raise HTTPException(status_code=403,
+                            detail="This origin may not change Nova's source.")
+
+
+async def _require_apply_approval(proposal_id: str, path: str) -> None:
+    """Marcus's explicit approval, through the broker, or nothing happens.
+
+    THE HOLE THIS CLOSES (audit 2026-11-02, C1). `confirm` is a boolean the
+    CALLER supplies, so "the UI must show the diff first" was a comment rather
+    than a mechanism, and `apply_proposal` ends by importing the module it just
+    wrote (core/dev_mode.py's boot test). Unauthenticated POST /dev/propose
+    followed by POST /dev/apply therefore executed arbitrary code, with the
+    PermissionBroker never consulted. Proven end to end with `Origin: null` and
+    `Sec-Fetch-Site: cross-site`.
+
+    The broker is the gate now: an unapproved apply raises a visible request
+    that only a human at the UI can answer, and every outcome is in the audit
+    trail. `confirm=True` is still required on top — one is the UI's intent,
+    the other is the human's decision.
+    """
+    if STATE.runtime is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+    broker = STATE.runtime.permission_broker
+    decision = await broker.request("dev.apply", details={"proposal_id": proposal_id,
+                                                          "path": path})
+    verdict = decision.get("decision")
+    if verdict == "allowed":
+        return
+    if verdict == "denied":
+        raise HTTPException(status_code=403, detail=(
+            f"Applying a code change isn't permitted in '{broker.mode}' permission "
+            f"mode. Nothing was written."))
+    request_id = decision["request_id"]
+    if not await broker.await_decision(request_id):
+        outcome = broker.settled_as(request_id) or "not_approved"
+        raise HTTPException(status_code=403, detail=(
+            f"That change was not approved ({outcome}) — nothing was written "
+            f"and nothing ran."))
+
+
 @router.post("/dev/propose")
-async def dev_propose(req: DevProposeRequest) -> dict:
+async def dev_propose(req: DevProposeRequest, request: Request) -> dict:
     from core.dev_mode import DevModeError
 
+    _require_local_origin(request)
     dev = _dev_mode()
     try:
         proposal = dev.propose_change(req.path, req.new_content, reason=req.reason, project=req.project)
@@ -242,10 +291,19 @@ async def dev_projects() -> dict:
 
 
 @router.post("/dev/apply")
-async def dev_apply(req: DevApplyRequest) -> dict:
+async def dev_apply(req: DevApplyRequest, request: Request) -> dict:
     from core.dev_mode import DevModeError
 
+    _require_local_origin(request)
     dev = _dev_mode()
+    # Resolve the proposal BEFORE asking for approval, so the request names the
+    # file Marcus is being asked about rather than an opaque id.
+    try:
+        detail = dev.get_proposal(req.proposal_id)
+    except DevModeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    await _require_apply_approval(req.proposal_id, str(detail.get("display_path")
+                                                       or detail.get("path") or ""))
     try:
         return dev.apply_proposal(req.proposal_id, confirm=req.confirm)
     except DevModeError as e:
@@ -253,9 +311,10 @@ async def dev_apply(req: DevApplyRequest) -> dict:
 
 
 @router.post("/dev/reject")
-async def dev_reject(req: DevRollbackRequest) -> dict:
+async def dev_reject(req: DevRollbackRequest, request: Request) -> dict:
     from core.dev_mode import DevModeError
 
+    _require_local_origin(request)
     dev = _dev_mode()
     try:
         dev.reject_proposal(req.proposal_id)
@@ -265,9 +324,10 @@ async def dev_reject(req: DevRollbackRequest) -> dict:
 
 
 @router.post("/dev/rollback")
-async def dev_rollback(req: DevRollbackRequest) -> dict:
+async def dev_rollback(req: DevRollbackRequest, request: Request) -> dict:
     from core.dev_mode import DevModeError
 
+    _require_local_origin(request)
     dev = _dev_mode()
     try:
         return dev.rollback_proposal(req.proposal_id)

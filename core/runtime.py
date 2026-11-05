@@ -28,7 +28,9 @@ from core.intent import (asks_about_work, mentions_completion,
                          is_purely_conversational)
 from core.project_names import is_project_dir
 from core.project_intent import (
+    MutationVerdict,
     describes_a_change,
+    references_project_work,
     asks_current_project,
     classify_removal,
     REMOVAL_AMBIGUOUS,
@@ -938,6 +940,12 @@ class RuntimeManager:
         )
         self._computer = ComputerControl(self._permission_broker,
                                          adapter=default_adapter())
+        # The actuator gate in core/tooling.py reads this AT CALL TIME. The
+        # router is built before the runtime exists (backend/app.py), so the
+        # broker cannot be a constructor argument there — and that gate fails
+        # closed without it, so this line is what lets shell.exec, code.write
+        # and discord.send run at all.
+        self._router.permission_broker = self._permission_broker  # type: ignore[attr-defined]
 
         async def _tool_computer_observe(args: dict[str, Any]) -> dict[str, Any]:
             return await self._computer.observe(str(args.get("what") or "windows"))
@@ -1674,6 +1682,15 @@ class RuntimeManager:
         is_complaint = bool(CONTINUATION_COMPLAINT_RE.search(t))
         may_mutate = authorize_project_mutation(t, complaint=is_complaint)
 
+        # WHO is speaking. Every other write path was scoped in P5.1d; this one
+        # was missed, so an unrecognised voice could start or improve a project
+        # with no owner and no broker (audit 2026-11-02, H10). A recognised
+        # guest does not get to either: core/turn_identity.py deliberately keeps
+        # projects OUT of the shared namespace, because what Marcus is building
+        # is his. One choke point, because every branch below reads this verdict.
+        if may_mutate.allowed and not current_identity().is_owner:
+            may_mutate = MutationVerdict(False, "vetoed: not Marcus")
+
         # "implement those suggestions" (uses last active project when unnamed)
         if IMPLEMENT_SUGG_RE.search(t) and may_mutate:
             slug = pb.known_slug_in_text(t) or await pb.last_active()
@@ -1750,7 +1767,11 @@ class RuntimeManager:
                                           "vetoed: deferral")
                                and defers_a_change(t)
                                and carries_a_proposal(t)))
-            if is_proposal and in_play:
+            # …and it must be ABOUT the work. A stored plan is executable: a
+            # later "go ahead" runs these exact words as instructions, so a
+            # sentence from someone's private life must never become one
+            # (audit, C3 — same borrowed-pointer root as the improve path).
+            if is_proposal and in_play and references_project_work(t):
                 self._pending_plan.setdefault(conv, {})[in_play] = t
                 self._bound_pending_plans()
 
@@ -1828,7 +1849,16 @@ class RuntimeManager:
             # reports, and "where did we leave off" names no project by nature.
             if STATUS_WORDS_RE.search(t):
                 slug = await pb.last_active()
-            elif may_mutate:
+            elif may_mutate and references_project_work(t):
+                # BOTH halves, and this is the second one (audit, C3). An
+                # affirmative instruction was enough on its own to borrow the
+                # last-active project as a target, and that pointer is durable
+                # across sessions — so with any project ever opened, "Add milk
+                # to the shopping list." started an autonomous improve of it and
+                # rewrote its acceptance contract. An instruction that says
+                # nothing about software is now conversation, which is where it
+                # belongs.
+                #
                 # …but only when the message did not NAME a different project.
                 # Measured with flappy-bird open: "Let's work on the calculator
                 # project." resolved no slug, borrowed the last-active one, and

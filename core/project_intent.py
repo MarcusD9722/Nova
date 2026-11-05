@@ -63,7 +63,89 @@ __all__ = [
     "REMOVAL_AMBIGUOUS",
     "removal_object_tokens",
     "REMOVAL_UNSUPPORTED",
+    "references_project_work",
 ]
+
+
+# ── THE OTHER HALF OF THE GATE (audit 2026-11-02, C3) ───────────────────────
+#
+# `authorize_project_mutation` answers "is this an instruction". It was being
+# used as though it answered "is this an instruction ABOUT THE PROJECT", and
+# those are different questions. With any project ever opened — the pointer is
+# durable across sessions — an unnamed instruction borrowed it as its target,
+# so ordinary life became project edits. Measured end to end on real weights:
+#
+#     "My marriage isn't working."     -> started an improve of flappy-bird
+#     "Add milk to the shopping list." -> started an improve of flappy-bird
+#
+# and the project's acceptance contract was rewritten to say
+# "The system adds milk to the shopping list."
+#
+# So borrowing the last-active project now requires the message to be about
+# software work at all. Naming the project is the clearest way; a work noun is
+# the other. Everything else falls through to conversation, which is the
+# direction whose mistakes cost a sentence instead of Marcus's files.
+
+#: Nouns that make a message about the WORK rather than about someone's life.
+#: An allowlist, deliberately: a sentence this does not recognise is treated as
+#: not about the project. The failure of the old rule was that it recognised
+#: everything.
+_WORK_SUBJECT_RE = re.compile(
+    r"\b(?:"
+    r"code|codebase|source|repo|repository|commit|branch|"
+    r"file|files|folder|directory|filename|readme|"
+    r"function|method|class|variable|constant|module|script|"
+    r"program|app|application|game|website|site|webpage|page|"
+    r"ui|interface|layout|button|screen|menu|window|dialog|form|input|"
+    r"level|sprite|texture|animation|physics|collision|score|"
+    r"bug|crash|error|exception|traceback|stacktrace|regression|"
+    r"test|tests|testing|pytest|unittest|assertion|coverage|"
+    r"version|dependency|dependencies|package|"
+    r"feature|endpoint|api|route|handler|"
+    r"css|html|javascript|typescript|python|json|yaml|sql|"
+    r"docstring|comment|comments|import|imports|logging|logs?|"
+    r"database|schema|query|table|server|client|frontend|backend|"
+    r"font|colour|color|pixel|icon|style|styling|theme|"
+    r"project|projects"
+    r")\b"
+    # …or a filename, which is unambiguous on its own.
+    r"|\b[\w-]+\.(?:py|js|jsx|ts|tsx|html|css|md|json|yml|yaml|txt|toml|cfg|sh|ps1)\b"
+    # `build`, `compile`, `deploy` and `release` are verbs far more often than
+    # nouns in ordinary speech — "Build me up, I had a rough day" was reading as
+    # a project reference — so they count only in a nominal position.
+    r"|\b(?:the|a|an|this|that|last|latest|failing|failed|first|next)\s+"
+    r"(?:build|compile|deploy|release)\b",
+    re.IGNORECASE,
+)
+
+#: Phrases that refer back to work Nova herself just described: the suggestion
+#: list, a pending plan, "that change". Legitimate even with no work noun,
+#: because the subject was established by Nova's own previous turn.
+_WORK_ANAPHORA_RE = re.compile(
+    r"\b(?:"
+    # An adjective or a count may sit in between: "those THREE suggestions",
+    # "the REMAINING next steps".
+    r"(?:that|those|the|this|your|these)\s+(?:\w+\s+){0,2}"
+    r"(?:change|changes|edit|edits|suggestion|suggestions|improvement|"
+    r"improvements|idea|ideas|step|steps|item|items|fix|fixes|"
+    r"recommendation|recommendations|next\s+steps?)"
+    r"|where\s+(?:we|you)\s+left\s+off"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def references_project_work(text: str) -> bool:
+    """Is this message about a project or its code at all?
+
+    Deliberately narrow and deliberately not a judgement about intent — that is
+    `authorize_project_mutation`'s job. Both must agree before anything is
+    written to disk, and neither is sufficient alone.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(_WORK_SUBJECT_RE.search(raw) or _WORK_ANAPHORA_RE.search(raw))
 
 
 # TWO VOCABULARIES, and the difference is the whole point.

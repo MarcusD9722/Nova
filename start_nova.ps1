@@ -62,6 +62,24 @@ $rendererUrl = "http://localhost:$rendererPort/"
 Write-Host "Renderer URL:  $rendererUrl" -ForegroundColor Green
 Write-Host ""
 
+# --- API TOKEN ---
+# Every endpoint on the backend port answers whoever can reach it unless
+# NOVA_API_TOKEN is set, and that includes POST /dev/apply, which writes a file
+# into Nova's source and then imports it. So the launcher mints one and hands
+# the SAME value to the backend, Vite and Electron, which is the piece that was
+# missing: a token in .env alone locks the UI out, because Electron never reads
+# .env (audit 2026-11-02, C1/M16).
+#
+# A value already in the environment wins, so setting your own still works.
+if (-not $env:NOVA_API_TOKEN) {
+  $bytes = New-Object 'System.Byte[]' 32
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  $env:NOVA_API_TOKEN = [System.BitConverter]::ToString($bytes).Replace("-", "").ToLower()
+  Write-Host "API token:      generated for this session (UI inherits it)" -ForegroundColor Green
+} else {
+  Write-Host "API token:      using the one already in your environment" -ForegroundColor Green
+}
+
 # --- AUTONOMY DEFAULTS ---
 # You asked Nova to be fully autonomous by default.
 $env:NOVA_AUTONOMY = "1"

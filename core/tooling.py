@@ -10,16 +10,45 @@ from typing import Any
 
 from core.code_ops import CodeOps
 from core.dates import parse_date_range, parse_reminder_time
-from core.dev_mode import DevMode, DevModeError
+from core.dev_mode import DevMode, DevModeError, secret_path_reason
 from core.file_extract import extract_excerpt as _extract_file_excerpt
+from core.permissions import HUMAN_DECISION_TIMEOUT_S
 from core.project_manager import ProjectManager
-from core.tool_router import ToolRouter
+from core.tool_router import (PERMISSION_EXECUTION_ALLOWANCE_S,
+                              PERMISSION_TOOL_TIMEOUT_S, ToolRouter)
 from core.logging_setup import get_logger
 from memory.unifier import MemoryUnifier
 from plugins.registry import REGISTRY
 
 
 logger = get_logger(__name__)
+
+#: The longest a single shell command may run. The router's declared budget for
+#: `shell.exec` is built from this plus the approval window, so the two numbers
+#: cannot drift into the state where cancellation beats the process's own
+#: timeout and nothing kills it.
+_SHELL_MAX_TIMEOUT_S = 120.0
+
+
+async def _kill_tree(proc: Any) -> None:
+    """Kill a shell command AND whatever it started.
+
+    `proc.kill()` on Windows kills the `cmd.exe` wrapper and leaves its children
+    running, so a cancelled `shell.exec` reported "cancelled" while the command
+    it launched carried on (audit 2026-11-02, M3). `taskkill /T` takes the tree.
+    """
+    pid = getattr(proc, "pid", None)
+    if pid and os.name == "nt":
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/T", "/F", "/PID", str(pid),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(killer.wait(), timeout=10)
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.debug("taskkill_failed", pid=pid, error=str(e)[:120])
+    with contextlib.suppress(Exception):
+        proc.kill()
 
 
 def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnifier) -> ToolRouter:
@@ -41,6 +70,99 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     # Load plugins (side-effects: register tools)
     with contextlib.suppress(Exception):
         import plugins.init  # noqa: F401
+
+    # ── The permission gate for actuators (audit 2026-11-02, C1/H10) ─────────
+    #
+    # core/permissions.py describes itself as the gate EVERY actuator passes,
+    # and three of them did not pass it: `shell.exec` ran a command,
+    # `code.write` wrote a source file and `discord.send` sent a message with
+    # nothing asked and nothing recorded — including in `locked` mode, which is
+    # documented as read-only.
+    #
+    # The broker is owned by RuntimeManager, which is built AFTER the router, so
+    # it is attached to the router afterwards (the same way `router.dev_mode`
+    # already is). These closures read it at CALL time, by which point boot has
+    # finished.
+
+    async def _gate(capability: str, details: dict[str, Any]) -> dict[str, Any] | None:
+        """Ask permission. None means proceed; a dict is the refusal to return.
+
+        A MISSING broker fails CLOSED. An actuator with nothing deciding for it
+        is precisely what this gate exists to prevent, and treating absence as
+        permission is how the hole would come back the first time some caller
+        built a router on its own.
+        """
+        broker = getattr(router, "permission_broker", None)
+        if broker is None:
+            logger.warning("actuator_without_broker", capability=capability)
+            return {"ok": False, "status": "denied", "error": "no_permission_broker",
+                    "note": ("Nothing is available to approve that right now, so I "
+                             "didn't run it.")}
+        decision = await broker.request(capability, details=details)
+        verdict = decision.get("decision")
+        if verdict == "allowed":
+            return None
+        if verdict == "denied":
+            return {"ok": False, "status": "denied", "capability": capability,
+                    "reason": decision.get("reason"),
+                    "note": f"{capability} isn't permitted in '{broker.mode}' mode, so I didn't run it."}
+        # needs_confirmation: wait on the broker's own window. The tool declares
+        # PERMISSION_TOOL_TIMEOUT_S so the agent loop does not amputate it.
+        request_id = decision["request_id"]
+        if not await broker.await_decision(request_id):
+            outcome = broker.settled_as(request_id) or "not_approved"
+            return {"ok": False, "status": "not_approved", "outcome": outcome,
+                    "capability": capability,
+                    "note": ("You didn't approve it (declined or timed out) — "
+                             "nothing ran.")}
+        return None
+
+    #: Shell commands that only LOOK. First token only, and only when the line
+    #: carries no shell metacharacter, so there is nothing chained onto the end.
+    #: An allowlist rather than a deny-list on purpose: a command this does not
+    #: recognise is treated as capable of changing the machine, which is the
+    #: direction whose mistakes are cheap.
+    _READ_ONLY_CMDS = frozenset({
+        "ls", "dir", "pwd", "cat", "type", "head", "tail", "wc", "findstr",
+        "grep", "rg", "tree", "where", "which", "whoami", "hostname", "date",
+        "echo", "printenv", "uname", "ver", "systeminfo", "nvidia-smi", "df",
+        "du", "free", "ps", "tasklist", "netstat", "stat", "file", "diff", "fc",
+        "uniq", "cut", "python", "py", "python3", "pip", "npm", "git",
+    })
+    #: For commands that both read and write depending on the subcommand, the
+    #: subcommands that only READ. Anything else drops to `shell.exec`.
+    _VERSION_FLAGS = frozenset({"--version", "-v", "-V", "--help", "-h", "version"})
+    _READ_ONLY_SUBCMDS = {
+        "git": frozenset({"log", "status", "diff", "show", "branch", "remote",
+                          "describe", "rev-parse", "ls-files", "config", "blame",
+                          "shortlog", "tag", "stash", "ls-remote", "cat-file"})
+                | _VERSION_FLAGS,
+        "pip": frozenset({"list", "show", "freeze", "check"}) | _VERSION_FLAGS,
+        "npm": frozenset({"ls", "list", "view", "outdated"}) | _VERSION_FLAGS,
+    }
+    _SHELL_META_RE = re.compile(r"[;&|><`$\n]|\$\(")
+
+    def _shell_capability(cmd: str) -> str:
+        """`shell.read` for a command that provably only looks, else `shell.exec`."""
+        text = (cmd or "").strip()
+        if not text or _SHELL_META_RE.search(text):
+            return "shell.exec"
+        parts = text.split()
+        head = Path(parts[0].strip('"\'')).name.lower()
+        head = head[:-4] if head.endswith(".exe") else head
+        if head not in _READ_ONLY_CMDS:
+            return "shell.exec"
+        allowed_subs = _READ_ONLY_SUBCMDS.get(head)
+        if allowed_subs is not None:
+            sub = parts[1].lower() if len(parts) > 1 else ""
+            if sub not in allowed_subs:
+                return "shell.exec"
+        # `python -c ...` and `pytest` run arbitrary code from somewhere. A
+        # version probe does not.
+        if head in {"python", "py", "python3"} and not (
+                len(parts) == 2 and parts[1] in {"--version", "-V", "-VV"}):
+            return "shell.exec"
+        return "shell.read"
 
     def _scope_guarded(name: str, fn: Any) -> Any:
         """Wrap an owner-private plugin so a non-owner is refused BEFORE it runs.
@@ -77,11 +199,44 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
 
         return guarded
 
+    #: Plugin tools that reach OUT of this machine on Marcus's behalf, and so
+    #: need his approval rather than only his data scope. Sending a message as
+    #: someone is not something to do unasked (audit 2026-11-02, H10).
+    _BROKERED_PLUGINS = {"discord.send": "discord.send"}
+
+    def _broker_guarded(name: str, capability: str, fn: Any) -> Any:
+        """Wrap a plugin so the broker decides before anything leaves the box."""
+
+        async def _guarded(args: dict[str, Any]) -> dict[str, Any]:
+            details = {"tool": name}
+            for key in ("to", "channel", "channel_id", "subject"):
+                if args.get(key):
+                    details[key] = str(args[key])[:120]
+            body = str(args.get("content") or args.get("message") or args.get("text") or "")
+            if body:
+                details["preview"] = body[:160]
+            refused = await _gate(capability, details)
+            if refused is not None:
+                return refused
+            return await fn(args)
+
+        return _guarded
+
     _plugin_specs = REGISTRY.get_tools()
-    plugin_tools = {
-        name: (_scope_guarded(name, spec.fn) if spec.data_scope == "owner_private" else spec.fn)
-        for name, spec in _plugin_specs.items()
-    }
+
+    def _wrap_plugin(name: str, spec: Any) -> Any:
+        fn = spec.fn
+        cap = _BROKERED_PLUGINS.get(name)
+        if cap is not None:
+            fn = _broker_guarded(name, cap, fn)
+        # Scope stays OUTERMOST: a speaker who may not touch Marcus's accounts
+        # is refused before a permission request is even raised, so no approval
+        # prompt appears for a call that was never going to run.
+        if spec.data_scope == "owner_private":
+            fn = _scope_guarded(name, fn)
+        return fn
+
+    plugin_tools = {name: _wrap_plugin(name, spec) for name, spec in _plugin_specs.items()}
     plugin_descriptions = {name: spec.description for name, spec in _plugin_specs.items()}
 
     async def _scaffold_project(args: dict[str, Any]) -> dict[str, Any]:
@@ -91,12 +246,30 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
 
     async def _code_read(args: dict[str, Any]) -> dict[str, Any]:
         path = Path(str(args.get("path") or "")).expanduser()
+        # The SAME secret rule dev mode uses (core/dev_mode.secret_path_reason).
+        # This tool had none, so it read `.env` — API key and all — into the
+        # model's prompt, for any speaker (audit 2026-11-02, H10).
+        reason = secret_path_reason(path)
+        if reason is not None:
+            return {"ok": False, "error": "refused_secret_path", "path": str(path),
+                    "note": f"I won't read that: {reason}."}
         content = await code_ops.read_text(path)
         return {"path": str(path), "content": content}
 
     async def _code_write(args: dict[str, Any]) -> dict[str, Any]:
         path = Path(str(args.get("path") or "")).expanduser()
         content = str(args.get("content") or "")
+        reason = secret_path_reason(path)
+        if reason is not None:
+            return {"ok": False, "error": "refused_secret_path", "path": str(path),
+                    "note": f"I won't write that: {reason}."}
+        # Writing source outside the propose -> review -> apply flow needs a
+        # human. Measured: the free agent loop called this and wrote a file into
+        # core/ with no proposal and no approval.
+        refused = await _gate("code.write", {"path": str(path),
+                                             "bytes": len(content.encode("utf-8"))})
+        if refused is not None:
+            return refused
         await code_ops.apply_patch_atomic(path, content)
         return {"path": str(path), "bytes": len(content.encode("utf-8"))}
 
@@ -1045,11 +1218,24 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         if not allow_shell:
             return {"ok": False, "error": "shell_disabled"}
         cmd = str(args.get("cmd") or args.get("command") or "").strip()
-        timeout_s = float(args.get("timeout_s") or 45.0)
+        # Capped, and the cap is part of the budget the router declares below.
+        # An uncapped inner timeout could outlive the router's window, and the
+        # cancellation that followed skipped the kill (audit, M3).
+        timeout_s = max(1.0, min(float(args.get("timeout_s") or 45.0), _SHELL_MAX_TIMEOUT_S))
         if not cmd:
             return {"ok": False, "error": "missing_cmd"}
         if _looks_dangerous_cmd(cmd):
             return {"ok": False, "error": "refusing_dangerous_command", "cmd": cmd}
+
+        # Permission, by what the command can DO. A command on the read-only
+        # allowlist asks for `shell.read` (allowed in every mode, `locked`
+        # included — looking at the machine is reading); anything else asks for
+        # `shell.exec`, which needs Marcus in guarded mode and is refused in
+        # locked. Before this, `locked` mode ran whatever it was handed.
+        capability = _shell_capability(cmd)
+        refused = await _gate(capability, {"cmd": cmd[:400]})
+        if refused is not None:
+            return {**refused, "cmd": cmd, "capability": capability}
 
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -1060,9 +1246,15 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
         try:
             out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except TimeoutError:
-            with contextlib.suppress(Exception):
-                proc.kill()
+            await _kill_tree(proc)
             return {"ok": False, "error": "timeout", "cmd": cmd, "timeout_s": timeout_s}
+        except asyncio.CancelledError:
+            # The router's budget fired, or the turn was abandoned. `except
+            # TimeoutError` never saw this, so the process was left running
+            # while the tool reported "cancelled" — a command still changing
+            # the machine after Nova said it had stopped (audit, M3).
+            await _kill_tree(proc)
+            raise
 
         stdout = (out_b or b"").decode("utf-8", errors="ignore")
         stderr = (err_b or b"").decode("utf-8", errors="ignore")
@@ -1282,6 +1474,19 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
     ):
         if _read_only in tools:
             router.set_retry_safe(_read_only, True)
+    # PERMISSION BUDGETS. These three can block on Marcus clicking Approve, so
+    # they declare the approval window plus room to actually do the work. The
+    # agent loop's generic 25s would otherwise abandon the call while the button
+    # was still live — the defect PERMISSION_TOOL_TIMEOUT_S exists to prevent,
+    # which the newly-gated tools would have walked straight back into.
+    for _gated, _budget in (
+        ("shell.exec", HUMAN_DECISION_TIMEOUT_S + _SHELL_MAX_TIMEOUT_S
+                       + PERMISSION_EXECUTION_ALLOWANCE_S),
+        ("code.write", PERMISSION_TOOL_TIMEOUT_S),
+        ("discord.send", PERMISSION_TOOL_TIMEOUT_S),
+    ):
+        if _gated in tools:
+            router.set_timeout(_gated, _budget)
     # Expose the shared self-editing surface so the /dev/* endpoints operate on
     # the same proposal store Nova writes to via self.propose_change.
     router.dev_mode = dev_mode  # type: ignore[attr-defined]

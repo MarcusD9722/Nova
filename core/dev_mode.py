@@ -49,6 +49,25 @@ _DENY_PARTS = {
     "credentials",  # OAuth tokens (PI1) — same protection tier as .env/model
 }
 _BOOT_TEST_TIMEOUT_S = 90.0
+
+
+def secret_path_reason(path: Path) -> str | None:
+    """Why this path may never be read or written — or None when it is fine.
+
+    ONE definition of "this file is a secret", shared with the `code.read` /
+    `code.write` tools in core/tooling.py. Dev mode has always had the rule;
+    the tools that most needed it did not, so `code.read` returned `.env` —
+    API key included — straight into a model prompt, for an unverified speaker
+    (audit 2026-11-02, H10). A second copy of the list would have drifted, so
+    there is only this one.
+    """
+    name = path.name.lower()
+    if name in _DENY_NAMES or name.startswith(".env"):
+        return "environment and secret files are off limits"
+    for part in path.parts:
+        if part.lower() in _DENY_PARTS:
+            return f"{part} is a protected directory"
+    return None
 # Same system-directory guard as memory.index_folder's — an external project
 # root must never be a Windows/system directory.
 _EXTERNAL_SYSTEM_PREFIXES = ("c:\\windows", "c:\\program files", "c:\\programdata")
@@ -174,9 +193,12 @@ class DevMode:
         if not allowed:
             raise DevModeError(f"Path is outside the allowed roots: {target}")
 
-        if target.name.lower() in _DENY_NAMES or target.name.lower().startswith(".env"):
-            raise DevModeError("Refusing to touch environment/secret files.")
-        if any(part.lower() in _DENY_PARTS for part in target.parts):
+        reason = secret_path_reason(target)
+        if reason is not None:
+            # Same wording as before for the two cases that already had it, so
+            # anything matching on the message still matches.
+            if "environment" in reason:
+                raise DevModeError("Refusing to touch environment/secret files.")
             raise DevModeError(f"Refusing to touch protected directory in path: {target}")
         return target
 
@@ -440,6 +462,16 @@ class DevMode:
         proposal = self._proposals.get(proposal_id)
         if proposal is None:
             raise DevModeError(f"Unknown proposal: {proposal_id}")
+        # Only a LIVE proposal can be rejected. Without this, rejecting one that
+        # had already been applied left the change sitting on disk, the status
+        # reading `rejected`, and `rollback_proposal` refusing it ("only an
+        # applied proposal can be rolled back") — so the change was unreachable
+        # from either direction (audit 2026-11-02, L11).
+        if proposal.status not in ("pending", "stale"):
+            raise DevModeError(
+                f"That proposal is {proposal.status}, not pending. "
+                + ("Use rollback to undo it." if proposal.status == "applied"
+                   else "There is nothing to reject."))
         proposal.status = "rejected"
         self._save_proposal(proposal)
         BUS.publish("dev.proposal_rejected", {"proposal_id": proposal_id})
@@ -493,7 +525,14 @@ class DevMode:
 
         # And re-validate the FILE: a path that is still legal may hold
         # something entirely different from what the diff was computed against.
-        self._drift_check(proposal, path)
+        try:
+            self._drift_check(proposal, path)
+        except DevModeError:
+            # `stale` has to SURVIVE. The check set the field and nothing wrote
+            # it, so the next boot loaded the proposal as `pending` again and
+            # offered an applicable-looking diff for a file that had moved on.
+            self._save_proposal(proposal)
+            raise
 
         # 1) Pre-apply syntax check for Python — never write code that won't compile.
         if path.suffix == ".py":

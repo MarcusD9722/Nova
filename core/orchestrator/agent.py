@@ -138,7 +138,15 @@ class ToolLoopExecutor:
 
         # Lenient parse: small models put the tool name in "action" or skip
         # the wrapper entirely ({"tool": "web.search", ...}).
-        known = set(self._router.list_tools())
+        #
+        # Validated against what this AGENT may call, not against the whole
+        # router. `skip_tools` and `tool_allowlist` only ever removed tools from
+        # the PROMPT, so a name the model produced anyway was executed:
+        # `code.write` sits on the default skip list and the free loop ran it,
+        # writing a file into core/ with no proposal and no approval
+        # (audit 2026-11-02, H10). Grounding lists every tool name, so the model
+        # did not even have to invent one.
+        known = set(self._allowed(agent))
         action = str(obj.get("action") or "").strip()
         tool = str(obj.get("tool") or "").strip()
         if action == "respond":

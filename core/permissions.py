@@ -52,6 +52,29 @@ CAPABILITY_TIERS: dict[str, int] = {
     "computer.system_setting": CRITICAL,
     "computer.delete": CRITICAL,
     "skill.run": STANDARD,             # a learned workflow (its steps re-checked individually)
+    # ── Actuators that reach outside memory (audit 2026-11-02, C1/H10) ───────
+    #
+    # The module docstring has always said this is the gate EVERY actuator
+    # passes. It wasn't: `shell.exec` ran and `code.write` wrote a file while
+    # the mode was `locked`, which is documented as read-only. Naming them here
+    # is what makes that sentence true.
+    #
+    # `shell.read` is the READ-ONLY subset — a command on the allowlist in
+    # core/tooling.py, with no chaining and no redirection. Inspecting the
+    # machine IS reading, so it stays allowed in every mode, `locked` included.
+    # Everything else is `shell.exec`: it could change the machine, so it needs
+    # a human in guarded mode and is refused in locked.
+    "shell.read": READ,
+    "shell.exec": ADMIN,
+    # Writing source directly, outside the propose -> review -> apply flow.
+    "code.write": ADMIN,
+    # Applying a reviewed diff EXECUTES it: core/dev_mode.py's boot test imports
+    # the module it just wrote. Same class as code.write, so the same tier —
+    # ADMIN rather than CRITICAL, because a diff Marcus has read and approved is
+    # a thing he must still be able to apply in the default mode.
+    "dev.apply": ADMIN,
+    # Speaking to the outside world as Marcus.
+    "discord.send": STANDARD,
     # Projects. Deleting is RECOVERABLE (the folder moves to projects/.trash/),
     # so it needs confirmation but is allowed in the default 'guarded' mode.
     # Purging erases bytes for good, so it sits at CRITICAL — denied by default,

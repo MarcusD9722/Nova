@@ -118,6 +118,21 @@ async function waitForBackendReady(port, timeoutMs = 12000) {
   return false;
 }
 
+// Mint the API token the backend and the renderer share.
+//
+// Without one, every endpoint on the backend port answers whoever can reach it
+// — including POST /dev/apply, which writes a file into Nova's source and then
+// imports it (audit 2026-11-02, C1). The packaged app spawns the backend, so it
+// is the only thing that can hand both halves the same value. In dev,
+// start_nova.ps1 does the same job and its value is inherited here, so an
+// existing one is always left alone.
+function ensureApiToken() {
+  if (!process.env.NOVA_API_TOKEN) {
+    process.env.NOVA_API_TOKEN = require("crypto").randomBytes(32).toString("hex");
+  }
+  return process.env.NOVA_API_TOKEN;
+}
+
 function startBackendIfPackaged(port) {
   if (isDev()) return null;
 
@@ -131,6 +146,10 @@ function startBackendIfPackaged(port) {
     fs.mkdirSync(path.join(userData, "memory_data"), { recursive: true });
     fs.mkdirSync(path.join(userData, "model"), { recursive: true });
   } catch {}
+
+  // Before the spread, so the backend inherits the same token the renderer
+  // will be given (preload reads it off process.env).
+  ensureApiToken();
 
   const env = {
     ...process.env,

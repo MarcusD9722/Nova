@@ -42,6 +42,18 @@ logger = get_logger(__name__)
 #: for one bad room, and re-recording is cheaper than a weak profile (§5).
 MIN_KEPT_SAMPLES = 5
 
+#: The only roles an enrollment may claim. `core/turn_identity.py` states that
+#: `stored_role` "comes from the durable enrolled profile and never from the
+#: request", and this route took it from a form field — so an arbitrary string
+#: could be written, and `owner` is the one that maps a voice into Marcus's own
+#: memory namespace (audit 2026-11-02, H12).
+#:
+#: The real gate is the API token the launcher now mints: an unauthenticated
+#: caller cannot reach this route at all. This is the second layer — whatever
+#: arrives may only be one of two known values, so nothing unexpected is ever
+#: persisted as a role.
+_ENROLLABLE_ROLES = ("owner", "guest")
+
 
 def _service():
     """The process-wide speaker service, CREATING it if this is the first use.
@@ -134,6 +146,10 @@ async def enroll(
     svc = _service()
     if not files:
         raise HTTPException(status_code=400, detail="no samples")
+    role = (role or "guest").strip().lower()
+    if role not in _ENROLLABLE_ROLES:
+        raise HTTPException(status_code=422, detail=(
+            f"role must be one of {list(_ENROLLABLE_ROLES)}; got {role!r}"))
 
     samples: list[tuple[Any, int]] = []
     for f in files:

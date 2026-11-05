@@ -400,10 +400,18 @@ def api_exposure_note() -> str | None:
     """
     if _api_token():
         return None
+    # NOT "set one in .env". Electron never reads .env, so a token set only
+    # there makes the backend demand something the UI does not have and every
+    # request comes back 401 — advice that breaks the app is worse than none
+    # (audit 2026-11-02, M16). start_nova.ps1 and the packaged launcher both
+    # mint one and hand it to every process, so the normal path needs nothing.
     return ("No NOVA_API_TOKEN is set: every endpoint on this port answers any "
             "local process, including POST /permissions/resolve, which APPROVES "
-            "an action that was waiting for you. Set one in .env if anything "
-            "else runs on this machine.")
+            "an action that was waiting for you, and POST /dev/apply, which "
+            "writes to Nova's source. Launch through start_nova.ps1 (it mints "
+            "one and passes it to the UI too), or set NOVA_API_TOKEN in the "
+            "environment of BOTH the backend and Electron — .env alone reaches "
+            "only the backend and locks the UI out.")
 
 
 def _request_token_ok(supplied: str | None) -> bool:
@@ -1373,8 +1381,9 @@ async def _startup() -> None:
     if not _api_token():
         logger.warning(
             "api_auth_disabled",
-            note="NOVA_API_TOKEN is not set — every endpoint is open to anything that can reach this port. "
-                 "Fine for localhost-only use; set a token before any 24/7 or remote exposure.",
+            note="NOVA_API_TOKEN is not set — every endpoint is open to anything that can reach this port, "
+                 "including /dev/apply. start_nova.ps1 mints one and shares it with the UI; a value in .env "
+                 "alone reaches only the backend and would 401 the UI.",
         )
 
     BUS.publish(
