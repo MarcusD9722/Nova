@@ -49,6 +49,14 @@ class _Client:
 
 async def main():
     cr.httpx.AsyncClient = _Client
+    # A THROWAWAY SPEND FILE. The daily cap persists to disk since audit
+    # 2026-11-02 L3 — a restart used to reset it, including the restart a
+    # runaway loop provokes — so this suite has to start from zero or two runs
+    # accumulate into each other. Pointed at a temp file, which also keeps
+    # test counters out of the real memory directory.
+    import tempfile
+    os.environ["NOVA_CLOUD_SPEND_PATH"] = str(
+        Path(tempfile.mkdtemp(prefix="nova-cloud-spend-")) / "spend.json")
     os.environ.update({"NOVA_CLOUD_ENABLED": "1", "NOVA_CLOUD_PROVIDER": "openai",
                        "NOVA_CLOUD_MODEL": "m", "NOVA_CLOUD_API_KEY": "k"})
     os.environ.pop("NOVA_CLOUD_DAILY_TOKEN_CAP", None)

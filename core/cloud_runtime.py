@@ -173,9 +173,16 @@ class CloudRuntime:
         # including the one a runaway loop provokes -- reset the day's spend to
         # zero, and the ceiling could be crossed once per restart. A plain
         # JSON file holding one day's counters.
+        # UNDER THE CONFIGURED MEMORY DIR, not a path computed from this file.
+        # A hard-coded `<repo>/memory_data` ignored NOVA_MEMORY_DIR, so every
+        # test run and every throwaway-root boot read and wrote the REAL
+        # file — two runs of the cost suite accumulated into each other, and
+        # test state landed in Marcus's own memory directory. The memory dir is
+        # where this state belongs and is already redirected per environment.
         self._spend_path = Path(
             os.getenv("NOVA_CLOUD_SPEND_PATH", "").strip()
-            or Path(__file__).resolve().parents[1] / "memory_data" / "cloud_spend.json")
+            or (Path(os.getenv("NOVA_MEMORY_DIR", "").strip() or "memory_data")
+                / "cloud_spend.json"))
         self._load_spend()
 
     def _load_spend(self) -> None:

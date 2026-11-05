@@ -95,6 +95,45 @@ without asking. Everything else was run.
 
 ---
 
+## What the full sweep changed
+
+The 195-suite sweep came back 172/195 the first time. All 23 failures were
+caused by this round, and the diagnosis is worth keeping, because two of them
+were my fixes going further than the findings asked:
+
+**Pulled back.** `Origin: null` is allowed again by default — dropping it
+broke `/permissions/resolve`, so with no token Electron could not approve
+anything, which is a silent failure of the path the whole permission system
+rests on. `NOVA_DROP_NULL_ORIGIN=1` is the opt-in and the minted token is the
+real boundary. And `discord.send` is no longer brokered: in `guarded` mode a
+STANDARD capability needs a click, so every Discord message would have waited
+for one. M1 asked only that the *unattended* planner not be offered it, and
+`_NEVER_UNATTENDED` already does that.
+
+**Over-reach in H18, corrected.** A check that exits 0 without printing a
+verdict is evidence again: requiring a declared verdict discarded every
+assert-based check, which is most of them, and H18's actual false pass was a
+script that *printed* `CANNOT_CHECK` and exited 0. And
+`ImportError: cannot import name` is a finding about the program, not a
+crashed check — the new crash attribution was shadowing a distinction the
+original code made deliberately.
+
+**C3's gate was one branch too wide.** Requiring work vocabulary to resolve a
+project target silenced the whole deferral feature ("Add a parallax
+background, but don't change anything yet" stored nothing, so every later
+"okay, do it" found nothing) and sent `delete tracker` to the model, which
+answered "Sure." — the one answer a destructive request must never get. The
+gate now sits only on immediate execution, with the conversation as a second
+way to qualify, and a removal resolves a target without it because what it
+reaches is a question, never an edit.
+
+The rest were tests encoding a contract that genuinely changed, each updated
+with the reason in a comment. One of them is worth noting on its own:
+`test_episodic_integration_v41` held a *second* `{"allowed": True}` fake
+broker — the same wrong shape that let H13 hide for as long as it did.
+
+---
+
 ## Still owed
 
 Three claims in this document rest on code and template inspection rather than
