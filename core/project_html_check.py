@@ -127,9 +127,11 @@ def _local_script(base: Path, src: str) -> Path | None:
     try:
         target = (base / rel).resolve()
         root = base.resolve()
-    except OSError:
+    except OSError:  # quiet-ok: a path that cannot be resolved is not part of the project; the note counts it as not checked
         return None
-    if not str(target).startswith(str(root)):
+    # By path components, not string prefix: `../calculator/app.js` from a
+    # project called `calc` shares the prefix and is not part of it.
+    if not target.is_relative_to(root):
         return None
     return target if target.is_file() else None
 
@@ -438,7 +440,7 @@ def _node_check(node: str, script: str, workdir: Path, label: str) -> str | None
         proc = subprocess.run([node, "--check", str(f)], capture_output=True,
                               text=True, timeout=SMOKE_TIMEOUT_S,
                               encoding="utf-8", errors="replace")
-    except (subprocess.TimeoutExpired, OSError) as e:
+    except (subprocess.TimeoutExpired, OSError) as e:  # quiet-ok: returned as this script's parse error
         return f"{label}: could not be parsed ({type(e).__name__})"
     if proc.returncode == 0:
         return None
@@ -454,7 +456,7 @@ def _smoke_sync(html_path: Path) -> HtmlSmokeResult:
         return res
     try:
         html = html_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
+    except OSError as e:  # quiet-ok: the note says the page could not be read
         res.skipped_reason = f"the page could not be read ({e})"
         return res
 
@@ -497,11 +499,11 @@ def _smoke_sync(html_path: Path) -> HtmlSmokeResult:
                 capture_output=True, text=True, timeout=SMOKE_TIMEOUT_S,
                 cwd=str(work), stdin=subprocess.DEVNULL,
                 encoding="utf-8", errors="replace")
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired:  # quiet-ok: recorded as the page's error, which the note reports
             res.errors = ["the page did not finish 60 ticks within "
                           f"{SMOKE_TIMEOUT_S:g}s — it may be looping"]
             return res
-        except OSError as e:
+        except OSError as e:  # quiet-ok: the note says node could not be started
             res.ran = False
             res.skipped_reason = f"node could not be started ({e})"
             return res

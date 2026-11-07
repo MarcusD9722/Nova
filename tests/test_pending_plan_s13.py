@@ -94,17 +94,39 @@ async def _chat(nova, cid: str, text: str) -> str:
     return str(r.json().get("assistant") or "")
 
 
+async def _idle(nova, *, ticks: int = 250) -> None:
+    """Wait until no project is being built or improved.
+
+    An instruction "settles" when it reaches the orchestration, and the next
+    one used to be sent at once. That was safe only while a failed improvement
+    did nothing after its plan. Since test program item 4 (2026-11-07) it
+    records the failure (PROJECT.md, last_error, the announcement) before it
+    lets go of the project, which takes a few tens of milliseconds, and an
+    instruction sent inside that window is told, truthfully, "I'm still
+    working on flappy-bird". Measured: that is how "Update the README." came
+    to start nothing. Waiting for the builder to be free is what a person's
+    next message does anyway; every assertion below is unchanged.
+    """
+    pb = nova.runtime._project_builder
+    for _ in range(ticks):
+        if all(task.done() for task in pb._active.values()):
+            return
+        await asyncio.sleep(0.02)
+
+
 async def _quiet(nova, rec: Recorder, *, ticks: int = 30) -> None:
-    """Give any edit that WAS started time to reach the orchestration."""
+    """Give any edit that WAS started time to reach the orchestration, and end."""
     for _ in range(ticks):
         if rec.prompts:
-            return
+            break
         await asyncio.sleep(0.05)
+    await _idle(nova)
 
 
 async def _settled(nova, rec: Recorder, before: int, *, ticks: int = 200) -> bool:
     for _ in range(ticks):
         if len(rec.prompts) > before:
+            await _idle(nova)
             return True
         await asyncio.sleep(0.05)
     return False

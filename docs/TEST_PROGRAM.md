@@ -15,7 +15,7 @@ and what is still open.
 | # | layer | proves | runs in | status |
 |---|---|---|---|---|
 | 1 | **Coverage map** | which functions no test ever reaches | offline | **done** — see below |
-| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–3 done, see the end |
+| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–4 done, see the end |
 | 3 | **Wiring tests** | chains across modules, workers and restarts behave as coded | offline gate (real backend, scripted model) | planned |
 | 4 | **Judgement corpora** | question / statement / remember-this / command / project request / small talk / status question, at scale, typed and voice-style | offline gate | planned |
 | 5 | **Real-model scenarios** | the same behaviours with the real 9B, judged on what happened and on what was said | opt-in, GPU to itself | planned |
@@ -247,7 +247,8 @@ because nothing has ever made them run. The most are in `memory/unifier.py`
    Layer 4 tests the same judgements at corpus scale.
 4. **Projects: plan, build, run, report.** The untaken branches of `_build`,
    `_generate_and_run_tests`, `_verify_and_fix_runtime`,
-   `_fix_runtime_error_patch` and `_smoke_test_html`.
+   `_fix_runtime_error_patch` and `_smoke_test_html`. **Done 2026-11-07**,
+   see *Layer 2* below.
 5. **The HTTP layer.**
    - every endpoint driven through FastAPI's `TestClient` on a throwaway root,
      checking status codes and validation;
@@ -606,3 +607,238 @@ new rule about sentence shapes. So it is recorded here, not added to this
 change.
 
 **Full run after the fix, 2026-11-07: 203 of 203 suites passed.**
+
+### Item 4: projects — plan, build, run, report — done 2026-11-07
+
+    venv\Scripts\python.exe tests\test_project_pipeline_2026_11.py   (175 checks, about 40 s)
+
+Real programs run in real subprocesses in throwaway directories; only the
+model's text is scripted. The scripted model raises on any prompt no case
+expected, so a test cannot pass through a model call it did not mean to make.
+`PP_ONLY=4,5` runs only the named sections.
+
+**What a fresh map showed.** The project suites were measured again: 31
+suites, 12.7 minutes, all passing under coverage. The builder had moved since
+layer 1. Whole paths had never run in any suite:
+
+- `_fix_runtime_error_patch` never applied a patch. Only its refusals ran.
+- The fix loop in `_generate_and_run_tests` never ran. So its promise had no
+  test: the file ends "either improved so the tests pass, or byte-for-byte as
+  it started".
+- The repair round in `_smoke_test_html` never ran.
+- No suite ever reached "pytest ran a test and it passed" in
+  `_run_test_file`. The only pass any suite reached was module-level asserts.
+- In `_run_check`: the timeout, a program waiting on `input()`, and a GUI
+  traceback swallowed by a program that keeps running.
+- In `_build`: loose plan shapes, unsafe paths, the syntax repair, "no files
+  were written", and the failure report itself failing.
+- In `_improve`: unsafe paths, and "no files were successfully improved".
+
+**What they were meant to do, and the fourteen places they didn't.** Each
+was measured on a throwaway root against the committed code first. The suite
+runs against the committed builder too, apart from the section that tests
+`failure_line`, which does not exist there. 47 of the 167 checks it can run
+fail there. Two of those 47 fail only because a message was reworded.
+
+1. **A planned file could land in another project.** The path check
+   compared strings: `str(target).startswith(str(path))`.
+   - Building `calc` with a planned absolute path into `calculator/` passed
+     the check, and overwrote `calculator/main.py` (on a throwaway root).
+   - The same check guarded improvements, and the HTML smoke test's script
+     loader, which ran a sibling project's script as part of the page.
+   - A plan entry of `.` passed too, and crashed the build trying to write
+     the folder.
+
+   Now the check compares path components (`is_relative_to`), and the folder
+   itself is not a file.
+2. **Long files lost their end, silently.** Every whole-file prompt shows
+   the file cut to a window (6,000, 7,000 or 9,000 characters) and asks for
+   "the COMPLETE corrected file". The model cannot return what it was not
+   shown. Measured on an 11,152-character `main.py`:
+   - an improvement kept the 51 of 80 functions it had been shown, and
+     logged "Changed: main.py. Run check passed.";
+   - when the edit did not compile, the "revert" wrote back only the 7,000
+     characters the prompt had held. The file was cut mid-string, so a
+     working project no longer compiled, and nothing said so.
+
+   Five places do this: the syntax repair, the crash fix, the logic fix, the
+   HTML repair and improvements. A file that does not fit is now left as it
+   was, with the reason in the log. The minimal patch edits the full file in
+   place, so it still works at any length. **This needs a decision from
+   Marcus;** see the end of this item.
+3. **An empty repair passed as a working program.** A generated file with a
+   syntax error got a repair that came back empty. An empty file compiles,
+   so it was written, and the run check passed it: "Run check passed
+   (main.py)." Now the build fails and says the repair came back empty. The
+   file keeps what was generated.
+4. **The crash fix was shown the wrong code.** The patch prompt took the
+   last "line N" anywhere in the error.
+   - For a crash raised inside a library call (`random.choice([])`), that is
+     the library's line, past the end of `main.py`. The model was shown an
+     empty code window.
+   - For a JSON error, "line 1 column 1" in the message made `import json`
+     the crash line.
+
+   Now the crash line is the deepest frame in the program's own file.
+5. **The notes never said what failed.**
+   - "Run check still failing after fixes: …" quoted the first 160
+     characters of the traceback. Those are always "Traceback (most recent
+     call last):" and a file path.
+   - The logic-test note quoted pytest's last line, "1 failed in 0.06s".
+     With pytest-asyncio installed, as it is here, that line is a
+     deprecation warning, because stderr was appended after pytest's report.
+   - The fix prompts were given the start of the traceback, which cuts the
+     exception off a long one.
+
+   Now `failure_line` picks the line that says what went wrong. pytest's
+   report comes last, and the prompts get the end of the traceback.
+6. **The logic-test note blamed tests that passed.** Tests passed on a
+   program whose main block crashes, and the note read "Logic tests
+   inconclusive (code left unchanged; a test may be wrong): unknown". Now it
+   reads "Logic tests passed (test_main.py), but the program itself does not
+   start", followed by the TypeError. A fix that made the tests pass but
+   stopped the program starting now says that.
+7. **An xfailed test counted as passing.** Exit 0 with "1 xfailed" means the
+   only test failed, as it was marked to. It read as "Logic tests passed".
+8. **A new file that did not compile was reported as a change.** An
+   improvement that added `helper.py` with a syntax error left it on disk and
+   logged "Changed: helper.py". Now the file is removed and logged as not
+   changed.
+9. **A failed improvement left no record.** It was logged, and the UI showed
+   it, but PROJECT.md, `last_error` and the announcer heard nothing. So
+   "what's the status?" answered with the last thing that had worked. Now it
+   is recorded the way a failed build is, keeping everything PROJECT.md
+   already said.
+10. **Every improvement reset PROJECT.md's file list and How to run** to
+    "(none yet)" and "(pending)". Both are now kept, and new files are added
+    to the list.
+11. **A change given as a bare path failed the improvement** with "'str'
+    object has no attribute 'get'". The build accepts the same shape in its
+    plan.
+12. **Suggestions in an unexpected shape.** One suggestion given as a string
+    became three letters: "A", "d", "d". A `null` failed the build after its
+    files had been written and verified.
+13. **A failed build kept generating.** When one file's generation failed,
+    the others carried on, holding the GPU and publishing progress for a
+    build already reported failed. Two finished after the end. Now they are
+    cancelled.
+14. **The HTML repair accepted a stub.** It was not compared with the page
+    it replaced, so a ten-line page that draws one rectangle could "repair"
+    a whole game. It is now judged like every other repair.
+
+**The quiet handlers in the builder and the HTML check, reviewed.** Layer 1
+counted 16 unreached quiet blocks in `project_builder.py`. With this suite
+reaching them, each was judged:
+
+- **Three could lose a real failure, and now say it.**
+  - `status_text` read a goal store that raised as "no planned work". The
+    status then let the completion state speak for both axes, which its own
+    comment forbids. It now logs `project_goals_unreadable`, and the answer
+    says it could not check the planned work.
+  - `last_active` read a fact store that raised as "nothing is current". It
+    now logs `last_active_unreadable`.
+  - `_validate_criteria` checked criteria against an empty program when the
+    entry file could not be read. It now logs `criteria_entry_unreadable`.
+- **One behaved differently from its neighbour.** A current-project pointer
+  that is not a project name at all (`..`) was returned as "nothing current"
+  and left in place. A pointer to a deleted project is cleared. Both are now
+  cleared.
+- **The rest are right as they are**, and carry a `# quiet-ok:` reason. In
+  each, the exception IS the answer, or the failure is returned to a caller
+  that reports it: a run check's crash text, a compile error, a smoke-test
+  note.
+
+One quiet block is left in the builder, in `write_repro_check`. That is one
+of the twenty unused functions, and item 7 tests it.
+
+**Mutation checks: 117 deliberate breaks, all caught, after four of my
+checks were corrected.**
+
+The first run broke 105 places: every fix reverted on its own, and every
+branch this suite reaches for the first time. 101 were caught. Each of the
+four that survived was a check something else could satisfy, not a gap in
+the code:
+
+- **The cancel test** checked that nothing finished after the build ended.
+  A version that waited for the other generations instead of cancelling
+  them made them finish before the end, so the check held. It now counts
+  the calls: four, not six.
+- **The patch prompt** states the error on a line of its own. So "the error
+  is in the prompt" passed with the traceback cut. The check now looks
+  inside the traceback block.
+- **Two `failure_line` samples** were too simple to tell its rules apart.
+  - One had a single `E` line, where the rule picks the last of several.
+  - One was a single line, which the fallback returns anyway.
+
+  Each now has a sample that passes only by the rule it pins.
+
+A second run broke those four again, and nine new places: the status answer,
+the current-project pointer and the criteria entry read. 13 of 13 were
+caught.
+
+**Then my own `failure_line` turned out too loose.** Reviewing the diff, I
+saw that it read pytest's rules ("FAILED …", "E   …") in ANY text. A crashing
+program that prints a board row "E . . X", or a log line "ERROR - lost
+connection", would have had that line quoted as its error. Those rules now
+apply only inside a pytest report. A third run broke the new conditions three
+ways, and re-broke four of the function's earlier rules against the new
+shape: 7 of 7 caught. Every file was restored byte-identically after every
+run.
+
+**The first full run found a suite that finding 9 broke, and the cause was
+the test's timing.** In `test_pending_plan_s13`, "Update the README." started
+nothing. The three S13 pending-plan suites send their next instruction the
+moment the previous one's plan prompt appears. Their scripted planner returns
+no changes, so every improvement fails at once. Before finding 9, a failed
+improvement did nothing after its plan, so it was always over before the next
+message arrived.
+
+It now records the failure first, which takes 30 to 50 ms, measured. An
+instruction sent inside that window was told, truthfully, "I'm still working
+on flappy-bird". That happened three times out of three when the test's
+timing was replayed. What the suites test, the routing, is unchanged. Their
+wait helpers now also wait for the builder to be free, as a person's next
+message would. Every assertion is as it was. The second full run found the
+same race in `test_project_selection_s13`, and it got the same wait.
+
+Freeing the project BEFORE recording the failure was considered and
+rejected. A new improvement could then start mid-report. The failed one's
+`evaluate` and announcement could then land on the new requirement
+revision, and so suppress that revision's own announcement.
+
+**Full run, 2026-11-07, on the final builder: 204 of 204 suites passed.**
+203 passed in the second full run. The 204th,
+`test_project_selection_s13`, failed there on the timing race above. It
+passed after its test-only fix, against the same builder.
+
+**Recorded, not changed:**
+
+- **The long-file guard (finding 2) is a decision for Marcus.** The real
+  projects are already past the window, read from the working tree:
+  `flappy-bird/main.py` is 12,451 characters and `gravity-runner/main.py` is
+  8,244. At roughly 3 to 4 characters per token, `flappy-bird` is also about
+  as long as the 3,000 tokens `_llm_file` has to write a whole file in, a
+  budget its reasoning spends from too (estimated, not tokenized). So a whole
+  rewrite of it could hardly ever have come back complete, whatever the
+  window. Improvements to both projects now stop with a reason instead of
+  silently cutting the files. The lasting fix is to
+  edit long files in pieces, or by find/replace patches as the crash fix
+  already does.
+- After a successful improvement the previous suggestions are still
+  dropped. Keeping them could offer again one the improvement just did, and
+  dropping them loses the rest. Marcus's call.
+- A missing project module is reported as "package 'game_logic' is not
+  installed on this machine". The run check cannot tell a pip package from a
+  file the model forgot to write.
+- `_validate_criteria` passes a `declare_scaffold` callback to
+  `check_criterion`. That function has ignored it since checks moved to a
+  copy of the project (audit H18), so the callback can never run.
+- `_verify_and_fix_runtime` ends with a `return None` that no path reaches.
+- `start()` accepts a `requested_by` that no caller passes and nothing
+  reads. That is one for item 8's small fixes.
+- The `..` test in `_build` refuses nothing the containment check would
+  allow, apart from paths that resolve inside the project anyway. It was
+  kept.
+- Asserts inside `if __name__ == "__main__":` in a generated test count as
+  checks only when they fail. A main block whose asserts all pass reads as
+  "No test actually passed". That fails safe, so it was left.

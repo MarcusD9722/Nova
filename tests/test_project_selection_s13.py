@@ -157,6 +157,24 @@ async def _chat(nova, cid: str, text: str) -> str:
     return str(r.json().get("assistant") or "")
 
 
+async def _idle(pb, *, ticks: int = 250) -> None:
+    """Wait until no project is being built or improved.
+
+    Each instruction here is improved with a plan of no changes, so every
+    improvement fails at once, and the next instruction used to be sent the
+    moment the last one's plan appeared. That was safe only while a failed
+    improvement did nothing after its plan. Since test program item 4
+    (2026-11-07) it records the failure (PROJECT.md, last_error, the
+    announcement) before it lets go of the project, which takes a few tens of
+    milliseconds, and an instruction sent inside that window was told,
+    truthfully, "I'm still working on calc-tool". Every assertion is unchanged.
+    """
+    for _ in range(ticks):
+        if all(task.done() for task in pb._active.values()):
+            return
+        await asyncio.sleep(0.02)
+
+
 def _tree(nova, slug: str) -> dict[str, str]:
     root = nova.projects_dir / slug
     if not root.exists():
@@ -212,6 +230,7 @@ async def test_select_then_act_actually_acts_through_chat():
             check(await pb.last_active() == "calc-tool",
                   f"and on the project it named ({await pb.last_active()!r}): "
                   f"{text!r}")
+            await _idle(pb)
 
         # …and the same starters with no second clause still only select.
         for starter in SELECTION_STARTERS[:6]:

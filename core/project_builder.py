@@ -47,6 +47,27 @@ _MAX_FILES = 5
 _FILE_TOKENS = int(os.getenv("NOVA_PROJECT_FILE_TOKENS", "3000").strip() or "3000")
 _CODE_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9+\-_.]*)\n(.*?)```", re.DOTALL)
 _MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
+#: A frame of a Python traceback: which file, which line.
+_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+#: The line a traceback ends with: `ZeroDivisionError: division by zero`,
+#: `json.decoder.JSONDecodeError: ...`, a bare `KeyboardInterrupt`.
+_EXCEPTION_LINE_RE = re.compile(
+    r"^(?:[A-Za-z_]\w*\.)*(?:[A-Z]\w*)?(?:Error|Exception|Exit|Interrupt)(?::|$)")
+#: The banners only a pytest report has. Its other rules ("FAILED ...",
+#: "E   ...") are read only inside one: a crashing program prints what it
+#: likes, a board row "E . . X" or a log line "ERROR - lost connection".
+_PYTEST_REPORT_RE = re.compile(r"^=+ (?:short test summary info|FAILURES|ERRORS) =+$",
+                               re.MULTILINE)
+#: pytest's short-summary line for one failure: "FAILED test_x.py::test_y - why".
+_PYTEST_SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR) \S+?\.py\S* - ")
+
+#: How much of a file each WHOLE-FILE prompt shows the model. Every one of
+#: them asks for "the COMPLETE corrected file", so a file longer than its
+#: window cannot come back whole: the model never saw the end of it. See
+#: `_fits_whole`.
+_REPAIR_WINDOW = 6000       # a generated file that does not compile
+_FIX_WINDOW = 7000          # a crash fix, a logic fix, an improvement
+_HTML_WINDOW = 9000         # a page that fails its smoke test
 
 
 #: Packages a small generated project might reasonably reach for. Probed, not
@@ -71,7 +92,7 @@ def _installed_packages() -> list[str]:
         try:
             if importlib.util.find_spec(name) is not None:
                 found.append(name)
-        except (ImportError, ValueError):
+        except (ImportError, ValueError):  # quiet-ok: a broken or shadowed install is treated as absent, so the stack note does not offer it
             # A broken or namespace-shadowed install is not something to plan
             # around. Treat it as absent.
             continue
@@ -469,15 +490,25 @@ def slugify(name: str) -> str:
 _PYTEST_COUNT_RE = re.compile(r"\b(\d+)\s+(passed|failed|error|errors|xpassed|xfailed)\b")
 
 
-def _collected_count(output: str) -> int:
+#: The outcomes in which a test ran and its assertions HELD.
+_HELD = frozenset({"passed", "xpassed"})
+
+
+def _collected_count(output: str, *, kinds: frozenset[str] | None = None) -> int:
     """How many tests pytest actually ran. 0 means nothing was proven.
 
     Parsed from the summary rather than trusted from the exit code, because exit
     0 is also what an empty run produces — the whole of H17.
+
+    `kinds` narrows the count to some outcomes. Passing `_HELD` asks the
+    question a pass needs answered: did anything run AND hold? Exit 0 with
+    "1 xfailed" is a run in which the only test FAILED, as it was marked to,
+    and it read as "Logic tests passed" (measured 2026-11-07).
     """
     if "no tests ran" in (output or "").lower():
         return 0
-    return sum(int(m.group(1)) for m in _PYTEST_COUNT_RE.finditer(output or ""))
+    return sum(int(m.group(1)) for m in _PYTEST_COUNT_RE.finditer(output or "")
+               if kinds is None or m.group(2) in kinds)
 
 
 def _module_level_asserts(path: Path) -> int:
@@ -489,9 +520,62 @@ def _module_level_asserts(path: Path) -> int:
     """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001  # quiet-ok: a file that does not parse runs no asserts; the caller then reports that no test passed
         return 0
     return sum(1 for node in tree.body if isinstance(node, ast.Assert))
+
+
+def failure_line(output: str) -> str:
+    """The ONE line of a run's output that says what went wrong.
+
+    Not the first characters and not the last line, which is what the build
+    notes used to quote (measured 2026-11-07):
+
+      * a run check's error was cut to its first 160 characters, and the first
+        160 characters of a traceback are always "Traceback (most recent call
+        last):" and a file path, so "Run check still failing after fixes" never
+        said what was failing;
+      * pytest's last line is "1 failed in 0.06s", and with pytest-asyncio
+        installed a deprecation warning comes after even that, so a failed
+        logic test was reported as the warning.
+
+    In order of preference, and the first two only inside a pytest report:
+    pytest's short summary line ("FAILED test_x.py::test_y - assert 5 == 6"),
+    the exception pytest prints on its "E   " lines, the exception line a
+    traceback ends with, the last line.
+    """
+    text = output or ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if _PYTEST_REPORT_RE.search(text):
+        for ln in lines:
+            if _PYTEST_SUMMARY_RE.match(ln):
+                return ln
+        shown = [ln[1:].strip() for ln in lines if ln.startswith("E ")]
+        named = [ln for ln in shown if _EXCEPTION_LINE_RE.match(ln)]
+        if named:
+            return named[-1]
+        if shown:
+            return shown[0]
+    for ln in reversed(lines):
+        if _EXCEPTION_LINE_RE.match(ln):
+            return ln
+    return lines[-1] if lines else ""
+
+
+def _fits_whole(text: str, window: int) -> bool:
+    """Can a whole-file prompt that shows `window` characters show ALL of it?
+
+    Every whole-file prompt here shows the file cut to a window and asks for
+    "the COMPLETE corrected file". For a longer file the model never sees the
+    end, so nothing it returns can contain it, and writing its reply deletes
+    the rest of the program. Measured 2026-11-07: an improvement to an
+    11,152-character main.py kept the 51 of its 80 functions the model had been
+    shown, and the log said "Changed: main.py. Run check passed." So a file
+    that does not fit is not rewritten whole: it is left as it was, and that is
+    said. The minimal-patch path (`_fix_runtime_error_patch`) edits the full
+    file in place and is not limited by this.
+    """
+    return len(text) <= window
 
 
 def _now_str() -> str:
@@ -589,9 +673,9 @@ class ProjectBuilder:
                     [_sys.executable, rel], cwd=str(path), capture_output=True,
                     text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired:  # quiet-ok: returned as the check's failure, saying it hung
                 return False, "check timed out (it hung — treated as a failure)"
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001  # quiet-ok: returned as the check's failure, with the error
                 return False, f"could not run the check: {e}"[:400]
             out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
             return proc.returncode == 0, out[-1500:]
@@ -655,6 +739,17 @@ class ProjectBuilder:
         if path.parent != self._projects_dir:
             raise ValueError(f"invalid project name: {slug}")
         return path
+
+    @staticmethod
+    def _inside(project: Path, target: Path) -> bool:
+        """Is the RESOLVED `target` a file path strictly inside `project`?
+
+        By path components, not by string prefix. `str(target).startswith(
+        str(project))` let a planned absolute path into ANOTHER project whose
+        name merely starts the same through: building `calc` overwrote
+        `calculator/main.py` (measured 2026-11-07, on a throwaway root).
+        """
+        return target != project and target.is_relative_to(project)
 
     def list_projects(self) -> list[str]:
         """Projects, by the ONE definition in `core.project_names`."""
@@ -946,7 +1041,12 @@ class ProjectBuilder:
         """
         try:
             fact = await self._memory.get_latest_fact(entity="projects", attribute="last_active")
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # No current project is the safe answer, but it must not be a
+            # silent one: a store that cannot be read looks exactly like
+            # "nothing is current".
+            logger.warning("last_active_unreadable",
+                           error=f"{type(e).__name__}: {str(e)[:160]}")
             return None
         slug = (fact.value or "").strip() if fact else ""
         if not slug:
@@ -959,8 +1059,8 @@ class ProjectBuilder:
         try:
             if is_project_dir(self._project_path(slug)):
                 return slug
-        except Exception:  # noqa: BLE001
-            return None
+        except Exception:  # noqa: BLE001  # quiet-ok: a pointer that is not a project name at all is no project, and is cleared below like a stale one
+            pass
         try:
             await self._memory.add_fact(entity="projects", attribute="last_active",
                                         value="", confidence=0.95)
@@ -975,7 +1075,7 @@ class ProjectBuilder:
         path = self._project_path(slug) / "PROJECT.md"
         try:
             return path.read_text(encoding="utf-8", errors="replace")
-        except FileNotFoundError:
+        except FileNotFoundError:  # quiet-ok: no PROJECT.md yet is not news; any other read failure is logged below
             return ""       # no PROJECT.md yet
         except OSError as e:
             # It exists but cannot be opened. Still "" -- callers treat that
@@ -1123,7 +1223,7 @@ class ProjectBuilder:
             from core.llm_runtime import CODE_REPEAT_PENALTY
 
             kwargs["repeat_penalty"] = CODE_REPEAT_PENALTY
-        except ImportError:
+        except ImportError:  # quiet-ok: a runtime module without the constant keeps its default penalty
             pass        # a runtime without the parameter keeps its default
         async with sem:
             raw = await runtime.chat(
@@ -1225,8 +1325,9 @@ class ProjectBuilder:
                 if ".." in rel.split("/"):
                     continue
                 target = (path / rel).resolve()
-                if not str(target).startswith(str(path)):
+                if not self._inside(path, target):
                     continue
+                rel = target.relative_to(path).as_posix()
                 planned.append((rel, target, (
                     f"Write the COMPLETE contents of `{rel}` for this project.\n"
                     f"Project request: {brief}\n"
@@ -1251,7 +1352,20 @@ class ProjectBuilder:
                 BUS.publish("project.progress", {"project": slug, "stage": "wrote", "file": rel})
                 return content
 
-            contents = await asyncio.gather(*(_generate(rel, prompt) for rel, _, prompt in planned))
+            # One file failing fails the build, and the others must stop with
+            # it. `gather` propagates the first exception and leaves the rest
+            # RUNNING: they went on holding the GPU and publishing "wrote"
+            # progress for a build that had already been reported as failed
+            # (measured 2026-11-07: two generations finished after the end).
+            jobs = [asyncio.ensure_future(_generate(rel, prompt))
+                    for rel, _, prompt in planned]
+            try:
+                contents = await asyncio.gather(*jobs)
+            except BaseException:
+                for job in jobs:
+                    job.cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+                raise
 
             for (rel, target, _), content in zip(planned, contents):
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -1262,12 +1376,25 @@ class ProjectBuilder:
                 if rel.endswith(".py"):
                     error = await asyncio.to_thread(self._py_compile_error, target)
                     if error:
+                        if not _fits_whole(content, _REPAIR_WINDOW):
+                            raise RuntimeError(
+                                f"{rel} does not compile ({error}) and is too long "
+                                f"({len(content)} characters) to repair whole")
                         BUS.publish("project.progress", {"project": slug, "stage": "repairing", "file": rel})
                         fixed = await self._llm_file(
                             f"This Python file has a syntax error. Fix it and return the COMPLETE corrected file.\n"
-                            f"Error: {error}\n\nFile `{rel}`:\n```python\n{content[:6000]}\n```\n"
+                            f"Error: {error}\n\nFile `{rel}`:\n```python\n{content}\n```\n"
                             "Reply with ONLY the corrected file content in a single fenced code block."
                         )
+                        if self._looks_like_failed_generation(fixed, content):
+                            # An empty file COMPILES. Writing this replaced a file
+                            # with one syntax error by a file with nothing in it,
+                            # and the run check then passed a program that does
+                            # nothing (measured 2026-11-07). The file is left as
+                            # it was generated, and the build fails saying why.
+                            raise RuntimeError(
+                                f"{rel} does not compile ({error}) and its repair "
+                                "came back empty")
                         target.write_text(fixed, encoding="utf-8")
                         error2 = await asyncio.to_thread(self._py_compile_error, target)
                         if error2:
@@ -1299,7 +1426,14 @@ class ProjectBuilder:
                 max_tokens=300,
             )
             suggestions = []
-            for s in (sugg_obj or {}).get("suggestions", []):
+            # The shape is the model's. One suggestion as a bare string was
+            # iterated letter by letter ("A", "d", "d"), and `null` raised
+            # TypeError here, AFTER the files were written and verified, which
+            # reported the whole build as failed (measured 2026-11-07).
+            raw = (sugg_obj or {}).get("suggestions")
+            if isinstance(raw, (str, dict)):
+                raw = [raw]
+            for s in raw if isinstance(raw, list) else []:
                 # Models sometimes return objects like {"improvement": "...", "rationale": "..."}
                 if isinstance(s, dict):
                     s = s.get("improvement") or s.get("suggestion") or s.get("text") or ""
@@ -1579,7 +1713,12 @@ class ProjectBuilder:
         if entry:
             try:
                 code = (path / entry).read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            except OSError as e:
+                # Each check is still run, against the program on disk, but
+                # whoever writes it is shown no code. Said, so a run of
+                # inconclusive verdicts has a reason someone can find.
+                logger.warning("criteria_entry_unreadable", project=slug,
+                               file=entry, error=f"{type(e).__name__}: {str(e)[:160]}")
                 code = ""
 
         def _declare(paths: list[str]) -> None:
@@ -1641,8 +1780,12 @@ class ProjectBuilder:
             missing = _MISSING_MODULE_RE.search(run_error)
             if missing:
                 return f"Run check blocked: package '{missing.group(1)}' is not installed on this machine."
+            # Every note below names the ERROR, by `failure_line`. It used to
+            # quote `run_error[:160]`, the first 160 characters of a
+            # traceback, which are always "Traceback (most recent call
+            # last):" and a path, so no note ever said what was failing.
             if attempt == 2:
-                return f"Run check still failing after fixes: {run_error[:180]}"
+                return f"Run check still failing after fixes: {failure_line(run_error)[:180]}"
             BUS.publish("project.progress", {"project": slug, "stage": "fixing_runtime_error", "file": entry})
             # Minimal-patch mode first: a small model applies a targeted
             # find/replace far more reliably than it regenerates a whole file
@@ -1651,15 +1794,22 @@ class ProjectBuilder:
                 continue
             target = path / entry
             current = target.read_text(encoding="utf-8", errors="replace")
+            if not _fits_whole(current, _FIX_WINDOW):
+                return (f"Run check failed, and {entry} is too long ({len(current)} "
+                        "characters) to fix whole without losing the part the fix "
+                        f"is not shown, so it was left as it was: "
+                        f"{failure_line(run_error)[:160]}")
             fixed = await self._llm_file(
                 f"This Python program crashes when run. Fix the bug and return the COMPLETE corrected file.\n"
-                f"Error output:\n{run_error[:1200]}\n\nFile `{entry}`:\n```python\n{current[:7000]}\n```\n"
+                # The END of a traceback is the error. `run_error[:1200]`
+                # kept the frames and cut the exception off a long one.
+                f"Error output:\n{run_error[-1200:]}\n\nFile `{entry}`:\n```python\n{current}\n```\n"
                 "Rules: keep all existing behavior, fix only the crash, and do not add any imports "
                 "the file does not already have. Do NOT quote or restate the buggy code. "
                 "Reply with EXACTLY ONE fenced code block containing the entire corrected file."
             )
             if self._looks_like_failed_generation(fixed, current):
-                return f"Run check failed; fix generation came back empty: {run_error[:160]}"
+                return f"Run check failed; fix generation came back empty: {failure_line(run_error)[:160]}"
             if fixed.strip() == current.strip():
                 # The model returned the file unchanged — retrying the same
                 # prompt is the only option left, so let the loop continue.
@@ -1668,8 +1818,19 @@ class ProjectBuilder:
             target.write_text(fixed, encoding="utf-8")
             if await asyncio.to_thread(self._py_compile_error, target):
                 target.write_text(current, encoding="utf-8")  # revert a broken "fix"
-                return f"Run check failed; proposed fix did not compile: {run_error[:160]}"
-        return None
+                return f"Run check failed; proposed fix did not compile: {failure_line(run_error)[:160]}"
+        return None  # not reached: every path of the third attempt returns above
+
+    @staticmethod
+    def _same_file(frame_file: str, target: Path, base: Path) -> bool:
+        """Does a traceback frame's file name `target`?"""
+        p = Path(frame_file)
+        if not p.is_absolute():
+            p = base / p
+        try:
+            return p.resolve() == target.resolve()
+        except OSError:  # quiet-ok: a path that cannot be resolved is compared by name
+            return p.name == target.name
 
     async def _fix_runtime_error_patch(self, path: Path, entry: str, run_error: str) -> bool:
         """Ask the LLM for a minimal find/replace patch and apply it.
@@ -1681,7 +1842,15 @@ class ProjectBuilder:
         target = path / entry
         current = target.read_text(encoding="utf-8", errors="replace")
         lines = current.splitlines()
-        frames = [int(n) for n in re.findall(r"line (\d+)", run_error)]
+        # THE CRASH LINE IS IN THIS FILE. It was the last `line N` anywhere in
+        # the text, and for a crash raised inside a library call that is the
+        # library's line: `random.choice([])` pointed at random.py line 373,
+        # past the end of main.py, so the model was shown an EMPTY code
+        # window. And "line 1 column 1" in a JSONDecodeError's message made
+        # `import json` the crash line (both measured 2026-11-07). The deepest
+        # frame in the program's own file is the line that went wrong there.
+        frames = [int(n) for name, n in _FRAME_RE.findall(run_error)
+                  if self._same_file(name, target, path)]
         ln = frames[-1] if frames else 0
         src = lines[ln - 1].strip() if 1 <= ln <= len(lines) else ""
         if ln:
@@ -1689,11 +1858,12 @@ class ProjectBuilder:
             window = "\n".join(lines[lo:hi])
         else:
             window = current[:2400]
-        err_last = run_error.strip().splitlines()[-1] if run_error.strip() else ""
+        err_last = failure_line(run_error)
 
         obj = await self._llm_json(
             "A Python program crashed. Produce the SMALLEST fix as a find/replace patch.\n"
-            f"Traceback:\n{run_error[:900]}\n\n"
+            # The end of a traceback is the error; the start is frames.
+            f"Traceback:\n{run_error[-900:]}\n\n"
             + (f"The crash is at line {ln}: `{src}`\n" if src else "")
             + f"The error is: {err_last}\n\n"
             f"Code around the crash:\n```python\n{window}\n```\n\n"
@@ -1722,8 +1892,8 @@ class ProjectBuilder:
 
         try:
             compile(patched, entry, "exec")
-        except Exception:
-            return False  # a patch that breaks the syntax is worse than none
+        except Exception:  # quiet-ok: a patch that breaks the syntax is refused, and the caller falls back to a whole-file fix
+            return False
         target.write_text(patched, encoding="utf-8")
         return True
 
@@ -1764,9 +1934,13 @@ class ProjectBuilder:
                     errors=result.errors[:2])
 
         # It ran and it is broken. ONE repair round, with the real error.
+        before = target.read_text(encoding="utf-8", errors="replace")
+        if not _fits_whole(before, _HTML_WINDOW):
+            return (f"{result.note()} ({page}) The page is too long ({len(before)} "
+                    "characters) to repair whole without losing the part the repair "
+                    "is not shown, so it was left as it was.")
         BUS.publish("project.progress",
                     {"project": slug, "stage": "repairing", "file": page})
-        before = target.read_text(encoding="utf-8", errors="replace")
         fixed = await self._llm_file(
             "This single-page HTML program fails when run headlessly.\n"
             "The errors, from a stub DOM that dispatches arrow keys and ticks "
@@ -1776,9 +1950,12 @@ class ProjectBuilder:
             + f"\n\nFix the CAUSE and return the COMPLETE corrected file "
               f"`{page}`.\nKeep every working feature. Do not add a build step, "
               "a framework, or anything loaded from the network.\n\n"
-              f"```html\n{before[:9000]}\n```\n"
+              f"```html\n{before}\n```\n"
               "Reply with ONLY the corrected file in one fenced code block.")
-        if self._looks_like_failed_generation(fixed):
+        # Judged against the page it would replace, as every other repair is.
+        # Without `before`, a ten-line stub that draws one rectangle was a
+        # "repair" of a whole game, and it passes the smoke test.
+        if self._looks_like_failed_generation(fixed, before):
             return (f"{result.note()} ({page}) The repair attempt came back "
                     "empty, so the file is unchanged.")
 
@@ -1879,14 +2056,16 @@ class ProjectBuilder:
             return "No reliable logic tests could be generated."
 
         last_err = ""
+        launch_err: str | None = None
+        too_long = False
         tests_green = False
         for attempt in range(3):
             BUS.publish("project.progress", {"project": slug, "stage": "logic_test", "file": test_name, "attempt": attempt + 1})
             err = await asyncio.to_thread(self._run_test_file, path, test_name)
             if err is None:
                 # Tests pass — confirm the (possibly-patched) code still launches.
-                if await asyncio.to_thread(self._run_check, path, entry) is None:
-                    tests_green = True
+                launch_err = await asyncio.to_thread(self._run_check, path, entry)
+                tests_green = launch_err is None
                 break
             last_err = err
             # Only chase a code fix when a logic ASSERTION failed. An
@@ -1894,12 +2073,16 @@ class ProjectBuilder:
             # mutate correct code to satisfy a broken test.
             if "AssertionError" not in err or attempt == 2:
                 break
-            BUS.publish("project.progress", {"project": slug, "stage": "fixing_logic", "file": entry})
             current = entry_path.read_text(encoding="utf-8", errors="replace")
+            if not _fits_whole(current, _FIX_WINDOW):
+                too_long = True
+                break
+            BUS.publish("project.progress", {"project": slug, "stage": "fixing_logic", "file": entry})
             fixed = await self._llm_file(
                 f"Your program `{entry}` fails a logic test. The test encodes the INTENDED behavior; "
-                f"fix the PROGRAM so the test passes.\nTest failure:\n{err[:1000]}\n\n"
-                f"`{entry}`:\n```python\n{current[:7000]}\n```\n"
+                # The END of a pytest report names the failing check.
+                f"fix the PROGRAM so the test passes.\nTest failure:\n{err[-1000:]}\n\n"
+                f"`{entry}`:\n```python\n{current}\n```\n"
                 "Rules: fix the logic bug in the program, not the test. Keep all other behavior. Do not add "
                 "imports the file lacks. Reply with EXACTLY ONE fenced code block containing the whole file."
             )
@@ -1907,7 +2090,7 @@ class ProjectBuilder:
                 break
             try:
                 compile(fixed, entry, "exec")
-            except Exception:
+            except Exception:  # quiet-ok: a fix that does not compile is never written; the note then says the tests were inconclusive
                 break  # never write a fix that breaks syntax
             entry_path.write_text(fixed, encoding="utf-8")
 
@@ -1915,11 +2098,28 @@ class ProjectBuilder:
             return f"Logic tests passed ({test_name})."
         # Never ship code made worse by a failed fix attempt.
         entry_path.write_text(original_main, encoding="utf-8")
+        failed = failure_line(last_err)[:150]
+        # SAY WHICH THING FAILED. Every way out of the loop used to end in "a
+        # test may be wrong: <last line>", including the two in which the test
+        # PASSED, and the last line was "unknown" or a deprecation warning
+        # (measured 2026-11-07).
+        if launch_err is not None and not last_err:
+            # The tests passed on the program as built. It is the program that
+            # does not start; nothing was changed and no test is to blame.
+            return (f"Logic tests passed ({test_name}), but the program itself does "
+                    f"not start: {failure_line(launch_err)[:150]}")
+        if launch_err is not None:
+            return (f"Logic tests failed ({failed}); a fix made them pass but stopped "
+                    "the program starting, so the code was left unchanged.")
+        if too_long:
+            return (f"Logic tests failed ({failed}); {entry} is too long to fix whole "
+                    "without losing the part the fix is not shown, so the code was "
+                    "left unchanged.")
         # A persistently-failing GENERATED test is ambiguous — the model may
         # have written a wrong assertion, so don't brand correct code "broken".
         # Report it honestly as review-worthy and leave the code untouched.
-        tail = last_err.strip().splitlines()[-1] if last_err.strip() else "unknown"
-        return f"Logic tests inconclusive (code left unchanged; a test may be wrong): {tail[:150]}"
+        return ("Logic tests inconclusive (code left unchanged; a test may be wrong): "
+                f"{failed or 'unknown'}")
 
     @staticmethod
     def _run_test_file(project_dir: Path, test_file: str, timeout_s: float = 60.0) -> str | None:
@@ -1939,52 +2139,66 @@ class ProjectBuilder:
         inverted sort under pytest, and the fix loop written for exactly that
         never fired.
 
-        So: run pytest, and require that it actually collected something. A file
-        that collects nothing falls back to a direct run (module-level asserts
-        are a legitimate shape) but can only ever report INCONCLUSIVE — never a
-        pass, because nothing proved anything.
+        So: run pytest, and require that something it collected ran AND held
+        (an xfailed test ran and failed). A file that collects nothing falls
+        back to a direct run (module-level asserts are a legitimate shape) but
+        can only ever report INCONCLUSIVE — never a pass, because nothing
+        proved anything.
         """
         import subprocess
         import sys
 
-        def _run(args: list[str]) -> tuple[int, str]:
+        def _run(args: list[str], *, report_on: str) -> tuple[int, str]:
+            """(exit code, output) with the stream holding the REPORT last.
+
+            Every reader of this text looks at its end. pytest writes its
+            report to stdout and plugin warnings to stderr, and stderr used to
+            be appended after it, so with pytest-asyncio installed the tail of
+            every failed run was a deprecation warning, which pushed the
+            collection error itself out of the 900 characters kept. A direct
+            run's traceback is on stderr, so for that one stderr goes last.
+            """
             try:
                 proc = subprocess.run(
                     args, cwd=str(project_dir), capture_output=True, text=True,
                     timeout=timeout_s, stdin=subprocess.DEVNULL,
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired:  # quiet-ok: returned as the run's result, saying it hung
                 return -9, "Test run timed out (possible infinite loop or blocking call)."
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001  # quiet-ok: returned as the run's result, with the error
                 return -1, str(e)[:400]
-            return proc.returncode, ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            so, se = proc.stdout or "", proc.stderr or ""
+            both = (se + "\n" + so) if report_on == "stdout" else (so + "\n" + se)
+            return proc.returncode, both.strip()
 
         code, out = _run([sys.executable, "-m", "pytest", test_file, "-q",
-                          "-p", "no:cacheprovider"])
+                          "-p", "no:cacheprovider"], report_on="stdout")
         if code == -9 or code == -1:
             return out
         # pytest's own exit codes: 0 all passed, 1 some failed, 2 interrupted,
         # 3 internal error, 4 usage error, 5 nothing collected.
-        if code == 0 and _collected_count(out) > 0:
+        if code == 0 and _collected_count(out, kinds=_HELD) > 0:
             return None
         if code == 1:
             return out[-1500:] or "a generated test failed"
         if code in (2, 3, 4) and "No module named pytest" not in out:
-            return (f"pytest could not run the generated tests (exit {code}):\n"
-                    f"{out[-900:]}")
+            return (f"pytest could not run the generated tests (exit {code}): "
+                    f"{failure_line(out)}\n{out[-900:]}")
 
         # Nothing collected, or pytest is unavailable. Run the file directly:
         # that executes module-level asserts, which is a real way to write a
         # check even though pytest cannot see it as a test.
-        direct_code, direct_out = _run([sys.executable, test_file])
+        direct_code, direct_out = _run([sys.executable, test_file], report_on="stderr")
         if direct_code != 0:
             return (direct_out or f"exit code {direct_code}").strip()[-1500:]
         if _module_level_asserts(project_dir / test_file) > 0:
             # Real checks, really executed, all passed. The shape is unusual;
             # the evidence is not.
             return None
-        return ("No test actually executed. pytest collected nothing from "
-                f"{test_file} and running it directly asserted nothing, so this "
+        # Exit 0 with nothing that held: no tests, only skipped ones, or only
+        # tests that failed as they were marked to (xfail).
+        return ("No test actually passed. pytest ran nothing that held in "
+                f"{test_file}, and running it directly asserted nothing, so this "
                 "says nothing about whether the code works.")
 
     @staticmethod
@@ -2008,7 +2222,7 @@ class ProjectBuilder:
                 timeout=timeout_s,
                 stdin=subprocess.DEVNULL,
             )
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired as e:  # quiet-ok: still running at the timeout is healthy; a traceback it printed is returned
             # The process stayed alive (a game/UI event loop). That is normally
             # healthy — BUT a GUI toolkit (Tkinter, etc.) catches exceptions
             # raised inside its callbacks and prints the traceback to stderr
@@ -2018,7 +2232,7 @@ class ProjectBuilder:
             if err and "Traceback (most recent call last)" in err:
                 return err.strip()[-1500:]
             return None
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # quiet-ok: returned as the crash output, so a run that cannot start is never healthy
             return str(e)[:400]
 
         if proc.returncode != 0:
@@ -2038,9 +2252,9 @@ class ProjectBuilder:
             source = path.read_text(encoding="utf-8", errors="replace")
             compile(source, str(path), "exec")
             return None
-        except SyntaxError as e:
+        except SyntaxError as e:  # quiet-ok: the syntax error IS the answer
             return f"SyntaxError: {e.msg} (line {e.lineno})"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # quiet-ok: returned as the compile error
             return str(e)[:300]
 
     @staticmethod
@@ -2118,23 +2332,47 @@ class ProjectBuilder:
                 "'fixed', 'resolved', 'stabilized' or 'ensured' — nothing is verified at this point, and "
                 "claiming a fix that didn't happen is worse than saying nothing."
             )
-            changes = (plan or {}).get("changes") or []
+            # Loose shapes, tolerated as `_build` tolerates them in its plan. A
+            # change given as a bare path raised AttributeError here and failed
+            # the whole improvement (measured 2026-11-07).
+            changes = (plan or {}).get("changes")
+            if isinstance(changes, (str, dict)):
+                changes = [changes]
+            changes = [{"path": c, "what": ""} if isinstance(c, str) else c
+                       for c in (changes if isinstance(changes, list) else [])]
+            changes = [c for c in changes if isinstance(c, dict)]
             if not changes:
                 raise RuntimeError("no improvement plan produced")
 
             changed: list[str] = []
             fail_reasons: list[str] = []
+            purpose: dict[str, str] = {}
             for ch in changes[:3]:
                 rel = str(ch.get("path") or "").replace("\\", "/").lstrip("/")
                 if not rel or ".." in rel.split("/"):
                     continue
                 target = (path / rel).resolve()
-                if not str(target).startswith(str(path)):
+                if not self._inside(path, target):
                     continue
+                rel = target.relative_to(path).as_posix()
 
+                existed = target.exists()
                 current = ""
-                if target.exists():
-                    current = target.read_text(encoding="utf-8", errors="replace")[:7000]
+                if existed:
+                    current = target.read_text(encoding="utf-8", errors="replace")
+                    # The prompt shows `_FIX_WINDOW` characters and asks for
+                    # the COMPLETE file, so a longer one came back without its
+                    # end, and the "revert" below wrote back only the part that
+                    # had been shown: an 11,152-character main.py became 7,000
+                    # characters cut mid-string (measured 2026-11-07).
+                    if not _fits_whole(current, _FIX_WINDOW):
+                        reason = (f"too long ({len(current)} characters) to rewrite "
+                                  "whole without losing the part the model is not "
+                                  "shown; left as it was")
+                        fail_reasons.append(f"{rel}: {reason}")
+                        BUS.publish("project.progress", {"project": slug, "stage": "skipped",
+                                                         "file": rel, "error": reason})
+                        continue
 
                 BUS.publish("project.progress", {"project": slug, "stage": "improving", "file": rel})
                 file_prompt = (
@@ -2164,12 +2402,19 @@ class ProjectBuilder:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(new_content, encoding="utf-8")
                 changed.append(rel)
+                purpose[rel] = str(ch.get("what") or "").strip()
 
                 if rel.endswith(".py"):
                     error = await asyncio.to_thread(self._py_compile_error, target)
-                    if error and current:
-                        # Revert on broken improvement rather than shipping a regression.
-                        target.write_text(current, encoding="utf-8")
+                    if error:
+                        # Revert on broken improvement rather than shipping a
+                        # regression. For a NEW file, reverting is removing it:
+                        # one that did not compile used to stay on disk and be
+                        # reported as "Changed" (measured 2026-11-07).
+                        if existed:
+                            target.write_text(current, encoding="utf-8")
+                        else:
+                            target.unlink(missing_ok=True)
                         changed.remove(rel)
                         fail_reasons.append(f"{rel}: compile error after edit — {clip(error, 160)}")
                         BUS.publish("project.progress", {"project": slug, "stage": "reverted", "file": rel, "error": clip(error, 160)})
@@ -2187,7 +2432,6 @@ class ProjectBuilder:
             test_note = await self._generate_and_run_tests(slug, path, code_candidates, summary)
             # Same gap on the improve path (audit, H19).
             html_note = await self._smoke_test_html(slug, path, code_candidates)
-            old_brief = re.search(r"## Brief\n(.*?)\n\n", project_md, re.DOTALL)
 
             # WHAT ACTUALLY HAPPENED, not what was planned. `summary` is the
             # planner's statement of intent, written before any code existed;
@@ -2212,12 +2456,23 @@ class ProjectBuilder:
             verdict = await self._completion.evaluate(slug=slug)
             improve_log.extend(self._evidence_log(verdict))
 
+            # What PROJECT.md already records and this improvement did not
+            # change is written back, not dropped: every improvement used to
+            # reset the file list to "(none yet)" and How to run to
+            # "(pending)" (measured 2026-11-07). New files join the list.
+            prior = self._md_sections(project_md)
+            listed = {f["path"] for f in prior["files"]}
+            files_after = prior["files"] + [
+                {"path": rel, "purpose": purpose.get(rel, "")}
+                for rel in dict.fromkeys(changed) if rel not in listed]
             self._write_project_md(
                 slug,
-                brief=(old_brief.group(1) if old_brief else instructions),
+                brief=prior["brief"] or instructions,
                 status=verdict.state,
                 verdict=verdict,
                 summary=f"requested: {summary}",
+                files=files_after,
+                run=prior["run"],
                 log_lines=improve_log,
             )
             await self._save_fact(slug, "status", verdict.state)
@@ -2232,9 +2487,59 @@ class ProjectBuilder:
                        "contract": verdict.seal_mode})
         except Exception as e:  # noqa: BLE001
             logger.warning("project_improve_failed", project=slug, error=str(e)[:300])
+            # RECORDED, as a failed build records itself. This path used to only
+            # log, so PROJECT.md went on describing the project as before, no
+            # last_error was kept, and "what's the status?" answered with the
+            # last thing that had worked (measured 2026-11-07). Nothing the
+            # file already records is dropped: the project is as it was.
+            try:
+                prior = self._md_sections(project_md)
+                verdict = await self._completion.evaluate(slug=slug)
+                self._write_project_md(
+                    slug, brief=prior["brief"] or instructions, status=verdict.state,
+                    verdict=verdict, summary=prior["summary"], files=prior["files"],
+                    run=prior["run"], suggestions=prior["suggestions"],
+                    log_lines=[f"Improvement failed: {e}"])
+                await self._save_fact(slug, "status", verdict.state)
+                await self._save_fact(slug, "last_error", str(e)[:200])
+                await self._announcer.announce(
+                    slug=slug, verdict=verdict,
+                    reason=f"improvement failed: {str(e)[:120]}",
+                    extra={"mode": "improve"})
+            except Exception as exc:  # noqa: BLE001
+                # Bound as `exc`: `e` is the improvement's failure, read below.
+                logger.warning("improve_failure_report_failed", project=slug,
+                               error=str(exc)[:160])
             BUS.publish("project.error", {"project": slug, "error": clip(e, 240), "mode": "improve"})
         finally:
             self._active.pop(slug, None)
+
+    @staticmethod
+    def _md_sections(md: str) -> dict[str, Any]:
+        """What an existing PROJECT.md records, to rewrite it without losing it.
+
+        `_write_project_md` writes every section from its arguments, so a
+        caller that passes nothing for one resets it. These are read back from
+        the file in the shape `_write_project_md` writes them.
+        """
+        def section(name: str) -> str:
+            m = re.search(rf"^## {re.escape(name)}\n(.*?)(?=\n## |\Z)", md or "",
+                          re.DOTALL | re.MULTILINE)
+            return m.group(1).strip() if m else ""
+
+        files = [{"path": m.group(1), "purpose": (m.group(2) or "").strip()}
+                 for m in re.finditer(r"^- `([^`]+)`(?: — (.*))?$", section("Files"),
+                                      re.MULTILINE)]
+        summary, run = section("Summary"), section("How to run")
+        return {
+            "brief": section("Brief"),
+            "summary": "" if summary == "(pending)" else summary,
+            "files": files,
+            "run": "" if run == "(pending)" else run,
+            "suggestions": [ln[len("- [ ] "):].strip()
+                            for ln in section("Next steps / suggestions").splitlines()
+                            if ln.startswith("- [ ] ")],
+        }
 
     # ── Status for chat ──────────────────────────────────────────────────────
 
@@ -2290,10 +2595,16 @@ class ProjectBuilder:
         # was the whole answer to "what's the status of alpha?" for a project
         # whose work plan had failed outright. Neither axis may speak for the
         # other, so when they disagree, both are said.
+        goals_read = True
         try:
             goals = await self._memory.list_goals(project_name=slug, limit=5)
-        except Exception:  # noqa: BLE001
-            goals = []
+        except Exception as e:  # noqa: BLE001
+            # UNREAD IS NOT "NO PLANNED WORK". Taking it as none let the
+            # completion state speak for both axes, which is the one thing the
+            # paragraph above forbids, and nothing said it had happened.
+            logger.warning("project_goals_unreadable", project=slug,
+                           error=f"{type(e).__name__}: {str(e)[:160]}")
+            goals, goals_read = [], False
         failed_goals = [g for g in goals if str(g.get("status")) == "failed"]
         live_goals = [g for g in goals
                       if str(g.get("status")) in ("active", "blocked")]
@@ -2306,6 +2617,9 @@ class ProjectBuilder:
             titles = "; ".join(str(g.get("title") or "untitled")
                                for g in live_goals[:3])
             parts.append(f"There is still planned work outstanding: {titles}.")
+        elif not goals_read:
+            parts.append("I could not check whether the planned work for it "
+                         "succeeded.")
 
         if verdict.legacy_note:
             parts.append(verdict.legacy_note)
