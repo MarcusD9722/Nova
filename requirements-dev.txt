@@ -1,0 +1,8 @@
+# Development-only tools. Nova does not need these to run.
+#
+#   venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+#
+# coverage: tests/coverage_map.py (layer 1 of docs/TEST_PROGRAM.md) - maps
+# which functions no test ever runs. 7.10+ is required for `patch =
+# subprocess`, which is how the restart suites' child processes get measured.
+coverage==7.17.2
