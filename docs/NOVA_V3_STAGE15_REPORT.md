@@ -388,9 +388,13 @@ exist.
   that phrasing reaches the model with neither axis attached. A grammar gap,
   not a composition defect; not patched, per the standing instruction not to
   broaden the intent grammar without a production defect requiring it.
+  *Fixed 2026-11-07, with Marcus's approval: the test program measured 43 of
+  51 ways of asking this missing. See `docs/TEST_PROGRAM.md`, layer 2 item 3.*
 * **"For blog, add a sidebar, but not yet."** — a leading TARGET phrase is a
   sentence shape the proposal grammar has never supported. Teaching it one
   would be broadening the grammar to fit a test.
+  *Supported since 2026-11-07, with Marcus's approval, when the phrase names
+  a project the turn resolved. Same record.*
 * **"Do it now."** is not an authorised instruction: `do` is not in Stage 13A's
   imperative vocabulary. An assumption of mine, measured and then recorded
   rather than "fixed".

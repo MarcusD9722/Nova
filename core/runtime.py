@@ -45,6 +45,7 @@ from core.project_intent import (
     defers_a_change,
     is_bare_approval,
     is_project_selection,
+    leading_target,
     qualified_project_name,
 )
 from core.gpu import GPU_SEM
@@ -2083,7 +2084,13 @@ class RuntimeManager:
         # Remembering it is what lets a later "make that change" execute the
         # plan the user actually approved. Only these two refusal shapes count:
         # a retrospective or a message about Nova herself is not a plan.
-        in_play = (pb.known_slug_in_text(t) or await pb.last_active()) if conv else None
+        # "For blog, add a sidebar, but not yet." says which project the
+        # change is FOR before it says what the change is, and that phrase
+        # outranks any other project the sentence happens to mention.
+        _target = leading_target(t) if conv else ""
+        _for_project = pb.known_slug_in_text(_target) if _target else None
+        in_play = (_for_project or pb.known_slug_in_text(t)
+                   or await pb.last_active()) if conv else None
         # The pending proposal is passed in because a SPECIFIC withdrawal
         # ("don't change the physics") can only be tied to the proposal it
         # refers to by looking at both. Measured on c86bfb1: with the
@@ -2129,7 +2136,8 @@ class RuntimeManager:
                            or (reason in ("vetoed: prohibition",
                                           "vetoed: deferral")
                                and defers_a_change(t)
-                               and carries_a_proposal(t)))
+                               and carries_a_proposal(
+                                   t, project=_for_project or "")))
             # …and it must be ABOUT the work. A stored plan is executable: a
             # later "go ahead" runs these exact words as instructions, so a
             # sentence from someone's private life must never become one

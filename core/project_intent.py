@@ -52,6 +52,7 @@ __all__ = [
     "defers_a_change",
     "withdraws_pending_change",
     "carries_a_proposal",
+    "leading_target",
     "is_bare_approval",
     "approves_without_naming_a_change",
     "qualified_project_name",
@@ -940,7 +941,47 @@ _CORRECTION_OPENER_RE = re.compile(
 )
 
 
-def carries_a_proposal(text: str) -> bool:
+#: "For blog, add a sidebar" / "In flappy-bird, make the pipes wider": a
+#: fronted phrase naming where the change goes, ended by a comma. Only ever
+#: acted on with a project the caller resolved, because the same shape also
+#: opens "On second thought, ..." and "For now, ...".
+_LEADING_TARGET_RE = re.compile(
+    r"^(?:for|in|on|over\s+in|inside)\s+(?P<target>[^,;:.!?]{1,60}?)\s*[,;:—]\s*",
+    re.IGNORECASE)
+_TARGET_DETERMINER_RE = re.compile(r"^(?:the|my|our|your|this|that)\s+",
+                                   re.IGNORECASE)
+_TARGET_KIND_RE = re.compile(
+    r"\s+(?:project|game|app|site|website|repo|one)$", re.IGNORECASE)
+
+
+def leading_target(text: str) -> str:
+    """The phrase fronting an instruction to say where it goes, or "".
+
+    "For blog, add a sidebar, but not yet." gives "blog". Whether that names a
+    real project is the caller's question: only the project resolver knows,
+    and the phrase looks the same in "On second thought, add a sidebar".
+    """
+    raw = _CORRECTION_OPENER_RE.sub("", (text or "").strip(), count=1).strip()
+    m = _LEADING_TARGET_RE.match(strip_preamble(raw))
+    return m.group("target").strip() if m else ""
+
+
+def _names_project(phrase: str, slug: str) -> bool:
+    """Does this fronted phrase name exactly this project?
+
+    "the blog project", "Blog" and "flappy bird" name blog and flappy-bird;
+    "the blog's header" does not name blog. Compared on the full identity,
+    spaces and hyphens normalised, for the reason `classify_removal` gives:
+    a component of a slug is never the project.
+    """
+    name = _TARGET_KIND_RE.sub("", _TARGET_DETERMINER_RE.sub(
+        "", (phrase or "").strip()))
+    got, want = _normalise(name), _normalise(slug)
+    return bool(want) and (got == want
+                           or got.replace(" ", "") == want.replace(" ", ""))
+
+
+def carries_a_proposal(text: str, *, project: str = "") -> bool:
     """Does this turn say WHAT to change, or only WHEN NOT to?
 
     A deferral answers "not now". On its own it proposes nothing:
@@ -979,15 +1020,16 @@ def carries_a_proposal(text: str) -> bool:
     "I'd like you to add a dark mode", "Help me add a dark mode", "Add a dark
     mode". Making every stray desire a future filesystem mutation is the wrong
     way to be wrong.
+
+    A FRONTED TARGET counts when the caller names it. "For blog, add a
+    sidebar, but not yet." proposes a sidebar for blog, but only `project`
+    can say that blog is a project at all, so without it the phrase is left
+    where it is and the sentence proposes nothing. Stage 15 recorded this
+    shape as unsupported; Marcus approved supporting it on 2026-11-07.
     """
     raw = (text or "").strip()
     if not raw:
         return False
-    # BOTH deferral forms come out before the grammar is applied. The
-    # docstring's rule is "a sentence that WOULD have authorised the change if
-    # the user had not deferred it", so any clause that does the deferring has
-    # to go -- otherwise the re-check trips over the very deferral being
-    # stripped and every deferred proposal reads as no proposal at all.
     # BOTH deferral forms come out before the grammar is applied. The
     # docstring's rule is "a sentence that WOULD have authorised the change if
     # the user had not deferred it", so any clause that does the deferring has
@@ -1001,6 +1043,17 @@ def carries_a_proposal(text: str) -> bool:
     # the instruction behind it and the correction is silently dropped --
     # leaving the plan it was correcting still approvable.
     rest = _CORRECTION_OPENER_RE.sub("", rest, count=1).strip()
+    # ...and so does a fronted phrase naming the project the change is FOR,
+    # which hides the instruction in exactly the same way. Only when it names
+    # `project`, the one the caller resolved from this same sentence: "For the
+    # blog," with no blog project, or "On second thought,", is not a target,
+    # and stripping it would file the change against whatever project is
+    # current.
+    if project:
+        core = strip_preamble(rest)
+        m = _LEADING_TARGET_RE.match(core)
+        if m and _names_project(m.group("target"), project):
+            rest = core[m.end():].strip()
     if not rest:
         return False
     return bool(authorize_project_mutation(rest, complaint=False).allowed)

@@ -138,6 +138,137 @@ _SOCIAL_OVERRIDE_RE = re.compile(
 _MAX_CONVERSATIONAL_WORDS = 12
 
 
+# ── What the work is called ─────────────────────────────────────────────────
+#
+# The subject-and-outcome shapes: "did THE BUILD finish?", "did MY GAME BUILD
+# work?", "has THE JOB run?", "are THE TESTS passing?".
+#
+# Measured before these existed (2026-11-07): 43 of 51 natural ways of asking
+# whether the work went right matched nothing. Every shape in
+# `_WORK_STATUS_RE` took a pronoun or "everything" as its subject, and none
+# took the work's own name. A miss means the reply is written with no record in
+# front of the model, which is the condition behind the audit's C4 false claim.
+#
+# A false match is not free either, so these stay closed shapes rather than a
+# keyword sniff. A matched turn carries the record, and a reply that claims
+# completion is then corrected against it: "did the laundry finish?" answered
+# "it's all done!" would be told that a project is failing.
+
+_WORK_DET = (r"(?:the|my|your|our|that|this|those|these|"
+             r"all\s+(?:of\s+)?(?:the|my|your|our))\s+")
+
+#: Up to two words before the noun, because they are usually the project or the
+#: feature ("the flappy-bird build", "the pause menu changes"), and no list
+#: could name those.
+_ANY_MODIFIERS = r"(?:[\w'’-]+\s+){0,2}"
+
+#: Said to Nova, these are her work whatever modifies them.
+_OPEN_WORK = (_ANY_MODIFIERS + r"(?:builds?|compil(?:e|es|ation)|"
+              r"deploy(?:s|ments?)?|install(?:s|ations?)?|scripts?|apps?|"
+              r"changes?|edits?|fix(?:es)?|improvements?|updates?)")
+#: These are as often somebody else's -- the road work, the promo code, the
+#: school project, her new job -- so they take only modifiers that keep them
+#: Nova's.
+_THE_WORK = (r"(?:(?:planned|remaining|pending|scheduled|background|whole|"
+             r"project|code|build|test)\s+)?work")
+_THE_CODE = r"(?:(?:new|game|project|test|build|updated|fixed)\s+)?code"
+_THE_PROJECT = (r"(?:(?:new|current|whole|game|coding|code|software|test)\s+)?"
+                r"projects?")
+_THE_TASKS = (r"(?:(?:background|scheduled|queued|pending|remaining|next|last|"
+              r"first|planned|build|test)\s+)?(?:tasks?|steps?)")
+_THE_JOBS = r"(?:(?:background|scheduled|queued|build|test|nightly)\s+)?jobs?"
+#: These also name things that are not software -- a blood test, the Chiefs
+#: game, a TV programme -- so they take only the verbs only software takes.
+#: "Did the tests pass?" is about the work; "is the test done?" is not decided
+#: to be.
+_THE_TESTS = _ANY_MODIFIERS + r"(?:tests?|test\s+(?:suite|run)s?)"
+_THE_SOFTWARE = _ANY_MODIFIERS + r"(?:games?|programs?)"
+
+#: How the work went, after "did", after "has/have/had", after "is/are/was".
+_DID_ANY = (r"(?:finish|complete|succeed|pass|work|run|build|compile|fail|"
+            r"break|crash|go\s+(?:through|ok(?:ay)?|alright|right|wrong|well|"
+            r"smoothly))")
+_HAS_ANY = (r"(?:been\s+)?(?:finished|completed|succeeded|passed|worked|run|"
+            r"ran|built|compiled|failed|broken|crashed|gone\s+through|done)")
+_IS_ANY = (r"(?:done|finished|complete|completed|working|passing|failing|"
+           r"broken|built|compiled|ready|successful|running|in\s+progress)")
+
+#: (subject, after "did", after "has", after "is")
+_WORK_SUBJECTS = (
+    (_OPEN_WORK, _DID_ANY, _HAS_ANY, _IS_ANY),
+    (_THE_WORK, _DID_ANY, _HAS_ANY, _IS_ANY),
+    (_THE_CODE, _DID_ANY, _HAS_ANY, _IS_ANY),
+    (_THE_PROJECT, _DID_ANY, _HAS_ANY, _IS_ANY),
+    (_THE_TASKS, _DID_ANY, _HAS_ANY, _IS_ANY),
+    (_THE_JOBS, _DID_ANY, _HAS_ANY, _IS_ANY),
+    (_THE_TESTS, r"(?:pass|fail|run)", r"(?:been\s+)?(?:passed|failed|run|ran)",
+     r"(?:passing|failing|passed|failed|running|green|red)"),
+    (_THE_SOFTWARE, r"(?:build|compile|crash)",
+     r"(?:been\s+)?(?:built|compiled|crashed)",
+     r"(?:built|compiling|crashing|working\s+(?:now|yet|again))"),
+)
+
+_OUTCOME_ADVERB = (r"(?:(?:all|actually|really|even|ever|finally|successfully|"
+                   r"properly|already|still|now|currently)\s+)?")
+
+
+def _outcome_shapes() -> str:
+    """Every "did/has/is + the work + how it went" shape, as one alternation."""
+    shapes = []
+    for subject, did, has, is_ in _WORK_SUBJECTS:
+        for aux, verb in ((r"did", did), (r"(?:has|have|had)", has),
+                          (r"(?:is|are|was|were)", is_)):
+            shapes.append(aux + r"\s+" + _WORK_DET + subject + r"\s+"
+                          + _OUTCOME_ADVERB + verb)
+    # "Does it work now?" -- only with now/yet/again/properly, because "does
+    # that work for you?" is agreement, not a question about the work.
+    nouns = "|".join(subject for subject, *_ in _WORK_SUBJECTS)
+    shapes.append(r"(?:does|do)\s+(?:(?:it|that|this|they)\s+|" + _WORK_DET
+                  + r"(?:" + nouns + r")\s+)" + _OUTCOME_ADVERB
+                  + r"work\s+(?:now|yet|again|properly|correctly)")
+    return "|".join(shapes)
+
+
+_WORK_OUTCOME_RE = re.compile(r"\b(?:" + _outcome_shapes() + r")\b",
+                              re.IGNORECASE)
+
+#: "How did the tests go?" Not jobs, games or a single test: "how did the job
+#: go?" and "how did the test go?" are as often about somebody's day.
+_HOW_SUBJECTS = ("(?:" + "|".join((_OPEN_WORK, _THE_WORK, _THE_CODE,
+                                   _THE_PROJECT, _THE_TASKS))
+                 + r"|" + _ANY_MODIFIERS + r"(?:tests|test\s+(?:suite|run)s?))")
+
+#: A claim or question whose outcome belongs to something else is not about
+#: the work: "everything worked out WITH THE DENTIST", "it all went through AT
+#: THE BANK", "they finished THEIR HOMEWORK". A complement that names the work
+#: still counts ("with the new build"), and so does one with no determiner at
+#: all ("with Chrome").
+_ANY_WORK_NP = "(?:" + "|".join(subject for subject, *_ in _WORK_SUBJECTS) + ")"
+
+
+def _elsewhere(prepositions: str) -> str:
+    """A lookahead refusing an outcome that belongs to something else."""
+    return (r"(?!\s+(?:out\s+)?(?:"
+            # a place or a person: "with the dentist", "at school"
+            r"(?:" + prepositions + r")\s+(?:"
+            r"(?:the|my|your|his|her|their|our|a|an)\s+(?!" + _ANY_WORK_NP
+            + r"\b)|(?:school|work|home|church|the\s+gym|the\s+office)\b)"
+            # an object that belongs to somebody: "they finished THEIR
+            # HOMEWORK", "they finished MY CAR". After the vague subjects this
+            # is applied to, a possessive object is never the work itself:
+            # nobody says "everything finished my build".
+            r"|(?:his|her|their|my|your|our)\s+"
+            r"))")
+
+
+#: For claims and "did everything...?": with/at only, because "it all worked
+#: out IN THE END" is still about the work.
+_ELSEWHERE = _elsewhere("with|at")
+#: For "did anything break?" and "any errors?", where in/on name a place too:
+#: "did something break IN THE KITCHEN?", "any errors ON MY BILL?".
+_ELSEWHERE_ANYWHERE = _elsewhere("with|at|in|on")
+
+
 #: Questions whose only honest source is the durable record, not the
 #: conversation. "What failed?" after a restart has no answer in a transcript
 #: that begins after the restart, and answering it from what Nova happens to
@@ -151,7 +282,10 @@ _WORK_STATUS_RE = re.compile(
     r"what should happen next|what(?:'s| is) next|where (?:are|were) we|"
     r"what(?:'s| is| are) (?:you|nova) working on|"
     r"what(?:'s| is) the status|how(?:'s| is) it going with|"
-    r"did (?:it|that) (?:all )?(?:work|finish|succeed|run)|"
+    # "Did it build?" and "did that pass?" are the same question as "did it
+    # work?" (widened 2026-11-07, with the subject-and-outcome shapes).
+    r"did (?:it|that) (?:all |actually |really |even )?"
+    r"(?:work|finish|succeed|run|build|compile|pass|fail|crash)|"
     # "Is anything still running?" - the first thing a person asks on
     # coming back to a machine that restarted, and a question whose only
     # honest source is the record: the transcript begins AFTER the restart.
@@ -173,7 +307,17 @@ _WORK_STATUS_RE = re.compile(
     # so "did everything pass?" was answered from an empty prompt while
     # a criterion sat FAILING with its error on disk.
     r"did (?:you|nova) (?:finish|complete) (?:it|that|this|them|everything|all of (?:it|them)|the (?:project|build|work|game|app|script|code))|"
-    r"did (?:everything|it all|they all|all of (?:it|them)) pass|"
+    r"did (?:they all|all of them) pass|"
+    # "Did everything work?" Not with "they all", which is as often people.
+    r"did (?:everything|it all|all of it) (?:actually |really |even )?"
+    r"(?:pass|work|finish|succeed|complete|build|compile|run|go through)"
+    + _ELSEWHERE + r"|"
+    # "Did anything fail?" -- the survey form of "what failed?".
+    r"did (?:anything|something) (?:else )?(?:fail|break|crash|go wrong)"
+    + _ELSEWHERE_ANYWHERE + r"|"
+    r"(?:any|were there any|are there any|was there an?|"
+    r"did (?:it|that|you) (?:get|hit|throw|see|run into) any) "
+    r"(?:errors?|exceptions?|failures?)" + _ELSEWHERE_ANYWHERE + r"|"
     r"(?:is|are) (?:it|that|this|they|the (?:project|build|work)) (?:all )?done|"
     r"(?:which|what) (?:requirement|criteri(?:on|a)|check|test)s? "
     r"(?:is|are) (?:failing|outstanding|left|still)|"
@@ -196,13 +340,14 @@ _WORK_STATUS_RE = re.compile(
     # ready to go... plus the tests are written too", about a build that had
     # just failed and written nothing (audit 2026-11-02, C4).
     #
-    # Attaching the record to one extra turn costs tokens. Not attaching it
-    # costs the truth.
+    # Attaching the record to one extra turn costs tokens, and sometimes a
+    # wrong correction (see `_elsewhere`). Not attaching it costs the truth.
     r"coming along|how(?:'s| is|’s) (?:it|that|the|this) .{0,24}?going|"
     r"how(?:'s| is|’s) (?:it|that) coming|how far along|"
     r"any (?:progress|news|update|updates)|what(?:'s| is) the latest|"
     r"what (?:did|have) you (?:actually )?(?:verif\w+|check\w+|test\w+|prov\w+)|"
-    r"how did (?:it|that) go|(?:is|was) (?:it|that) successful"
+    r"how did (?:it|that|" + _WORK_DET + _HOW_SUBJECTS + r") go|"
+    r"(?:is|was) (?:it|that) successful"
     r")\b", re.IGNORECASE)
 
 
@@ -223,7 +368,35 @@ _WORK_PREMISE_RE = re.compile(
     r"\b(everything|it|that(?!\s+\w+\s+(?:was|were|is|are)\b)|those|they|the (?:tasks?|steps?|work|jobs?))\b"
     r"[^.?!]{0,40}?"
     r"\b(finish(?:ed)?|worked|work out|done|complete[ds]?|went through|"
-    r"succeed(?:ed)?|ran ok(?:ay)?|all set|sorted)\b",
+    r"succeed(?:ed)?|ran ok(?:ay)?|all set|sorted)\b"
+    # ...unless the outcome belongs somewhere else. "Everything worked out
+    # with the dentist." matched until 2026-11-07, so a reply agreeing that
+    # it was all good was then corrected against a failing project.
+    + _ELSEWHERE,
+    re.IGNORECASE)
+
+
+#: The same claim with the work's own name as its subject: "so the build
+#: passed?", "my game build worked, right?", "the changes went through?".
+#:
+#: Only verbs and adverbs may stand between the two, so "the changes to my
+#: schedule are done" is not read as one. Updates, apps and installs are left
+#: out on purpose: "the Windows update finally finished" is said to Nova about
+#: the computer, and agreeing with it must not be corrected against a project.
+#: Tests take only "passed", because "the tests are done" is as often a
+#: hospital's.
+_WORK_NOUN_PREMISE_RE = re.compile(
+    r"\b" + _WORK_DET + r"(?:"
+    + _ANY_MODIFIERS + r"(?:builds?|compil(?:e|es|ation)|deploy(?:s|ments?)?|"
+    r"scripts?|changes?|edits?|fix(?:es)?|improvements?)"
+    + "|" + "|".join((_THE_WORK, _THE_CODE, _THE_PROJECT, _THE_TASKS, _THE_JOBS))
+    + r")\s+(?:(?:is|are|was|were|has|have|had|all|been|now|finally|actually|"
+    r"really|already|successfully|properly|completely|fully)\s+){0,3}"
+    r"(?:finish(?:ed)?|worked|work(?:ed)?\s+out|done|complete[ds]?|"
+    r"went\s+through|gone\s+through|succeed(?:ed)?|ran\s+(?:ok(?:ay)?|fine)|"
+    r"all\s+set|sorted|built|compiled|passed|ready|works|working)\b"
+    r"|\b" + _WORK_DET + _THE_TESTS
+    + r"\s+(?:(?:have|all|have\s+all|all\s+have)\s+)?passed\b",
     re.IGNORECASE)
 
 
@@ -277,16 +450,22 @@ def asks_about_work(text: str) -> bool:
     """Is this turn about the state of Nova's own work?
 
     Deliberately closed shapes rather than a keyword sniff: this decides only
-    whether to ATTACH authoritative state to the answer. Attaching it to an
-    unrelated turn is prompt bloat; missing one leaves the model answering from
-    memory, which after a restart is nothing at all.
+    whether to ATTACH authoritative state to the answer. Missing one leaves the
+    model answering from memory, which after a restart is nothing at all.
+    Attaching it to an unrelated turn is worse than prompt bloat: a reply that
+    agrees the unrelated thing is done is then corrected against a project.
 
     Both a QUESTION about the work and a CLAIM about it count. The claim is the
     case that matters most: "so everything finished successfully, right?" asks
     Nova to agree, and she can only decline from the record.
+
+    Either may name the work by a pronoun ("did it pass?") or by what it is
+    ("did the build pass?"). The second was missing until 2026-11-07.
     """
     raw = text or ""
-    return bool(_WORK_STATUS_RE.search(raw) or _WORK_PREMISE_RE.search(raw))
+    return bool(_WORK_STATUS_RE.search(raw) or _WORK_OUTCOME_RE.search(raw)
+                or _WORK_PREMISE_RE.search(raw)
+                or _WORK_NOUN_PREMISE_RE.search(raw))
 
 
 def is_purely_conversational(text: str) -> bool:

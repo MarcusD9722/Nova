@@ -15,7 +15,7 @@ and what is still open.
 | # | layer | proves | runs in | status |
 |---|---|---|---|---|
 | 1 | **Coverage map** | which functions no test ever reaches | offline | **done** — see below |
-| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–2 done, see the end |
+| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–3 done, see the end |
 | 3 | **Wiring tests** | chains across modules, workers and restarts behave as coded | offline gate (real backend, scripted model) | planned |
 | 4 | **Judgement corpora** | question / statement / remember-this / command / project request / small talk / status question, at scale, typed and voice-style | offline gate | planned |
 | 5 | **Real-model scenarios** | the same behaviours with the real 9B, judged on what happened and on what was said | opt-in, GPU to itself | planned |
@@ -237,7 +237,8 @@ because nothing has ever made them run. The most are in `memory/unifier.py`
      `add_fact` ends the rest of that turn's facts. It is logged as
      `memory_ingest_failed`, but nothing says which facts were lost;
    - `_reconcile`, where a failed `find_conflict_candidates` returns quietly.
-3. **Understanding: question, statement, remember-this, command.**
+3. **Understanding: question, statement, remember-this, command.** **Done
+   2026-11-07**, see *Layer 2* below.
    - the two known misses: `asks_about_work` misses "Did the build finish?",
      and "For blog, add a sidebar, but not yet" drops the proposal;
    - the untaken branches in `project_intent`, `understanding`, `recall_gate`
@@ -424,7 +425,7 @@ The one failure was `test_cg1_continuity`. It created reminders with
 refuses. Read back as UTC, that time was six hours off: the M5 bug. The test
 now passes UTC, and run alone it passes. No Nova code changed after the run.
 
-### Item 3: understanding — the untaken branches done 2026-11-06; fixing the two misses approved 2026-11-07
+### Item 3: understanding — done 2026-11-07
 
     venv\Scripts\python.exe tests\test_understanding_branches_2026_11.py   (37 checks)
 
@@ -456,12 +457,18 @@ scored each one by term overlap, which is 0 with no terms, and dropped them
 all, so the fallback never returned anything. Recency mode now keeps the
 store's newest-first order.
 
-**The two known misses were held for Marcus's decision, and on 2026-11-07 he
-approved fixing both.** The
-Stage 15 report records his standing instruction not to broaden the intent
-grammar without a production defect requiring it, and a test pins one of the
-two as a known limitation. Measured now: `asks_about_work` returns False for
-all eight of these:
+### The two known misses — fixed 2026-11-07
+
+    venv\Scripts\python.exe tests\test_work_questions_2026_11.py    (22 checks)
+    venv\Scripts\python.exe tests\test_s15_proposal_lifecycle.py    (55 checks)
+
+The Stage 15 report recorded Marcus's standing instruction not to broaden the
+intent grammar without a production defect requiring it, and a test pinned one
+of the two misses as a known limitation, so both waited for him. He approved
+fixing both on 2026-11-07.
+
+**Miss 1: asking about the work by its own name.** On 2026-11-06,
+`asks_about_work` returned False for all eight of these:
 
 - "Did the build finish?"
 - "Did the planned work succeed?"
@@ -475,3 +482,127 @@ all eight of these:
 A miss means the reply is written with no work record attached. That is the
 condition behind the audit's C4 false claim, where Nova said a failed build
 was "all set up and ready to go".
+
+Measured before changing anything, the gap was wider than the eight. 43 of 51
+natural ways of asking whether the work went right matched nothing, including
+"Did the build pass?", "Are the tests passing?", "Did anything fail?" and "Any
+errors?". Every shape took a pronoun or "everything" as its subject, and none
+took the work's own name.
+
+The fix adds shapes keyed to what the work is called: *did / has / is / does*,
+then the work's name, then how it went.
+
+- **Nouns that also mean something outside software take only software
+  verbs.** "Did the tests pass?" counts; "Is the pregnancy test done?" and "Did
+  the Chiefs game finish?" do not.
+- **Nouns that are often somebody else's take only a closed set of
+  modifiers.** "The planned work" counts; "the road work", "the school
+  project", "the promo code" and "her new job" do not.
+- **Claims count as well as questions:** "So the build passed?", "My game
+  build worked, right?".
+
+**A false match costs more than tokens, and that shaped all of it.** A matched
+turn carries the record. If the reply then claims completion, the C4 fix puts
+"To be accurate: <project> is not done" in front of it. So "Did the laundry
+finish?" answered "It's all done!" would have been corrected against a failing
+project. 40 near misses pin the boundary, and each shares vocabulary with a
+shape that does match.
+
+**Two false matches were already live, and are fixed.** Both came from the
+existing claim detector, and both are things Marcus is likely to say:
+
+- "They finished their homework." was read as "they … finished", a claim
+  about the work.
+- "Everything worked out with the dentist." was read as "everything …
+  worked".
+
+With a failing project, an agreeing reply to either one was corrected with "To
+be accurate: … is not done". Now an outcome is not a claim about the work when
+it is followed by:
+
+- somebody's thing: "their homework", "my car";
+- a person or a place outside the work: "with the dentist", "at the bank",
+  "at work".
+
+"With the new build", "with Chrome" and "in the end" still count.
+
+**The C4 correction had no test at all.** `docs/AUDIT_2026-11-02_FIXES.md`
+listed `test_audit_routing_2026_11.py` as its proof. That suite tests the
+pre-model routing patterns and never reaches `_false_completion_notice`. The
+table now says so.
+
+The new suite drives the correction end to end through `/chat`:
+
+- a project whose authoritative state is FAILING;
+- a scripted reply that says "It's all done and working!";
+- the reply that comes back, which starts "To be accurate: calculator is not
+  done — it has failing criteria."
+
+**Deliberate boundaries:**
+
+- **Not matched:** "Is it working?" and "Is this working?". People say these
+  to check a microphone, and a voice assistant hears them constantly. "Does it
+  work now?" still matches.
+- **Matched, and accepted:** "Did the Windows update finish?" and "Is the Uber
+  app working?". Updates and apps are Nova's work often enough to keep. As
+  questions they carry little risk, because Nova cannot claim to know the
+  answer. As statements ("the Windows update finally finished") they are left
+  out.
+- **Matched, and accepted:** "The car fix worked." and "They finished the
+  race." A modifier or a plain object from outside the work cannot be told
+  apart without knowing every project.
+
+**Miss 2: "For blog, add a sidebar, but not yet."** The proposal grammar is
+anchored at the start of the sentence, so a fronted "For blog," hid the
+instruction and the proposal was dropped. The same sentence without "but not
+yet" was already kept, so the deferral alone made it vanish.
+
+The fronted phrase is now stripped, but only when it names the project that the
+turn resolved from that same phrase:
+
+- said while flappy-bird is current, the plan is filed against blog, and "Go
+  ahead" on flappy-bird runs only flappy-bird's own plan;
+- the fronted project outranks a longer project name later in the sentence:
+  "For blog, add a footer like flappy-bird's" is blog's;
+- "For the blog, …" with no blog project files nothing anywhere, and neither
+  does "On second thought, …", exactly as before;
+- every veto still applies behind the phrase: "For blog, I changed the menu
+  yesterday, but don't change anything yet." proposes nothing.
+
+While there I removed a comment paragraph that `carries_a_proposal` carried
+twice.
+
+**Mutation checks: 57 of 57 caught.**
+
+- **The detector, 47 ways.** Each new shape was removed, each guard widened,
+  and the two consumers switched off: the correction, and the completion
+  record's use of the detector.
+- **The fronted target, 10 ways.**
+
+Every file was restored byte-identically.
+
+**One slip of mine, recorded.** I first pinned "Did they all finish?" as a near
+miss and called it a decision, without measuring it. The committed code
+already matched it, on purpose: Stage 13C reads "they … finished" as a claim
+about the work and lists "They all finished?" among its claims. The suite
+caught the contradiction on its first run. The pin now covers what this change
+actually decided: the new verbs were not given to "did they all …?", so "Did
+they all run the race?" stays ordinary.
+
+**Still open, measured, not fixed: "For the blog, add a sidebar." with no
+blog project.** Without "not yet" this sentence never reaches the grammar
+changed here. The project pre-pass reads it as a plain description of a
+change, and holds it as the CURRENT project's plan. Measured with flappy-bird
+current, it was held as flappy-bird's plan, so a later "Go ahead" would run it
+there.
+
+Nothing runs before that approval, and the approval's reply names flappy-bird,
+so the mistake would be visible. It is still the wrong project. It predates
+this work: the committed code does the same. "On second thought, add a
+sidebar." is held as flappy-bird's too, and that one is right.
+
+Telling the two apart, when the fronted phrase names no known project, is a
+new rule about sentence shapes. So it is recorded here, not added to this
+change.
+
+**Full run after the fix, 2026-11-07: 203 of 203 suites passed.**

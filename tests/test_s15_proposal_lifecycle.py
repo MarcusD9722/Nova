@@ -32,7 +32,7 @@ os.environ.setdefault("NOVA_LOG_LEVEL", "ERROR")
 
 from harness import Checks, boot, run  # noqa: E402
 
-from core.project_intent import carries_a_proposal  # noqa: E402
+from core.project_intent import carries_a_proposal, leading_target  # noqa: E402
 
 check = Checks()
 
@@ -208,16 +208,39 @@ async def test_two_projects_do_not_share_correction_state():
 
         # A proposal for the OTHER project, made while it is the current one.
         #
-        # RECORDED LIMITATION, measured rather than assumed. A leading target
-        # phrase -- "For blog, add a sidebar, but not yet." -- is NOT stored
-        # against blog, and is not stored at all: the affirmative grammar is
-        # anchored at the start of the sentence, so "For blog," hides the
-        # imperative behind it exactly as "No," used to. That is a sentence
-        # SHAPE the grammar has never supported, not a correction opener, and
-        # teaching it one would be broadening the grammar to fit a test. It is
-        # left unsupported and written down here instead.
+        # Stage 15 recorded a leading target phrase -- "For blog, add a
+        # sidebar, but not yet." -- as a shape the grammar did not support: it
+        # hid the imperative exactly as "No," used to, and the proposal was
+        # dropped. Marcus approved supporting it on 2026-11-07. It counts only
+        # when the phrase names the project the turn resolved, which is what
+        # these two pin; test_a_fronted_target_files_against_that_project
+        # drives it through a real turn.
+        check(carries_a_proposal("For blog, add a sidebar, but not yet.",
+                                 project="blog"),
+              "a leading target naming blog carries blog's proposal")
         check(not carries_a_proposal("For blog, add a sidebar, but not yet."),
-              "a leading target phrase is not a proposal (known limitation)")
+              "and with no project resolved, the phrase is not a target")
+        check(not carries_a_proposal("For blog, add a sidebar, but not yet.",
+                                     project="flappy-bird"),
+              "nor is it flappy-bird's when it names blog")
+        check(carries_a_proposal(
+                  "For the blog project, add a sidebar, but not yet.",
+                  project="blog"),
+              "'the blog project' names blog")
+        check(carries_a_proposal("So, for blog, add a sidebar, but not yet.",
+                                 project="blog"),
+              "behind a lead-in too")
+        check(not carries_a_proposal(
+                  "For blog, I changed the menu yesterday, but don't change "
+                  "anything yet.", project="blog"),
+              "and every veto still applies behind it: a retrospective "
+              "proposes nothing")
+        check(leading_target("So, for blog, add a sidebar") == "blog"
+              and leading_target("No, in flappy-bird, make it faster")
+              == "flappy-bird"
+              and leading_target("Add a sidebar") == "",
+              "leading_target finds the phrase behind a lead-in or a "
+              "correction, and nothing where there is none")
 
         await nova.memory.add_fact(entity="projects", attribute="last_active",
                                    value="blog", confidence=0.99)
@@ -250,6 +273,87 @@ async def test_two_projects_do_not_share_correction_state():
                   "and blog's plan is untouched, still waiting")
         finally:
             spy.restore()
+
+
+async def test_a_fronted_target_files_against_that_project():
+    check.section("I28 'For blog, ...' files the plan against blog")
+    async with boot(default_reply="Sure.") as nova:
+        seed(nova, "flappy-bird")
+        seed(nova, "blog")
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="flappy-bird", confidence=0.99)
+        conv = str(uuid4())
+
+        await nova.brain.chat("Make the pipe gap wider, but not yet.",
+                              conversation_id=conv)
+        # Said while flappy-bird is current.
+        await nova.brain.chat("For blog, add a sidebar, but not yet.",
+                              conversation_id=conv)
+        fb, bl = held(nova, conv, "flappy-bird"), held(nova, conv, "blog")
+        check("sidebar" in bl, f"blog holds the sidebar plan ({bl[:50]!r})")
+        check("pipe gap" in fb and "sidebar" not in fb,
+              f"and flappy-bird keeps its own, unchanged ({fb[:50]!r})")
+
+        # A second project named later in the sentence does not win: the
+        # fronted phrase says where the change is FOR. Without that, the
+        # longer slug is the one the resolver returns.
+        await nova.brain.chat(
+            "For blog, add a footer like flappy-bird's, but not yet.",
+            conversation_id=conv)
+        fb, bl = held(nova, conv, "flappy-bird"), held(nova, conv, "blog")
+        check("footer" in bl, f"blog's plan is now the footer ({bl[:50]!r})")
+        check("footer" not in fb and "pipe gap" in fb,
+              f"and flappy-bird's is still the pipe gap ({fb[:50]!r})")
+
+        # A correction in front of the target: blog's plan is replaced.
+        await nova.brain.chat(
+            "No, for blog, add a search box instead, but not yet.",
+            conversation_id=conv)
+        bl = held(nova, conv, "blog")
+        check("search box" in bl and "footer" not in bl,
+              f"'No, for blog, ...' replaces blog's plan ({bl[:50]!r})")
+
+        spy = ImproveSpy(nova)
+        try:
+            await nova.brain.chat("Go ahead.", conversation_id=conv)
+            await settle(nova)
+            check(len(spy.calls) == 1 and spy.calls[0][0] == "flappy-bird"
+                  and "pipe gap" in spy.calls[0][1],
+                  f"approving on flappy-bird runs flappy-bird's plan "
+                  f"({[(s, i[:30]) for s, i in spy.calls]})")
+            check("search box" in held(nova, conv, "blog"),
+                  "and blog's waits for blog")
+
+            await nova.memory.add_fact(entity="projects",
+                                       attribute="last_active",
+                                       value="blog", confidence=0.99)
+            await nova.brain.chat("Go ahead.", conversation_id=conv)
+            await settle(nova)
+            check(len(spy.calls) == 2 and spy.calls[1][0] == "blog"
+                  and "search box" in spy.calls[1][1],
+                  f"on blog, the approval runs blog's plan "
+                  f"({[(s, i[:30]) for s, i in spy.calls]})")
+        finally:
+            spy.restore()
+
+
+async def test_a_fronted_target_that_is_not_a_project_files_nothing():
+    check.section("I28 'For the blog, ...' with no blog files nothing")
+    async with boot(default_reply="Sure.") as nova:
+        seed(nova, "flappy-bird")
+        await nova.memory.add_fact(entity="projects", attribute="last_active",
+                                   value="flappy-bird", confidence=0.99)
+        conv = str(uuid4())
+        # There is no blog project. Reading "For the blog," as a target that
+        # resolves to nothing, and then filing the sidebar against the CURRENT
+        # project, would be the wrong-project defect Stage 14 exists for.
+        await nova.brain.chat("For the blog, add a sidebar, but not yet.",
+                              conversation_id=conv)
+        check(not held(nova, conv, "flappy-bird"),
+              f"nothing is filed against flappy-bird "
+              f"({held(nova, conv, 'flappy-bird')[:50]!r})")
+        check(not nova.runtime._pending_plan.get(conv),
+              f"or anywhere else ({nova.runtime._pending_plan.get(conv)})")
 
 
 async def test_a_restart_leaves_no_pending_text_anywhere():
@@ -286,6 +390,8 @@ async def main() -> None:
     await test_withdrawal_then_a_new_correction()
     await test_two_conversations_do_not_share_proposals()
     await test_two_projects_do_not_share_correction_state()
+    await test_a_fronted_target_files_against_that_project()
+    await test_a_fronted_target_that_is_not_a_project_files_nothing()
     await test_a_restart_leaves_no_pending_text_anywhere()
     check.finish()
 

@@ -26,7 +26,7 @@ regressions the M10 fix caused, and the defect they hid**, below.
 | C1 | `/dev/propose` and `/dev/apply` go through `PermissionBroker` (`dev.apply`, ADMIN), both check a local origin, and `start_nova.ps1` mints `NOVA_API_TOKEN` and passes it to the backend, Vite and Electron | `test_audit_security_2026_11.py`; 5/5 mutants caught |
 | C2 | A `threading.Lock` held inside the worker thread for the whole stream, plus `stream.close()` on cancel and `aclosing` on the generators. `GPU_SEM` could not do this: the work runs in `asyncio.to_thread`, which cancellation cannot reach | **Real weights: 3 boots × 6 mid-reply disconnects = 18/18 survived, exit 0, zero CUDA asserts** (previously 7/7 fatal on the first close). A mutant without the lock reaches 5 threads inside the model |
 | C3 | `references_project_work()` gates the project pre-pass; the identity choke point vetoes any mutation by a non-owner | 19/19 of the audit's own sentences reach conversation; 11/12 real instructions still act |
-| C4 | Deterministic status answers come from the authoritative record, and `_claims_completion()` prefixes a notice when a reply claims work that did not happen | `test_audit_routing_2026_11.py` |
+| C4 | Deterministic status answers come from the authoritative record, and `_claims_completion()` prefixes a notice when a reply claims work that did not happen | `test_audit_routing_2026_11.py` — **corrected 2026-11-07:** that suite tests the routing patterns and never reaches the notice, so this fix had no test. `test_work_questions_2026_11.py` now drives it through `/chat` against a failing project, and switching the notice off is caught |
 
 ## High
 
