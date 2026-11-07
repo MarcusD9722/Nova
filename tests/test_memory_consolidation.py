@@ -38,7 +38,11 @@ async def seed_days(mem: MemoryUnifier, *, days: int) -> list[str]:
     dates = []
     for i in range(days):
         when = datetime.now(timezone.utc) - timedelta(days=i + 1)
-        dates.append(when.strftime("%Y-%m-%d"))
+        # The LOCAL day: episodes are grouped by Marcus's calendar day since
+        # the M17 fix. A UTC date here made this check fail every evening from
+        # 6pm to midnight Central, when the UTC date is already tomorrow
+        # (found by the layer 2 full run, 2026-11-06 at 21:00).
+        dates.append(when.astimezone().strftime("%Y-%m-%d"))
         conv = uuid4()
         for n in range(3):
             tid = await mem.ingest_turn(conv, "user", f"day {i} message {n} about the workshop project")

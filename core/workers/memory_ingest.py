@@ -190,33 +190,62 @@ class MemoryIngestWorker:
                 # Retire anything this contradicts BEFORE writing it, so the
                 # two never coexist. Skipped for singleton attributes, which
                 # already supersede by key and need no model call.
-                if not self._memory._is_singleton_fact(entity, f.attribute):
-                    await self._reconcile(entity=entity, attribute=f.attribute,
-                                          value=f.value, ident=ident)
-                await self._memory.add_fact(
-                    entity=entity, attribute=f.attribute, value=f.value,
-                    confidence=float(f.confidence),
-                    # None lets the unifier's default stand for unremarkable
-                    # moments, so identity facts keep their own high floor
-                    # instead of being dragged down by a flat 0.0.
-                    salience=(moment if moment > 0 else None),
-                )
+                # One fact at a time: a write that fails is reported by name and
+                # the rest of this turn's facts still land. It used to end the
+                # loop, so everything after it was lost under one generic
+                # `memory_ingest_failed` (layer 2, 2026-11-06).
+                try:
+                    if not self._memory._is_singleton_fact(entity, f.attribute):
+                        await self._reconcile(entity=entity, attribute=f.attribute,
+                                              value=f.value, ident=ident)
+                    await self._memory.add_fact(
+                        entity=entity, attribute=f.attribute, value=f.value,
+                        confidence=float(f.confidence),
+                        # None lets the unifier's default stand for unremarkable
+                        # moments, so identity facts keep their own high floor
+                        # instead of being dragged down by a flat 0.0.
+                        salience=(moment if moment > 0 else None),
+                    )
+                except Exception as e:  # noqa: BLE001 - one fact must not take the rest
+                    log_worker_error(logger, "memory_fact_write_failed", e,
+                                     attribute=str(f.attribute)[:40])
 
-        # also persist policy-provided facts (already validated) if any
+        # Policy-provided facts, if any. Nothing in Nova sends these today --
+        # the runtime's one MemoryIngestEvent passes [] -- but the field is
+        # part of the event's contract, so a fact that arrives malformed, or
+        # whose write fails, is SAID. One fact's failure still never stops
+        # the ones after it (tests/test_workers.py pins that).
         for mf in (ev.policy_memory_facts or []):
+            attribute = ""
             try:
                 entity = str(mf.get("entity") or "").strip()
                 attribute = str(mf.get("attribute") or "").strip()
                 value = str(mf.get("value") or "").strip()
                 conf = float(mf.get("confidence") or 0.7)
                 persist = bool(mf.get("persist", True))
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.warning("policy_fact_malformed", attribute=attribute[:40],
+                               error=f"{type(e).__name__}: {str(e)[:120]}")
+                continue
+            if not persist:
+                continue
+            if not (entity and attribute and value):
+                logger.warning("policy_fact_malformed", attribute=attribute[:40],
+                               error="missing entity, attribute or value")
+                continue
+            try:
                 # Same routing as the extractor. These come from the policy
                 # layer rather than a model, but they describe the same speaker.
-                target = remap_entity_for(entity, ident) if entity else None
-                if target and attribute and value and persist:
-                    await self._memory.add_fact(entity=target, attribute=attribute, value=value, confidence=conf)
-            except Exception:
-                continue
+                target = remap_entity_for(entity, ident)
+                if target is None:
+                    logger.debug("policy_fact_suppressed_unverified",
+                                 attribute=attribute[:40])
+                    continue
+                await self._memory.add_fact(entity=target, attribute=attribute,
+                                            value=value, confidence=conf)
+            except Exception as e:  # noqa: BLE001 - one fact must not stop the rest
+                log_worker_error(logger, "policy_fact_write_failed", e,
+                                 attribute=attribute[:40])
 
     async def _reconcile(self, *, entity: str, attribute: str, value: str,
                          ident: TurnIdentity | None = None) -> None:
@@ -235,7 +264,11 @@ class MemoryIngestWorker:
         """
         try:
             candidates = await self._memory.find_conflict_candidates(entity=entity, value=value)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # Best-effort, so the new fact is still added -- but said, like the
+            # judge failure below: a contradiction this would have retired now
+            # sits beside the new fact.
+            logger.warning("reconcile_candidates_failed", error=str(e)[:160])
             return
         if not candidates:
             return
@@ -269,6 +302,7 @@ class MemoryIngestWorker:
         obj = extract_first_json_object(raw or "") or {}
         verdicts = obj.get("verdicts") if isinstance(obj, dict) else None
         if not isinstance(verdicts, list):
+            logger.warning("reconcile_judge_unparseable", reply_chars=len(raw or ""))
             return
 
         retire: list[str] = []
@@ -336,7 +370,13 @@ class MemoryIngestWorker:
                 return
             try:
                 hint = self._sq.get_nowait()
-            except Exception:
+            except asyncio.QueueEmpty:
+                return          # nothing waiting: the normal case
+            except Exception as e:  # noqa: BLE001
+                # Never expected from an asyncio.Queue. Reported, not raised:
+                # both call sites in _run are outside its try, so raising
+                # here would end the worker's loop.
+                log_worker_error(logger, "summarize_hint_read_failed", e)
                 return
             try:
                 # Re-enter the speaker for the WHOLE hint (V3 P5.1 closure).

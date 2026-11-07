@@ -186,22 +186,44 @@ class CloudRuntime:
         self._load_spend()
 
     def _load_spend(self) -> None:
-        """Read today's counters back. A missing or unreadable file is zero."""
+        """Read today's counters back. A missing file is zero.
+
+        An unreadable or damaged file is zero too, and now SAYS so. Marcus,
+        2026-11-06: Nova is local-first and the cloud is rarely used, so the
+        cap does not fail closed on a file it cannot read -- but restarting
+        the day's count without a word is how a cap stops meaning anything.
+        A damaged file must also never stop Nova booting: RuntimeManager
+        builds this object whether the cloud is enabled or not, and a file
+        holding valid JSON that was not an object (`null`, a list) used to
+        raise AttributeError straight out of the constructor.
+        """
         try:
             raw = json.loads(self._spend_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return          # nothing recorded yet: the normal first run
+        except (OSError, ValueError) as e:
+            self._spend_unreadable(f"{type(e).__name__}: {str(e)[:160]}")
+            return
+        if not isinstance(raw, dict):
+            self._spend_unreadable(f"expected an object, found {type(raw).__name__}")
             return
         if str(raw.get("day") or "") != self._day:
             return          # yesterday's numbers; the day has rolled
         try:
-            self._prompt_tokens = int(raw.get("prompt_tokens") or 0)
-            self._completion_tokens = int(raw.get("completion_tokens") or 0)
-        except (TypeError, ValueError):
+            prompt = int(raw.get("prompt_tokens") or 0)
+            completion = int(raw.get("completion_tokens") or 0)
+        except (TypeError, ValueError) as e:
+            self._spend_unreadable(f"token counts are not numbers: {str(e)[:120]}")
             return
+        self._prompt_tokens, self._completion_tokens = prompt, completion
         self._capped = self._over_cap()
         if self._capped:
             logger.warning("cloud_cap_restored_as_reached",
                            tokens=self._prompt_tokens + self._completion_tokens)
+
+    def _spend_unreadable(self, why: str) -> None:
+        logger.warning("cloud_spend_unreadable", path=str(self._spend_path),
+                       error=why, counted_from="zero")
 
     def _save_spend(self) -> None:
         try:

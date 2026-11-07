@@ -260,7 +260,9 @@ class ReminderWorker:
                     # 12:53 AM "good morning" after an overnight-offline gap).
                     try:
                         nxt = self._next_future_occurrence(due_at, recurrence, now)
-                        await self._memory.reschedule_reminder(reminder_id=reminder_id, next_due_at_iso=nxt.isoformat())
+                        if not await self._memory.reschedule_reminder(
+                                reminder_id=reminder_id, next_due_at_iso=nxt.isoformat()):
+                            logger.warning("reminder_reschedule_missed", reminder_id=reminder_id)
                     except Exception as e:  # noqa: BLE001
                         logger.warning("reminder_reschedule_failed", reminder_id=reminder_id, error=str(e)[:160])
                         await self._memory.complete_reminder(reminder_id=reminder_id)
@@ -305,7 +307,9 @@ class ReminderWorker:
                 continue
             try:
                 next_due = self._next_future_occurrence(due_at, recurrence, now)
-                await self._memory.reschedule_reminder(reminder_id=reminder_id, next_due_at_iso=next_due.isoformat())
+                if not await self._memory.reschedule_reminder(
+                        reminder_id=reminder_id, next_due_at_iso=next_due.isoformat()):
+                    logger.warning("reminder_reschedule_missed", reminder_id=reminder_id)
             except Exception as e:  # noqa: BLE001
                 logger.warning("reminder_reschedule_failed", reminder_id=reminder_id, error=str(e)[:160])
                 await self._memory.complete_reminder(reminder_id=reminder_id)  # don't loop forever on a bad row

@@ -629,8 +629,15 @@ class ProjectBuilder:
             try:
                 handle = self._models.for_role(role)
                 return handle.runtime, handle.semaphore
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Still builds, on the local model. But a router that RAISES
+                # is a bug -- a misconfigured role is already warned about
+                # when the router is built -- and a build quietly running on
+                # a different model than the one configured is exactly the
+                # kind of thing nobody would ever notice.
+                logger.warning("builder_model_route_failed", role=role,
+                               error=f"{type(e).__name__}: {str(e)[:160]}",
+                               fell_back_to="local")
         return self._llm, self._sem
 
     # ── Path safety ──────────────────────────────────────────────────────────
@@ -968,7 +975,14 @@ class ProjectBuilder:
         path = self._project_path(slug) / "PROJECT.md"
         try:
             return path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except FileNotFoundError:
+            return ""       # no PROJECT.md yet
+        except OSError as e:
+            # It exists but cannot be opened. Still "" -- callers treat that
+            # as "no project notes" -- but said, because "there are no notes"
+            # and "there are notes I could not read" are different facts.
+            logger.warning("project_md_unreadable", project=slug,
+                           error=f"{type(e).__name__}: {str(e)[:160]}")
             return ""
 
     def _acceptance_section(self, verdict: Any) -> str:
@@ -1849,8 +1863,14 @@ class ProjectBuilder:
             try:
                 compile(reviewed, test_name, "exec")
                 test_src = reviewed
-            except Exception:
-                pass  # keep the original test if the review broke it
+            except Exception as e:  # noqa: BLE001 - SyntaxError, or ValueError for a NUL byte
+                # Keep the original test: the review broke it. Recorded,
+                # because otherwise "the review changed nothing" and "the
+                # review returned code that does not compile" look the same,
+                # and only the second says the reviewer is failing.
+                logger.warning("builder_test_review_discarded", project=slug,
+                               file=test_name,
+                               error=f"{type(e).__name__}: {str(e)[:160]}")
 
         test_path = path / test_name
         test_path.write_text(test_src, encoding="utf-8")

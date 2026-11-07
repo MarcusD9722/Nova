@@ -41,17 +41,45 @@ class ConversationState:
 
     @staticmethod
     def from_obj(obj: Any) -> "ConversationState":
-        if isinstance(obj, str):
+        """Rebuild a state from what the cache holds.
+
+        None means nothing is stored yet, or a speaker with no durable
+        history, and is quietly empty. Anything else that is not a state --
+        text that is not JSON, JSON that is not an object, a field that is
+        not a list -- is damage. It still becomes an empty state, because a
+        turn must not fail over its own recent history, but it is LOGGED:
+        the recent turns it held are gone. (A field holding a number used to
+        raise TypeError out of load(); one holding a string was split into
+        single characters and replayed as "recent messages".)
+        """
+        if obj is None:
+            obj = {}
+        elif isinstance(obj, str):
             try:
                 obj = json.loads(obj)
-            except Exception:
+            except ValueError as e:
+                logger.warning("conversation_state_unreadable",
+                               error=f"not JSON: {str(e)[:120]}")
                 obj = {}
         if not isinstance(obj, dict):
+            logger.warning("conversation_state_unreadable",
+                           error=f"expected an object, found {type(obj).__name__}")
             obj = {}
+
+        def _texts(key: str) -> list[str]:
+            items = obj.get(key)
+            if items is None:
+                return []
+            if not isinstance(items, list):
+                logger.warning("conversation_state_unreadable", field=key,
+                               error=f"expected a list, found {type(items).__name__}")
+                return []
+            return [str(x) for x in items][-50:]
+
         return ConversationState(
-            last_user_messages=[str(x) for x in (obj.get("last_user_messages") or [])][-50:],
-            last_assistant_replies=[str(x) for x in (obj.get("last_assistant_replies") or [])][-50:],
-            last_follow_up_questions=[str(x) for x in (obj.get("last_follow_up_questions") or [])][-50:],
+            last_user_messages=_texts("last_user_messages"),
+            last_assistant_replies=_texts("last_assistant_replies"),
+            last_follow_up_questions=_texts("last_follow_up_questions"),
             last_mode=(str(obj.get("last_mode")) if obj.get("last_mode") is not None else None),
         )
 

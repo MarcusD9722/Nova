@@ -294,9 +294,16 @@ async def retrieve(store: EpisodicStore, query: str, *, limit: int = 3,
     # not allowed to see it.
     candidates = [ep for ep in candidates if _may_read_episode(ep)]
 
-    scored = [(score_episode(ep, terms), ep) for ep in candidates]
-    scored = [(s, ep) for s, ep in scored if s > 0]
-    scored.sort(key=lambda kv: kv[0], reverse=True)
+    if terms:
+        scored = [(score_episode(ep, terms), ep) for ep in candidates]
+        scored = [(s, ep) for s, ep in scored if s > 0]
+        scored.sort(key=lambda kv: kv[0], reverse=True)
+    else:
+        # RECENCY MODE: nothing to match on. `score_episode` ranks by term
+        # overlap and is 0 without terms, so scoring these dropped every one of
+        # them below: the fallback promised above returned nothing, ever
+        # (layer 2, 2026-11-06). Newest first, as the store returned them.
+        scored = [(1.0 / (1 + i), ep) for i, ep in enumerate(candidates)]
     top = [ep for _s, ep in scored[:limit]]
 
     lines: list[str] = []

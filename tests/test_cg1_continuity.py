@@ -47,7 +47,10 @@ async def main():
         # build_catchup_summary with an indexed doc + fired reminder -> non-empty
         since_past = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
         await mem.index_document(path=str(Path(td) / "test.txt"), excerpt="hello world", mtime=0.0)
-        rid = await mem.create_reminder(title="pack for trip", details="pack for trip", due_at_iso=datetime.now().isoformat(), recurrence="none")
+        # UTC, not datetime.now(): a due time with no timezone is refused since
+        # layer 2 (2026-11-06). Read back as UTC, a naive LOCAL time is six
+        # hours off, which is the M5 bug; every production writer passes UTC.
+        rid = await mem.create_reminder(title="pack for trip", details="pack for trip", due_at_iso=datetime.now(timezone.utc).isoformat(), recurrence="none")
         await mem.complete_reminder(reminder_id=str(rid))
         summary = await mem.build_catchup_summary(since_past)
         check("indexed" in summary.lower(), f"catchup mentions indexed file (got {summary!r})")
@@ -55,7 +58,7 @@ async def main():
 
         # Internal __nova_ reminders should be excluded from the fired-reminder count
         since_past2 = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
-        rid2 = await mem.create_reminder(title="__nova_habit_weather.current__", details="internal", due_at_iso=datetime.now().isoformat(), recurrence="none")
+        rid2 = await mem.create_reminder(title="__nova_habit_weather.current__", details="internal", due_at_iso=datetime.now(timezone.utc).isoformat(), recurrence="none")
         await mem.complete_reminder(reminder_id=str(rid2))
         summary2 = await mem.build_catchup_summary(since_past2)
         # should still say "1 reminder(s)" not 2, since the internal one is filtered

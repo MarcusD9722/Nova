@@ -49,12 +49,22 @@ M12) - but a quiet block is where a failure can disappear, which is how deep
 mode's planner and critic failed for months without one line of evidence.
 Whether each quiet block was REACHED by any suite is recorded too: a quiet
 block a test reached means an error was swallowed while that test ran.
+
+A quiet block that has been REVIEWED and is right as it is carries a
+`# quiet-ok: <reason>` comment on its `except` line, and is counted as
+*deliberate* instead: the exception IS the answer (`fromisoformat` saying
+"not a date"), or the failure reaches someone another way. The marker is read
+from real comment tokens, so the same text inside a string does not count,
+and a marker with no reason after it does not count either. Without it, a
+guard made narrow and correct would sit in the "quiet" count for ever and the
+review would leave no trace.
 """
 from __future__ import annotations
 
 import argparse
 import ast
 import datetime as _dt
+import io
 import json
 import os
 import re
@@ -62,6 +72,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tokenize
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
@@ -350,8 +361,30 @@ def collect_log_helpers(trees: Iterable[ast.AST]) -> dict[str, int]:
     return {name: min(lvls) for name, lvls in seen.items() if min(lvls) > 0}
 
 
+#: `# quiet-ok: <reason>`, anywhere in a comment. The reason is required.
+_DELIBERATE_RE = re.compile(r"#\s*quiet-ok:\s*\S")
+
+
+def deliberate_lines(source: str) -> set[int]:
+    """Lines carrying a `# quiet-ok: <reason>` COMMENT (see the module docstring)."""
+    out: set[int] = set()
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT and _DELIBERATE_RE.search(tok.string):
+            out.add(tok.start[0])
+    return out
+
+
+def handler_kinds(source: str, tree: ast.AST,
+                  helpers: Mapping[str, int] | None = None) -> dict[int, str]:
+    """Every `except` block in one file, by its line, classified with its markers."""
+    marked = deliberate_lines(source)
+    return {node.lineno: classify_handler(node, helpers, marked)
+            for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)}
+
+
 def classify_handler(handler: ast.ExceptHandler,
-                     helpers: Mapping[str, int] | None = None) -> str:
+                     helpers: Mapping[str, int] | None = None,
+                     deliberate: Iterable[int] = ()) -> str:
     helpers = helpers or {}
     raises = False
     level = 0
@@ -371,7 +404,14 @@ def classify_handler(handler: ast.ExceptHandler,
         if caught <= _END_OF_DATA | _POLL_TIMEOUT and isinstance(
                 only, (ast.Break, ast.Continue)):
             return "control-flow"
-    return _LEVEL_NAMES[level]
+    kind = _LEVEL_NAMES[level]
+    # The marker belongs on the `except` header: any line of it, up to the
+    # line before the body (the body may share the header's line).
+    header = range(handler.lineno, max(handler.lineno, handler.body[0].lineno - 1) + 1)
+    marked = set(deliberate)
+    if kind in ("quiet", "logs-debug") and any(line in marked for line in header):
+        return "deliberate"
+    return kind
 
 
 def _first_line(node: ast.AST, width: int = 72) -> str:
@@ -430,6 +470,7 @@ def cmd_report() -> int:
     handlers: list[dict[str, Any]] = []
     files: list[dict[str, Any]] = []
     for root, path, rel, src, tree in parsed:
+        kinds = handler_kinds(src, tree, helpers)
         try:
             _, statements, _excluded, missing, _ = cov.analysis2(str(path))
         except Exception as exc:  # noqa: BLE001 - reported, not hidden
@@ -468,7 +509,7 @@ def cmd_report() -> int:
                 "in": enclosing(node.lineno),
                 "catches": _first_line(node.type) if node.type else "(bare except)",
                 "does": _first_line(node.body[0]),
-                "kind": classify_handler(node, helpers),
+                "kind": kinds[node.lineno],
                 "reached": (first in executed) if first in stmts else None,
                 "suites": sorted({(c or "(subprocess)")
                                   for c in contexts.get(first, [])}),
@@ -588,7 +629,7 @@ def render_report(files: list[dict], functions: list[dict], handlers: list[dict]
                 + ", ".join(f"`{f['file']}`" for f in sorted(untouched, key=lambda r: r["file"]))]
 
     kinds = ["quiet", "logs-debug", "logs-info", "logs-warning", "logs-error", "raises",
-             "control-flow"]
+             "control-flow", "deliberate"]
     focus_h = [h for h in handlers if h["file"].split("/")[0] in FOCUS]
     out += ["", "## Error handlers (`except` blocks) in core, memory, backend", "",
             "| handler | count | reached by a suite | never reached |",
@@ -601,7 +642,8 @@ def render_report(files: list[dict], functions: list[dict], handlers: list[dict]
             "*quiet* = neither re-raises nor logs nor prints. *logs-debug* is invisible at "
             "the default log level, so for a user it is as quiet as *quiet*. "
             "*control-flow* = catches only \"nothing more\" (empty queue, end of "
-            "iteration) and simply exits, or a poll timeout and just loops again.", ""]
+            "iteration) and simply exits, or a poll timeout and just loops again. "
+            "*deliberate* = a quiet block reviewed and marked `# quiet-ok: <reason>`.", ""]
     if helpers:
         named = ", ".join(f"`{n}` ({_LEVEL_NAMES[lv].removeprefix('logs-')})"
                           for n, lv in sorted(helpers.items()))

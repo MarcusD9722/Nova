@@ -15,7 +15,7 @@ and what is still open.
 | # | layer | proves | runs in | status |
 |---|---|---|---|---|
 | 1 | **Coverage map** | which functions no test ever reaches | offline | **done** — see below |
-| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | next — order at the end of layer 1 |
+| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–2 done, see the end |
 | 3 | **Wiring tests** | chains across modules, workers and restarts behave as coded | offline gate (real backend, scripted model) | planned |
 | 4 | **Judgement corpora** | question / statement / remember-this / command / project request / small talk / status question, at scale, typed and voice-style | offline gate | planned |
 | 5 | **Real-model scenarios** | the same behaviours with the real 9B, judged on what happened and on what was said | opt-in, GPU to itself | planned |
@@ -69,8 +69,9 @@ The output is `coverage_map/SWALLOWED.md`.
 
 The tool lives in `tests/`, not `tools/`, because it sets the harness's own
 `NOVA_IT_WATCHDOG_S`, and `test_settings_p04` scans `tools/` as Nova code.
-Its rules are pinned by `tests/test_coverage_map_tool.py`: 32 deliberately
-broken versions of the tool, all caught by the suite. The pinned rules cover
+Its rules are pinned by `tests/test_coverage_map_tool.py`: 39 deliberately
+broken versions of the tool, all caught by the suite (32 at layer 1, seven
+more for the `# quiet-ok:` marker added in layer 2). The pinned rules cover
 the def line, closures, branches, endpoints, every handler rule (including
 that `except TimeoutError: return None` is a swallowed failure, not control
 flow, and that dropping an item on `QueueFull` is data loss), the
@@ -196,12 +197,12 @@ coverage saw run. Each block falls into one of three kinds:
 
 | # | where | what the suites hit | what goes unheard |
 |---|---|---|---|
-| 1 | `cloud_runtime.py:192` `_load_spend` | only a missing file (×398) | a truncated or unreadable spend file reads as "nothing spent today", which silently restarts the daily cloud cap. **Worse, found while checking this:** a spend file holding valid JSON that is not an object (`null`, `[1,2]`) raises `AttributeError` out of `CloudRuntime()`. `RuntimeManager.__init__` builds that unconditionally, cloud enabled or not, and the backend's startup builds `RuntimeManager` with no `try` around it, so one bad file in `memory_data/` should stop Nova booting. The `CloudRuntime()` crash is reproduced on a temp file; the boot failure is read from the code, not run |
+| 1 | `cloud_runtime.py:192` `_load_spend` | only a missing file (×398) | a truncated or unreadable spend file reads as "nothing spent today", which silently restarts the daily cloud cap. **Worse, found while checking this:** a spend file holding valid JSON that is not an object (`null`, `[1,2]`) raises `AttributeError` out of `CloudRuntime()`. `RuntimeManager.__init__` builds that unconditionally, cloud enabled or not, and the backend's startup builds `RuntimeManager` with no `try` around it, so one bad file in `memory_data/` should stop Nova booting. The `CloudRuntime()` crash is reproduced on a temp file. The boot failure was read from the code here; layer 2 confirmed it with a real startup |
 | 2 | `completion_artifacts.py:55` `declared_scaffold` | only a missing manifest (×757) | a corrupt manifest reads as "no scaffolding". Nova's own validation files then count as project files, and the next `declare_scaffold` overwrites the manifest, losing what it listed (the write is not atomic) |
 | 3 | `conversation_state.py:47` `from_obj` | the guard test's `"not json"` | a corrupt saved conversation state is replaced by an empty one |
 | 4 | `project_builder.py:632` `_handle` | the test's injected router failure | a router that raises silently builds on the local model. That would be a bug: a misconfigured role is already warned about when the router is built |
 | 5 | `project_builder.py:971` `_read_project_md` | only a missing file (×122) | any other read failure reads as "no PROJECT.md" |
-| 6 | `memory_ingest.py:218` `_ingest_scoped` | the test's non-numeric confidence | **a fact whose database write fails is dropped without a word**: the "remember this" path |
+| 6 | `memory_ingest.py:218` `_ingest_scoped` | the test's non-numeric confidence | a policy fact whose database write fails is dropped without a word. **Corrected in layer 2:** this is not the "remember this" path, because nothing sends policy facts today |
 | 7 | `chroma_backend.py:538/542` `_read_journal` | the test's corrupt journals | the outcome is safe (not adopted) but nothing says why |
 | 8 | `memory_ingest.py:339` `_drain_summarize_hints` | only `QueueEmpty` (×675) | `except Exception` would hide anything else |
 | 9 | `chroma_backend.py:769/801` staging cleanup | only "does not exist" (×41) | `except Exception` would hide a real failure to delete |
@@ -224,12 +225,18 @@ because nothing has ever made them run. The most are in `memory/unifier.py`
 
 1. **The 13 handlers above.** Make each one heard, or narrow it to the
    exception it means, with a mutation-checked test that the failure is now
-   reported and the behaviour around it is unchanged.
-2. **Memory: "remember this", recall and forget.**
+   reported and the behaviour around it is unchanged. **Done 2026-11-06**,
+   see *Layer 2* below.
+2. **Memory: "remember this", recall and forget.** **Done 2026-11-06**, see
+   *Layer 2* below.
    - `forget`, `recent_turns_text`, `facts_needing_reverification`;
    - reminders: reschedule, list, cancel;
    - `add_fact`'s supersession branches;
-   - the 55 unreached quiet handlers in `unifier.py`.
+   - the 55 unreached quiet handlers in `unifier.py`;
+   - the extractor loop in `MemoryIngestWorker._ingest_scoped`: one failed
+     `add_fact` ends the rest of that turn's facts. It is logged as
+     `memory_ingest_failed`, but nothing says which facts were lost;
+   - `_reconcile`, where a failed `find_conflict_candidates` returns quietly.
 3. **Understanding: question, statement, remember-this, command.**
    - the two known misses: `asks_about_work` misses "Did the build finish?",
      and "For blog, add a sidebar, but not yet" drops the proposal;
@@ -256,3 +263,215 @@ because nothing has ever made them run. The most are in `memory/unifier.py`
    - the stale `docs/NEXT_SESSION.md`.
 
 The map is re-run after layer 2, so the movement shows.
+
+## Layer 2 — function tests
+
+### Item 1: the 13 quiet handlers — done 2026-11-06
+
+    venv\Scripts\python.exe tests\test_quiet_handlers_2026_11.py     (89 checks, ~6 s)
+
+For every handler the suite checks three things:
+
+- the harmless case still says nothing, because a missing file is not news;
+- the bad case is now reported, under its own event name, with the reason;
+- the behaviour around it is unchanged, or changed on purpose where the old
+  behaviour was itself the bug.
+
+I then broke the fixes deliberately, in 42 different ways. The suite caught
+every one, and the files were restored byte-identically after each. Two of
+the 42 used to crash the suite instead of failing a check. Both now fail a
+check.
+
+| # | where | what it does now |
+|---|---|---|
+| 1 | `CloudRuntime._load_spend` | missing file: quiet. Unreadable: `cloud_spend_unreadable`, and counting restarts from zero (Marcus: no fail-closed). JSON that is not an object no longer crashes. Counts that only half-read are both zero, not one of them |
+| 2 | `declared_scaffold`, `declare_scaffold` | unreadable: `scaffold_manifest_unreadable`. Declaring over an unreadable manifest keeps the old bytes as `scaffold.json.unreadable` and logs `scaffold_manifest_replaced`. The write is atomic, so a crash part-way through can't corrupt it |
+| 3 | `ConversationState.from_obj` | damage: `conversation_state_unreadable`, naming the damaged field; what is intact is kept |
+| 4 | `ProjectBuilder._handle` | `builder_model_route_failed` with the role and the error; still builds on the local model |
+| 5 | `ProjectBuilder._read_project_md` | missing: quiet. Unreadable: `project_md_unreadable` |
+| 6 | policy facts in `MemoryIngestWorker._ingest_scoped` | malformed: `policy_fact_malformed` (warning). Failed write: `policy_fact_write_failed` (error). The facts after it still land |
+| 7 | `ChromaMemoryBackend._read_journal` | `semantic_journal_unreadable`, once per distinct reason, because recovery retries on every open |
+| 8 | `MemoryIngestWorker._drain_summarize_hints` | only an empty queue is quiet. Anything else logs `summarize_hint_read_failed` (error), and the worker keeps running |
+| 9 | staging cleanup | `begin_staged_rebuild` deletes a leftover only if one exists. A real failure to delete it aborts the rebuild with that reason. `abort_staged_rebuild` logs `semantic_staging_cleanup_failed` instead of raising over the failure that called it |
+| 10 | `ProjectBuilder._generate_and_run_tests` | a review that does not compile: `builder_test_review_discarded`; the original test is kept |
+| 11 | `MemoryUnifier._ensure_semantic_index` | a recovery refusal: `semantic_index_unavailable`, and no rebuild starts, because it would refuse for the same reason. Any other count failure: `semantic_index_count_failed`, and the index is still rebuilt |
+
+**What fixing them turned up:**
+
+- **The spend-file boot failure is real.** With the object check removed, the
+  real startup (`backend.app._startup`, run through `tests/harness.boot`)
+  fails with `AttributeError: 'NoneType' object has no attribute 'get'`.
+  Layer 1 had only read that from the code.
+- **One damaged journal blocked semantic-index rebuilds for good.** When no
+  backup was present, recovery cleared the promotion journal only if it could
+  read it. `_unfinished_promotion` refuses while the file exists. Reproduced:
+  every `begin_staged_rebuild` was refused, on every boot, with "a previous
+  promotion journal has not been cleared". An unreadable journal with no
+  backup is now cleared, as the leftover it is. The neighbouring handler that
+  hid a failure to *remove* the journal (`_write_journal`, never reached by a
+  suite) now logs `semantic_journal_not_removed`.
+- **A leftover staging collection that could not be deleted was built on.**
+  `get_or_create_collection` handed back the old collection, still holding the
+  old generation id.
+- **Two more crashes.**
+  - A scaffold manifest that is not valid UTF-8 raised `UnicodeDecodeError`
+    out of `implementation_files()`, because only `JSONDecodeError` was caught.
+  - A saved conversation state with a number where a list belongs raised
+    `TypeError` out of `load()`. One with text there was replayed as single
+    characters.
+
+**Corrections to layer 1:**
+
+- **Row 6 overstated the risk.** Nothing in Nova sends policy facts: the
+  runtime's only `MemoryIngestEvent` passes `policy_memory_facts=[]`. The
+  real "remember this" path is the extractor, and a failed write there
+  already reaches `memory_ingest_failed` at error level. It does take the
+  rest of that turn's facts with it, which is on the item 2 list. The
+  handler is fixed anyway, because the field is part of the event's
+  contract.
+- **Row 3 is narrower than it read.** The store saves objects, so "text that
+  is not JSON" needs a value no current code writes. The reachable damage is
+  the `TypeError` above.
+
+### Item 2: memory — remember, recall, forget, reminders — done 2026-11-06
+
+Two suites:
+
+    venv\Scripts\python.exe tests\test_memory_functions_2026_11.py   (69 checks)
+    venv\Scripts\python.exe tests\test_memory_handlers_2026_11.py    (64 checks)
+
+I broke the fixes deliberately: 23 broken versions for the first suite and 58
+for the second. Every one was caught, and the files were restored
+byte-identically after each. The mutation driver now runs the unbroken suite
+first and refuses to judge anything if that fails. A suite that already fails
+"catches" every mutant, and one round of this work nearly counted 23 of those.
+
+**What each memory function was meant to do, and the six places it didn't:**
+
+| function | meant to | what was wrong |
+|---|---|---|
+| `forget` | delete exactly what the speaker named, from their own memory only | **Its own docstring's request matched nothing.** "Please forget my locker code, I don't want you storing that" required "please", "forget", "want" and "storing" to appear in the stored fact. Request words no longer count. **And the owner's forget also deleted a guest's matching fact**, against its first promise that nobody forgets anybody else's memory. It no longer touches `speaker:` namespaces, in either shape. *Marcus confirmed this on 2026-11-07: his forget stays out of guests' memories* |
+| `add_fact` replacing a single-valued fact | the new value replaces the old one | **The old value was deleted, in its own committed transaction, before the new one was written.** A write that failed left neither. The old value is now retired only after the new one is stored |
+| `recent_turns_text`, for the reflection pass | lessons about Marcus, from Marcus | **It read every speaker's turns and labelled each one "Marcus".** Reflection, running as the owner, wrote lessons about how to treat him from what guests said: the leak `scoped_entity` exists to prevent. It now reads only the current speaker's exchanges |
+| `episodes_for_consolidation` | insights about Marcus's routine, from Marcus | **Same leak:** a guest's messages fed insights stored as his. Fixed the same way |
+| `digital_twin_profile`, active hours | Marcus's working pattern | **Same leak, smaller:** a guest's turn times counted toward his peak hours. It now reads only his turns |
+| `reminder.list` | list his reminders, truthfully | **The limit was applied before Nova's own bookkeeping reminders were filtered out.** Birthday heads-ups and habit prompts used up the slots, so his were cut off under "These are the only reminders that exist". With 20 or more of hers due first, it answered "Nothing is scheduled". It now filters first and says when a list is cut short |
+| `MemoryIngestWorker`, extracting facts | save every fact it extracted | **One failed write ended the loop**, losing every fact after it under one generic error. Each fact now fails alone, by name |
+
+Also fixed, each pinned by a check:
+
+- A reminder's due time is checked when it is written and stored as UTC.
+  "Tomorrow" was stored as text and never fired, silently. A time with an
+  offset fired early, because due times are compared as text.
+- `reschedule_reminder` now says whether it moved anything, and the worker
+  logs it when it didn't.
+- `_reconcile`'s two silent returns are now logged.
+- `forget`, reverification and the reminder set were all tested against
+  their docstrings and work as written.
+
+**The 56 quiet handlers in `memory/unifier.py`.** None is left unreviewed. A
+structural check in the suite fails if one appears.
+
+- **24 best-effort sections** (the digital twin, the executive layer, the
+  catch-up summary, known names and others) still leave a failed section out.
+  They now log `memory_section_failed`, naming the section.
+- **13 readers of stored JSON** that no longer parses still fall back. They
+  now log `memory_blob_unreadable`. Three of them were read-modify-write paths
+  that then overwrote the unreadable value without a trace: a person's
+  attributes, an experiment's trials, the activity log. Those now copy the old
+  bytes into the audit log first.
+- **9 guards for an unimportable `core.turn_identity`** fall back to treating
+  every speaker as Marcus. They now say so every time. This cannot happen in
+  the running app, which imports that module first.
+- **10 were reviewed and are right as they are**, such as a timestamp parse
+  whose answer is the exception. Each was narrowed to the exception it means
+  and marked `# quiet-ok: <reason>`.
+
+**A data-loss bug behind them: five writers cut serialized JSON.**
+`json.dumps(x)[:20000]` is not JSON past the limit. Each value was read back
+with `json.loads`, the read fell back to "nothing", and the next write saved
+that:
+
+- the activity log and experiment trials kept resetting;
+- a plan over 20,000 characters read back as no plan;
+- a skill edited often enough vanished, because it keeps every earlier
+  version.
+
+Values are now kept under the limit by dropping their oldest entries, never by
+cutting the text. Measured: the activity log keeps its newest 192 events
+instead of resetting to a handful, and a skill edited 200 times survives at
+version 201.
+
+**The coverage map counts reviewed handlers now.** A quiet `except` marked
+`# quiet-ok: <reason>` on its header is counted as *deliberate*. The marker is
+read from real comment tokens, so the text inside a string does not count, and
+a marker with no reason does not count. Seven more broken versions of the tool
+pin this, 39 in all.
+
+**A test bug the full run found.** `test_memory_consolidation` expected UTC
+dates from a function that has grouped by local day since M17, so it failed
+every evening from 6 pm to midnight Central. It now expects local dates. The
+committed code behaved the same, so this was never a regression.
+
+**One slip of mine, recorded:** both memory patches were applied while the
+full run was still going. A setting meant to aim them at a copy did not take
+effect. That run's later suites therefore tested the new code, and the final
+full run at the end of layer 2 is the one that counts.
+
+**The final full run for items 1–3, 2026-11-06: 201 of 202 suites passed.**
+The one failure was `test_cg1_continuity`. It created reminders with
+`datetime.now()`, a local time with no timezone, which the new check now
+refuses. Read back as UTC, that time was six hours off: the M5 bug. The test
+now passes UTC, and run alone it passes. No Nova code changed after the run.
+
+### Item 3: understanding — the untaken branches done 2026-11-06; fixing the two misses approved 2026-11-07
+
+    venv\Scripts\python.exe tests\test_understanding_branches_2026_11.py   (37 checks)
+
+23 deliberately broken versions; 22 caught. **The one that survived:**
+
+- **What it changed:** it removed the guard in `strip_preamble` that stops
+  before stripping a message down to nothing.
+- **Why no test catches it:** a fallback at the end of the same function
+  already returns the original text in that case, so the message is never
+  emptied either way.
+- **Where the two versions differ:** only on input made entirely of openers.
+  For "so so", the original returns "so" and the broken one returns "so so".
+- **Why no check was added:** the docstring does not say which is right, so
+  pinning either would lock in a guess. It is recorded here instead.
+
+Every branch the map found untaken in `intent`, `understanding`,
+`recall_gate` and `episodic_recall` is tested for what it is meant to do:
+
+- empty input is never a question, a recall or a history search;
+- a model answer the code did not offer falls back;
+- the prompt budget is a budget;
+- an episode with no owner is Marcus's, never a guest's;
+- a reference into a past result set resolves, reports that it is
+  ambiguous, or says why not.
+
+**One of those branches hid a bug.** When a question had no usable terms,
+`retrieve` fell back to the newest episodes, as its comment promises. It then
+scored each one by term overlap, which is 0 with no terms, and dropped them
+all, so the fallback never returned anything. Recency mode now keeps the
+store's newest-first order.
+
+**The two known misses were held for Marcus's decision, and on 2026-11-07 he
+approved fixing both.** The
+Stage 15 report records his standing instruction not to broaden the intent
+grammar without a production defect requiring it, and a test pins one of the
+two as a known limitation. Measured now: `asks_about_work` returns False for
+all eight of these:
+
+- "Did the build finish?"
+- "Did the planned work succeed?"
+- "did the tests pass?"
+- "Did everything work?"
+- "did the project build ok?"
+- "Has the build finished yet?"
+- "Did the job run?"
+- "Did my game build work?"
+
+A miss means the reply is written with no work record attached. That is the
+condition behind the audit's C4 false claim, where Nova said a failed build
+was "all set up and ready to go".

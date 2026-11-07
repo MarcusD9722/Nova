@@ -1161,8 +1161,14 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             limit = max(1, min(int(args.get("limit") or 20), 50))
         except (TypeError, ValueError):
             limit = 20
+        # Fetched WIDE and filtered BEFORE the limit. The limit used to apply
+        # first, so Nova's own bookkeeping reminders (birthday heads-ups, habit
+        # prompts, the briefing), which sort among his by due time, used up the
+        # slots: his were cut off under "These are the only reminders that
+        # exist", and with enough of hers the answer was "Nothing is
+        # scheduled" while things were (layer 2, 2026-11-06).
         rows = await memory.list_reminders(status=(None if status == "all" else status),
-                                           limit=limit)
+                                           limit=1000)
         items = []
         for r in rows:
             title = str(r.get("title") or "")
@@ -1181,6 +1187,12 @@ def build_tool_router(*, repo_root: Path, projects_dir: Path, memory: MemoryUnif
             return {"ok": True, "reminders": [], "count": 0,
                     "note": "Nothing is scheduled. Say that plainly — do not "
                             "describe a reminder that is not in this list."}
+        total = len(items)
+        if total > limit:
+            items = items[:limit]
+            return {"ok": True, "count": len(items), "total": total, "reminders": items,
+                    "note": (f"These are the first {len(items)} of {total} reminders. "
+                             "Say that there are more; never present these as all of them.")}
         return {"ok": True, "count": len(items), "reminders": items,
                 "note": "These are the only reminders that exist."}
 

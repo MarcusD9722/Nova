@@ -8,7 +8,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from core.dates import parse_month_day
@@ -22,6 +22,7 @@ from core.settings import get_bool
 from memory import semantic_records
 from memory.backends.chroma_backend import ChromaMemoryBackend
 from memory.backends.chroma_backend import semantic_space_id as chroma_semantic_space_id
+from memory.backends.chroma_backend import SemanticUnavailable
 from memory.backends.diskcache_backend import DiskCacheBackend
 from memory.backends.json_backend import JsonAuditBackend
 from memory.backends.sqlite_backend import SQLiteMemoryBackend
@@ -66,6 +67,25 @@ _BOOKKEEPING_ENTITIES = frozenset({
 })
 _BOOKKEEPING_PREFIXES = ("agent:", "agentmem:", "exptrials:", "plan:")
 
+#: Words that say what to DO, not what to delete. `forget` deletes a fact only
+#: when it holds every remaining word, so while these counted, "Please forget my
+#: locker code, I don't want you storing that" -- the request forget's own
+#: docstring is built around -- matched nothing (layer 2, 2026-11-06).
+_FORGET_REQUEST_WORDS = frozenset(
+    "forget forgot forgetting delete remove erase wipe please want don't dont "
+    "storing anymore".split()
+)
+
+
+def _guest_owned(entity: Any) -> bool:
+    """Is this entity inside some non-owner speaker's namespace?
+
+    `speaker:p-alice...`, and the legacy child shape `lesson:speaker:p-alice`.
+    The owner never has entities of either shape.
+    """
+    e = str(entity or "").strip().lower()
+    return e.startswith("speaker:") or ":speaker:" in e
+
 
 def _is_bookkeeping_entity(entity: Any) -> bool:
     e = str(entity or "").strip().lower()
@@ -107,6 +127,83 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _section_failed(where: str, exc: BaseException) -> None:
+    """A best-effort part of a larger answer failed and was left out: said."""
+    logger.warning("memory_section_failed", where=where,
+                   error=f"{type(exc).__name__}: {str(exc)[:160]}")
+
+
+def _blob_unreadable(what: str, key: Any, exc: BaseException) -> None:
+    """A stored JSON value no longer parses, and its reader falls back: said."""
+    logger.warning("memory_blob_unreadable", what=what, key=str(key)[:80],
+                   error=f"{type(exc).__name__}: {str(exc)[:160]}")
+
+
+def _identity_unavailable(exc: BaseException) -> None:
+    """core.turn_identity would not import, so memory runs single-owner: every
+    speaker is treated as Marcus. Never expected in the running app, which
+    imports it first; said every time it happens."""
+    logger.warning("memory_identity_unavailable", fallback="single owner",
+                   error=f"{type(exc).__name__}: {str(exc)[:160]}")
+
+
+#: Stored JSON values are kept under this many characters.
+_BLOB_LIMIT = 20000
+
+
+def _json_within(obj: Any, *, what: str, trim: Callable[[Any], bool] | None = None,
+                 ensure_ascii: bool = True) -> str:
+    """Serialize a value for storage under `_BLOB_LIMIT` WITHOUT cutting the text.
+
+    Five writers stored `json.dumps(x)[:20000]`. Past the limit that is not
+    JSON, and every one of them is read back with json.loads: the read failed,
+    fell back to "nothing stored", and the next write saved that. Experiment
+    trials and the activity log reset to empty, a large plan read back as no
+    plan, and a skill edited often enough -- it keeps every earlier version --
+    vanished (layer 2, 2026-11-06).
+
+    `trim(obj)` drops the oldest expendable part in place and returns False
+    when nothing is left to drop. A value that still does not fit is stored
+    whole and said: too big is a cost, a corrupted value is a loss.
+    """
+    text = json.dumps(obj, ensure_ascii=ensure_ascii)
+    while len(text) > _BLOB_LIMIT and trim is not None and trim(obj):
+        text = json.dumps(obj, ensure_ascii=ensure_ascii)
+    if len(text) > _BLOB_LIMIT:
+        logger.warning("memory_blob_oversize", what=what, chars=len(text))
+    return text
+
+
+def _drop_oldest(items: list[Any]) -> bool:
+    if not items:
+        return False
+    del items[0]
+    return True
+
+
+def _drop_oldest_version(skill: dict[str, Any]) -> bool:
+    return _drop_oldest(skill.get("versions") or [])
+
+
+def _reminder_due_utc(value: Any) -> str:
+    """A reminder's due time as UTC ISO text, or ValueError.
+
+    Due times are compared AS TEXT (`due_at <= now` in SQL), which is right only
+    while every row is UTC in one form. Every writer passes UTC today; this keeps
+    it that way. A value that was not a time used to be stored as given and then
+    never fired, without a word, and a naive one is the M5 bug again: local time
+    read back as UTC (layer 2, 2026-11-06).
+    """
+    text = str(value or "").strip()
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"reminder due time is not an ISO timestamp: {text[:60]!r}") from None
+    if dt.tzinfo is None:
+        raise ValueError(f"reminder due time has no timezone: {text[:60]!r}")
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _as_local(raw: Any) -> datetime | None:
     """A stored timestamp as LOCAL wall-clock time, or None if unreadable.
 
@@ -128,7 +225,7 @@ def _as_local(raw: Any) -> datetime | None:
         return None
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+    except ValueError:  # quiet-ok: not an ISO time; the caller reads None as no time
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -155,7 +252,8 @@ def _personal_tail(entity: Any) -> str:
     """
     try:
         from core.turn_identity import personal_tail
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return str(entity or "").strip().lower()
     return personal_tail(entity)
 
@@ -240,7 +338,7 @@ def _staleness_factor(
             dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except (TypeError, ValueError):  # quiet-ok: an unreadable stamp is skipped; with none left the fact does not decay
             continue
         if newest is None or dt > newest:
             newest = dt
@@ -259,7 +357,8 @@ def _read_scope_entity() -> str | None:
     """The current speaker's personal root, or None if they have no history."""
     try:
         from core.turn_identity import current_identity
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return "user"
     return current_identity().memory_entity
 
@@ -268,7 +367,8 @@ def _read_scope_key() -> str:
     """Cache-key component identifying WHOSE view of memory this is."""
     try:
         from core.turn_identity import current_identity
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return "owner"
     ident = current_identity()
     if ident.is_owner:
@@ -300,7 +400,8 @@ def scoped_entity(base: str) -> str | None:
     """
     try:
         from core.turn_identity import OWNER_ENTITY, current_identity
-    except Exception:  # noqa: BLE001 - memory must not hard-depend on runtime
+    except Exception as e:  # noqa: BLE001 - memory must not hard-depend on runtime
+        _identity_unavailable(e)
         return base
     ent = current_identity().memory_entity
     if ent is None:
@@ -314,7 +415,8 @@ def _scope_is_owner() -> bool:
     """True when this write belongs to Marcus (typed, legacy voice, or owner)."""
     try:
         from core.turn_identity import current_identity
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return True
     return current_identity().is_owner
 
@@ -327,7 +429,8 @@ def _turn_source_meta() -> tuple[str, str]:
     """
     try:
         from core.turn_identity import current_identity
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return ("typed", "")
     ident = current_identity()
     return (ident.input_source or "typed", ident.speaker_status or "")
@@ -341,7 +444,8 @@ def _turn_speaker_meta(role: str) -> tuple[str, str]:
     """
     try:
         from core.turn_identity import current_identity, turn_speaker_label
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return ("Marcus" if role == "user" else "Nova", "user")
     ident = current_identity()
     label = "Nova" if role != "user" else turn_speaker_label(ident)
@@ -356,7 +460,8 @@ def _scope_subject() -> tuple[str, str]:
     """
     try:
         from core.turn_identity import current_identity
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _identity_unavailable(e)
         return ("Marcus", "he")
     ident = current_identity()
     if ident.is_owner:
@@ -372,7 +477,8 @@ def _filter_hits_for_scope(hits: list[MemoryHit]) -> list[MemoryHit]:
     """
     try:
         from core.turn_identity import current_identity, may_read_entity
-    except Exception:  # noqa: BLE001 - memory must not hard-depend on runtime
+    except Exception as e:  # noqa: BLE001 - memory must not hard-depend on runtime
+        _identity_unavailable(e)
         return hits
 
     ident = current_identity()
@@ -493,7 +599,7 @@ class MemoryUnifier:
             sem = self._chroma.semantic_status()
             out["semantic"] = sem
             out["degraded"] = bool(out["degraded"] or sem.get("degraded"))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # quiet-ok: the error is returned in the health report itself
             out["semantic"] = {"error": str(e)[:200]}
         return out
 
@@ -639,7 +745,20 @@ class MemoryUnifier:
         sqlite_counts = await self._sqlite.count_records()
         try:
             chroma_count = await self._chroma.count()
-        except Exception:
+        except SemanticUnavailable as e:
+            # Recovery refused to name an authority (SemanticRecoveryError),
+            # or the embedding model is unavailable. A rebuild cannot help
+            # either: it runs the same recovery first and refuses. This used
+            # to read as "empty", start that doomed rebuild, and surface late
+            # as `semantic_rebuild_aborted`. Say the real reason instead.
+            logger.warning("semantic_index_unavailable", error=str(e)[:300])
+            return
+        except Exception as e:  # noqa: BLE001
+            # Could not count. Treated as empty, as before, so the staged
+            # rebuild below can repair it -- the live index is untouched until
+            # a verified promotion -- but no longer silently.
+            logger.warning("semantic_index_count_failed",
+                           error=f"{type(e).__name__}: {str(e)[:160]}")
             chroma_count = 0
 
         # If there is nothing to index, don't touch Chroma. Turns and document
@@ -652,7 +771,8 @@ class MemoryUnifier:
             try:
                 extra = (len(await self._sqlite.all_turns(limit=1))
                          + len(await self._sqlite.all_document_chunks(limit=1)))
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                _section_failed("semantic_index.count_turns", e)
                 extra = 0
             if extra <= 0:
                 return
@@ -698,7 +818,7 @@ class MemoryUnifier:
                 logger.warning("semantic_rebuild_skipped_model_unavailable")
                 return {**empty, "complete": False, "skipped": 1,
                         "reason": f"embedding model unavailable: {_emb.load_error() or 'not loaded'}"}
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # quiet-ok: returned as the rebuild's reason, which the caller shows
             return {**empty, "complete": False, "skipped": 1,
                     "reason": f"embedding availability check failed: {str(e)[:160]}"}
 
@@ -880,8 +1000,8 @@ class MemoryUnifier:
             try:
                 lp = await self.get_latest_fact(entity="projects", attribute="last_active")
                 active_project = lp.value.strip() if lp and lp.value else None
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("ingest_turn.active_project", e)
             for edge in extract_turn_edges(content, known, active_project):
                 await self._graph.upsert_edge(edge)
         except Exception as e:  # noqa: BLE001
@@ -903,8 +1023,8 @@ class MemoryUnifier:
                 n = str(row.get("name") or "").strip()
                 if n:
                     names.add(n)
-        except Exception:
-            pass
+        except Exception as e:
+            _section_failed("known_person_names.people", e)
         try:
             for attr in ("child", "spouse", "mother", "father", "sibling", "cousin", "friend", "pet"):
                 for rec in await self.get_facts(entity="user", attribute=attr, limit=30, newest_first=False):
@@ -913,8 +1033,8 @@ class MemoryUnifier:
                     # sentences as child names); real names are short.
                     if n and len(n) <= 32 and len(n.split()) <= 3:
                         names.add(n)
-        except Exception:
-            pass
+        except Exception as e:
+            _section_failed("known_person_names.facts", e)
         result = sorted(names)
         self._known_names_cache = (_time.monotonic(), result)
         return result
@@ -1048,12 +1168,15 @@ class MemoryUnifier:
             # Local hour-of-day for recent turns (created_at is UTC).
             try:
                 hours: list[int] = []
-                for row in await self._sqlite.recent_turns(conversation_id=None, limit=300):
+                # HIS turns: the twin is Marcus's working pattern, and a guest's
+                # evenings are not his peak hours (layer 2, 2026-11-06).
+                for row in await self._sqlite.search_turns(limit=300, speaker_entity="user"):
                     dt = self._parse_dt(row.get("created_at"))
                     if dt is not None:
                         hours.append(dt.astimezone().hour)
                 return hours
-            except Exception:
+            except Exception as e:
+                _section_failed("digital_twin.turn_hours", e)
                 return []
 
         async def _trends() -> tuple[str, str]:
@@ -1062,13 +1185,15 @@ class MemoryUnifier:
                     self.recent_mood_trend(days=5),
                     self.recent_wellbeing_trend(days=7),
                 )
-            except Exception:
+            except Exception as e:
+                _section_failed("digital_twin.trends", e)
                 return "", ""
 
         async def _interests() -> list[str]:
             try:
                 return [r.value for r in await self.get_facts(entity="interest_focus", limit=6, newest_first=True) if r.value]
-            except Exception:
+            except Exception as e:
+                _section_failed("digital_twin.interests", e)
                 return []
 
         async def _lessons_recent() -> int:
@@ -1078,7 +1203,8 @@ class MemoryUnifier:
                     1 for r in await self.get_facts(entity=LESSON_ENTITY, limit=60, newest_first=True)
                     if r.created_at >= cut
                 )
-            except Exception:
+            except Exception as e:
+                _section_failed("digital_twin.lessons", e)
                 return 0
 
         async def _reminder_punctuality() -> tuple[int, int]:
@@ -1093,8 +1219,8 @@ class MemoryUnifier:
                             behind += 1
                         else:
                             on_time += 1
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("digital_twin.reminder_punctuality", e)
             return on_time, behind
 
         async def _goal_progress() -> tuple[int, int]:
@@ -1108,8 +1234,8 @@ class MemoryUnifier:
                     up = self._parse_dt(g.get("updated_at"))
                     if up is None or up < stale_cut:
                         stalled += 1
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("digital_twin.goal_progress", e)
             return active, stalled
 
         turn_hours, (mood, wellbeing), interests, lessons_recent, (ontime, late), (goals_active, goals_stalled) = (
@@ -1143,8 +1269,9 @@ class MemoryUnifier:
                             "value": read,
                             "basis": f"read from the mood/wellbeing signal: {evidence[:120]}",
                         }
-                except Exception:
-                    pass  # keep the deterministic read
+                except Exception as e:
+                    _section_failed("digital_twin.stress_read", e)
+                    # keep the deterministic read
 
         profile["enabled"] = True
         return profile
@@ -1179,8 +1306,8 @@ class MemoryUnifier:
                         late.append(title)
                     elif delta_h <= 24:
                         soon.append({"label": title, "hours_until": max(0.0, delta_h)})
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("executive.reminders", e)
             return late, soon
 
         async def _important_dates() -> list[dict[str, Any]]:
@@ -1189,7 +1316,8 @@ class MemoryUnifier:
                     {"name": u["name"], "label": u["label"], "days_until": u["days_until"]}
                     for u in await self.list_people_with_upcoming_dates(within_days=3)
                 ]
-            except Exception:
+            except Exception as e:
+                _section_failed("executive.important_dates", e)
                 return []
 
         async def _goals() -> tuple[list[str], list[str]]:
@@ -1205,8 +1333,8 @@ class MemoryUnifier:
                     up = self._parse_dt(g.get("updated_at"))
                     if up is None or up < stale_cut:
                         stalled.append(title)
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("executive.goals", e)
             return active, stalled
 
         async def _twin_signals() -> tuple[str | None, float, str]:
@@ -1218,8 +1346,8 @@ class MemoryUnifier:
                         float(prof["procrastination_likelihood"]["value"]),
                         prof["stress_level"]["value"],
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("executive.twin_signals", e)
             return None, 0.0, "low"
 
         (overdue, upcoming), upcoming_dates, (active_goals, stalled_goals), (peak, procrastination, stress) = (
@@ -1250,8 +1378,9 @@ class MemoryUnifier:
                 phrased["message"] = await self._expression.rephrase(
                     r["message"], context=f"proactive nudge about {r.get('kind', 'something')}",
                 )
-            except Exception:
-                pass  # keep the template
+            except Exception as e:
+                _section_failed("executive.rephrase", e)
+                # keep the template
             out.append(phrased)
         return out
 
@@ -1281,11 +1410,18 @@ class MemoryUnifier:
 
     # ── Long-term goal planning (Phase 5 / #3) ───────────────────────────────
 
+    async def _keep_unreadable(self, entity: str, attribute: str, raw: Any) -> None:
+        """Copy a stored value that no longer parses into the audit log BEFORE it
+        is overwritten, so the overwrite destroys nothing for good."""
+        await self._json.append_audit({"kind": "unreadable_overwritten", "entity": entity,
+                                       "attribute": attribute, "value": str(raw or "")})
+
     async def save_plan(self, goal_id: str, plan: dict[str, Any]) -> None:
         """Persist a goal's plan tree as a JSON fact (one current tree per goal)."""
         await self.initialize()
         await self.add_fact(entity=f"plan:{goal_id}", attribute="tree",
-                            value=json.dumps(plan, ensure_ascii=False)[:20000], confidence=1.0)
+                            value=_json_within(plan, what="plan", ensure_ascii=False),
+                            confidence=1.0)
 
     async def load_plan(self, goal_id: str) -> dict[str, Any] | None:
         await self.initialize()
@@ -1294,7 +1430,8 @@ class MemoryUnifier:
             return None
         try:
             return json.loads(rec.value)
-        except Exception:
+        except Exception as e:
+            _blob_unreadable("plan", goal_id, e)
             return None
 
     async def advance_plan(self, goal_id: str) -> dict[str, Any] | None:
@@ -1371,7 +1508,7 @@ class MemoryUnifier:
             rec = await self.get_latest_fact(entity=ent, attribute=attr)
             try:
                 return float(rec.value) if rec and rec.value else default
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # quiet-ok: a setting that is not a number falls back to its default
                 return default
 
         consulted = int(await _num("consulted", 0))
@@ -1446,12 +1583,18 @@ class MemoryUnifier:
         rec = await self.get_latest_fact(entity=f"exptrials:{exp_id}", attribute="data")
         try:
             trials = json.loads(rec.value) if rec and rec.value else []
-        except Exception:
+            if not isinstance(trials, list):
+                raise ValueError(f"expected a list of trials, found {type(trials).__name__}")
+        except (TypeError, ValueError) as e:
+            # About to be overwritten: keep the old value first.
+            _blob_unreadable("experiment trials", exp_id, e)
+            await self._keep_unreadable(f"exptrials:{exp_id}", "data", rec.value if rec else "")
             trials = []
         clean = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
         trials.append({"variant": variant, "metrics": clean})
         await self.add_fact(entity=f"exptrials:{exp_id}", attribute="data",
-                            value=json.dumps(trials)[:20000], confidence=1.0)
+                            value=_json_within(trials, what="experiment trials", trim=_drop_oldest),
+                            confidence=1.0)
         return True
 
     async def analyze_experiment(self, exp_id: str) -> dict[str, Any] | None:
@@ -1462,7 +1605,8 @@ class MemoryUnifier:
             return {"verdict": "inconclusive", "reason": "no trials recorded", "ranking": [], "requires_approval": True}
         try:
             trials = json.loads(rec.value)
-        except Exception:
+        except Exception as e:
+            _blob_unreadable("experiment trials", exp_id, e)
             trials = []
         return compare_variants(trials)
 
@@ -1472,12 +1616,14 @@ class MemoryUnifier:
         for r in await self.get_facts(entity="experiment", limit=100, newest_first=True):
             try:
                 defn = json.loads(r.value)
-            except Exception:
+            except Exception as e:
+                _blob_unreadable("experiment", r.attribute, e)
                 continue
             trials_rec = await self.get_latest_fact(entity=f"exptrials:{defn['id']}", attribute="data")
             try:
                 n_trials = len(json.loads(trials_rec.value)) if trials_rec and trials_rec.value else 0
-            except Exception:
+            except Exception as e:
+                _blob_unreadable("experiment trials", defn.get('id'), e)
                 n_trials = 0
             out.append({**defn, "trials": n_trials})
         return out
@@ -1494,18 +1640,26 @@ class MemoryUnifier:
         rec = await self.get_latest_fact(entity="activity", attribute="log")
         try:
             log = json.loads(rec.value) if rec and rec.value else []
-        except Exception:
+            if not isinstance(log, list):
+                raise ValueError(f"expected a list of events, found {type(log).__name__}")
+        except (TypeError, ValueError) as e:
+            # About to be overwritten: keep the old value first.
+            _blob_unreadable("activity log", "log", e)
+            await self._keep_unreadable("activity", "log", rec.value if rec else "")
             log = []
         log.append(event)
         log = log[-cap:]
-        await self.add_fact(entity="activity", attribute="log", value=json.dumps(log)[:20000], confidence=1.0)
+        await self.add_fact(entity="activity", attribute="log",
+                            value=_json_within(log, what="activity log", trim=_drop_oldest),
+                            confidence=1.0)
 
     async def recent_activity(self, limit: int = 100) -> list[str]:
         await self.initialize()
         rec = await self.get_latest_fact(entity="activity", attribute="log")
         try:
             log = json.loads(rec.value) if rec and rec.value else []
-        except Exception:
+        except Exception as e:
+            _blob_unreadable("activity log", 'log', e)
             log = []
         return log[-int(limit):]
 
@@ -1525,8 +1679,8 @@ class MemoryUnifier:
                 found["suggested_name"] = await self._expression.name_for(
                     found["steps"], fallback=" then ".join(found["steps"][:2]),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("skills.name_for", e)
         return found
 
     async def learn_skill(self, name: str, steps: list[str]) -> str | None:
@@ -1541,7 +1695,9 @@ class MemoryUnifier:
         skill = {"id": skill_id, "name": name[:120], "steps": steps, "version": 1, "versions": [],
                  "parameters": workflow_parameters(steps), "created_at": _now().isoformat(),
                  "updated_at": _now().isoformat()}
-        await self.add_fact(entity="skill", attribute=skill_id, value=json.dumps(skill)[:20000], confidence=1.0)
+        await self.add_fact(entity="skill", attribute=skill_id,
+                            value=_json_within(skill, what="skill", trim=_drop_oldest_version),
+                            confidence=1.0)
         return skill_id
 
     async def get_skill(self, skill_id: str) -> dict[str, Any] | None:
@@ -1551,7 +1707,8 @@ class MemoryUnifier:
             return None
         try:
             return json.loads(rec.value)
-        except Exception:
+        except Exception as e:
+            _blob_unreadable("skill", skill_id, e)
             return None
 
     async def list_skills(self) -> list[dict[str, Any]]:
@@ -1562,7 +1719,8 @@ class MemoryUnifier:
                 s = json.loads(r.value)
                 out.append({"id": s["id"], "name": s["name"], "steps": len(s["steps"]),
                             "version": s["version"], "parameters": s.get("parameters", [])})
-            except Exception:
+            except Exception as e:
+                _blob_unreadable("skill", r.attribute, e)
                 continue
         return out
 
@@ -1579,7 +1737,9 @@ class MemoryUnifier:
         skill["steps"] = steps
         skill["parameters"] = workflow_parameters(steps)
         skill["updated_at"] = _now().isoformat()
-        await self.add_fact(entity="skill", attribute=skill_id, value=json.dumps(skill)[:20000], confidence=1.0)
+        await self.add_fact(entity="skill", attribute=skill_id,
+                            value=_json_within(skill, what="skill", trim=_drop_oldest_version),
+                            confidence=1.0)
         return skill
 
     async def branch_skill(self, skill_id: str, new_name: str) -> str | None:
@@ -1661,10 +1821,13 @@ class MemoryUnifier:
             # duplicates for list-valued ones (child, friend, note, ...).
             stale_ids: list[str] = []
             if self._is_singleton_fact(entity, attribute):
+                # Found now, RETIRED only once the new value is safely written
+                # (below). Deleting first lost both values whenever the write
+                # after it failed: "my favourite colour is green" against a
+                # locked database left no favourite colour at all
+                # (layer 2, 2026-11-06).
                 try:
                     stale_ids = await self._fact_ids_for(entity, attribute)
-                    if stale_ids:
-                        await self._sqlite.delete_facts_by_ids(stale_ids)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("fact_supersede_failed", entity=entity, attribute=attribute, error=str(e)[:200])
                     stale_ids = []
@@ -1735,6 +1898,16 @@ class MemoryUnifier:
                 )
             await asyncio.gather(*tasks)
 
+            if stale_ids:
+                try:
+                    await self._sqlite.delete_facts_by_ids(stale_ids)
+                except Exception as e:  # noqa: BLE001
+                    # Both values are stored for now. Reads take the newest,
+                    # and the next write of this attribute retires them all.
+                    logger.warning("fact_supersede_failed", entity=entity,
+                                   attribute=attribute, error=str(e)[:200])
+                    stale_ids = []
+
         self._search_gen += 1
         if stale_ids and self._chroma is not None:
             try:
@@ -1777,10 +1950,15 @@ class MemoryUnifier:
         if existing:
             try:
                 prior = json.loads(existing.get("attributes_json") or "{}")
-                if isinstance(prior, dict):
-                    merged = {**prior, **attributes}
-            except Exception:
-                pass
+                if not isinstance(prior, dict):
+                    raise ValueError(f"expected an object, found {type(prior).__name__}")
+                merged = {**prior, **attributes}
+            except (TypeError, ValueError) as e:
+                # What was known about this person can no longer be read, so it
+                # cannot be merged and is about to be replaced: keep it first.
+                _blob_unreadable("person attributes", name, e)
+                await self._keep_unreadable(f"person:{name}", "attributes_json",
+                                            existing.get("attributes_json"))
         attributes_json = json.dumps(merged, ensure_ascii=False, sort_keys=True)
 
         async with self._write_lock:
@@ -1850,7 +2028,8 @@ class MemoryUnifier:
             attributes = json.loads(row.get("attributes_json") or "{}")
             if not isinstance(attributes, dict):
                 attributes = {}
-        except Exception:
+        except Exception as e:
+            _blob_unreadable("person attributes", name, e)
             attributes = {}
 
         last_mentioned: str | None = None
@@ -1858,8 +2037,8 @@ class MemoryUnifier:
             turns = await self._sqlite.search_turns(term=name, limit=1)
             if turns:
                 last_mentioned = str(turns[0]["created_at"])
-        except Exception:
-            pass
+        except Exception as e:
+            _section_failed("recall_person.last_mentioned", e)
 
         return {
             "name": row["name"],
@@ -1885,7 +2064,8 @@ class MemoryUnifier:
                 attributes = json.loads(row.get("attributes_json") or "{}")
                 if not isinstance(attributes, dict):
                     continue
-            except Exception:
+            except Exception as e:
+                _blob_unreadable("person attributes", row.get('name'), e)
                 continue
             for d in self._important_dates_for(attributes):
                 # Compare month/day only — the stored year (if any) isn't the
@@ -1893,7 +2073,7 @@ class MemoryUnifier:
                 try:
                     this_year = today.replace(month=d["month"], day=d["day"], year=today.year)
                     occurrence = this_year if this_year >= today else this_year.replace(year=today.year + 1)
-                except ValueError:
+                except ValueError:  # quiet-ok: Feb 29 in a non-leap year is skipped, never guessed
                     continue  # e.g. Feb 29 landing on a non-leap year — skip rather than guess
                 days_until = (occurrence - today).days
                 if 0 <= days_until <= within_days:
@@ -1971,7 +2151,7 @@ class MemoryUnifier:
         if isinstance(raw, str) and raw.strip():
             try:
                 return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except Exception:
+            except (TypeError, ValueError):  # quiet-ok: not a timestamp; callers read None as unknown
                 return None
         return None
 
@@ -2115,7 +2295,8 @@ class MemoryUnifier:
                     "detail": ("I'm not sure who I'm speaking with, so I won't "
                                "delete anything from memory.")}
         terms = [t for t in re.findall(r"[a-z0-9']+", (query or "").lower())
-                 if len(t) >= 3 and t not in _STOP_WORDS]
+                 if len(t) >= 3 and t not in _STOP_WORDS
+                 and t not in _FORGET_REQUEST_WORDS]
         if not terms:
             return {"ok": False, "error": "too_vague",
                     "detail": ("Tell me which thing to forget — I won't delete "
@@ -2135,6 +2316,12 @@ class MemoryUnifier:
             # Only the speaker's own memory. The owner keeps legacy semantics
             # (everything personal is his); a guest reaches only their own root.
             if own != OWNER_ENTITY and not may_read_entity(entity):
+                continue
+            # ...and "everything personal is his" never included a GUEST's
+            # namespace. "Forget my locker code" from Marcus also deleted
+            # Alice's, against this method's first promise: nobody forgets
+            # anybody else's memory (layer 2, 2026-11-06).
+            if own == OWNER_ENTITY and _guest_owned(entity):
                 continue
             blob = f"{entity} {row.get('attribute')} {row.get('value')}".lower()
             if all(t in blob for t in terms):
@@ -2425,7 +2612,7 @@ class MemoryUnifier:
             last_dt = datetime.fromisoformat(last.value)
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except (TypeError, ValueError):  # quiet-ok: an unreadable last-nudge time just allows the nudge
             return True
         return (_now() - last_dt).days >= min_gap_days
 
@@ -2510,7 +2697,7 @@ class MemoryUnifier:
                 if prior_dt.tzinfo is None:
                     prior_dt = prior_dt.replace(tzinfo=timezone.utc)
                 gap = _now() - prior_dt
-            except Exception:
+            except (TypeError, ValueError):  # quiet-ok: no gap is reported this once, and the stamp is rewritten just below
                 gap = None
         await self.add_fact(entity="session", attribute="last_active", value=_now().isoformat(), confidence=1.0)
         return gap
@@ -2526,8 +2713,8 @@ class MemoryUnifier:
             new_docs = [d for d in docs if str(d.get("indexed_at") or "") >= since_iso]
             if new_docs:
                 parts.append(f"I indexed {len(new_docs)} new file(s)")
-        except Exception:
-            pass
+        except Exception as e:
+            _section_failed("catchup.documents", e)
 
         try:
             rems = await self.list_reminders(status="fired", limit=100)
@@ -2537,8 +2724,8 @@ class MemoryUnifier:
             ]
             if fired:
                 parts.append(f"{len(fired)} reminder(s) fired")
-        except Exception:
-            pass
+        except Exception as e:
+            _section_failed("catchup.reminders", e)
 
         try:
             goals = await self.list_goals(limit=50)
@@ -2546,16 +2733,16 @@ class MemoryUnifier:
             if updated:
                 titles = ", ".join(str(g.get("title") or "") for g in updated[:3])
                 parts.append(f"progress on: {titles}")
-        except Exception:
-            pass
+        except Exception as e:
+            _section_failed("catchup.goals", e)
 
         for trend_fn in (self.recent_mood_trend, self.recent_wellbeing_trend):
             try:
                 trend = await trend_fn()
                 if trend:
                     parts.append(trend.rstrip("."))
-            except Exception:
-                pass
+            except Exception as e:
+                _section_failed("catchup.trend", e)
 
         if not parts:
             return ""
@@ -2606,6 +2793,7 @@ class MemoryUnifier:
     async def create_reminder(
         self, *, title: str, details: str = "", due_at_iso: str, recurrence: str = "none"
     ) -> UUID:
+        due_at_iso = _reminder_due_utc(due_at_iso)
         await self.initialize()
         rid = uuid4()
         async with self._write_lock:
@@ -2624,10 +2812,13 @@ class MemoryUnifier:
         await self.initialize()
         return await self._sqlite.due_reminders(now_iso=_now().isoformat(), limit=limit)
 
-    async def reschedule_reminder(self, *, reminder_id: str, next_due_at_iso: str) -> None:
+    async def reschedule_reminder(self, *, reminder_id: str, next_due_at_iso: str) -> bool:
+        """True if the reminder was moved; False when there is no such reminder."""
+        next_due_at_iso = _reminder_due_utc(next_due_at_iso)
         await self.initialize()
         async with self._write_lock:
-            await self._sqlite.reschedule_reminder(reminder_id=reminder_id, next_due_at_iso=next_due_at_iso)
+            return await self._sqlite.reschedule_reminder(
+                reminder_id=reminder_id, next_due_at_iso=next_due_at_iso)
 
     async def complete_reminder(self, *, reminder_id: str) -> None:
         await self.initialize()
@@ -2735,7 +2926,8 @@ class MemoryUnifier:
         if self._chroma is not None:
             try:
                 chroma_hits = await self._chroma.query(topic, limit=limit * 3)
-            except Exception:
+            except Exception as e:
+                _section_failed("documents.semantic", e)
                 chroma_hits = []
             for ch in chroma_hits:
                 meta = ch.get("metadata") or {}
@@ -2796,7 +2988,14 @@ class MemoryUnifier:
         her learn from her own output, which drifts.
         """
         await self.initialize()
-        rows = await self._sqlite.recent_turns(conversation_id=None, limit=int(max_turns))
+        # The CURRENT speaker's turns only (layer 2, 2026-11-06). Consolidation
+        # writes what it finds as insights about Marcus, and it read every
+        # speaker's messages, so a guest's evenings became his routine -- the
+        # same leak recent_turns_text had.
+        own = _read_scope_entity()
+        if own is None:
+            return []
+        rows = await self._sqlite.search_turns(limit=int(max_turns), speaker_entity=own)
         cutoff = _now() - timedelta(days=int(days))
         by_day: dict[str, list[str]] = {}
         for r in rows:
@@ -2807,7 +3006,8 @@ class MemoryUnifier:
                 dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-            except Exception:
+            except Exception as e:
+                _blob_unreadable("episode turn time", raw, e)
                 continue
             if dt < cutoff:
                 continue
@@ -2859,13 +3059,28 @@ class MemoryUnifier:
 
     async def recent_turns_text(self, limit: int = 30) -> str:
         """Recent conversation turns (across conversations) as a transcript —
-        used by the reflection pass to distill behavioral lessons."""
+        used by the reflection pass to distill behavioral lessons.
+
+        Only the CURRENT speaker's exchanges, under the read policy every other
+        turn read follows (V3 P5.1d.1). It read every turn and labelled each user
+        line "Marcus", and the reflection pass, which runs as the owner, made
+        lessons about how to treat him out of what it read -- so a guest's "stop
+        being so chatty" became a standing instruction about Marcus, the leak
+        `scoped_entity` exists to prevent (layer 2, 2026-11-06). An unverified
+        speaker reads nothing.
+        """
         await self.initialize()
-        rows = await self._sqlite.recent_turns(conversation_id=None, limit=int(limit))
+        own = _read_scope_entity()
+        if own is None:
+            return ""
+        rows = await self._sqlite.search_turns(limit=int(limit), speaker_entity=own)
         rows = list(reversed(rows))  # chronological
         lines: list[str] = []
         for r in rows:
-            role = "Marcus" if str(r.get("role")) == "user" else "Nova"
+            if str(r.get("role")) == "user":
+                role = str(r.get("speaker_label") or "") or "Marcus"
+            else:
+                role = "Nova"
             content = str(r.get("content") or "").strip()
             if content:
                 lines.append(f"{role}: {content}")
@@ -3100,7 +3315,7 @@ class MemoryUnifier:
 
                 try:
                     created_at = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
-                except Exception:
+                except (KeyError, TypeError, ValueError):  # quiet-ok: a turn whose time cannot be read cannot pass the two-hour recency rule
                     continue
                 # Tolerate legacy naive timestamps (assume UTC) so mixing them
                 # with timezone-aware ones never crashes the search.
@@ -3911,7 +4126,8 @@ class MemoryUnifier:
             goals = await self.list_goals(project_name=project_name, limit=limit)
             tasks = await self.list_goal_tasks(limit=100)
             auto = await self.list_tasks(limit=50)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            _section_failed("work_state", e)
             return ""
 
         if project_name:

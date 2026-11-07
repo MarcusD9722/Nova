@@ -30,7 +30,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+
+from core.logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 #: Nova's own metadata directory. Everything under it is derived: the scaffold
 #: manifest, evidence caches, anything a later stage adds.
@@ -47,18 +52,42 @@ _NOISE_DIRS = {"__pycache__", ".git", ".pytest_cache", ".mypy_cache",
 _NOISE_SUFFIXES = {".pyc", ".pyo", ".log", ".tmp"}
 
 
-def declared_scaffold(project_path: Path) -> set[str]:
-    """Relative paths Nova has declared as her own validation scaffolding."""
-    manifest = Path(project_path) / SCAFFOLD_MANIFEST
+def _read_manifest(manifest: Path) -> tuple[set[str], str]:
+    """(declared paths, why the manifest could not be read).
+
+    A missing manifest is not a failure -- most projects have none -- so its
+    reason is "". Anything else that cannot be read gives the empty set, the
+    safe direction (undeclared files count as the user's), WITH a reason.
+    """
     try:
         raw = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
+    except FileNotFoundError:
+        return set(), ""
+    except (OSError, ValueError) as e:
+        # ValueError covers bad JSON AND bad UTF-8. The first version caught
+        # only JSONDecodeError, so a manifest that was not valid UTF-8 raised
+        # UnicodeDecodeError out of every implementation_files() call.
+        return set(), f"{type(e).__name__}: {str(e)[:160]}"
     if isinstance(raw, dict):
         raw = raw.get("paths", [])
     if not isinstance(raw, list):
-        return set()
-    return {str(p).replace("\\", "/").lstrip("/") for p in raw if str(p).strip()}
+        return set(), f"expected a list of paths, found {type(raw).__name__}"
+    return {str(p).replace("\\", "/").lstrip("/") for p in raw if str(p).strip()}, ""
+
+
+def declared_scaffold(project_path: Path) -> set[str]:
+    """Relative paths Nova has declared as her own validation scaffolding.
+
+    An unreadable manifest reads as "nothing declared", the safe direction,
+    and is LOGGED: it also means Nova's own check files now sit inside the
+    fence as if the user had written them.
+    """
+    manifest = Path(project_path) / SCAFFOLD_MANIFEST
+    paths, problem = _read_manifest(manifest)
+    if problem:
+        logger.warning("scaffold_manifest_unreadable", manifest=str(manifest),
+                       error=problem)
+    return paths
 
 
 def declare_scaffold(project_path: Path, paths: list[str]) -> set[str]:
@@ -66,14 +95,31 @@ def declare_scaffold(project_path: Path, paths: list[str]) -> set[str]:
 
     Additive: a later check declaring one more file does not un-declare the
     files an earlier one wrote. Returns the full declared set.
+
+    The write is atomic, so a crash part-way cannot leave the half-written
+    manifest that would un-declare everything. A manifest that is ALREADY
+    unreadable is kept beside the new one as `scaffold.json.unreadable`, and
+    the loss is logged: what it listed cannot be recovered automatically,
+    and those files now count as the user's.
     """
     root = Path(project_path)
-    current = declared_scaffold(root)
-    current |= {str(p).replace("\\", "/").lstrip("/") for p in paths if str(p).strip()}
     manifest = root / SCAFFOLD_MANIFEST
+    current, problem = _read_manifest(manifest)
+    current |= {str(p).replace("\\", "/").lstrip("/") for p in paths if str(p).strip()}
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(json.dumps({"paths": sorted(current)}, indent=2),
-                        encoding="utf-8")
+    if problem:
+        kept = manifest.with_name(manifest.name + ".unreadable")
+        try:
+            os.replace(manifest, kept)
+            where = str(kept)
+        except OSError as e:
+            where = f"not kept: {type(e).__name__}: {str(e)[:120]}"
+        logger.warning("scaffold_manifest_replaced", manifest=str(manifest),
+                       error=problem, old_copy=where)
+    tmp = manifest.with_name(manifest.name + ".tmp")
+    tmp.write_text(json.dumps({"paths": sorted(current)}, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, manifest)
     return current
 
 

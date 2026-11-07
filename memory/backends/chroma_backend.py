@@ -10,8 +10,12 @@ import chromadb
 from chromadb.config import Settings
 import numpy as np
 
+from core.logging_setup import get_logger
+
 
 __all__ = ["ChromaMemoryBackend"]
+
+logger = get_logger(__name__)
 
 
 class _HashEmbeddingFunction:
@@ -520,8 +524,11 @@ class ChromaMemoryBackend:
                 path.unlink()
             except FileNotFoundError:
                 pass
-            except Exception:  # noqa: BLE001
-                pass
+            except OSError as e:
+                # Left in place, the journal makes `_unfinished_promotion`
+                # refuse every later rebuild, so this cannot be silent.
+                logger.warning("semantic_journal_not_removed", path=str(path),
+                               error=f"{type(e).__name__}: {str(e)[:160]}")
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
@@ -529,19 +536,40 @@ class ChromaMemoryBackend:
         os.replace(tmp, path)   # atomic on Windows and POSIX
 
     def _read_journal(self) -> dict[str, Any] | None:
+        """The promotion journal, or None when there is none or it is unreadable.
+
+        An unreadable journal is no evidence, and the authority check fails
+        closed on None, so returning None is safe. It is LOGGED, once per
+        distinct reason -- recovery re-runs on every open while it refuses --
+        because "no journal" and "a journal I cannot read" call for
+        different fixes.
+        """
         import json
 
+        path = self._journal_path()
         try:
-            raw = self._journal_path().read_text(encoding="utf-8")
+            raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        except Exception:  # noqa: BLE001
+        except (OSError, ValueError) as e:
+            self._journal_unreadable(path, f"{type(e).__name__}: {str(e)[:160]}")
             return None
         try:
             entry = json.loads(raw)
-        except Exception:  # noqa: BLE001
+        except ValueError as e:
+            self._journal_unreadable(path, f"not JSON: {str(e)[:160]}")
             return None
-        return entry if isinstance(entry, dict) else None
+        if not isinstance(entry, dict):
+            self._journal_unreadable(
+                path, f"expected an object, found {type(entry).__name__}")
+            return None
+        return entry
+
+    def _journal_unreadable(self, path: Path, why: str) -> None:
+        if why != getattr(self, "_journal_warned", ""):
+            self._journal_warned = why
+            logger.warning("semantic_journal_unreadable", path=str(path),
+                           error=why)
 
     def _collection_is_valid(self, name: str, journal: dict[str, Any]) -> tuple[bool, str]:
         """Does `name` hold the generation the journal describes?
@@ -659,8 +687,12 @@ class ChromaMemoryBackend:
 
         if backup not in names:
             # No backup: nothing to protect. A journal here is residue from a
-            # crash before anything moved, or from a finished promotion.
-            if journal is not None:
+            # crash before anything moved, or from a finished promotion --
+            # and so is one that cannot be READ. Only a readable one used to
+            # be cleared, and since `_unfinished_promotion` refuses while the
+            # file exists, one damaged journal blocked every rebuild on every
+            # boot after it, with a reason that pointed nowhere.
+            if journal is not None or self._journal_path().exists():
                 self._write_journal(None)
             self._recovery_error = ""
             return
@@ -763,11 +795,13 @@ class ChromaMemoryBackend:
             staging = self._staging_name()
             self._pending_generation = uuid4().hex
             # A staging collection left behind by an earlier crashed rebuild is
-            # garbage, never a partial result to resume from.
-            try:
+            # garbage, never a partial result to resume from. Deleted only if
+            # it EXISTS: the old `except Exception: pass` around an
+            # unconditional delete also hid a real failure to delete, after
+            # which `get_or_create_collection` below handed the garbage back to
+            # build on. Now that failure propagates and the rebuild aborts.
+            if staging in await asyncio.to_thread(self._existing_names):
                 await asyncio.to_thread(self._client.delete_collection, staging)
-            except Exception:
-                pass
             self._staging = await asyncio.to_thread(
                 self._client.get_or_create_collection,
                 name=staging,
@@ -797,9 +831,17 @@ class ChromaMemoryBackend:
             if self._client is None:
                 return
             try:
-                await asyncio.to_thread(self._client.delete_collection, self._staging_name())
-            except Exception:
-                pass
+                if self._staging_name() in await asyncio.to_thread(self._existing_names):
+                    await asyncio.to_thread(self._client.delete_collection,
+                                            self._staging_name())
+            except Exception as e:  # noqa: BLE001 - abort runs on a failure path
+                # The live index is untouched either way, and raising here
+                # would bury the failure that called abort. The next rebuild
+                # deletes this staging first and aborts if it still cannot,
+                # so this is the first sign of that.
+                logger.warning("semantic_staging_cleanup_failed",
+                               collection=self._staging_name(),
+                               error=f"{type(e).__name__}: {str(e)[:160]}")
 
     async def commit_staged_rebuild(self, expected: int | None = None,
                                     _fail_at: str = "") -> int:

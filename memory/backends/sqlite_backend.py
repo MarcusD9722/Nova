@@ -1577,16 +1577,17 @@ class SQLiteMemoryBackend:
                 rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def reschedule_reminder(self, *, reminder_id: str, next_due_at_iso: str) -> None:
+    async def reschedule_reminder(self, *, reminder_id: str, next_due_at_iso: str) -> bool:
         """Fire-and-reschedule for a recurring reminder — stays 'pending'."""
         await self.initialize()
         now = self._now_iso()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
+            cur = await db.execute(
                 "UPDATE reminders SET due_at=?, updated_at=? WHERE reminder_id=?",
                 (next_due_at_iso, now, reminder_id),
             )
             await db.commit()
+            return cur.rowcount == 1
 
     async def set_reminder_status(self, *, reminder_id: str, status: str,
                                   only_if: str | None = None) -> bool:

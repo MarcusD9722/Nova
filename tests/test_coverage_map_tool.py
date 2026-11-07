@@ -431,6 +431,82 @@ async def test_records_group_by_handler_and_exception() -> None:
           "a block coverage saw run but the recorder never saw is listed as unexplained")
 
 
+DELIBERATE_SRC = '''\
+def a(x):
+    try:
+        return int(x)
+    except ValueError:  # quiet-ok: not a number is an answer here
+        return None
+
+
+def b(x):
+    try:
+        return int(x)
+    except ValueError:
+        return None  # quiet-ok: a marker on the BODY is not on the header
+
+
+def c(x):
+    try:
+        return int(x)
+    except ValueError: s = "# quiet-ok: inside a string, not a comment"
+
+
+def d(x):
+    try:
+        return int(x)
+    except ValueError:  # quiet-ok:
+        return None
+
+
+def e(x):
+    try:
+        return int(x)
+    except ValueError:  # noqa: BLE001  # quiet-ok: after another comment
+        return None
+
+
+def f(x):
+    try:
+        return int(x)
+    except ValueError:  # quiet-ok: a block that logs keeps what it is
+        logger.warning("bad", x=x)
+
+
+def g(x):
+    try:
+        return int(x)
+    except (ValueError,
+            TypeError):  # quiet-ok: on the last line of a long header
+        return None
+'''
+
+
+async def test_a_reviewed_quiet_handler_is_deliberate() -> None:
+    check.section("A reviewed quiet block marked `# quiet-ok: <reason>` is deliberate")
+    tree = ast.parse(DELIBERATE_SRC)
+    kinds = cm.handler_kinds(DELIBERATE_SRC, tree, {})
+    by_fn = {}
+    for fn in tree.body:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.ExceptHandler):
+                by_fn[fn.name] = kinds.get(node.lineno)
+    check(len(by_fn) == 7, f"the helper found all seven handlers ({sorted(by_fn)})")
+    want = {
+        "a": ("deliberate", "a marker with a reason on the except line"),
+        "b": ("quiet", "a marker on the body line"),
+        "c": ("quiet", "the marker text inside a string"),
+        "d": ("quiet", "a marker with no reason"),
+        "e": ("deliberate", "a marker after another comment on the line"),
+        "f": ("logs-warning", "a marked block that logs is still logs-warning"),
+        "g": ("deliberate", "a marker on the last line of a two-line header"),
+    }
+    for name, (kind, label) in want.items():
+        check(by_fn.get(name) == kind, f"{label} -> {kind} (got {by_fn.get(name)})")
+    check(cm.deliberate_lines("x = 1  # quiet-ok: yes\ny = 2\n") == {1},
+          "deliberate_lines reports the line the marker is on")
+
+
 async def test_control_flow_is_narrow_on_purpose() -> None:
     check.section("Only 'nothing more' and a poll tick are control flow")
     good = [
@@ -470,6 +546,7 @@ async def main() -> None:
     await test_the_recorder_sees_what_a_handler_caught()
     await test_records_group_by_handler_and_exception()
     await test_control_flow_is_narrow_on_purpose()
+    await test_a_reviewed_quiet_handler_is_deliberate()
     check.finish()
 
 
