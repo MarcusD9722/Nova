@@ -163,7 +163,8 @@ class Script:
 
 
 def bare_builder(root: Path, *, files: Script | None = None,
-                 plans: Script | None = None) -> ProjectBuilder:
+                 plans: Script | None = None,
+                 edits: Script | None = None) -> ProjectBuilder:
     """A ProjectBuilder on a throwaway root, with only the model scripted."""
     import asyncio as _asyncio
 
@@ -171,7 +172,18 @@ def bare_builder(root: Path, *, files: Script | None = None,
                         llm_semaphore=_asyncio.Semaphore(1), memory=None)
     pb._llm_file = files or Script()
     pb._llm_json = plans or Script()
+    pb._llm_edits = edits or Script()
     return pb
+
+
+def edit_block(search: str, replace: str) -> str:
+    """One find/replace edit, as the model is asked to write it."""
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+#: A context window that leaves a patch prompt room for about 2,240
+#: characters of Python, so a file of a few thousand is too long to show whole.
+SMALL_CONTEXT = str(builder_mod._FILE_TOKENS + builder_mod._PATCH_PROMPT_TOKENS + 700)
 
 
 # ── 1. the run check: what a real run says ──────────────────────────────────
@@ -584,11 +596,48 @@ async def test_the_run_check_fix_loop() -> None:
     padding = "".join(f"# {'-' * 70}\n" for _ in range(110))
     write(proj, "main.py", padding + CRASHER)
     files = Script().when("crashes when run", FIXED_CRASHER)     # must not be asked
-    pb = bare_builder(root, files=files, plans=Script().when("SMALLEST fix", None))
+    edits = Script().when("find-and-replace edits", edit_block(
+        "    return sum(values) / len(values)",
+        "    return sum(values) / len(values) if values else 0.0"))
+    pb = bare_builder(root, files=files, plans=Script().when("SMALLEST fix", None), edits=edits)
     out = await pb._verify_and_fix_runtime("long", proj, ["main.py"])
-    check(out is not None and "too long" in out and "ZeroDivisionError" in out
-          and not files.prompts and read(proj / "main.py") == padding + CRASHER,
-          "a file longer than the fix can be shown is not rewritten from part of it")
+    check(out == "Run check passed (main.py)." and read(proj / "main.py") == padding + FIXED_CRASHER,
+          f"a file too long to rewrite whole is fixed by a patch, its start kept ({out!r})")
+    check(not files.prompts, "and it is never rewritten whole from part of it")
+    prompt = edits.prompts[0] if edits.prompts else ""
+    check(padding + CRASHER in prompt and "ZeroDivisionError" in prompt,
+          "the patch was shown the whole file, and the error")
+
+    proj = root / "long-unpatched"
+    write(proj, "main.py", padding + CRASHER)
+    edits = Script().when("find-and-replace edits", "I would guard the division.")
+    pb = bare_builder(root, files=Script().when("crashes when run", FIXED_CRASHER),
+                      plans=Script().when("SMALLEST fix", None), edits=edits)
+    out = await pb._verify_and_fix_runtime("long-unpatched", proj, ["main.py"])
+    check(out is not None and "too long" in out and "a patch fix could not be applied" in out
+          and "no edit blocks" in out and "ZeroDivisionError" in out
+          and read(proj / "main.py") == padding + CRASHER,
+          f"when no patch can be applied it is left as it was, saying why ({(out or '')[:90]!r})")
+    check(len(edits.prompts) == 2
+          and "YOUR LAST EDITS COULD NOT BE USED: the reply has no edit blocks in it" in edits.prompts[1],
+          "after ONE retry that was told why the first reply was refused")
+
+    proj = root / "long-deep"
+    chain = "".join(f"def f{i}(x):\n    return f{i + 1}(x)\n\n\n" for i in range(250))
+    deep = chain + "def f250(x):\n    raise ValueError('deep failure')\n\n\nf0(1)\n"
+    write(proj, "main.py", deep)
+    edits = Script().when("find-and-replace edits", edit_block(
+        "    raise ValueError('deep failure')", "    return x"))
+    pb = bare_builder(root, plans=Script().when("SMALLEST fix", None), edits=edits)
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT):
+        out = await pb._verify_and_fix_runtime("long-deep", proj, ["main.py"])
+    prompt = edits.prompts[0] if edits.prompts else ""
+    check(out == "Run check passed (main.py)." and read(proj / "main.py") == deep.replace(
+              "    raise ValueError('deep failure')", "    return x"),
+          f"too long even to SHOW whole: still patched, in the full file ({out!r})")
+    check("Outline:" in prompt and "def f250(x):\n    raise ValueError('deep failure')" in prompt
+          and "def f3(x):\n    return f4(x)" not in prompt,
+          "shown the outline and the function the traceback ends in, not the rest")
 
 
 # ── 5. the minimal patch ────────────────────────────────────────────────────
@@ -789,11 +838,52 @@ async def test_the_html_repair_round() -> None:
     proj = root / "long-page"
     long_page = BROKEN_PAGE.replace("<script>", "<script>\n" + "// the rest of the game\n" * 400)
     write(proj, "index.html", long_page)
-    pb = bare_builder(root, files=Script().when("fails when run headlessly", GOOD_PAGE))  # must not be asked
+    edits = Script().when("find-and-replace edits", edit_block("undefinedHelper(); ", ""))
+    pb = bare_builder(root, files=Script().when("fails when run headlessly", GOOD_PAGE),  # must not be asked
+                      edits=edits)
     note = await pb._smoke_test_html("long-page", proj, ["index.html"])
-    check(note is not None and "too long" in note and not pb._llm_file.prompts
+    check(note is not None and "failed the first time and was repaired" in note
+          and read(proj / "index.html") == long_page.replace("undefinedHelper(); ", ""),
+          f"a page too long to rewrite whole is repaired by a patch, the rest kept ({(note or '')[-60:]!r})")
+    check(not pb._llm_file.prompts and "undefinedHelper" in (edits.prompts or [""])[0],
+          "it is never rewritten whole, and the patch was shown the error")
+
+    proj = root / "long-page-unpatched"
+    write(proj, "index.html", long_page)
+    pb = bare_builder(root, edits=Script().when("find-and-replace edits", "Remove the call."))
+    note = await pb._smoke_test_html("long-page-unpatched", proj, ["index.html"])
+    check(note is not None and "too long" in note and "a patch repair could not be applied" in note
+          and "no edit blocks" in note and read(proj / "index.html") == long_page,
+          "when no patch can be applied the page is left as it was, and why is said")
+
+    proj = root / "long-page-no-help"
+    write(proj, "index.html", long_page)
+    pb = bare_builder(root, edits=Script().when("find-and-replace edits", edit_block(
+        "undefinedHelper(); ", "otherMissingHelper(); ")))
+    note = await pb._smoke_test_html("long-page-no-help", proj, ["index.html"])
+    check(note is not None and "did not help, so the file was restored unchanged" in note
           and read(proj / "index.html") == long_page,
-          "a page longer than the repair can be shown is left as it was, and said")
+          "a patch that applies but does not help is undone, as a whole-file repair is")
+
+    proj = root / "huge-page"
+    huge_page = BROKEN_PAGE.replace("<script>", "<script>\n" + "// the rest of the game\n" * 600)
+    write(proj, "index.html", huge_page)
+    edits = Script().when("find-and-replace edits", edit_block("undefinedHelper(); ", ""))
+    pb = bare_builder(root, edits=edits)
+    note = await pb._smoke_test_html("huge-page", proj, ["index.html"])
+    prompt = (edits.prompts or [""])[0]
+    check(note is not None and "repaired" in note
+          and read(proj / "index.html") == huge_page.replace("undefinedHelper(); ", ""),
+          "a page too long even to SHOW whole is repaired in place")
+    # In a SHOWN part: the outline's row for `loop` holds that one-line
+    # function too, so finding the text anywhere in the prompt proves nothing.
+    thrown = huge_page.split("\n").index(next(
+        ln for ln in huge_page.split("\n") if "undefinedHelper();" in ln)) + 1
+    shown = [(int(a), int(c)) for a, c in re.findall(r"Lines (\d+)-(\d+)", prompt)]
+    check("Outline:" in prompt and any(a <= thrown <= c for a, c in shown)
+          and prompt.count("// the rest of the game") < 100,
+          f"shown the page's own line the error points at (line {thrown}, in {shown}), "
+          f"not the whole page ({prompt.count('// the rest of the game')} filler lines)")
 
     write(root / "calculator", "app.js", "throw new Error('a sibling project was loaded');\n")
     proj = root / "calc"
@@ -847,14 +937,15 @@ DISCOUNT_TEST = src("""
 
 async def run_logic(root: Path, name: str, main: str, *, tests: Any,
                     fixes: Any = None, written: list[str] | None = None,
-                    review: Any = None) -> tuple[str | None, Path, Script]:
+                    review: Any = None, edits: Script | None = None,
+                    plans: Script | None = None) -> tuple[str | None, Path, Script]:
     proj = root / name
     write(proj, "main.py", main)
     files = Script().when("Write a test file", tests)
     files.when("TRACE each assertion", review if review is not None else tests)
     if fixes is not None:
         files.when("fails a logic test", fixes)
-    pb = bare_builder(root, files=files)
+    pb = bare_builder(root, files=files, edits=edits, plans=plans)
     out = await pb._generate_and_run_tests(name, proj, written or ["main.py"], "discounts")
     return out, proj, files
 
@@ -933,11 +1024,48 @@ async def test_the_logic_test_loop() -> None:
           and "TypeError" in out,
           f"and the note does not blame a test that PASSED, it names the crash ({out!r})")
 
-    long_buggy = "".join(f"# {'-' * 70}\n" for _ in range(110)) + BUGGY_MAIN
-    out, proj, files = await run_logic(root, "long", long_buggy, tests=DISCOUNT_TEST, fixes=FIXED_MAIN)
-    check(not files.asked("fails a logic test") and read(proj / "main.py") == long_buggy
-          and out is not None and "too long" in out,
-          "a file longer than the fix can be shown is not rewritten from part of it")
+    padding = "".join(f"# {'-' * 70}\n" for _ in range(110))
+    long_buggy = padding + BUGGY_MAIN
+    the_fix = edit_block("    return price * percent / 100", "    return price - price * percent / 100")
+    edits = Script().when("fails a logic test", the_fix)
+    out, proj, files = await run_logic(root, "long", long_buggy, tests=DISCOUNT_TEST,
+                                       fixes=FIXED_MAIN, edits=edits)
+    check(out == "Logic tests passed (test_main.py)." and read(proj / "main.py") == padding + FIXED_MAIN,
+          f"a file too long to rewrite whole gets its logic fixed by a patch, its start kept ({out!r})")
+    check(not files.asked("fails a logic test") and "assert" in (edits.prompts or [""])[0],
+          "it is never rewritten whole, and the patch was shown the failing assertion")
+
+    edits = Script().when("fails a logic test", "Subtract the discount.")
+    out, proj, _ = await run_logic(root, "long-unpatched", long_buggy, tests=DISCOUNT_TEST, edits=edits)
+    check(out is not None and "too long" in out and "a patch fix could not be applied" in out
+          and read(proj / "main.py") == long_buggy,
+          f"when no patch can be applied the code is left unchanged, and that is said ({(out or '')[:80]!r})")
+
+    edits = Script().when("fails a logic test", the_fix)
+    plans = Script().when("choose the parts", {"parts": []})
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT):
+        out, proj, _ = await run_logic(root, "long-named", long_buggy, tests=DISCOUNT_TEST,
+                                       edits=edits, plans=plans)
+    prompt = (edits.prompts or [""])[0]
+    check(out == "Logic tests passed (test_main.py)." and read(proj / "main.py") == padding + FIXED_MAIN,
+          "too long even to SHOW whole: still fixed, in the full file")
+    check("def apply_discount(price, percent):\n    return price * percent / 100" in prompt
+          and prompt.count("# ---") < 20 and not plans.prompts,
+          "shown the function the failure names, not the rest, without having to ask which")
+
+    rate_main = "RATE = 0.2\n\n\n" + "".join(
+        f"def helper_{i:03d}(x):\n    return x * RATE + {i}\n\n\n" for i in range(170))
+    assert len(rate_main) > builder_mod._FIX_WINDOW, len(rate_main)   # the case is a LONG file
+    rate_test = "from main import RATE\n\n\ndef test_rate():\n    assert RATE == 0.25\n"
+    edits = Script().when("fails a logic test", edit_block("RATE = 0.2", "RATE = 0.25"))
+    plans = Script().when("choose the parts", {"parts": ["helper_000"]})
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT):
+        out, proj, _ = await run_logic(root, "long-constant", rate_main, tests=rate_test,
+                                       edits=edits, plans=plans)
+    check(out == "Logic tests passed (test_main.py)." and len(plans.prompts) == 1
+          and read(proj / "main.py") == rate_main.replace("RATE = 0.2\n", "RATE = 0.25\n"),
+          f"a failure that names none of the program's functions: it asks which parts to "
+          f"see, and is fixed ({out!r})")
 
 
 # ── 8. the contract helpers, at their own layer ─────────────────────────────
@@ -1166,6 +1294,9 @@ class Builds:
     def on_repair(self, rel: str, reply: Any) -> None:
         self.nova.llm.when(lambda p, r=rel: "has a syntax error" in p and f"File `{r}`" in p, reply)
 
+    def on_patch(self, rel: str, reply: Any) -> None:
+        self.nova.llm.when(lambda p, r=rel: f"Change `{r}` with find-and-replace edits" in p, reply)
+
     def on_suggest(self, summary: str, reply: Any) -> None:
         self.nova.llm.when(lambda p, s=summary: f"A project was just built: {s}\n" in p, reply)
 
@@ -1283,14 +1414,45 @@ async def test_the_build_pipeline() -> None:
               f"and the build fails instead of 'passing' a run of an empty file "
               f"({log.splitlines()[-1][-70:] if log else ''!r})")
 
-        long_broken = "".join(f"# {'-' * 70}\n" for _ in range(90)) + broken
+        padding = "".join(f"# {'-' * 70}\n" for _ in range(90))
+        long_broken = padding + broken
         b.on_plan("case longbroken: something", plan("longbroken_main.py"))
         b.on_file("case longbroken: something", "longbroken_main.py", fenced(long_broken))
-        b.on_repair("longbroken_main.py", fenced(ADDER))
+        b.on_repair("longbroken_main.py", fenced(ADDER))              # must not be asked
+        b.on_patch("longbroken_main.py", edit_block("def add(a, b)", "def add(a, b):"))
         proj, doc = await b.build("longbroken", "case longbroken: something")
         log = md_section(doc, "Progress log")
-        check("too long" in log and "Build failed" in log and b.calls("`longbroken_main.py`:\n") == 0,
-              "a generated file too long for its repair to be shown whole fails the build, unrepaired")
+        check(read(proj / "longbroken_main.py") == padding + ADDER
+              and "Run check passed (longbroken_main.py)." in log,
+              "a generated file too long to repair whole is repaired by a patch, and the build goes on")
+        check(b.calls("`longbroken_main.py`:\n") == 0
+              and "(line 91)" in (nova.llm.prompts_matching("Change `longbroken_main.py`") or [""])[0],
+              "it is never rewritten whole; the patch was told the line the error is on")
+
+        b.on_plan("case hugebroken: something", plan("hugebroken_main.py"))
+        b.on_file("case hugebroken: something", "hugebroken_main.py", fenced(long_broken))
+        b.on_patch("hugebroken_main.py", edit_block("def add(a, b)", "def add(a, b):"))
+        saved_ctx = nova.llm.context_tokens
+        nova.llm.context_tokens = int(SMALL_CONTEXT)
+        try:
+            proj, doc = await b.build("hugebroken", "case hugebroken: something")
+        finally:
+            nova.llm.context_tokens = saved_ctx
+        prompt = (nova.llm.prompts_matching("Change `hugebroken_main.py`") or [""])[0]
+        shown = [(int(a), int(c)) for a, c in re.findall(r"Lines (\d+)-(\d+)", prompt)]
+        check(read(proj / "hugebroken_main.py") == padding + ADDER
+              and any(a <= 91 <= c for a, c in shown) and prompt.count("# ---") < 50,
+              f"too long even to SHOW whole: the repair is shown the line the error is on, "
+              f"and made in the full file ({shown})")
+
+        b.on_plan("case longunpatched: something", plan("longunpatched_main.py"))
+        b.on_file("case longunpatched: something", "longunpatched_main.py", fenced(long_broken))
+        proj, doc = await b.build("longunpatched", "case longunpatched: something")
+        log = md_section(doc, "Progress log")
+        check("Build failed: longunpatched_main.py does not compile (SyntaxError" in log
+              and "a patch to repair it could not be applied: the reply has no edit blocks" in log
+              and read(proj / "longunpatched_main.py") == long_broken,
+              "when no patch can be applied the build fails saying why, the file as generated")
 
         b.on_plan("case shapes: something", plan("shapes_main.py", summary="shapes summary"))
         b.on_file("case shapes: something", "shapes_main.py", fenced(ADDER))
@@ -1411,6 +1573,11 @@ class Improves:
         """`rel` is a PREFIX of the file name: "" is every file of this case."""
         self.nova.llm.when(lambda p, s=slug, r=rel: f"Improve `{r}" in p
                            and f"` in project `{s}`." in p, reply)
+
+    def on_patch(self, instructions: str, reply: Any) -> None:
+        """A patch prompt names the file and the request, not the project."""
+        self.nova.llm.when(lambda p, i=instructions: "with find-and-replace edits" in p
+                           and f"Overall request: {i}\n" in p, reply)
 
     async def improve(self, slug: str, instructions: str = "make it better") -> tuple[str, _Recorder]:
         with listening(builder_mod) as rec:
@@ -1553,18 +1720,57 @@ async def test_the_improve_pipeline() -> None:
                   for t, d in seen) and not im.pb.is_building("imp-reportfails"),
               "and the failure still reaches the user, and the project is free again")
 
-        long_main = "".join(f"def helper_{i:03d}(x):\n    return x + {i}  # {'-' * 60}\n\n\n"
+        def line(i: int, n: int | None = None) -> str:
+            return f"    return x + {i if n is None else n}  # {'-' * 60}"
+
+        long_main = "".join(f"def helper_{i:03d}(x):\n{line(i)}\n\n\n"
                             for i in range(80)) + "print(helper_000(1))\n"
         proj = await seed(nova, "imp-long", {"main.py": long_main})
         im.on_plan("imp-long", '{"changes": [{"path": "main.py", "what": "tidy"}], "summary": "s"}')
-        im.on_file("imp-long", "main.py", fenced(ADDER * 40))
-        doc, rec = await im.improve("imp-long")
+        im.on_file("imp-long", "main.py", fenced(ADDER * 40))      # must not be asked
+        # Each edit in a fence of its own, as models write them. A whole-file
+        # reply keeps only its LARGEST fence; an edit reply must keep them all.
+        im.on_patch("tidy helper five", "Two edits:\n```python\n" + edit_block(line(5), line(5, 500))
+                    + "```\nand\n```python\n" + edit_block(line(6), line(6, 600)) + "```\n")
+        doc, rec = await im.improve("imp-long", "tidy helper five")
+        log = md_section(doc, "Progress log")
+        check(read(proj / "main.py") == long_main.replace(line(5) + "\n", line(5, 500) + "\n")
+              .replace(line(6) + "\n", line(6, 600) + "\n")
+              and "Changed: main.py" in log and not rec.named("project_improve_failed"),
+              "a file too long to rewrite whole is improved by a patch, all 80 functions kept, "
+              "every edit of a reply that fences each one applied")
+        check(im.calls("in project `imp-long`") == 0, "it is never rewritten whole from its first part")
+
+        proj = await seed(nova, "imp-long-unpatched", {"main.py": long_main})
+        im.on_plan("imp-long-unpatched", '{"changes": [{"path": "main.py", "what": "tidy"}], "summary": "s"}')
+        doc, rec = await im.improve("imp-long-unpatched", "tidy it all")
         failed = rec.named("project_improve_failed")
-        check(read(proj / "main.py") == long_main and im.calls("in project `imp-long`") == 0,
-              "a file longer than the model can be shown is not rewritten from its first part")
+        check(read(proj / "main.py") == long_main,
+              "when no patch can be applied the file is left exactly as it was")
         check(failed and "too long" in str(failed[0].get("error"))
-              and "too long" in md_section(doc, "Progress log"),
+              and "a patch could not be applied (the reply has no edit blocks in it)" in str(failed[0].get("error"))
+              and "a patch could not be applied" in md_section(doc, "Progress log"),
               "and the improvement says why it changed nothing")
+
+        proj = await seed(nova, "imp-huge", {"main.py": long_main})
+        im.on_plan("imp-huge", '{"changes": [{"path": "main.py", "what": "tidy"}], "summary": "s"}')
+        nova.llm.when("`main.py` in project `imp-huge` is too long to show whole",
+                      '{"parts": ["helper_042()", "Helpers.helper_043", "helper_999"]}')
+        im.on_patch("change helper 42", edit_block(line(42), line(42, 4200)))
+        saved_ctx = nova.llm.context_tokens
+        nova.llm.context_tokens = int(SMALL_CONTEXT)
+        try:
+            doc, rec = await im.improve("imp-huge", "change helper 42")
+        finally:
+            nova.llm.context_tokens = saved_ctx
+        prompt = (nova.llm.prompts_matching("Overall request: change helper 42\n") or [""])[-1]
+        check(read(proj / "main.py") == long_main.replace(line(42) + "\n", line(42, 4200) + "\n")
+              and not rec.named("project_improve_failed"),
+              "too long even to SHOW whole: the model chooses the parts it needs, and the edit "
+              "lands in the full file")
+        check(line(42) in prompt and line(43) in prompt and line(10) not in prompt
+              and "Outline:" in prompt,
+              "the patch is shown the parts it chose, in the shapes models write them, not the rest")
 
         proj = await seed(nova, "imp-sections", {"main.py": ADDER})
         im.on_plan("imp-sections", '{"changes": [{"path": "main.py", "what": "sub"}, '
@@ -1688,6 +1894,134 @@ async def test_status_and_current_project() -> None:
           "a stale pointer that cannot be cleared is logged")
 
 
+# ── 13. _patch_file: a long file, edited in place ───────────────────────────
+
+async def test_the_patch_file() -> None:
+    check.section("13. _patch_file: edits to the whole file, refused with a reason, one retry")
+    root = tmp("patchfile")
+    proj = root / "p"
+    prog = "".join(f"def helper_{i:03d}(x):\n    return x + {i}\n\n\n" for i in range(120)) \
+        + "print(helper_000(1))\n"
+    target = write(proj, "main.py", prog)
+
+    def edited(i: int, n: int) -> str:
+        return prog.replace(f"    return x + {i}\n", f"    return x + {n}\n")
+
+    edits = Script().when("find-and-replace edits", edit_block("    return x + 7", "    return x + 70"))
+    pb = bare_builder(root, edits=edits)
+    with listening(builder_mod) as rec, bus_events() as seen:
+        out, why = await pb._patch_file("p", target, "main.py", task="Make helper_007 add 70.")
+    check(out == edited(7, 70) and why == "", "the edit is applied to the whole file, every other byte kept")
+    check(read(target) == prog, "and NOTHING is written: the caller checks the result and writes it")
+    check(len(rec.named("builder_patch_applied")) == 1
+          and any(t == "project.progress" and d.get("stage") == "patching" for t, d in seen),
+          "the applied patch is logged, and its progress published")
+    check(prog in (edits.prompts or [""])[0] and "Make helper_007 add 70." in edits.prompts[0],
+          "the model was shown the whole file and the task")
+
+    edits = Script().when("YOUR LAST EDITS", edit_block("    return x + 7", "    return x + 70")) \
+        .when("find-and-replace edits", edit_block("    return x + 700", "    return x"))
+    pb = bare_builder(root, edits=edits)
+    with listening(builder_mod) as rec:
+        out, why = await pb._patch_file("p", target, "main.py", task="t")
+    check(out == edited(7, 70) and len(edits.prompts) == 2,
+          "a refused first reply gets ONE retry, and a good retry is used")
+    check("no line of the file reads `return x + 700`" in edits.prompts[1]
+          and len(rec.named("builder_patch_refused")) == 1,
+          "the retry is told exactly what was wrong, and the refusal is logged")
+
+    async def refusal(reply: str, rel: str = "main.py", path: Path = target) -> tuple[Any, str, Script]:
+        e = Script().when("find-and-replace edits", reply)
+        o, w = await bare_builder(root, edits=e)._patch_file("p", path, rel, task="t")
+        return o, w, e
+
+    out, why, e = await refusal("I would change helper seven.")
+    check(out is None and "no edit blocks" in why and len(e.prompts) == 2,
+          "two refusals: nothing, and the reason, after exactly two tries")
+    out, why, _ = await refusal(edit_block("def helper_007(x):", "def helper_007(x)"))
+    check(out is None and "does not compile" in why and "(line 29)" in why,
+          f"edits that break the syntax are refused, with the error ({why[:70]!r})")
+    out, why, _ = await refusal(edit_block("    return x + 7", "    return x + 7"))
+    check(out is None and "change nothing" in why, "edits that change nothing are refused")
+    out, why, _ = await refusal(edit_block(prog.rstrip("\n"), "print(1)"))
+    check(out is None and "delete most of the file" in why,
+          "edits that would leave a fraction of the file are refused, as a whole-file reply is")
+    check(read(target) == prog, "and none of them wrote anything")
+
+    page = write(proj, "index.html", "<html>\n" + "<p>row</p>\n" * 50 + "</html>\n")
+    out, why, _ = await refusal(edit_block("<html>", '<html lang="en">'), "index.html", page)
+    check(out is not None and out.startswith('<html lang="en">\n<p>row</p>'),
+          "a page is not held to Python's syntax")
+
+    crash_line = prog.split("\n").index("    return x + 42") + 1
+    edits = Script().when("find-and-replace edits", edit_block("    return x + 42", "    return x + 4200"))
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT):
+        out, why = await bare_builder(root, edits=edits)._patch_file(
+            "p", target, "main.py", task="t", focus_lines=[crash_line])
+    prompt = (edits.prompts or [""])[0]
+    check(out == edited(42, 4200), "a file too long to SHOW whole is still edited whole")
+    check("Outline:" in prompt and "def helper_042(x):\n    return x + 42\n" in prompt
+          and "    return x + 10\n" not in prompt and prog not in prompt,
+          "shown its outline and the part around the focus line, not the rest")
+    check("481 lines" in prompt and "too many to show whole" in prompt
+          and "The whole of `main.py`" not in prompt,
+          "and told that it is seeing part of the file, and how long the file is")
+
+    plans = Script().when("choose the parts", {"parts": ["helper_077()", "Thing.helper_078",
+                                                         "helper_999", "`helper_077`"]})
+    edits = Script().when("find-and-replace edits", edit_block("    return x + 77", "    return x + 7700"))
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT), listening(builder_mod) as rec:
+        out, why = await bare_builder(root, plans=plans, edits=edits)._patch_file(
+            "p", target, "main.py", task="Change helper_077.", choose_parts=True)
+    prompt = (edits.prompts or [""])[0]
+    chosen = rec.named("builder_patch_parts_chosen")
+    check(len(plans.prompts) == 1 and "Change helper_077." in plans.prompts[0]
+          and "Outline:" in plans.prompts[0],
+          "with no focus, it is first asked which parts it needs, shown the change and the outline")
+    rows = len(re.findall(r"\| def helper_", plans.prompts[0] if plans.prompts else ""))
+    check(rows >= 40, f"as much of the outline as the whole budget holds, since it is choosing "
+                      f"among them ({rows} of 120 rows)")
+    check(chosen and chosen[0].get("chosen") == ["helper_077", "helper_078"],
+          f"names in the shapes models write are read; one not in the file is dropped "
+          f"({chosen[0].get('chosen') if chosen else None})")
+    check("    return x + 77\n" in prompt and "    return x + 78\n" in prompt
+          and out == edited(77, 7700),
+          "the parts chosen are what the patch is shown, and the edit lands in the full file")
+
+    plans = Script().when("choose the parts", None)
+    edits = Script().when("find-and-replace edits", edit_block("    return x + 3", "    return x + 30"))
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT):
+        out, _ = await bare_builder(root, plans=plans, edits=edits)._patch_file(
+            "p", target, "main.py", task="t", choose_parts=True)
+    check(out == edited(3, 30) and "Lines 1-" in (edits.prompts or [""])[0],
+          "no usable answer: the top of the file is shown, and the patch can still work")
+
+    plans = Script().when("choose the parts", {"parts": ["helper_001"]})
+    edits = Script().when("find-and-replace edits", edit_block("    return x + 3", "    return x + 30"))
+    pb = bare_builder(root, plans=plans, edits=edits)
+    await pb._patch_file("p", target, "main.py", task="t", choose_parts=True)
+    check(not plans.prompts, "a file that can be shown whole is not asked about")
+    with env(NOVA_CONTEXT_TOKENS=SMALL_CONTEXT):
+        await pb._patch_file("p", target, "main.py", task="t", focus_names=["helper_003"],
+                             choose_parts=True)
+        check(not plans.prompts, "nor is one whose focus is already known")
+        await pb._patch_file("p", target, "main.py", task="t", focus_names=["no_such_function"],
+                             focus_lines=[0, 99_999], choose_parts=True)
+        check(len(plans.prompts) == 1, "a focus that is not in the file is no focus: then it asks")
+
+    tb = ("Traceback (most recent call last):\n"
+          f'  File "{target}", line 9, in <module>\n'
+          '  File "C:\\Python\\Lib\\random.py", line 373, in choice\n'
+          f'  File "{target}", line 5, in pick\n'
+          "IndexError: list index out of range\n")
+    check(PB._entry_frames(tb, target, proj) == [5, 9],
+          "a traceback's frames in the program itself, deepest first; a library's are not")
+    report = ("    def test_x():\n>       assert f(1) == 2\nmain.py:12: in f\n    return x\n"
+              "E   assert 1 == 2\ntest_main.py:4: AssertionError\n")
+    check(PB._entry_frames(report, target, proj) == [12],
+          "a pytest report's location lines in the program count; the test file's do not")
+
+
 SECTIONS = {
     "1": test_the_run_check_reads_a_real_run,
     "2": test_a_test_file_passes_only_when_a_test_ran,
@@ -1702,6 +2036,7 @@ SECTIONS = {
     "10": test_a_failed_build_stops_its_other_files,
     "11": test_the_improve_pipeline,
     "12": test_status_and_current_project,
+    "13": test_the_patch_file,
 }
 
 

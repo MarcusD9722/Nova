@@ -15,7 +15,7 @@ and what is still open.
 | # | layer | proves | runs in | status |
 |---|---|---|---|---|
 | 1 | **Coverage map** | which functions no test ever reaches | offline | **done** — see below |
-| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–4 done, see the end |
+| 2 | **Function tests** | each function does what it is *meant* to do; every test mutation-checked | offline gate | **in progress** — items 1–4 done, and long files are edited by patches; see the end |
 | 3 | **Wiring tests** | chains across modules, workers and restarts behave as coded | offline gate (real backend, scripted model) | planned |
 | 4 | **Judgement corpora** | question / statement / remember-this / command / project request / small talk / status question, at scale, typed and voice-style | offline gate | planned |
 | 5 | **Real-model scenarios** | the same behaviours with the real 9B, judged on what happened and on what was said | opt-in, GPU to itself | planned |
@@ -248,7 +248,8 @@ because nothing has ever made them run. The most are in `memory/unifier.py`
 4. **Projects: plan, build, run, report.** The untaken branches of `_build`,
    `_generate_and_run_tests`, `_verify_and_fix_runtime`,
    `_fix_runtime_error_patch` and `_smoke_test_html`. **Done 2026-11-07**,
-   see *Layer 2* below.
+   see *Layer 2* below. Its follow-up, long files edited by patches, is done
+   the same day.
 5. **The HTTP layer.**
    - every endpoint driven through FastAPI's `TestClient` on a throwaway root,
      checking status codes and validation;
@@ -610,7 +611,7 @@ change.
 
 ### Item 4: projects — plan, build, run, report — done 2026-11-07
 
-    venv\Scripts\python.exe tests\test_project_pipeline_2026_11.py   (175 checks, about 40 s)
+    venv\Scripts\python.exe tests\test_project_pipeline_2026_11.py   (175 checks then, 223 with the follow-up below)
 
 Real programs run in real subprocesses in throwaway directories; only the
 model's text is scripted. The scripted model raises on any prompt no case
@@ -813,17 +814,12 @@ passed after its test-only fix, against the same builder.
 
 **Recorded, not changed:**
 
-- **The long-file guard (finding 2) is a decision for Marcus.** The real
+- **The long-file guard (finding 2) was a decision for Marcus.** The real
   projects are already past the window, read from the working tree:
   `flappy-bird/main.py` is 12,451 characters and `gravity-runner/main.py` is
-  8,244. At roughly 3 to 4 characters per token, `flappy-bird` is also about
-  as long as the 3,000 tokens `_llm_file` has to write a whole file in, a
-  budget its reasoning spends from too (estimated, not tokenized). So a whole
-  rewrite of it could hardly ever have come back complete, whatever the
-  window. Improvements to both projects now stop with a reason instead of
-  silently cutting the files. The lasting fix is to
-  edit long files in pieces, or by find/replace patches as the crash fix
-  already does.
+  8,244. Improvements to both stopped with a reason instead of silently
+  cutting the files. Marcus chose, the same day, to have long files edited
+  by find/replace patches. That is the follow-up below.
 - After a successful improvement the previous suggestions are still
   dropped. Keeping them could offer again one the improvement just did, and
   dropping them loses the rest. Marcus's call.
@@ -842,3 +838,148 @@ passed after its test-only fix, against the same builder.
 - Asserts inside `if __name__ == "__main__":` in a generated test count as
   checks only when they fail. A main block whose asserts all pass reads as
   "No test actually passed". That fails safe, so it was left.
+
+### Item 4, follow-up: long files are edited by patches — done 2026-11-07
+
+    venv\Scripts\python.exe tests\test_patch_edit_2026_11.py          (85 checks, about 1 s)
+    venv\Scripts\python.exe tests\test_project_pipeline_2026_11.py    (223 checks, about 45 s)
+
+**Marcus's decision, 2026-11-07:** build patch editing before item 5. The
+guard from finding 2 refused a long file instead of cutting it. Now a long
+file is changed by find/replace edits applied to the whole file.
+
+**How it works.** `core/patch_edit.py` is new. The model replies with
+SEARCH/REPLACE blocks, and they are applied to the FULL file on disk. So
+nothing the model was not shown can be lost: nothing it does not name is
+touched. The rules:
+
+- an edit applies only where its SEARCH matches exactly one place, and an
+  edit that could mean two places is refused, not guessed;
+- all of a reply's edits apply, or none do;
+- the match is exact. Failing that, exact text inside a line. Failing that,
+  the lines with trailing whitespace ignored and, if need be, all moved by
+  one consistent indentation, with the replacement moved the same way.
+  Nothing looser.
+
+Each refusal names the edit and what was wrong with it ("edit 2's SEARCH is
+not in the file: its first line, `def fall(self):`, is line 12, but the
+lines after it are different there"). The model is shown that and gets one
+more try.
+
+The five whole-file places from finding 2 keep their whole-file path for a
+file that fits its window. A longer one goes to `_patch_file`. Each place
+keeps its own check and its own way back, so `_patch_file` writes nothing.
+It refuses, before anything is written, edits that do not compile (Python),
+that change nothing, or that would leave less than a fifth of the file.
+
+**What the model is shown is measured, not guessed.** The model's own
+tokenizer, loaded without weights, was run on the projects on this machine:
+
+| file | characters | tokens | characters per token |
+|---|---|---|---|
+| `flappy-bird/main.py` | 12,124 | 2,824 | 4.29 |
+| `gravity-runner/main.py` | 8,003 | 2,022 | 3.96 |
+| `gravity-runner/test_main.py` | 2,156 | 606 | 3.56 |
+| `aetherlings/index.html` | 6,205 | 2,248 | 2.76 |
+| `.trash/last-stand/index.html` | 36,527 | 13,143 | 2.78 |
+
+The patch view budget is 3.2 characters a token for Python and 2.5 for
+anything else, both rounded down. It is taken from the model's context,
+minus the 3,000-token reply and 1,000 for the prompt. At the default 8,192
+tokens that shows a whole Python file of up to 13,414 characters, or a page
+of 10,480.
+
+A longer file is shown its outline: every function and class line, with its
+line number, each one exact. Then the parts that matter, copied exactly:
+
+- the lines a traceback passes through, deepest first;
+- the line a syntax error names;
+- the functions a failing test's report mentions;
+- the page line a script error points at, mapped from the smoke test's
+  `inline-script-N.js:L`;
+- for an improvement, the parts the model asks for, from the outline.
+
+The `last-stand` page in the trash is larger than the whole context. A page
+like that can now be patched, where the old path could not show it at all.
+
+**The real model drives it.** The real model ran on a throwaway copy of
+`flappy-bird`, read-only from the real folder. Nothing was executed, because
+the game is a window.
+
+| task | view | result | time |
+|---|---|---|---|
+| add a pause on P | whole file | 7 edits, compiles, all 325 lines kept | 18.9 s |
+| crash fix (`pipe_list`) | whole file | the exact one-line fix | 4.8 s |
+| speed up as the score rises | outline (forced) | applied and compiles, but **did nothing** | 158 s |
+| the same, after the fix below | outline (forced) | a working change, twice out of twice | 100.8 s, 119.6 s |
+
+**The real model found a flaw in my view.** It asked for four parts, the game's class first, then
+three of its methods. The class runs from line 20 to line 309, so it filled
+the whole view from its first line. The view showed lines 20 to 122:
+`spawn_pipe` was cut off, and `update_game_loop`, where the pipes move, was
+not shown at all. The model edited the only place it could see, and
+computed a faster speed that nothing used. Now a part that holds another
+wanted part, or the focus line, is shown after it. The same request then
+showed lines 20-36, 58-72, 120-135 and 137-199, and both tries put the
+speed-up where the score goes up.
+
+The outline-view patches are slow because the reasoning overran its 3,000
+tokens once each time before answering. Only a file past about 13,400
+characters takes that path.
+
+**Three more of my own, caught before the real model ran:**
+
+- The outline was cut from the top when it was too long, which dropped the
+  very function in focus from it. It now keeps the rows being shown, then
+  top-level ones, and counts what each gap hides.
+- Lines were first counted by `str.splitlines`, which also breaks at a form
+  feed, so line numbers after one would not match Python's. They are counted
+  by newline only.
+- "Trailing whitespace ignored" was a matching mode of its own, but the
+  indentation mode with no shift does exactly the same. No test could tell
+  them apart, so they are one mode.
+
+**Tests.** `test_patch_edit_2026_11.py` holds the module to its docstring:
+parsing, each matching mode and each refusal, the outline, the view and its
+budget, `page_lines`, and the builder's budget and prompt. In the pipeline
+suite, the five long-file cases that checked the refusal now check the patch
+twice: once when it applies, keeping the file's start and end, and once when
+no patch can be applied. Then the file is left exactly as it was, the reason
+is said, and the retry was told why. Each place also has a case too long even
+to show whole, which checks what the model was shown. Section 13 tests
+`_patch_file` itself.
+
+**Mutation: 93 breaks, all caught, after two of my checks were corrected.**
+56 broke the module, `page_lines` and the builder's budget and prompt, and
+were judged by the module's suite. 37 broke the builder's use of it, and
+each was judged by the pipeline sections that cover it. The first run caught
+91. Each of the two that survived was a check something else could satisfy:
+
+- **The outline's cap.** The check used a sample in which the kept rows
+  opened two gaps. Without the room kept for gaps, that came in one
+  character under the cap. A sample whose kept rows are scattered through
+  the file opens a gap after nearly every row, and now overflows the cap
+  without that room: 2,298 characters against 1,500.
+- **The page line a patch is shown.** The check found the line the error is
+  on anywhere in the prompt. In that page the whole function is on one
+  line, so its outline row held the same text. The check now requires a
+  shown part that contains the page's line, 604.
+
+Both were broken again and caught. Every file was restored byte-identically
+after every run.
+
+**Full run, 2026-11-07, on the final code: 205 of 205 suites passed**, in
+about an hour.
+
+**Recorded, not changed:**
+
+- The test generator is still shown the first 6,500 characters of a long
+  program. No file is written from that prompt, so nothing can be lost, but
+  the generated tests can only cover what they were shown.
+- `flappy-bird`'s own game loop runs once. `update_game_loop()` is called
+  when the countdown ends, and nothing schedules the next frame (the only
+  `after()` calls are the countdown's). So the game draws one frame and
+  stops. That is a bug in the project, not in Nova, and the project was
+  only read.
+- `core/project_builder.py` line 859 has a raw backspace byte in a comment,
+  where "\b" was meant. It is harmless and was already there; item 8.

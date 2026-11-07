@@ -157,6 +157,38 @@ def inline_scripts(html: str) -> tuple[list[str], list[str]]:
     return bodies, external
 
 
+#: Where an error happened, as the harness names it: line 42 of the third
+#: script it ran is `inline-script-3.js:42`, in a stack and in `node --check`.
+_SCRIPT_POS_RE = re.compile(r"inline-script-(\d+)(?:\.js)?:(\d+)")
+
+
+def page_lines(html: str, errors: list[str], *, local_scripts: int = 0) -> list[int]:
+    """The lines of the PAGE that the smoke test's errors point at, in order.
+
+    The harness numbers the scripts it runs over the project's own `.js` files
+    first, then the page's inline scripts, and counts lines within each one. A
+    repair of a page too long to show whole needs the page's line, to be shown
+    the code that threw. An error inside a separate `.js` file has no line in
+    the page and is left out.
+    """
+    bodies, _ = inline_scripts(html)
+    starts: list[int] = []
+    pos = 0
+    for body in bodies:                 # in document order, so search onwards
+        at = html.find(body, pos)
+        starts.append(-1 if at < 0 else html.count("\n", 0, at) + 1)
+        pos = pos if at < 0 else at + len(body)
+    out: list[int] = []
+    for err in errors:
+        for m in _SCRIPT_POS_RE.finditer(err or ""):
+            j = int(m.group(1)) - local_scripts - 1
+            if 0 <= j < len(starts) and starts[j] > 0:
+                line = starts[j] + int(m.group(2)) - 1
+                if line not in out:
+                    out.append(line)
+    return out
+
+
 #: The DOM stub. Deliberately small and honest: it answers the calls a simple
 #: canvas game makes, records what was drawn, and does not pretend to lay
 #: anything out. Written as a file rather than a string argument so a quote in

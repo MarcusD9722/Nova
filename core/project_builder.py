@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from core import patch_edit
 from core.event_bus import BUS, clip
 from core.logging_setup import get_logger
 from core.policy._json_extract import extract_first_json_object
@@ -61,13 +62,101 @@ _PYTEST_REPORT_RE = re.compile(r"^=+ (?:short test summary info|FAILURES|ERRORS)
 #: pytest's short-summary line for one failure: "FAILED test_x.py::test_y - why".
 _PYTEST_SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR) \S+?\.py\S* - ")
 
-#: How much of a file each WHOLE-FILE prompt shows the model. Every one of
-#: them asks for "the COMPLETE corrected file", so a file longer than its
-#: window cannot come back whole: the model never saw the end of it. See
-#: `_fits_whole`.
+#: How long a file each WHOLE-FILE prompt may hold. Every one of them asks for
+#: "the COMPLETE corrected file", so a file longer than this is changed by
+#: find/replace edits instead (`_patch_file`). See `_fits_whole`.
 _REPAIR_WINDOW = 6000       # a generated file that does not compile
 _FIX_WINDOW = 7000          # a crash fix, a logic fix, an improvement
 _HTML_WINDOW = 9000         # a page that fails its smoke test
+
+#: Characters per token of the file a patch prompt shows, MEASURED with the
+#: model's own tokenizer on the projects on this machine (2026-11-07): Python
+#: 3.4 to 4.3 (test files lowest), HTML 2.8. Rounded down, so what a view is
+#: estimated to cost comes out high.
+_PATCH_CHARS_PER_TOKEN = {"python": 3.2}
+_PATCH_CHARS_PER_TOKEN_OTHER = 2.5
+#: What a patch prompt costs besides the file: its rules, the task and its
+#: error text, a retry's reason, the chat template.
+_PATCH_PROMPT_TOKENS = 1000
+
+
+def _context_window(runtime: Any) -> int:
+    """The model's context in tokens. A runtime that does not report one (a
+    cloud model, a test double) gets the configured local window, the
+    smallest any route here has."""
+    try:
+        reported = int(getattr(runtime, "context_tokens", 0) or 0)
+    except (TypeError, ValueError):  # quiet-ok: a window that is not a number is treated as not reported
+        reported = 0
+    if reported > 0:
+        return reported
+    try:
+        return int(os.getenv("NOVA_CONTEXT_TOKENS", "8192").strip() or "8192")
+    except ValueError:  # quiet-ok: a malformed setting falls back to the documented default
+        return 8192
+
+
+def _patch_view_budget(runtime: Any, kind: str) -> int:
+    """How many characters of a file a patch prompt can show, leaving the
+    reply its full `_FILE_TOKENS`. At the default 8,192-token window that is
+    about 13,400 characters of Python and 10,500 of HTML."""
+    tokens = _context_window(runtime) - _FILE_TOKENS - _PATCH_PROMPT_TOKENS
+    per = _PATCH_CHARS_PER_TOKEN.get(kind, _PATCH_CHARS_PER_TOKEN_OTHER)
+    return max(2000, int(tokens * per))
+
+
+def _patch_prompt(*, rel: str, task: str, view: str, whole: bool, kind: str,
+                  n_lines: int, chars: int, retry_reason: str) -> str:
+    """The prompt for find/replace edits to a file too long to rewrite whole."""
+    fence = {"python": "python", "html": "html", "js": "javascript"}.get(kind, "")
+    if whole:
+        shown = f"The whole of `{rel}`, {n_lines} lines:\n```{fence}\n{view}\n```\n"
+    else:
+        shown = (f"`{rel}` has {n_lines} lines ({chars} characters), too many to show "
+                 "whole. Here are its outline and the parts this change concerns, "
+                 "each copied exactly from the file. Search only for text shown "
+                 "here.\n\n" + view + "\n")
+    retry = (f"\nYOUR LAST EDITS COULD NOT BE USED: {retry_reason}. Nothing was "
+             "changed. Write the edits again.\n" if retry_reason else "")
+    return (
+        f"Change `{rel}` with find-and-replace edits. It is too long to rewrite "
+        "whole, so do NOT return the whole file.\n\n"
+        f"{task}\n\n{shown}{retry}\n"
+        "Write each change as an edit block, exactly like this:\n"
+        "<<<<<<< SEARCH\n"
+        "the existing lines to change, copied exactly\n"
+        "=======\n"
+        "the lines to put in their place\n"
+        ">>>>>>> REPLACE\n\n"
+        "Rules:\n"
+        "- Copy the SEARCH lines character for character from the file shown, "
+        "indentation included. They must match only ONE place in the file: add a "
+        "neighbouring line if they could match more.\n"
+        "- To add new code, SEARCH for the lines where it goes and repeat them in "
+        "REPLACE with the new code added.\n"
+        "- To delete lines, leave REPLACE empty. Never leave SEARCH empty.\n"
+        "- Change only what this needs. Several small edits are better than one "
+        "big one.\n"
+        "Reply with ONLY the edit blocks."
+    )
+
+
+def _compile_error_text(text: str, name: str) -> str | None:
+    """`_py_compile_error` for text that is not on disk yet."""
+    try:
+        compile(text, name, "exec")
+        return None
+    except SyntaxError as e:  # quiet-ok: the syntax error IS the answer
+        return f"SyntaxError: {e.msg} (line {e.lineno})"
+    except Exception as e:  # noqa: BLE001  # quiet-ok: returned as the compile error (ValueError for a NUL byte)
+        return str(e)[:300]
+
+
+#: The line a compile error names: "SyntaxError: ... (line 12)".
+_ERROR_LINE_RE = re.compile(r"\(line (\d+)\)")
+#: A location line of a pytest report: "main.py:12: in apply_discount".
+_PYTEST_FRAME_RE = re.compile(r"^(\S[^:\n]*\.py):(\d+):", re.MULTILINE)
+_NAME_RE = re.compile(r"[A-Za-z_]\w*")
 
 
 #: Packages a small generated project might reasonably reach for. Probed, not
@@ -571,9 +660,9 @@ def _fits_whole(text: str, window: int) -> bool:
     the rest of the program. Measured 2026-11-07: an improvement to an
     11,152-character main.py kept the 51 of its 80 functions the model had been
     shown, and the log said "Changed: main.py. Run check passed." So a file
-    that does not fit is not rewritten whole: it is left as it was, and that is
-    said. The minimal-patch path (`_fix_runtime_error_patch`) edits the full
-    file in place and is not limited by this.
+    that does not fit is not rewritten whole. It is changed by find/replace
+    edits applied to the full file (`_patch_file`), and when those cannot be
+    made it is left as it was, and that is said.
     """
     return len(text) <= window
 
@@ -1211,6 +1300,23 @@ class ProjectBuilder:
         return None
 
     async def _llm_file(self, prompt: str) -> str:
+        """A whole source file: the largest fenced block of the coder's reply."""
+        raw = await self._coder_chat(prompt)
+        # Take the LARGEST fenced block, not the first: models often quote the
+        # buggy snippet from the prompt before giving the full corrected file,
+        # and grabbing the first fence would write the bug right back.
+        blocks = _CODE_FENCE_RE.findall(raw)
+        if blocks:
+            return max(blocks, key=len).strip() + "\n"
+        # No fence: strip leading prose line if it doesn't look like code
+        return raw + "\n"
+
+    async def _llm_edits(self, prompt: str) -> str:
+        """The coder's reply to a patch prompt, as it came: edit blocks, which
+        `patch_edit.parse_edits` reads out of any prose or fences around them."""
+        return await self._coder_chat(prompt)
+
+    async def _coder_chat(self, prompt: str) -> str:
         # Writing/rewriting an actual source file — the `coder` role.
         runtime, sem = self._handle("coder")
         kwargs: dict[str, Any] = {}
@@ -1234,15 +1340,114 @@ class ProjectBuilder:
                 thinking=True,
                 **kwargs,
             )
-        raw = (raw or "").strip()
-        # Take the LARGEST fenced block, not the first: models often quote the
-        # buggy snippet from the prompt before giving the full corrected file,
-        # and grabbing the first fence would write the bug right back.
-        blocks = _CODE_FENCE_RE.findall(raw)
-        if blocks:
-            return max(blocks, key=len).strip() + "\n"
-        # No fence: strip leading prose line if it doesn't look like code
-        return raw + "\n"
+        return (raw or "").strip()
+
+    # ── Edits to a file too long to rewrite whole ────────────────────────────
+
+    async def _patch_file(self, slug: str, target: Path, rel: str, *, task: str,
+                          focus_lines: Any = (), focus_names: Any = (),
+                          choose_parts: bool = False) -> tuple[str | None, str]:
+        """Change a file too long to rewrite whole, by find/replace edits.
+
+        Returns (the edited text, "") or (None, why it could not be done), and
+        writes NOTHING: each caller keeps its own check of the result and its
+        own way back, exactly as with a whole-file reply.
+
+        The model is shown the whole file when that fits the context, and its
+        outline plus the parts that matter when it does not: the code around
+        each of `focus_lines`, then each function or class in `focus_names`.
+        With neither and `choose_parts`, it is first asked which parts it needs.
+        Its edits are applied to the FULL file, so nothing it was not shown can
+        be lost. They are refused, with the reason, when any SEARCH does not
+        match exactly one place, when they change nothing, when they would
+        delete most of the file, or when a Python file no longer compiles. A
+        refusal is told to the model, and it gets ONE more try.
+        """
+        current = target.read_text(encoding="utf-8", errors="replace")
+        kind = patch_edit.file_kind(rel)
+        runtime, _sem = self._handle("coder")
+        budget = _patch_view_budget(runtime, kind)
+        n_lines = len(patch_edit.split_lines(current))
+        # Only what can be shown: a line in the file, a name in its outline.
+        known = {p.name for p in patch_edit.outline_parts(current, kind)}
+        lines = [n for n in dict.fromkeys(int(x) for x in focus_lines) if 1 <= n <= n_lines]
+        names = [n for n in dict.fromkeys(focus_names) if n in known]
+        if choose_parts and len(current) > budget and not lines and not names and known:
+            names = await self._choose_parts(slug, rel, current, kind, task, budget)
+        view, whole = patch_edit.file_view(current, kind=kind, budget=budget,
+                                           focus_lines=lines, focus_names=names)
+        reason = ""
+        for attempt in (1, 2):
+            BUS.publish("project.progress", {"project": slug, "stage": "patching",
+                                             "file": rel, "attempt": attempt})
+            reply = await self._llm_edits(_patch_prompt(
+                rel=rel, task=task, view=view, whole=whole, kind=kind,
+                n_lines=n_lines, chars=len(current), retry_reason=reason))
+            try:
+                edits = patch_edit.parse_edits(reply)
+                patched = patch_edit.apply_edits(current, edits)
+                if patched == current:
+                    raise patch_edit.PatchError("the edits change nothing")
+                if self._looks_like_failed_generation(patched, current):
+                    raise patch_edit.PatchError(
+                        "the edits would delete most of the file")
+                if kind == "python":
+                    error = _compile_error_text(patched, rel)
+                    if error:
+                        raise patch_edit.PatchError(
+                            f"after the edits the file does not compile: {error}")
+            except patch_edit.PatchError as e:  # quiet-ok: logged here, told to the model, and returned to the caller, which reports it
+                reason = str(e)
+                logger.info("builder_patch_refused", project=slug, file=rel,
+                            attempt=attempt, reason=reason[:240], whole_view=whole)
+                continue
+            logger.info("builder_patch_applied", project=slug, file=rel,
+                        attempt=attempt, edits=len(edits), whole_view=whole,
+                        chars_before=len(current), chars_after=len(patched))
+            return patched, ""
+        return None, reason
+
+    async def _choose_parts(self, slug: str, rel: str, current: str, kind: str,
+                            task: str, budget: int) -> list[str]:
+        """Which functions or classes of a file too long to show the model needs
+        to see for `task`, asked of the model from the file's outline."""
+        parts = patch_edit.outline_parts(current, kind)
+        # The whole budget: nothing else is shown yet, and this is the moment
+        # the model chooses among them, so it should see as many as fit.
+        outline = patch_edit.outline_text(parts, budget)
+        obj = await self._llm_json(
+            f"`{rel}` in project `{slug}` is too long to show whole "
+            f"({len(patch_edit.split_lines(current))} lines). Before it is changed, "
+            "choose the parts of it you need to see.\n\n"
+            f"The change:\n{task}\n\n{outline}\n\n"
+            'Reply ONLY with JSON: {"parts": ["name", ...]}\n'
+            "Name at most 6 functions or classes from the outline: the ones the "
+            "change will edit, and the ones it must read to get them right.",
+            max_tokens=500,
+        )
+        raw = (obj or {}).get("parts")
+        if isinstance(raw, str):
+            raw = [raw]
+        known = {p.name for p in parts}
+        chosen: list[str] = []
+        for item in raw if isinstance(raw, list) else []:
+            # "Bird.flap", "flap()" and "`flap`" all name flap.
+            name = str(item).split("(")[0].strip().strip("`'\" ").split(".")[-1]
+            if name in known and name not in chosen:
+                chosen.append(name)
+        logger.info("builder_patch_parts_chosen", project=slug, file=rel,
+                    chosen=chosen[:6], offered=len(parts))
+        return chosen[:6]
+
+    @staticmethod
+    def _entry_frames(error: str, target: Path, base: Path) -> list[int]:
+        """The lines of `target` that a traceback or pytest report passes
+        through, deepest first."""
+        frames = [int(n) for name, n in _FRAME_RE.findall(error or "")
+                  if ProjectBuilder._same_file(name, target, base)]
+        frames += [int(n) for name, n in _PYTEST_FRAME_RE.findall(error or "")
+                   if ProjectBuilder._same_file(name, target, base)]
+        return list(dict.fromkeys(reversed(frames)))
 
     # ── Build pipeline ───────────────────────────────────────────────────────
 
@@ -1376,25 +1581,34 @@ class ProjectBuilder:
                 if rel.endswith(".py"):
                     error = await asyncio.to_thread(self._py_compile_error, target)
                     if error:
-                        if not _fits_whole(content, _REPAIR_WINDOW):
-                            raise RuntimeError(
-                                f"{rel} does not compile ({error}) and is too long "
-                                f"({len(content)} characters) to repair whole")
                         BUS.publish("project.progress", {"project": slug, "stage": "repairing", "file": rel})
-                        fixed = await self._llm_file(
-                            f"This Python file has a syntax error. Fix it and return the COMPLETE corrected file.\n"
-                            f"Error: {error}\n\nFile `{rel}`:\n```python\n{content}\n```\n"
-                            "Reply with ONLY the corrected file content in a single fenced code block."
-                        )
-                        if self._looks_like_failed_generation(fixed, content):
-                            # An empty file COMPILES. Writing this replaced a file
-                            # with one syntax error by a file with nothing in it,
-                            # and the run check then passed a program that does
-                            # nothing (measured 2026-11-07). The file is left as
-                            # it was generated, and the build fails saying why.
-                            raise RuntimeError(
-                                f"{rel} does not compile ({error}) and its repair "
-                                "came back empty")
+                        if _fits_whole(content, _REPAIR_WINDOW):
+                            fixed = await self._llm_file(
+                                f"This Python file has a syntax error. Fix it and return the COMPLETE corrected file.\n"
+                                f"Error: {error}\n\nFile `{rel}`:\n```python\n{content}\n```\n"
+                                "Reply with ONLY the corrected file content in a single fenced code block."
+                            )
+                            if self._looks_like_failed_generation(fixed, content):
+                                # An empty file COMPILES. Writing this replaced a file
+                                # with one syntax error by a file with nothing in it,
+                                # and the run check then passed a program that does
+                                # nothing (measured 2026-11-07). The file is left as
+                                # it was generated, and the build fails saying why.
+                                raise RuntimeError(
+                                    f"{rel} does not compile ({error}) and its repair "
+                                    "came back empty")
+                        else:
+                            # Too long to be shown whole, so repaired IN PLACE:
+                            # the line the error names, edited in the full file.
+                            fixed, why = await self._patch_file(
+                                slug, target, rel,
+                                task=(f"This Python file does not compile: {error}. "
+                                      "Fix that syntax error and change nothing else."),
+                                focus_lines=[int(n) for n in _ERROR_LINE_RE.findall(error)])
+                            if fixed is None:
+                                raise RuntimeError(
+                                    f"{rel} does not compile ({error}), and a patch to "
+                                    f"repair it could not be applied: {why}")
                         target.write_text(fixed, encoding="utf-8")
                         error2 = await asyncio.to_thread(self._py_compile_error, target)
                         if error2:
@@ -1795,10 +2009,22 @@ class ProjectBuilder:
             target = path / entry
             current = target.read_text(encoding="utf-8", errors="replace")
             if not _fits_whole(current, _FIX_WINDOW):
-                return (f"Run check failed, and {entry} is too long ({len(current)} "
-                        "characters) to fix whole without losing the part the fix "
-                        f"is not shown, so it was left as it was: "
-                        f"{failure_line(run_error)[:160]}")
+                # Too long to rewrite whole: edited in place, at the lines the
+                # traceback passes through in this file, deepest first.
+                fixed, why = await self._patch_file(
+                    slug, target, entry,
+                    task=("This Python program crashes when run. Fix the cause of the "
+                          "crash. Keep all other behavior, and do not add imports the "
+                          "file does not already have.\n"
+                          f"Error output:\n{run_error[-1200:]}"),
+                    focus_lines=self._entry_frames(run_error, target, path))
+                if fixed is None:
+                    return (f"Run check failed, and {entry} is too long ({len(current)} "
+                            "characters) to fix whole; a patch fix could not be "
+                            f"applied ({why[:160]}), so it was left as it was: "
+                            f"{failure_line(run_error)[:160]}")
+                target.write_text(fixed, encoding="utf-8")
+                continue
             fixed = await self._llm_file(
                 f"This Python program crashes when run. Fix the bug and return the COMPLETE corrected file.\n"
                 # The END of a traceback is the error. `run_error[:1200]`
@@ -1935,29 +2161,45 @@ class ProjectBuilder:
 
         # It ran and it is broken. ONE repair round, with the real error.
         before = target.read_text(encoding="utf-8", errors="replace")
-        if not _fits_whole(before, _HTML_WINDOW):
-            return (f"{result.note()} ({page}) The page is too long ({len(before)} "
-                    "characters) to repair whole without losing the part the repair "
-                    "is not shown, so it was left as it was.")
         BUS.publish("project.progress",
                     {"project": slug, "stage": "repairing", "file": page})
-        fixed = await self._llm_file(
-            "This single-page HTML program fails when run headlessly.\n"
-            "The errors, from a stub DOM that dispatches arrow keys and ticks "
-            "requestAnimationFrame:\n"
-            + "\n".join(f"- {e}" for e in (result.errors
-                                           or ["it never drew anything"])[:4])
-            + f"\n\nFix the CAUSE and return the COMPLETE corrected file "
-              f"`{page}`.\nKeep every working feature. Do not add a build step, "
-              "a framework, or anything loaded from the network.\n\n"
-              f"```html\n{before}\n```\n"
-              "Reply with ONLY the corrected file in one fenced code block.")
-        # Judged against the page it would replace, as every other repair is.
-        # Without `before`, a ten-line stub that draws one rectangle was a
-        # "repair" of a whole game, and it passes the smoke test.
-        if self._looks_like_failed_generation(fixed, before):
-            return (f"{result.note()} ({page}) The repair attempt came back "
-                    "empty, so the file is unchanged.")
+        errors = ("The errors, from a stub DOM that dispatches arrow keys and ticks "
+                  "requestAnimationFrame:\n"
+                  + "\n".join(f"- {e}" for e in (result.errors
+                                                 or ["it never drew anything"])[:4]))
+        if _fits_whole(before, _HTML_WINDOW):
+            fixed = await self._llm_file(
+                "This single-page HTML program fails when run headlessly.\n"
+                + errors
+                + f"\n\nFix the CAUSE and return the COMPLETE corrected file "
+                  f"`{page}`.\nKeep every working feature. Do not add a build step, "
+                  "a framework, or anything loaded from the network.\n\n"
+                  f"```html\n{before}\n```\n"
+                  "Reply with ONLY the corrected file in one fenced code block.")
+            # Judged against the page it would replace, as every other repair is.
+            # Without `before`, a ten-line stub that draws one rectangle was a
+            # "repair" of a whole game, and it passes the smoke test.
+            if self._looks_like_failed_generation(fixed, before):
+                return (f"{result.note()} ({page}) The repair attempt came back "
+                        "empty, so the file is unchanged.")
+        else:
+            # Too long to rewrite whole: edited in place, shown the page's own
+            # lines that the errors point at.
+            from core.project_html_check import page_lines
+
+            fixed, why = await self._patch_file(
+                slug, target, page,
+                task=("This single-page HTML program fails when run headlessly.\n"
+                      + errors + "\n\nFix the CAUSE. Keep every working feature. Do "
+                      "not add a build step, a framework, or anything loaded from "
+                      "the network."),
+                focus_lines=page_lines(before, result.errors,
+                                       local_scripts=result.local_scripts))
+            if fixed is None:
+                return (f"{result.note()} ({page}) The page is too long "
+                        f"({len(before)} characters) to repair whole, and a patch "
+                        f"repair could not be applied ({why[:160]}), so it was left "
+                        "as it was.")
 
         target.write_text(fixed, encoding="utf-8")
         after = await smoke_test_html(target)
@@ -2057,7 +2299,7 @@ class ProjectBuilder:
 
         last_err = ""
         launch_err: str | None = None
-        too_long = False
+        patch_why: str | None = None
         tests_green = False
         for attempt in range(3):
             BUS.publish("project.progress", {"project": slug, "stage": "logic_test", "file": test_name, "attempt": attempt + 1})
@@ -2074,24 +2316,38 @@ class ProjectBuilder:
             if "AssertionError" not in err or attempt == 2:
                 break
             current = entry_path.read_text(encoding="utf-8", errors="replace")
-            if not _fits_whole(current, _FIX_WINDOW):
-                too_long = True
-                break
             BUS.publish("project.progress", {"project": slug, "stage": "fixing_logic", "file": entry})
-            fixed = await self._llm_file(
-                f"Your program `{entry}` fails a logic test. The test encodes the INTENDED behavior; "
-                # The END of a pytest report names the failing check.
-                f"fix the PROGRAM so the test passes.\nTest failure:\n{err[-1000:]}\n\n"
-                f"`{entry}`:\n```python\n{current}\n```\n"
-                "Rules: fix the logic bug in the program, not the test. Keep all other behavior. Do not add "
-                "imports the file lacks. Reply with EXACTLY ONE fenced code block containing the whole file."
-            )
-            if self._looks_like_failed_generation(fixed, current):
-                break
-            try:
-                compile(fixed, entry, "exec")
-            except Exception:  # quiet-ok: a fix that does not compile is never written; the note then says the tests were inconclusive
-                break  # never write a fix that breaks syntax
+            if _fits_whole(current, _FIX_WINDOW):
+                fixed = await self._llm_file(
+                    f"Your program `{entry}` fails a logic test. The test encodes the INTENDED behavior; "
+                    # The END of a pytest report names the failing check.
+                    f"fix the PROGRAM so the test passes.\nTest failure:\n{err[-1000:]}\n\n"
+                    f"`{entry}`:\n```python\n{current}\n```\n"
+                    "Rules: fix the logic bug in the program, not the test. Keep all other behavior. Do not add "
+                    "imports the file lacks. Reply with EXACTLY ONE fenced code block containing the whole file."
+                )
+                if self._looks_like_failed_generation(fixed, current):
+                    break
+                try:
+                    compile(fixed, entry, "exec")
+                except Exception:  # quiet-ok: a fix that does not compile is never written; the note then says the tests were inconclusive
+                    break  # never write a fix that breaks syntax
+            else:
+                # Too long to rewrite whole: edited in place, shown what the
+                # failure names: the program's lines in the report, and the
+                # program's functions it mentions (`apply_discount(80, 25)`).
+                fixed, why = await self._patch_file(
+                    slug, entry_path, entry,
+                    task=(f"This program fails a logic test. The test encodes the "
+                          "INTENDED behavior: fix the PROGRAM so the test passes, not "
+                          "the test. Keep all other behavior, and do not add imports "
+                          f"the file lacks.\nTest failure:\n{err[-1000:]}"),
+                    focus_lines=self._entry_frames(err, entry_path, path),
+                    focus_names=_NAME_RE.findall(err),
+                    choose_parts=True)
+                if fixed is None:
+                    patch_why = why
+                    break
             entry_path.write_text(fixed, encoding="utf-8")
 
         if tests_green:
@@ -2111,10 +2367,10 @@ class ProjectBuilder:
         if launch_err is not None:
             return (f"Logic tests failed ({failed}); a fix made them pass but stopped "
                     "the program starting, so the code was left unchanged.")
-        if too_long:
-            return (f"Logic tests failed ({failed}); {entry} is too long to fix whole "
-                    "without losing the part the fix is not shown, so the code was "
-                    "left unchanged.")
+        if patch_why is not None:
+            return (f"Logic tests failed ({failed}); {entry} is too long to fix whole, "
+                    f"and a patch fix could not be applied ({patch_why[:150]}), so the "
+                    "code was left unchanged.")
         # A persistently-failing GENERATED test is ambiguous — the model may
         # have written a wrong assertion, so don't brand correct code "broken".
         # Report it honestly as review-worthy and leave the code untouched.
@@ -2360,45 +2616,59 @@ class ProjectBuilder:
                 current = ""
                 if existed:
                     current = target.read_text(encoding="utf-8", errors="replace")
-                    # The prompt shows `_FIX_WINDOW` characters and asks for
-                    # the COMPLETE file, so a longer one came back without its
-                    # end, and the "revert" below wrote back only the part that
-                    # had been shown: an 11,152-character main.py became 7,000
-                    # characters cut mid-string (measured 2026-11-07).
-                    if not _fits_whole(current, _FIX_WINDOW):
+
+                BUS.publish("project.progress", {"project": slug, "stage": "improving", "file": rel})
+                if existed and not _fits_whole(current, _FIX_WINDOW):
+                    # A whole-file prompt showed `_FIX_WINDOW` characters and
+                    # asked for the COMPLETE file, so a longer one came back
+                    # without its end, and the "revert" below wrote back only
+                    # the part that had been shown: an 11,152-character main.py
+                    # became 7,000 characters cut mid-string (measured
+                    # 2026-11-07). So it is edited in place instead.
+                    new_content, why = await self._patch_file(
+                        slug, target, rel,
+                        task=(f"Improvement to make: {ch.get('what')}\n"
+                              f"Overall request: {instructions}\n"
+                              "If you add a feature, function, screen or button, make "
+                              "sure it is actually CALLED and reachable from the code "
+                              "that should trigger it: a game-over or restart screen "
+                              "must be shown when the game ends, a new button's handler "
+                              "must be wired up. Never leave new code defined but never "
+                              "called."),
+                        choose_parts=True)
+                    if new_content is None:
                         reason = (f"too long ({len(current)} characters) to rewrite "
-                                  "whole without losing the part the model is not "
-                                  "shown; left as it was")
+                                  f"whole, and a patch could not be applied "
+                                  f"({why[:160]}); left as it was")
                         fail_reasons.append(f"{rel}: {reason}")
                         BUS.publish("project.progress", {"project": slug, "stage": "skipped",
                                                          "file": rel, "error": reason})
                         continue
-
-                BUS.publish("project.progress", {"project": slug, "stage": "improving", "file": rel})
-                file_prompt = (
-                    f"Improve `{rel}` in project `{slug}`.\n"
-                    f"Improvement to make: {ch.get('what')}\nOverall request: {instructions}\n\n"
-                    f"Current content:\n```\n{current}\n```\n\n"
-                    "Return the COMPLETE improved file (not a diff), fully working, no placeholders. "
-                    "CRITICAL: if you add a new feature, function, screen, or button, make sure it is "
-                    "actually CALLED and reachable by the code path that should trigger it — e.g. a "
-                    "game-over/restart screen must be invoked when the game ends, a new button's handler "
-                    "must be wired up. Never leave new code defined but never called. "
-                    "Reply with ONLY the file content in a single fenced code block."
-                )
-                new_content = await self._llm_file(file_prompt)
-                if self._looks_like_failed_generation(new_content, current):
-                    # Retry once — the first attempt likely got truncated mid-reasoning.
-                    new_content = await self._llm_file(file_prompt)
-                if self._looks_like_failed_generation(new_content, current):
-                    # Never overwrite existing working code with an empty/near-empty
-                    # response — skip this file instead of destroying it.
-                    fail_reasons.append(f"{rel}: generation came back empty/incomplete")
-                    BUS.publish(
-                        "project.progress",
-                        {"project": slug, "stage": "skipped", "file": rel, "error": "generation came back empty/incomplete"},
+                else:
+                    file_prompt = (
+                        f"Improve `{rel}` in project `{slug}`.\n"
+                        f"Improvement to make: {ch.get('what')}\nOverall request: {instructions}\n\n"
+                        f"Current content:\n```\n{current}\n```\n\n"
+                        "Return the COMPLETE improved file (not a diff), fully working, no placeholders. "
+                        "CRITICAL: if you add a new feature, function, screen, or button, make sure it is "
+                        "actually CALLED and reachable by the code path that should trigger it — e.g. a "
+                        "game-over/restart screen must be invoked when the game ends, a new button's handler "
+                        "must be wired up. Never leave new code defined but never called. "
+                        "Reply with ONLY the file content in a single fenced code block."
                     )
-                    continue
+                    new_content = await self._llm_file(file_prompt)
+                    if self._looks_like_failed_generation(new_content, current):
+                        # Retry once — the first attempt likely got truncated mid-reasoning.
+                        new_content = await self._llm_file(file_prompt)
+                    if self._looks_like_failed_generation(new_content, current):
+                        # Never overwrite existing working code with an empty/near-empty
+                        # response — skip this file instead of destroying it.
+                        fail_reasons.append(f"{rel}: generation came back empty/incomplete")
+                        BUS.publish(
+                            "project.progress",
+                            {"project": slug, "stage": "skipped", "file": rel, "error": "generation came back empty/incomplete"},
+                        )
+                        continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(new_content, encoding="utf-8")
                 changed.append(rel)
